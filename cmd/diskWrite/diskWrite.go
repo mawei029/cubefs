@@ -171,7 +171,7 @@ func consumeOne(list *MyQueue, closed, finish chan bool, fh *os.File) {
 	for {
 		select {
 		case <-closed:
-			fmt.Printf("close consumer... cnt=%d, gMaxDequeue=%v, timeCount=%d \n", gCnt, gMaxDequeue, len(costArr))
+			fmt.Printf("close consumer... gCnt=%d, gMaxDequeue=%v, delayCostCount=%d \n", gCnt, gMaxDequeue, len(costArr))
 			//fmt.Printf("cost time deQueue... len=%d, costArr=%v \n", len(costArr), costArr)
 			//fmt.Printf("cost time Write done... len=%d, costWtDoneArr=%v \n", len(costWtDoneArr), costWtDoneArr)
 			recordCostTimeFile(COST_TIME_FILE+".one.log", costArr, costWtDoneArr)
@@ -220,7 +220,7 @@ func consumeOne(list *MyQueue, closed, finish chan bool, fh *os.File) {
 				list.lock.RUnlock()
 			} // end for list
 			if notEmpty {
-				fmt.Printf("consume once..., size=%d, gMaxDequeue=%v \n", gCnt, gMaxDequeue)
+				fmt.Printf("consume once..., gCnt=%d, gMaxDequeue=%v \n", gCnt, gMaxDequeue)
 			}
 		} // end select
 	} // end for
@@ -246,7 +246,7 @@ func productMulti(i int, list *MyQueue, closed chan bool) {
 			size := list.getSize()
 			list.lock.RUnlock()
 			if size >= QUEUE_SIZE { // oom
-				time.Sleep(time.Millisecond * 3)
+				time.Sleep(PRODUCT_INTERVAL * 2)
 				continue
 			}
 			dataIdx := rand.Intn(maxIdx)
