@@ -20,8 +20,8 @@ import (
 var (
 	READ_FILE        = "./readFile.log" // "./demo/read8M.log"  read64K.log
 	WRITE_FILE       = "./dstFile.log"
-	THREAD_NUM       = 8    // 生产者的并发个数
-	QUEUE_SIZE       = 200  // 缓存队列的长度
+	THREAD_NUM       = 2    // 生产者的并发个数
+	QUEUE_SIZE       = 20   // 缓存队列的长度
 	LOOP_TIME        = 30   // 持续写盘的时间
 	INTERVAL         = 1    // 控制台输出的间隔
 	IS_SINGLE        = true // 是否是单协程写
@@ -68,7 +68,7 @@ func parseFlag() (err error) {
 	DELAY_ARRAY = *delayArrLen
 	TOTAL_DATA_COUNT = *totalDataCount
 
-	fmt.Printf("parse flag: readFile=%s, writeFile=%s, productNum=%d, QmaxSiz=%d, eelapsedTime=%d, interval=%d, "+
+	fmt.Printf("parse flag: readFile=%s, writeFile=%s, consumerNum=%d, QmaxSiz=%d, eelapsedTime=%d, interval=%d, "+
 		"batchDataAtOnce=%d, productInterval=%s, delayArrLen=%d, isSingleMode=%v \n",
 		READ_FILE, WRITE_FILE, THREAD_NUM, QUEUE_SIZE, LOOP_TIME, INTERVAL, TOTAL_DATA_COUNT, *productInterval, DELAY_ARRAY, IS_SINGLE)
 
@@ -362,11 +362,26 @@ func showResult(finishRecord chan bool, cntCh chan int, costCh chan []time.Durat
 		}
 		fmt.Printf("multi consumer done... write cnt: %d , gMaxDequeue=%v \n", cnt, gMaxDequeue)
 
-		costTm := make([]time.Duration, 0, cnt)
+		cnt = 0
+		costUn := make([][]time.Duration, THREAD_NUM)
 		for i := 0; i < THREAD_NUM; i++ {
-			costEach := <-costCh
-			costTm = append(costTm, costEach...)
+			//costEach := <-costCh
+			//costTm = append(costTm, costEach...)
+			costUn[i] = <-costCh
+			cnt += len(costUn[i])
 		}
+
+		costTm := make([]time.Duration, cnt)
+		for i := 0; i < cnt; {
+			for j := 0; j < THREAD_NUM; j++ {
+				if len(costUn[j]) > 0 {
+					costTm[i] = costUn[j][0]
+					costUn[j] = costUn[j][1:]
+					i++
+				}
+			}
+		}
+
 		recordCostTimeFile(COST_TIME_FILE+".many.log", nil, costTm)
 		fmt.Println("multi consumer record cost time, count=", len(costTm))
 	}
