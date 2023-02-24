@@ -47,9 +47,9 @@ type NodeData struct {
 func parseFlag() (err error) {
 	rdFile := flag.String("r", READ_FILE, "read from file")
 	wtFile := flag.String("w", WRITE_FILE, "write to file")
-	goNum := flag.Int("n", THREAD_NUM, "multi product num")
+	goNum := flag.Int("n", THREAD_NUM, "multi consumer num")
 	queueSize := flag.Int("q", QUEUE_SIZE, "queue max size")
-	totalDataCount := flag.Int("c", QUEUE_SIZE, "total request data count, many datas at once")
+	totalDataCount := flag.Int("c", TOTAL_DATA_COUNT, "total request data count, many datas at once")
 	loopTime := flag.Int("t", LOOP_TIME, "write disk elapsed time")
 	interval := flag.Int("i", INTERVAL, "interval time")
 	isSingerWrite := flag.Bool("m", IS_SINGLE, "is single write mode")
@@ -165,6 +165,9 @@ func consumeMulti(i int, list chan NodeData, closed chan bool, cntSum chan int, 
 		idx++
 		tm := time.Unix(0, node.time)
 		cost := time.Since(tm)
+		if i == 0 && cost > gMaxDequeue {
+			gMaxDequeue = cost
+		}
 		costArr = append(costArr, cost)
 
 		_, err := fh.Write([]byte(node.data))
@@ -231,6 +234,7 @@ func productConstCount(list chan NodeData, closed chan bool, datas []byte) {
 		for {
 			if len(list) == 0 {
 				close(closed)
+				return
 			}
 			<-ticker.C
 		}
@@ -249,17 +253,24 @@ func productDataPeriod(i int, list chan NodeData, closed chan bool, datas []byte
 	maxIdx := len(datas)
 	rand.Seed(time.Now().UnixNano())
 
-	for {
-		datas[rand.Intn(maxIdx)] = ch[rand.Intn(maxChar)] // 随机修改一点数据，模拟不同的请求数据
+	// 先生产够一批，和多线程个数匹配的数据
+	for i := 0; i < THREAD_NUM; i++ {
 		node := NodeData{
 			data: string(datas),
 			time: time.Now().UnixNano(),
 		}
-		list <- node // list.push(node)
+		list <- node
+	}
 
+	for {
 		select {
 		case <-ticker.C:
-			break
+			datas[rand.Intn(maxIdx)] = ch[rand.Intn(maxChar)] // 随机修改一点数据，模拟不同的请求数据
+			node := NodeData{
+				data: string(datas),
+				time: time.Now().UnixNano(),
+			}
+			list <- node // list.push(node)
 		case <-closed:
 			fmt.Println("close product...", i)
 			return
@@ -312,7 +323,11 @@ func appendWrite(fh *os.File, data []byte) error {
 func showInfoPeriod(list chan NodeData, doneTest chan bool, wait chan bool) {
 	ticker := time.NewTicker(time.Second * time.Duration(INTERVAL))
 	defer ticker.Stop()
+	defer func() {
+		wait <- true
+	}()
 	t := 0
+
 	for {
 		select {
 		case <-ticker.C:
@@ -321,30 +336,31 @@ func showInfoPeriod(list chan NodeData, doneTest chan bool, wait chan bool) {
 			if t >= LOOP_TIME {
 				goto FINAL
 			}
+		case <-doneTest:
+			fmt.Printf("Finished consume const %d data\n", TOTAL_DATA_COUNT)
+			return
 		}
 	}
 
 FINAL:
-	fmt.Println("stop request, closing......")
+	fmt.Println("It's time to stop request, closing......")
 	close(doneTest)
-
-	wait <- true
 }
 
 func showResult(finishRecord chan bool, cntCh chan int, costCh chan []time.Duration) {
 	if IS_SINGLE {
-		waitTime := time.Now()
+		//waitTime := time.Now()
 		fmt.Printf("main go: single consumer done... cnt=%d, gMaxDequeue=%v \n", gCnt, gMaxDequeue)
-		fmt.Println("waiting consumer close...")
+		//fmt.Println("waiting consumer close...")
 		<-finishRecord
-		fmt.Println("wait for closing consumer, cleanup cost time: ", time.Since(waitTime))
+		//fmt.Println("wait for closing consumer, cleanup cost time: ", time.Since(waitTime))
 	} else {
 		// multi thread consume
 		cnt := 0
 		for i := 0; i < THREAD_NUM; i++ {
 			cnt += <-cntCh
 		}
-		fmt.Printf("multi consumer done... write cnt: %d \n", cnt)
+		fmt.Printf("multi consumer done... write cnt: %d , gMaxDequeue=%v \n", cnt, gMaxDequeue)
 
 		costTm := make([]time.Duration, 0, cnt)
 		for i := 0; i < THREAD_NUM; i++ {
