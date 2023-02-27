@@ -17,65 +17,54 @@ import (
 // 1. 一次性往队列里扔，固定个数的data。 模拟瞬时大量请求，并查看谁先消费完
 // 2. 慢慢的周期往队列里扔数据。 查看长尾的效应
 
+const (
+	defaultIsSingleMode   = true             // 是否是单协程写
+	defaultIsReservedData = false            // 预埋一批数据
+	defaultThreadNum      = 2                // 生产者的并发个数
+	defaultQueueSize      = 20               // 缓存队列的长度
+	defaultLoopTime       = 30               // 持续写盘的时间
+	defaultBatchCount     = 1                // 模拟客户端一次请求的总个数，固定IO大小
+	defaultShowInterval   = 1                // 控制台输出的间隔
+	defaultRecordDelay    = 2000             // 记录时延的数组长度
+	defaultReadFile       = "./readFile.log" // "./demo/read8M.log"  read64K.log
+	defaultWriteFile      = "./dstFile.log"
+	defaultInterval       = "1us"
+	defaultRecordCostFile = "costTimeInfo"
+)
+
 var (
-	READ_FILE        = "./readFile.log" // "./demo/read8M.log"  read64K.log
-	WRITE_FILE       = "./dstFile.log"
-	IS_SINGLE        = true  // 是否是单协程写
-	IS_RESERVED_DATA = false // 预埋一批数据
-	THREAD_NUM       = 2     // 生产者的并发个数
-	QUEUE_SIZE       = 20    // 缓存队列的长度
-	LOOP_TIME        = 30    // 持续写盘的时间
-	INTERVAL         = 1     // 控制台输出的间隔
-	DELAY_ARRAY      = 2000  // 记录时延的数组长度
-	BATCH_COUNT      = 1     // 模拟客户端一次请求的总个数，固定IO大小
-	COST_TIME_FILE   = "costTimeInfo"
+	rdFile         = flag.String("r", defaultReadFile, "read from file")
+	wtFile         = flag.String("w", defaultWriteFile, "write to file")
+	isReservedData = flag.Bool("rm", defaultIsReservedData, "is reserved data mode")
+	isSingerWrite  = flag.Bool("sm", defaultIsSingleMode, "is single write mode")
+	goNum          = flag.Int("n", defaultThreadNum, "multi consumer num")
+	queueSize      = flag.Int("q", defaultQueueSize, "requst queue max size")
+	loopTime       = flag.Int("t", defaultLoopTime, "write disk elapsed time")
+	batchCount     = flag.Int("b", defaultBatchCount, "total request data count, many datas at once")
+	showInterval   = flag.Int("i", defaultShowInterval, "show interval")
+	delayArrLen    = flag.Int("d", defaultRecordDelay, "record delay array length")
+	// consumeInterval := flag.String("ci", DefaultInterval, "consume interval")
+	productInterval = flag.String("pi", defaultInterval, "product interval")
 
-	DefaultInterval = "1us"
-	//CONSUME_INTERVAL time.Duration = 1000 // 消费间隔定时器，单位ns
-	PRODUCT_INTERVAL time.Duration = 1000 // 生产者间隔定时器，单位ns
-
-	gCnt        int           // 单协程下统计写入请求的总个数
-	gMaxDequeue time.Duration // 单协程下，最大出队时间
+	gTotalReqCnt   int // 单协程下统计写入请求的总个数
+	gProductPeriod time.Duration
+	gMaxDequeue    time.Duration // 单协程下，最大出队时间
 )
 
 // 入队的每个节点
 type NodeData struct {
 	data string
-	time int64
+	time time.Time
 }
 
 // gflag: ./<exe> -r ./readFile.log -n 8 -t 200 -m=false
 func parseFlag() (err error) {
-	rdFile := flag.String("r", READ_FILE, "read from file")
-	wtFile := flag.String("w", WRITE_FILE, "write to file")
-	goNum := flag.Int("n", THREAD_NUM, "multi consumer num")
-	queueSize := flag.Int("q", QUEUE_SIZE, "queue max size")
-	batchCount := flag.Int("c", BATCH_COUNT, "total request data count, many datas at once")
-	loopTime := flag.Int("t", LOOP_TIME, "write disk elapsed time")
-	interval := flag.Int("i", INTERVAL, "interval time")
-	isReservedData := flag.Bool("m", IS_RESERVED_DATA, "is reserved data mode")
-	isSingerWrite := flag.Bool("m", IS_SINGLE, "is single write mode")
-	//consumeInterval := flag.String("ci", DefaultInterval, "consume interval")
-	productInterval := flag.String("pi", DefaultInterval, "product interval")
-	delayArrLen := flag.Int("d", DELAY_ARRAY, "delay array length")
 	flag.Parse()
-
-	READ_FILE = *rdFile
-	WRITE_FILE = *wtFile
-	THREAD_NUM = *goNum
-	QUEUE_SIZE = *queueSize
-	LOOP_TIME = *loopTime
-	INTERVAL = *interval
-	IS_SINGLE = *isSingerWrite
-	DELAY_ARRAY = *delayArrLen
-	BATCH_COUNT = *batchCount
-	IS_RESERVED_DATA = *isReservedData
-
 	fmt.Printf("parse flag: readFile=%s, writeFile=%s, consumerNum=%d, QmaxSiz=%d, eelapsedTime=%d, interval=%d, "+
 		"batchDataAtOnce=%d, productInterval=%s, delayArrLen=%d, isSingleMode=%v , isReservedData=%v \n",
-		READ_FILE, WRITE_FILE, THREAD_NUM, QUEUE_SIZE, LOOP_TIME, INTERVAL, BATCH_COUNT, *productInterval, DELAY_ARRAY, IS_SINGLE, IS_RESERVED_DATA)
+		*rdFile, *wtFile, *goNum, *queueSize, *queueSize, *showInterval, *batchCount, *productInterval, *delayArrLen, *isSingerWrite, *isReservedData)
 
-	PRODUCT_INTERVAL, err = time.ParseDuration(*productInterval)
+	gProductPeriod, err = time.ParseDuration(*productInterval)
 	if err != nil {
 		return err
 	}
@@ -88,34 +77,36 @@ func main() {
 	if err := parseFlag(); err != nil {
 		fmt.Println("ERROR... fail to parse flag.", err)
 	}
-	doneTest := make(chan bool)         // 结束测试
-	finishRecord := make(chan bool)     // 单协程closed完毕
-	cntCh := make(chan int, THREAD_NUM) // 多协程统计写请求总个数
-	costCh := make(chan []time.Duration, THREAD_NUM)
-	list := make(chan NodeData, QUEUE_SIZE) // list := newListQueue()
-	if IS_RESERVED_DATA && BATCH_COUNT > 1 {
-		list = make(chan NodeData, BATCH_COUNT)
+	doneTest := make(chan bool)     // 结束测试
+	finishRecord := make(chan bool) // 单协程closed完毕
+	cntCh := make(chan int, *goNum) // 多协程统计写请求总个数
+	costCh := make(chan []time.Duration, *goNum)
+	list := make(chan NodeData, *queueSize) // list := newListQueue()
+	if *isReservedData && *batchCount > 1 {
+		list = make(chan NodeData, *batchCount)
 	}
 
-	os.Remove(WRITE_FILE)
-	fh, err := os.OpenFile(WRITE_FILE, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+	os.Remove(*wtFile)
+	fh, err := os.OpenFile(*wtFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
 	if err != nil {
 		fmt.Println("ERROR... open file err:", err.Error())
-	}
-	defer fh.Close()
-
-	// 改为单个生产者
-	errCh := make(chan error)
-	go productMulti(0, list, doneTest, errCh)
-	if err = <-errCh; err != nil {
 		return
 	}
+	defer fh.Close()
+	_, err = os.Stat(*rdFile)
+	if os.IsNotExist(err) {
+		fmt.Println("ERROR... read file err:", err.Error())
+		return
+	}
+
+	// 改为单个生产者
+	go productMulti(0, list, doneTest)
 	tStart := time.Now()
 
-	if IS_SINGLE { // 单个消费者
+	if *isSingerWrite { // 单个消费者
 		go consumeOne(list, doneTest, finishRecord, fh)
 	} else { // 测试多线程写
-		for i := 0; i < THREAD_NUM; i++ {
+		for i := 0; i < *goNum; i++ {
 			go consumeMulti(i, list, doneTest, cntCh, costCh, fh)
 		}
 	}
@@ -130,25 +121,24 @@ func main() {
 }
 
 func consumeOne(list chan NodeData, closed, finishRecord chan bool, fh *os.File) {
-	costArr := make([]time.Duration, 0, DELAY_ARRAY)
-	costWtDoneArr := make([]time.Duration, 0, DELAY_ARRAY)
+	costArr := make([]time.Duration, 0, *delayArrLen)
+	costWtDoneArr := make([]time.Duration, 0, *delayArrLen)
 
 	for {
 		node, ok := <-list
 		if !ok {
 			goto FINISH
 		}
-		tm := time.Unix(0, node.time)
-		cost := time.Since(tm)
+		cost := time.Since(node.time)
 		costArr = append(costArr, cost)
 		if cost > gMaxDequeue {
 			gMaxDequeue = cost
 		}
 
 		appendWrite(fh, []byte(node.data))
-		cost = time.Since(tm)
+		cost = time.Since(node.time)
 		costWtDoneArr = append(costWtDoneArr, cost)
-		gCnt++ //idx++
+		gTotalReqCnt++ // idx++
 
 		select {
 		case <-closed:
@@ -158,17 +148,17 @@ func consumeOne(list chan NodeData, closed, finishRecord chan bool, fh *os.File)
 		} // end select
 	} // end for
 FINISH:
-	fmt.Printf("close consumer... gCnt=%d, gMaxDequeue=%v, delayCostCount=%d \n", gCnt, gMaxDequeue, len(costArr))
-	//fmt.Printf("cost time deQueue... len=%d, costArr=%v \n", len(costArr), costArr)
-	//fmt.Printf("cost time Write done... len=%d, costWtDoneArr=%v \n", len(costWtDoneArr), costWtDoneArr)
-	recordCostTimeFile(COST_TIME_FILE+".one.log", costArr, costWtDoneArr)
+	fmt.Printf("close consumer... gTotalReqCnt=%d, gMaxDequeue=%v, delayCostCount=%d \n", gTotalReqCnt, gMaxDequeue, len(costArr))
+	// fmt.Printf("cost time deQueue... len=%d, costArr=%v \n", len(costArr), costArr)
+	// fmt.Printf("cost time Write done... len=%d, costWtDoneArr=%v \n", len(costWtDoneArr), costWtDoneArr)
+	recordCostTimeFile(defaultRecordCostFile+".one.log", costArr, costWtDoneArr)
 	finishRecord <- true
 	return
 }
 
 func consumeMulti(i int, list chan NodeData, closed chan bool, cntSum chan int, costSum chan []time.Duration, fh *os.File) {
-	costArr := make([]time.Duration, 0, DELAY_ARRAY)
-	costWtDoneArr := make([]time.Duration, 0, DELAY_ARRAY)
+	costArr := make([]time.Duration, 0, *delayArrLen)
+	costWtDoneArr := make([]time.Duration, 0, *delayArrLen)
 	idx := 0
 
 	for {
@@ -177,8 +167,7 @@ func consumeMulti(i int, list chan NodeData, closed chan bool, cntSum chan int, 
 			goto FINISH
 		}
 		idx++
-		tm := time.Unix(0, node.time)
-		cost := time.Since(tm)
+		cost := time.Since(node.time)
 		if i == 0 && cost > gMaxDequeue {
 			gMaxDequeue = cost
 		}
@@ -192,7 +181,7 @@ func consumeMulti(i int, list chan NodeData, closed chan bool, cntSum chan int, 
 		if err != nil {
 			fmt.Println("ERROR... consumeOne: fail to sync file.", err)
 		}
-		cost = time.Since(tm)
+		cost = time.Since(node.time)
 		costWtDoneArr = append(costWtDoneArr, cost)
 
 		select {
@@ -209,39 +198,34 @@ FINISH:
 	return
 }
 
-func productMulti(i int, list chan NodeData, closed chan bool, errCh chan error) error {
-	datas, err := ioutil.ReadFile(READ_FILE)
+func productMulti(i int, list chan NodeData, closed chan bool) {
+	datas, err := ioutil.ReadFile(*rdFile)
 	if err != nil {
 		fmt.Println("ERROR... product bad datas, read fail")
-		errCh <- err
-		return err
 	}
 
-	errCh <- nil
 	// 预埋数据，一次性固定生产一堆数据，模拟瞬时大量请求
-	if IS_RESERVED_DATA {
+	if *isReservedData {
 		productConstCount(list, closed, datas)
-		return nil
 	}
 
 	productDataPeriod(i, list, closed, datas)
-	return nil
 }
 
 // 生产固定个数的请求
 func productConstCount(list chan NodeData, closed chan bool, datas []byte) {
-	fmt.Printf("I'm going to produce %d datas at once \n", BATCH_COUNT)
+	fmt.Printf("I'm going to produce %d datas at once \n", *batchCount)
 
 	ch := []byte("abcdefghijklmnopqrstuvwxyz")
 	maxChar := len(ch)
 	maxIdx := len(datas)
 	rand.Seed(time.Now().UnixNano())
 
-	for i := 0; i < BATCH_COUNT; i++ {
+	for i := 0; i < *batchCount; i++ {
 		datas[rand.Intn(maxIdx)] = ch[rand.Intn(maxChar)] // 随机修改一点数据，模拟不同的请求数据
 		node := NodeData{
 			data: string(datas),
-			time: time.Now().UnixNano(),
+			time: time.Now(),
 		}
 		list <- node // list.push(datas)
 	}
@@ -262,8 +246,8 @@ func productConstCount(list chan NodeData, closed chan bool, datas []byte) {
 
 // 周期的生产数据
 func productDataPeriod(i int, list chan NodeData, closed chan bool, datas []byte) {
-	fmt.Printf("I'm going to produce 1 datas per %v \n", PRODUCT_INTERVAL)
-	ticker := time.NewTicker(PRODUCT_INTERVAL)
+	fmt.Printf("I'm going to produce %d datas per %v \n", *batchCount, gProductPeriod)
+	ticker := time.NewTicker(gProductPeriod)
 	defer ticker.Stop()
 
 	ch := []byte("abcdefghijklmnopqrstuvwxyz")
@@ -272,10 +256,10 @@ func productDataPeriod(i int, list chan NodeData, closed chan bool, datas []byte
 	rand.Seed(time.Now().UnixNano())
 
 	// 先生产够一批，和多线程个数匹配的数据
-	for i := 0; i < THREAD_NUM; i++ {
+	for i := 0; i < *goNum; i++ {
 		node := NodeData{
 			data: string(datas),
-			time: time.Now().UnixNano(),
+			time: time.Now(),
 		}
 		list <- node
 	}
@@ -286,9 +270,9 @@ func productDataPeriod(i int, list chan NodeData, closed chan bool, datas []byte
 			datas[rand.Intn(maxIdx)] = ch[rand.Intn(maxChar)] // 随机修改一点数据，模拟不同的请求数据
 			node := NodeData{
 				data: string(datas),
-				time: time.Now().UnixNano(),
+				time: time.Now(),
 			}
-			for j := 0; j < BATCH_COUNT; j++ {
+			for j := 0; j < *batchCount; j++ {
 				list <- node // list.push(node)
 			}
 		case <-closed:
@@ -303,8 +287,8 @@ func recordCostTimeFile(path string, dequeTm, writeTm []time.Duration) {
 	type costTime struct {
 		DequeCostInt []time.Duration `json:"deque_int"`
 		WriteCostInt []time.Duration `json:"write_int"`
-		//DequeCostStr []string        `json:"deque_cost"`
-		//WriteCostStr []string        `json:"write_cost"`
+		// DequeCostStr []string        `json:"deque_cost"`
+		// WriteCostStr []string        `json:"write_cost"`
 	}
 
 	//dequeStr := make([]string, 0, len(dequeTm))
@@ -319,11 +303,11 @@ func recordCostTimeFile(path string, dequeTm, writeTm []time.Duration) {
 	cost := costTime{
 		DequeCostInt: dequeTm,
 		WriteCostInt: writeTm,
-		//DequeCostStr: dequeStr,
-		//WriteCostStr: writeStr,
+		// DequeCostStr: dequeStr,
+		// WriteCostStr: writeStr,
 	}
 	datas, _ := json.MarshalIndent(cost, "", " ")
-	err := ioutil.WriteFile(path, datas, 0644)
+	err := ioutil.WriteFile(path, datas, 0o644)
 	if err != nil {
 		fmt.Println("ERROR... write file err:", err)
 	}
@@ -342,7 +326,7 @@ func appendWrite(fh *os.File, data []byte) error {
 }
 
 func showInfoPeriod(list chan NodeData, doneTest chan bool, wait chan bool) {
-	ticker := time.NewTicker(time.Second * time.Duration(INTERVAL))
+	ticker := time.NewTicker(time.Second * time.Duration(*showInterval))
 	defer ticker.Stop()
 	defer func() {
 		wait <- true
@@ -352,13 +336,13 @@ func showInfoPeriod(list chan NodeData, doneTest chan bool, wait chan bool) {
 	for {
 		select {
 		case <-ticker.C:
-			t += INTERVAL
+			t += *showInterval
 			fmt.Printf("%d s...  size: %d \n", t, len(list))
-			if t >= LOOP_TIME {
+			if t >= *loopTime {
 				goto FINAL
 			}
 		case <-doneTest:
-			fmt.Printf("Finished consume const %d data\n", BATCH_COUNT)
+			fmt.Printf("Finished consume const %d data\n", *batchCount)
 			return
 		}
 	}
@@ -369,32 +353,32 @@ FINAL:
 }
 
 func showResult(finishRecord chan bool, cntCh chan int, costCh chan []time.Duration) {
-	if IS_SINGLE {
-		//waitTime := time.Now()
-		fmt.Printf("main go: single consumer done... cnt=%d, gMaxDequeue=%v \n", gCnt, gMaxDequeue)
-		//fmt.Println("waiting consumer close...")
+	if *isSingerWrite {
+		// waitTime := time.Now()
+		fmt.Printf("main go: single consumer done... cnt=%d, gMaxDequeue=%v \n", gTotalReqCnt, gMaxDequeue)
+		// fmt.Println("waiting consumer close...")
 		<-finishRecord
-		//fmt.Println("wait for closing consumer, cleanup cost time: ", time.Since(waitTime))
+		// fmt.Println("wait for closing consumer, cleanup cost time: ", time.Since(waitTime))
 	} else {
 		// multi thread consume
 		cnt := 0
-		for i := 0; i < THREAD_NUM; i++ {
+		for i := 0; i < *goNum; i++ {
 			cnt += <-cntCh
 		}
 		fmt.Printf("multi consumer done... write cnt: %d , gMaxDequeue=%v \n", cnt, gMaxDequeue)
 
 		cnt = 0
-		costUn := make([][]time.Duration, THREAD_NUM)
-		for i := 0; i < THREAD_NUM; i++ {
-			//costEach := <-costCh
-			//costTm = append(costTm, costEach...)
+		costUn := make([][]time.Duration, *goNum)
+		for i := 0; i < *goNum; i++ {
+			// costEach := <-costCh
+			// costTm = append(costTm, costEach...)
 			costUn[i] = <-costCh
 			cnt += len(costUn[i])
 		}
 
 		costTm := make([]time.Duration, cnt)
 		for i := 0; i < cnt; {
-			for j := 0; j < THREAD_NUM; j++ {
+			for j := 0; j < *goNum; j++ {
 				if len(costUn[j]) > 0 {
 					costTm[i] = costUn[j][0]
 					costUn[j] = costUn[j][1:]
@@ -403,7 +387,7 @@ func showResult(finishRecord chan bool, cntCh chan int, costCh chan []time.Durat
 			}
 		}
 
-		recordCostTimeFile(COST_TIME_FILE+".many.log", nil, costTm)
+		recordCostTimeFile(defaultRecordCostFile+".many.log", nil, costTm)
 		fmt.Println("multi consumer record cost time, count=", len(costTm))
 	}
 }
