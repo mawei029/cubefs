@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"math/rand"
 	"os"
@@ -26,10 +28,19 @@ const (
 	defaultBatchCount     = 1                // 模拟客户端一次请求的总个数，固定IO大小
 	defaultShowInterval   = 1                // 控制台输出的间隔
 	defaultRecordDelay    = 2000             // 记录时延的数组长度
+	defaultModel          = 1                // 测试模式模型,1:append write; 2:random write; 3:random read ; 4: random read and write
 	defaultReadFile       = "./readFile.log" // "./demo/read8M.log"  read64K.log
 	defaultWriteFile      = "./dstFile.log"
 	defaultInterval       = "1us"
 	defaultRecordCostFile = "costTimeInfo"
+	defaultConfigFile     = "disk.conf"
+)
+
+const (
+	modelAppendWrite = iota + 1
+	modelRandomWrite
+	modelRandomRead
+	modelRandomRdWt
 )
 
 var (
@@ -43,18 +54,26 @@ var (
 	batchCount     = flag.Int("b", defaultBatchCount, "total request data count, many datas at once")
 	showInterval   = flag.Int("i", defaultShowInterval, "show interval")
 	delayArrLen    = flag.Int("d", defaultRecordDelay, "record delay array length")
+	model          = flag.Int("m", defaultModel, "test model: 1:append write; 2:random write; 3:random read ; 4: random read and write")
 	// consumeInterval := flag.String("ci", DefaultInterval, "consume interval")
 	productInterval = flag.String("pi", defaultInterval, "product interval")
+	confFile        = flag.String("f", defaultConfigFile, "config file")
 
 	gTotalReqCnt   int // 单协程下统计写入请求的总个数
 	gProductPeriod time.Duration
 	gMaxDequeue    time.Duration // 单协程下，最大出队时间
+	gConf          *DiskConfig
 )
 
 // 入队的每个节点
 type NodeData struct {
 	data string
 	time time.Time
+}
+
+type DiskConfig struct {
+	Model     int    `json:"model"`
+	DirPrefix string `json:"dir_prefix"`
 }
 
 // gflag: ./<exe> -r ./readFile.log -n 8 -t 200 -m=false
@@ -72,9 +91,10 @@ func parseFlag() (err error) {
 }
 
 func main() {
-	fmt.Println("Tests the write performance of a single hard disk")
+	fmt.Println("Tests the write performance of a single hard disk, exec=", os.Args[0])
 	// init
-	if err := parseFlag(); err != nil {
+	var err error
+	if err = parseFlag(); err != nil {
 		fmt.Println("ERROR... fail to parse flag.", err)
 	}
 	doneTest := make(chan bool)     // 结束测试
@@ -85,30 +105,26 @@ func main() {
 	if *isReservedData && *batchCount > 1 {
 		list = make(chan NodeData, *batchCount)
 	}
-
-	os.Remove(*wtFile)
-	fh, err := os.OpenFile(*wtFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	gConf, err = initConfig()
 	if err != nil {
-		fmt.Println("ERROR... open file err:", err.Error())
-		return
-	}
-	defer fh.Close()
-	_, err = os.Stat(*rdFile)
-	if os.IsNotExist(err) {
-		fmt.Println("ERROR... read file err:", err.Error())
 		return
 	}
 
-	// 改为单个生产者
-	go productMulti(0, list, doneTest)
+	//testDemoRandomWrite()
+
 	tStart := time.Now()
-
-	if *isSingerWrite { // 单个消费者
-		go consumeOne(list, doneTest, finishRecord, fh)
-	} else { // 测试多线程写
-		for i := 0; i < *goNum; i++ {
-			go consumeMulti(i, list, doneTest, cntCh, costCh, fh)
-		}
+	switch *model {
+	case modelAppendWrite: // 1:append write;
+		commonModel(list, doneTest, finishRecord, cntCh, costCh, modelAppendWrite)
+	case modelRandomWrite: // 2:random write;
+		randomWrite(list, doneTest, finishRecord, cntCh, costCh, modelRandomWrite)
+	case modelRandomRead: // 3:random read ;
+		randomRead()
+	case modelRandomRdWt: // 4: random read and write
+		randomReadAndWrite()
+	default:
+		fmt.Println("error test model flag, exit.")
+		return
 	}
 
 	// 主线程 周期打印
@@ -120,7 +136,7 @@ func main() {
 	time.Sleep(time.Second)
 }
 
-func consumeOne(list chan NodeData, closed, finishRecord chan bool, fh *os.File) {
+func consumeOne(list chan NodeData, closed, finishRecord chan bool, fh *os.File, mode int) {
 	costArr := make([]time.Duration, 0, *delayArrLen)
 	costWtDoneArr := make([]time.Duration, 0, *delayArrLen)
 
@@ -135,7 +151,15 @@ func consumeOne(list chan NodeData, closed, finishRecord chan bool, fh *os.File)
 			gMaxDequeue = cost
 		}
 
-		appendWrite(fh, []byte(node.data))
+		if mode == modelAppendWrite {
+			writeAppend(fh, []byte(node.data))
+		} else {
+			fh1, err := getRandomFile()
+			if err != nil {
+				panic(err)
+			}
+			writeAndClose(fh1, []byte(node.data))
+		}
 		cost = time.Since(node.time)
 		costWtDoneArr = append(costWtDoneArr, cost)
 		gTotalReqCnt++ // idx++
@@ -156,7 +180,7 @@ FINISH:
 	return
 }
 
-func consumeMulti(i int, list chan NodeData, closed chan bool, cntSum chan int, costSum chan []time.Duration, fh *os.File) {
+func consumeMulti(i int, list chan NodeData, closed chan bool, cntSum chan int, costSum chan []time.Duration, fh *os.File, mode int) {
 	costArr := make([]time.Duration, 0, *delayArrLen)
 	costWtDoneArr := make([]time.Duration, 0, *delayArrLen)
 	idx := 0
@@ -173,14 +197,16 @@ func consumeMulti(i int, list chan NodeData, closed chan bool, cntSum chan int, 
 		}
 		costArr = append(costArr, cost)
 
-		_, err := fh.Write([]byte(node.data))
-		if err != nil {
-			fmt.Println("ERROR... consumeOne: fail to write file.", err)
+		if mode == modelAppendWrite {
+			writeAppend(fh, []byte(node.data))
+		} else {
+			fh1, err := getRandomFile()
+			if err != nil {
+				panic(err)
+			}
+			writeAndClose(fh1, []byte(node.data))
 		}
-		err = fh.Sync()
-		if err != nil {
-			fmt.Println("ERROR... consumeOne: fail to sync file.", err)
-		}
+
 		cost = time.Since(node.time)
 		costWtDoneArr = append(costWtDoneArr, cost)
 
@@ -313,7 +339,7 @@ func recordCostTimeFile(path string, dequeTm, writeTm []time.Duration) {
 	}
 }
 
-func appendWrite(fh *os.File, data []byte) error {
+func writeAppend(fh *os.File, data []byte) error {
 	_, err := fh.Write(data)
 	if err != nil {
 		fmt.Println("ERROR... consumeOne: fail to write file.", err)
@@ -323,6 +349,14 @@ func appendWrite(fh *os.File, data []byte) error {
 		fmt.Println("ERROR... consumeOne: fail to sync file.", err)
 	}
 	return err
+}
+
+func writeAndClose(fh *os.File, data []byte) error {
+	err := writeAppend(fh, data)
+	if err != nil {
+		return err
+	}
+	return fh.Close()
 }
 
 func showInfoPeriod(list chan NodeData, doneTest chan bool, wait chan bool) {
@@ -390,4 +424,152 @@ func showResult(finishRecord chan bool, cntCh chan int, costCh chan []time.Durat
 		recordCostTimeFile(defaultRecordCostFile+".many.log", nil, costTm)
 		fmt.Println("multi consumer record cost time, count=", len(costTm))
 	}
+}
+
+func commonModel(list chan NodeData, doneTest, finishRecord chan bool, cntCh chan int, costCh chan []time.Duration, mode int) {
+	os.Remove(*wtFile)
+	fh, err := os.OpenFile(*wtFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	if err != nil {
+		fmt.Println("ERROR... open file err:", err.Error())
+		return
+	}
+	defer fh.Close()
+	_, err = os.Stat(*rdFile)
+	if os.IsNotExist(err) {
+		fmt.Println("ERROR... read file err:", err.Error())
+		panic(err)
+		return
+	}
+
+	// 改为单个生产者
+	go productMulti(0, list, doneTest)
+
+	if *isSingerWrite { // 单个消费者
+		go consumeOne(list, doneTest, finishRecord, fh, mode)
+	} else { // 测试多线程写
+		for i := 0; i < *goNum; i++ {
+			go consumeMulti(i, list, doneTest, cntCh, costCh, fh, mode)
+		}
+	}
+}
+
+//func appendWriteModel(list chan NodeData, doneTest, finishRecord chan bool, cntCh chan int, costCh chan []time.Duration, model int) {
+//	commonModel(list, doneTest, finishRecord, cntCh, costCh, model)
+//}
+
+func initConfig() (*DiskConfig, error) {
+	data, err := ioutil.ReadFile(*confFile)
+	if nil != err {
+		fmt.Println("Fail to read config file, err=", err)
+		return nil, err
+	}
+
+	conf := DiskConfig{}
+	err = json.Unmarshal(data, &conf)
+	if err != nil {
+		fmt.Println("Fail to parse config json, err=", err)
+		return nil, err
+	}
+
+	return &conf, nil
+}
+
+var (
+	dirPrefix = "/home/oppo/code/cubefs/blobstore/cmd/diskWrite"
+	//dirPrefix = "/home/service/var/data1/io_test"
+	dirTop    = "test_dir_%d"
+	dirMiddle = "vdb.1_%d.dir"
+	dirDown   = "vdb_f000%d.file"
+)
+
+func randomWrite(list chan NodeData, doneTest, finishRecord chan bool, cntCh chan int, costCh chan []time.Duration, mode int) {
+	s, err := os.Stat(dirPrefix)
+	if err != nil || !s.IsDir() {
+		fmt.Printf("ERROR... dir=%s, err=%v \n", dirPrefix, err)
+		fmt.Printf("i will use conf=%s dir_prefix=%s \n", defaultConfigFile, gConf.DirPrefix)
+		dirPrefix = gConf.DirPrefix
+
+		s, err = os.Stat(dirPrefix)
+		if err != nil || !s.IsDir() {
+			panic(err)
+		}
+	}
+
+	commonModel(list, doneTest, finishRecord, cntCh, costCh, mode)
+}
+
+func randomRead() {
+	// 创建句柄
+	fi, err := os.Open("a.txt")
+	if err != nil {
+		panic(err)
+	}
+
+	// 创建 Reader
+	r := bufio.NewReader(fi)
+
+	// 每次读取 1024 个字节
+	buf := make([]byte, 1024)
+	for {
+		// func (b *Reader) Read(p []byte) (n int, err error) {}
+		n, err := r.Read(buf)
+		if err != nil && err != io.EOF {
+			panic(err)
+		}
+
+		if n == 0 {
+			break
+		}
+		fmt.Println(string(buf[:n]))
+	}
+}
+
+func randomReadAndWrite() {
+}
+
+func getRandomFile() (*os.File, error) {
+	numTop, numMiddle, numDown := 2, 5, 9
+	rand.Seed(time.Now().UnixNano())
+	fName := fmt.Sprintf(dirTop+"/"+dirMiddle+"/"+dirDown, rand.Intn(numTop)+1, rand.Intn(numMiddle)+1, rand.Intn(numDown)+1)
+	fPath := fmt.Sprintf(dirPrefix + "/" + fName)
+	// fmt.Println("test file fName=", fName)
+	return os.OpenFile(fPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+}
+
+func testDemoRandomWrite() {
+	numTop, numMiddle, numDown := 2, 5, 9
+	rand.Seed(time.Now().UnixNano())
+
+	datas, err := ioutil.ReadFile(*rdFile)
+	if err != nil {
+		panic(err)
+	}
+
+	fPath := ""
+	for i := 0; i < 10; i++ {
+		fName := fmt.Sprintf(dirTop+"/"+dirMiddle+"/"+dirDown, rand.Intn(numTop)+1, rand.Intn(numMiddle)+1, rand.Intn(numDown)+1)
+		//fPath = fmt.Sprintf(dirPrefix + "/" + fName)
+		fPath = "test_dir_1/vdb.1_5.dir/vdb_f0003.file"
+		fmt.Println("test file fName=", fName)
+
+		//fh, err := os.OpenFile(fPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+		fh, err := os.OpenFile(fPath, os.O_WRONLY, 0o644)
+		if err != nil {
+			panic(err)
+		}
+
+		fi, err := fh.Stat()
+
+		size := fi.Size()
+		if size != 0 {
+			//fh.Seek(rand.Int63n(size), os.SEEK_SET)
+			off := rand.Int63n(size)
+			off = size/2 + int64(i*1024)
+			fh.Seek(off, os.SEEK_SET)
+		}
+		n, err := fh.Write(datas)
+		fh.Close()
+		fmt.Printf("random write success, n=%d, file=%s, err=%v \n", n, fName, err)
+	}
+	fmt.Println("random write all file done")
 }
