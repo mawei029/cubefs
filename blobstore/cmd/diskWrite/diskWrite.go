@@ -1,18 +1,16 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"math/rand"
 	"os"
 	"time"
 )
 
-// 0. 写文件，大IO-8M，小IO-64k
+// 测试目的，只控制写线程，不控制读的并发: 0. 写文件，大IO-8M，小IO-64k
 // 1. 单个协程写，后台开一个写的协程消费者，一个装数据的队列，多个产生数据的生产者。不停的取出队列的数据，append写入到某个文件
 // 2. 多个协程并发，append写入一个文件
 
@@ -39,8 +37,8 @@ const (
 const (
 	modelAppendWrite = iota + 1
 	modelRandomWrite
-	modelRandomRead
 	modelRandomRdWt
+	// modelRandomRead
 )
 
 var (
@@ -72,8 +70,10 @@ type NodeData struct {
 }
 
 type DiskConfig struct {
-	Model     int    `json:"model"`
-	DirPrefix string `json:"dir_prefix"`
+	Model            int    `json:"model"`
+	ReadCntWhenWrite int    `json:"read_cnt_when_write"`
+	DirPrefix        string `json:"dir_prefix"`
+	ReadPrefix       string `json:"read_prefix"`
 }
 
 // gflag: ./<exe> -r ./readFile.log -n 8 -t 200 -m=false
@@ -110,18 +110,16 @@ func main() {
 		return
 	}
 
-	//testDemoRandomWrite()
-
 	tStart := time.Now()
 	switch *model {
 	case modelAppendWrite: // 1:append write;
 		commonModel(list, doneTest, finishRecord, cntCh, costCh, modelAppendWrite)
 	case modelRandomWrite: // 2:random write;
 		randomWrite(list, doneTest, finishRecord, cntCh, costCh, modelRandomWrite)
-	case modelRandomRead: // 3:random read ;
-		randomRead()
+	//case modelRandomRead: // 3:random read ;
+	//	randomRead()
 	case modelRandomRdWt: // 4: random read and write
-		randomReadAndWrite()
+		randomReadAndWrite(list, doneTest, finishRecord, cntCh, costCh, modelRandomRdWt)
 	default:
 		fmt.Println("error test model flag, exit.")
 		return
@@ -154,7 +152,7 @@ func consumeOne(list chan NodeData, closed, finishRecord chan bool, fh *os.File,
 		if mode == modelAppendWrite {
 			writeAppend(fh, []byte(node.data))
 		} else {
-			fh1, err := getRandomFile()
+			fh1, err := getRandomFile(gConf.DirPrefix, os.O_WRONLY|os.O_CREATE|os.O_APPEND)
 			if err != nil {
 				panic(err)
 			}
@@ -200,7 +198,7 @@ func consumeMulti(i int, list chan NodeData, closed chan bool, cntSum chan int, 
 		if mode == modelAppendWrite {
 			writeAppend(fh, []byte(node.data))
 		} else {
-			fh1, err := getRandomFile()
+			fh1, err := getRandomFile(gConf.DirPrefix, os.O_WRONLY|os.O_CREATE|os.O_APPEND)
 			if err != nil {
 				panic(err)
 			}
@@ -214,8 +212,8 @@ func consumeMulti(i int, list chan NodeData, closed chan bool, cntSum chan int, 
 		case <-closed:
 			goto FINISH
 		default:
-			break
-		} // end select
+			break // break select
+		}
 	}
 FINISH:
 	fmt.Printf("close multi consumer...%d, write cost time record len=%d, \n", i, len(costWtDoneArr))
@@ -273,8 +271,8 @@ func productConstCount(list chan NodeData, closed chan bool, datas []byte) {
 // 周期的生产数据
 func productDataPeriod(i int, list chan NodeData, closed chan bool, datas []byte) {
 	fmt.Printf("I'm going to produce %d datas per %v \n", *batchCount, gProductPeriod)
-	ticker := time.NewTicker(gProductPeriod)
-	defer ticker.Stop()
+	tk := time.NewTicker(gProductPeriod)
+	defer tk.Stop()
 
 	ch := []byte("abcdefghijklmnopqrstuvwxyz")
 	maxChar := len(ch)
@@ -292,7 +290,7 @@ func productDataPeriod(i int, list chan NodeData, closed chan bool, datas []byte
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-tk.C:
 			datas[rand.Intn(maxIdx)] = ch[rand.Intn(maxChar)] // 随机修改一点数据，模拟不同的请求数据
 			node := NodeData{
 				data: string(datas),
@@ -475,101 +473,75 @@ func initConfig() (*DiskConfig, error) {
 }
 
 var (
-	dirPrefix = "/home/oppo/code/cubefs/blobstore/cmd/diskWrite"
-	//dirPrefix = "/home/service/var/data1/io_test"
+	// dirPrefix = "/home/oppo/code/cubefs/blobstore/cmd/diskWrite"
+	// dirPrefix = "/home/service/var/data1/io_test"
 	dirTop    = "test_dir_%d"
 	dirMiddle = "vdb.1_%d.dir"
 	dirDown   = "vdb_f000%d.file"
 )
 
 func randomWrite(list chan NodeData, doneTest, finishRecord chan bool, cntCh chan int, costCh chan []time.Duration, mode int) {
+	dirPrefix := gConf.DirPrefix
 	s, err := os.Stat(dirPrefix)
 	if err != nil || !s.IsDir() {
 		fmt.Printf("ERROR... dir=%s, err=%v \n", dirPrefix, err)
-		fmt.Printf("i will use conf=%s dir_prefix=%s \n", defaultConfigFile, gConf.DirPrefix)
-		dirPrefix = gConf.DirPrefix
-
-		s, err = os.Stat(dirPrefix)
-		if err != nil || !s.IsDir() {
-			panic(err)
-		}
+		panic(err)
 	}
 
 	commonModel(list, doneTest, finishRecord, cntCh, costCh, mode)
 }
 
 func randomRead() {
-	// 创建句柄
-	fi, err := os.Open("a.txt")
-	if err != nil {
+}
+
+func randomReadAndWrite(list chan NodeData, doneTest, finishRecord chan bool, cntCh chan int, costCh chan []time.Duration, mode int) {
+	dirPrefix := gConf.DirPrefix
+	s, err := os.Stat(dirPrefix)
+	if err != nil || !s.IsDir() {
+		fmt.Printf("ERROR... dir=%s, err=%v \n", dirPrefix, err)
 		panic(err)
 	}
-
-	// 创建 Reader
-	r := bufio.NewReader(fi)
-
-	// 每次读取 1024 个字节
-	buf := make([]byte, 1024)
-	for {
-		// func (b *Reader) Read(p []byte) (n int, err error) {}
-		n, err := r.Read(buf)
-		if err != nil && err != io.EOF {
-			panic(err)
-		}
-
-		if n == 0 {
-			break
-		}
-		fmt.Println(string(buf[:n]))
+	if gConf.ReadCntWhenWrite <= 0 {
+		panic("ERROR... read_cnt_when_write=%d, it must greater than 0")
 	}
+
+	for i := 0; i < gConf.ReadCntWhenWrite; i++ {
+		go func() {
+			tk := time.NewTicker(gProductPeriod)
+			defer tk.Stop()
+
+			for {
+				fh, err := getRandomFile(gConf.ReadPrefix, os.O_RDONLY)
+				if err != nil {
+					panic(err)
+				}
+				//fh, _ = os.OpenFile("test_dir_1/vdb.1_5.dir/vdb_f0003.file", os.O_RDONLY, 0o644)
+
+				// io.Copy(ioutil.Discard, fh)
+				fi, err := fh.Stat()
+				rdByte := 1024 * 1024 * 4
+				buf := make([]byte, rdByte)
+				rdByte, err = fh.ReadAt(buf, rand.Int63n(fi.Size()-int64(rdByte)))
+				fh.Close()
+
+				select {
+				case <-doneTest:
+					return
+				case <-tk.C:
+				default:
+				}
+			}
+		}()
+	}
+
+	commonModel(list, doneTest, finishRecord, cntCh, costCh, mode)
 }
 
-func randomReadAndWrite() {
-}
-
-func getRandomFile() (*os.File, error) {
+func getRandomFile(dirPrefix string, flag int) (*os.File, error) {
 	numTop, numMiddle, numDown := 2, 5, 9
-	rand.Seed(time.Now().UnixNano())
+	// rand.Seed(time.Now().UnixNano())
 	fName := fmt.Sprintf(dirTop+"/"+dirMiddle+"/"+dirDown, rand.Intn(numTop)+1, rand.Intn(numMiddle)+1, rand.Intn(numDown)+1)
 	fPath := fmt.Sprintf(dirPrefix + "/" + fName)
 	// fmt.Println("test file fName=", fName)
-	return os.OpenFile(fPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
-}
-
-func testDemoRandomWrite() {
-	numTop, numMiddle, numDown := 2, 5, 9
-	rand.Seed(time.Now().UnixNano())
-
-	datas, err := ioutil.ReadFile(*rdFile)
-	if err != nil {
-		panic(err)
-	}
-
-	fPath := ""
-	for i := 0; i < 10; i++ {
-		fName := fmt.Sprintf(dirTop+"/"+dirMiddle+"/"+dirDown, rand.Intn(numTop)+1, rand.Intn(numMiddle)+1, rand.Intn(numDown)+1)
-		//fPath = fmt.Sprintf(dirPrefix + "/" + fName)
-		fPath = "test_dir_1/vdb.1_5.dir/vdb_f0003.file"
-		fmt.Println("test file fName=", fName)
-
-		//fh, err := os.OpenFile(fPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
-		fh, err := os.OpenFile(fPath, os.O_WRONLY, 0o644)
-		if err != nil {
-			panic(err)
-		}
-
-		fi, err := fh.Stat()
-
-		size := fi.Size()
-		if size != 0 {
-			//fh.Seek(rand.Int63n(size), os.SEEK_SET)
-			off := rand.Int63n(size)
-			off = size/2 + int64(i*1024)
-			fh.Seek(off, os.SEEK_SET)
-		}
-		n, err := fh.Write(datas)
-		fh.Close()
-		fmt.Printf("random write success, n=%d, file=%s, err=%v \n", n, fName, err)
-	}
-	fmt.Println("random write all file done")
+	return os.OpenFile(fPath, flag, 0o644)
 }
