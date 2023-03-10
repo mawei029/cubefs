@@ -398,7 +398,7 @@ FINAL:
 }
 
 func showResult(finishRecord chan bool, cntCh chan int, costCh chan []time.Duration) {
-	if *consumerNum > 1 {
+	if *consumerNum <= 1 {
 		// waitTime := time.Now()
 		fmt.Printf("main go: single consumer done... cnt=%d, gMaxCost=%v \n", gTotalReqCnt, gMaxCost)
 		// fmt.Println("waiting consumer close...")
@@ -458,7 +458,8 @@ func commonModel(list chan NodeData, doneTest, finishRecord chan bool, cntCh cha
 	// 改为单个生产者
 	go productMulti(0, list, doneTest)
 
-	if *consumerNum > 1 { // 单个消费者
+	if *consumerNum <= 1 { // 单个消费者
+		*consumerNum = 1
 		go consumeOne(list, doneTest, finishRecord, fh, mode)
 	} else { // 测试多线程写
 		for i := 0; i < *consumerNum; i++ {
@@ -500,10 +501,16 @@ var (
 	dirDown   = "vdb_f000%d.file"
 )
 
+// "write_dir_prefix":"/home/service/var/data1/io_test",
+// "write_dir_prefix":"/home/oppo/code/cubefs/blobstore/cmd/diskWrite",
 func checkWriteDir(dirPrefix string) {
 	s, err := os.Stat(dirPrefix)
 	if err != nil || !s.IsDir() {
 		fmt.Printf("ERROR... dir=%s, err=%v \n", dirPrefix, err)
+		panic(err)
+	}
+	_, err = getRandomFile(dirPrefix, os.O_RDONLY)
+	if err != nil {
 		panic(err)
 	}
 }
