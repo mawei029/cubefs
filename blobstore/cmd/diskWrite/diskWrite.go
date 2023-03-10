@@ -59,7 +59,7 @@ var (
 
 	gTotalReqCnt   int // 单协程下统计写入请求的总个数
 	gProductPeriod time.Duration
-	gMaxDequeue    time.Duration // 单协程下，最大出队时间
+	gMaxCost       time.Duration // 单协程下，最大出队时间
 	gConf          *DiskConfig
 )
 
@@ -145,8 +145,8 @@ func consumeOne(list chan NodeData, closed, finishRecord chan bool, fh *os.File,
 		}
 		cost := time.Since(node.time)
 		costArr = append(costArr, cost)
-		if cost > gMaxDequeue {
-			gMaxDequeue = cost
+		if cost > gMaxCost {
+			gMaxCost = cost
 		}
 
 		if mode == modelAppendWrite {
@@ -170,7 +170,7 @@ func consumeOne(list chan NodeData, closed, finishRecord chan bool, fh *os.File,
 		} // end select
 	} // end for
 FINISH:
-	fmt.Printf("close consumer... gTotalReqCnt=%d, gMaxDequeue=%v, delayCostCount=%d \n", gTotalReqCnt, gMaxDequeue, len(costArr))
+	fmt.Printf("close consumer... gTotalReqCnt=%d, gMaxCost=%v, delayCostCount=%d \n", gTotalReqCnt, gMaxCost, len(costArr))
 	// fmt.Printf("cost time deQueue... len=%d, costArr=%v \n", len(costArr), costArr)
 	// fmt.Printf("cost time Write done... len=%d, costWtDoneArr=%v \n", len(costWtDoneArr), costWtDoneArr)
 	recordCostTimeFile(defaultRecordCostFile+".one.log", costArr, costWtDoneArr)
@@ -190,9 +190,9 @@ func consumeMulti(i int, list chan NodeData, closed chan bool, cntSum chan int, 
 		}
 		idx++
 		cost := time.Since(node.time)
-		if i == 0 && cost > gMaxDequeue {
-			gMaxDequeue = cost
-		}
+		//if i == 0 && cost > gMaxCost {
+		//	gMaxCost = cost
+		//}
 		costArr = append(costArr, cost)
 
 		if mode == modelAppendWrite {
@@ -387,7 +387,7 @@ FINAL:
 func showResult(finishRecord chan bool, cntCh chan int, costCh chan []time.Duration) {
 	if *consumerNum > 1 {
 		// waitTime := time.Now()
-		fmt.Printf("main go: single consumer done... cnt=%d, gMaxDequeue=%v \n", gTotalReqCnt, gMaxDequeue)
+		fmt.Printf("main go: single consumer done... cnt=%d, gMaxCost=%v \n", gTotalReqCnt, gMaxCost)
 		// fmt.Println("waiting consumer close...")
 		<-finishRecord
 		// fmt.Println("wait for closing consumer, cleanup cost time: ", time.Since(waitTime))
@@ -397,7 +397,6 @@ func showResult(finishRecord chan bool, cntCh chan int, costCh chan []time.Durat
 		for i := 0; i < *consumerNum; i++ {
 			cnt += <-cntCh
 		}
-		fmt.Printf("multi consumer done... write cnt: %d , gMaxDequeue=%v \n", cnt, gMaxDequeue)
 
 		cnt = 0
 		costUn := make([][]time.Duration, *consumerNum)
@@ -414,10 +413,14 @@ func showResult(finishRecord chan bool, cntCh chan int, costCh chan []time.Durat
 				if len(costUn[j]) > 0 {
 					costTm[i] = costUn[j][0]
 					costUn[j] = costUn[j][1:]
+					if costTm[i] > gMaxCost {
+						gMaxCost = costTm[i]
+					}
 					i++
 				}
 			}
 		}
+		fmt.Printf("multi consumer done... write cnt: %d , gMaxCost=%v \n", cnt, gMaxCost)
 
 		recordCostTimeFile(defaultRecordCostFile+".many.log", nil, costTm)
 		fmt.Println("multi consumer record cost time, count=", len(costTm))
