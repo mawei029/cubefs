@@ -122,15 +122,16 @@ func main() {
 	}
 
 	tStart := time.Now()
+	var fh *os.File
 	switch *model {
 	case modelAppendWrite: // 1:append write;
-		commonModel(list, doneTest, finishRecord, cntCh, costCh, modelAppendWrite)
+		fh = commonModel(list, doneTest, finishRecord, cntCh, costCh, modelAppendWrite)
 	case modelRandomWrite: // 2:random write;
-		randomWrite(list, doneTest, finishRecord, cntCh, costCh, modelRandomWrite)
+		fh = randomWrite(list, doneTest, finishRecord, cntCh, costCh, modelRandomWrite)
 	case modelRandomRdWt: // 4: random read and write
-		randomReadAndWrite(list, doneTest, finishRecord, cntCh, costCh, modelRandomWrite)
+		fh = randomReadAndWrite(list, doneTest, finishRecord, cntCh, costCh, modelRandomWrite)
 	case modelAppendWriteByRead:
-		appendWriteByRead(list, doneTest, finishRecord, cntCh, costCh, modelAppendWrite)
+		fh = appendWriteByRead(list, doneTest, finishRecord, cntCh, costCh, modelAppendWrite)
 	default:
 		fmt.Println("error test model flag, exit.")
 		return
@@ -140,6 +141,9 @@ func main() {
 	wait := make(chan bool)
 	go showInfoPeriod(list, doneTest, wait)
 	<-wait
+	if fh != nil {
+		fh.Close()
+	}
 	showResult(finishRecord, cntCh, costCh)
 	fmt.Println("all done... total cost time: ", time.Since(tStart))
 	time.Sleep(time.Second)
@@ -181,7 +185,7 @@ func consumeOne(list chan NodeData, closed, finishRecord chan bool, fh *os.File,
 		} // end select
 	} // end for
 FINISH:
-	fh.Close()
+	//fh.Close()
 	fmt.Printf("close consumer... gTotalReqCnt=%d, gMaxCost=%v, delayCostCount=%d \n", gTotalReqCnt, gMaxCost, len(costArr))
 	// fmt.Printf("cost time deQueue... len=%d, costArr=%v \n", len(costArr), costArr)
 	// fmt.Printf("cost time Write done... len=%d, costWtDoneArr=%v \n", len(costWtDoneArr), costWtDoneArr)
@@ -228,7 +232,7 @@ func consumeMulti(i int, list chan NodeData, closed chan bool, cntSum chan int, 
 		}
 	}
 FINISH:
-	fh.Close()
+	//fh.Close()
 	fmt.Printf("close multi consumer...%d, write cost time record len=%d, \n", i, len(costWtDoneArr))
 	cntSum <- idx
 	costSum <- costWtDoneArr
@@ -440,19 +444,19 @@ func showResult(finishRecord chan bool, cntCh chan int, costCh chan []time.Durat
 	}
 }
 
-func commonModel(list chan NodeData, doneTest, finishRecord chan bool, cntCh chan int, costCh chan []time.Duration, mode int) {
+func commonModel(list chan NodeData, doneTest, finishRecord chan bool, cntCh chan int, costCh chan []time.Duration, mode int) *os.File {
 	os.Remove(gConf.AppendWriteFile)
 	fh, err := os.OpenFile(gConf.AppendWriteFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
 	if err != nil {
 		fmt.Println("ERROR... open file err:", err.Error())
-		return
+		return nil
 	}
 
 	_, err = os.Stat(*rdFile)
 	if os.IsNotExist(err) {
 		fmt.Println("ERROR... read file err:", err.Error())
 		panic(err)
-		return
+		return nil
 	}
 
 	// 改为单个生产者
@@ -466,6 +470,7 @@ func commonModel(list chan NodeData, doneTest, finishRecord chan bool, cntCh cha
 			go consumeMulti(i, list, doneTest, cntCh, costCh, fh, mode)
 		}
 	}
+	return fh
 }
 
 //func appendWriteModel(list chan NodeData, doneTest, finishRecord chan bool, cntCh chan int, costCh chan []time.Duration, model int) {
@@ -524,9 +529,9 @@ func checkReadAndWriteDir() {
 
 }
 
-func randomWrite(list chan NodeData, doneTest, finishRecord chan bool, cntCh chan int, costCh chan []time.Duration, mode int) {
+func randomWrite(list chan NodeData, doneTest, finishRecord chan bool, cntCh chan int, costCh chan []time.Duration, mode int) *os.File {
 	checkWriteDir(gConf.WriteDirPrefix)
-	commonModel(list, doneTest, finishRecord, cntCh, costCh, mode)
+	return commonModel(list, doneTest, finishRecord, cntCh, costCh, mode)
 }
 
 func backgroundRead(doneTest chan bool) {
@@ -560,14 +565,14 @@ func backgroundRead(doneTest chan bool) {
 	}
 }
 
-func randomReadAndWrite(list chan NodeData, doneTest, finishRecord chan bool, cntCh chan int, costCh chan []time.Duration, mode int) {
+func randomReadAndWrite(list chan NodeData, doneTest, finishRecord chan bool, cntCh chan int, costCh chan []time.Duration, mode int) *os.File {
 	checkReadAndWriteDir()
 	backgroundRead(doneTest)
-	commonModel(list, doneTest, finishRecord, cntCh, costCh, mode)
+	return commonModel(list, doneTest, finishRecord, cntCh, costCh, mode)
 }
 
-func appendWriteByRead(list chan NodeData, doneTest, finishRecord chan bool, cntCh chan int, costCh chan []time.Duration, mode int) {
-	randomReadAndWrite(list, doneTest, finishRecord, cntCh, costCh, mode)
+func appendWriteByRead(list chan NodeData, doneTest, finishRecord chan bool, cntCh chan int, costCh chan []time.Duration, mode int) *os.File {
+	return randomReadAndWrite(list, doneTest, finishRecord, cntCh, costCh, mode)
 }
 
 func getRandomFile(dirPrefix string, flag int) (*os.File, error) {
