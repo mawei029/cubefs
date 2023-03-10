@@ -19,47 +19,48 @@ import (
 
 const (
 	// defaultIsSingleMode   = true             // 是否是单协程写
-	defaultIsReservedData = false            // 预埋一批数据
-	defaultThreadNum      = 1                // 消费者的并发个数
-	defaultQueueSize      = 20               // 缓存队列的长度
-	defaultLoopTime       = 30               // 持续写盘的时间
-	defaultBatchCount     = 1                // 模拟客户端一次请求的总个数，固定IO大小
-	defaultShowInterval   = 1                // 控制台输出的间隔
-	defaultRecordDelay    = 2000             // 记录时延的数组长度
-	defaultModel          = 1                // 测试模式模型,1:append write; 2:random write; 3:random read ; 4: random read and write
-	defaultReadFile       = "./readFile.log" // "./demo/read8M.log"  read64K.log
-	defaultWriteFile      = "./dstFile.log"
-	defaultInterval       = "1us"
+	defaultIsReservedData = false          // 预埋一批数据
+	defaultThreadNum      = 1              // 消费者的并发个数
+	defaultQueueSize      = 20             // 缓存队列的长度
+	defaultLoopTime       = 30             // 持续写盘的时间
+	defaultBatchCount     = 1              // 模拟客户端一次请求的总个数，固定IO大小
+	defaultShowInterval   = 1              // 控制台输出的间隔
+	defaultRecordDelay    = 2000           // 记录时延的数组长度
+	defaultModel          = 1              // 测试模式模型,1:append write; 2:random write; 3:random read ; 4: random read and write
+	defaultReadFile       = "readFile.log" // "./demo/read8M.log"  read64K.log
+	defaultWriteFile      = "dstFile.log"
+	defaultInterval       = "100us"
 	defaultRecordCostFile = "costTimeInfo"
 	defaultConfigFile     = "disk.conf"
 )
 
 const (
-	modelAppendWrite = iota + 1
-	modelRandomWrite
-	modelRandomRdWt
-	// modelRandomRead
+	modelAppendWrite       = iota + 1 // 纯写-顺序写
+	modelRandomWrite                  // 纯写-随机写
+	modelRandomRdWt                   // 读写混合-随机写
+	modelAppendWriteByRead            // 伴随着读的顺序写
 )
 
 var (
-	rdFile         = flag.String("r", defaultReadFile, "Read from file")
-	wtFile         = flag.String("w", defaultWriteFile, "Write to file")
-	isReservedData = flag.Bool("rm", defaultIsReservedData, "is Reserved data Mode")
-	//isSingerWrite  = flag.Bool("sm", defaultIsSingleMode, "is single write mode")
-	consumerNum  = flag.Int("c", defaultThreadNum, "multi Consumer num")
-	queueSize    = flag.Int("q", defaultQueueSize, "requst Queue max size")
-	loopTime     = flag.Int("t", defaultLoopTime, "write disk elapsed Time")
-	batchCount   = flag.Int("b", defaultBatchCount, "total request data count, Batch datas at once")
-	showInterval = flag.Int("i", defaultShowInterval, "show Interval")
-	delayArrLen  = flag.Int("d", defaultRecordDelay, "record Delay array length")
-	model        = flag.Int("m", defaultModel, "test Model: 1:append write; 2:random write; 3:random read ; 4: random read and write")
-	// consumeInterval := flag.String("ci", DefaultInterval, "consume interval")
+	// isSingerWrite  = flag.Bool("sm", defaultIsSingleMode, "is single write mode")
+	// wtFile         = flag.String("w", defaultWriteFile, "Write to file")
+	rdFile          = flag.String("r", defaultReadFile, "Read from file")
+	isReservedData  = flag.Bool("rm", defaultIsReservedData, "is Reserved data Mode")
+	consumerNum     = flag.Int("c", defaultThreadNum, "multi Consumer num")
+	queueSize       = flag.Int("q", defaultQueueSize, "requst Queue max size")
+	loopTime        = flag.Int("t", defaultLoopTime, "write disk elapsed Time")
+	batchCount      = flag.Int("b", defaultBatchCount, "total request data count, Batch datas at once")
+	showInterval    = flag.Int("i", defaultShowInterval, "show Interval")
+	delayArrLen     = flag.Int("d", defaultRecordDelay, "record Delay array length")
+	model           = flag.Int("m", defaultModel, "test Model: 1:append write; 2:random write; 3:random read ; 4: random read and write")
+	readInterval    = flag.String("ri", defaultInterval, "background Read Interval")
 	productInterval = flag.String("pi", defaultInterval, "Product Interval")
 	confFile        = flag.String("f", defaultConfigFile, "config File")
 
 	gTotalReqCnt   int // 单协程下统计写入请求的总个数
 	gProductPeriod time.Duration
 	gMaxCost       time.Duration // 单协程下，最大出队时间
+	gReadPeriod    time.Duration
 	gConf          *DiskConfig
 )
 
@@ -71,22 +72,30 @@ type NodeData struct {
 
 type DiskConfig struct {
 	Model            int    `json:"model"`
-	ReadCntWhenWrite int    `json:"read_cnt_when_write"`
-	DirPrefix        string `json:"dir_prefix"`
-	ReadPrefix       string `json:"read_prefix"`
+	ReadByte         int    `json:"read_byte"`
+	ReadNumWhenWrite int    `json:"read_num_when_write"`
+	AppendWriteFile  string `json:"append_write_file"`
+	WriteDirPrefix   string `json:"write_dir_prefix"`
+	ReadDirPrefix    string `json:"read_dir_prefix"`
 }
 
 // gflag: ./<exe> -r ./readFile.log -n 8 -t 200 -m=false
 func parseFlag() (err error) {
 	flag.Parse()
-	fmt.Printf("parse flag: readFile=%s, writeFile=%s, consumerNum=%d, QmaxSiz=%d, eelapsedTime=%d, interval=%d, "+
-		"batchDataAtOnce=%d, productInterval=%s, delayArrLen=%d, isReservedData=%v \n",
-		*rdFile, *wtFile, *consumerNum, *queueSize, *queueSize, *showInterval, *batchCount, *productInterval, *delayArrLen, *isReservedData)
+	fmt.Printf("parse flag: readFile=%s, consumerNum=%d, QmaxSize=%d, eelapsedTime=%d, interval=%d, "+
+		"batchDataAtOnce=%d, productInterval=%s, delayArrLen=%d, isReservedData=%v model=%d, readInterval=%s \n",
+		*rdFile, *consumerNum, *queueSize, *queueSize, *showInterval,
+		*batchCount, *productInterval, *delayArrLen, *isReservedData, *model, *readInterval)
 
 	gProductPeriod, err = time.ParseDuration(*productInterval)
 	if err != nil {
 		return err
 	}
+	gReadPeriod, err = time.ParseDuration(*readInterval)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -96,7 +105,13 @@ func main() {
 	var err error
 	if err = parseFlag(); err != nil {
 		fmt.Println("ERROR... fail to parse flag.", err)
+		return
 	}
+	gConf, err = initConfig()
+	if err != nil {
+		return
+	}
+
 	doneTest := make(chan bool)           // 结束测试
 	finishRecord := make(chan bool)       // 单协程closed完毕
 	cntCh := make(chan int, *consumerNum) // 多协程统计写请求总个数
@@ -105,10 +120,6 @@ func main() {
 	if *isReservedData && *batchCount > 1 {
 		list = make(chan NodeData, *batchCount)
 	}
-	gConf, err = initConfig()
-	if err != nil {
-		return
-	}
 
 	tStart := time.Now()
 	switch *model {
@@ -116,10 +127,10 @@ func main() {
 		commonModel(list, doneTest, finishRecord, cntCh, costCh, modelAppendWrite)
 	case modelRandomWrite: // 2:random write;
 		randomWrite(list, doneTest, finishRecord, cntCh, costCh, modelRandomWrite)
-	//case modelRandomRead: // 3:random read ;
-	//	randomRead()
 	case modelRandomRdWt: // 4: random read and write
-		randomReadAndWrite(list, doneTest, finishRecord, cntCh, costCh, modelRandomRdWt)
+		randomReadAndWrite(list, doneTest, finishRecord, cntCh, costCh, modelRandomWrite)
+	case modelAppendWriteByRead:
+		appendWriteByRead(list, doneTest, finishRecord, cntCh, costCh, modelAppendWrite)
 	default:
 		fmt.Println("error test model flag, exit.")
 		return
@@ -151,8 +162,8 @@ func consumeOne(list chan NodeData, closed, finishRecord chan bool, fh *os.File,
 
 		if mode == modelAppendWrite {
 			writeAppend(fh, []byte(node.data))
-		} else {
-			fh1, err := getRandomFile(gConf.DirPrefix, os.O_WRONLY|os.O_CREATE|os.O_APPEND)
+		} else if mode == modelRandomWrite {
+			fh1, err := getRandomFile(gConf.WriteDirPrefix, os.O_WRONLY|os.O_CREATE|os.O_APPEND)
 			if err != nil {
 				panic(err)
 			}
@@ -170,6 +181,7 @@ func consumeOne(list chan NodeData, closed, finishRecord chan bool, fh *os.File,
 		} // end select
 	} // end for
 FINISH:
+	fh.Close()
 	fmt.Printf("close consumer... gTotalReqCnt=%d, gMaxCost=%v, delayCostCount=%d \n", gTotalReqCnt, gMaxCost, len(costArr))
 	// fmt.Printf("cost time deQueue... len=%d, costArr=%v \n", len(costArr), costArr)
 	// fmt.Printf("cost time Write done... len=%d, costWtDoneArr=%v \n", len(costWtDoneArr), costWtDoneArr)
@@ -197,8 +209,8 @@ func consumeMulti(i int, list chan NodeData, closed chan bool, cntSum chan int, 
 
 		if mode == modelAppendWrite {
 			writeAppend(fh, []byte(node.data))
-		} else {
-			fh1, err := getRandomFile(gConf.DirPrefix, os.O_WRONLY|os.O_CREATE|os.O_APPEND)
+		} else if mode == modelRandomWrite {
+			fh1, err := getRandomFile(gConf.WriteDirPrefix, os.O_WRONLY|os.O_CREATE|os.O_APPEND)
 			if err != nil {
 				panic(err)
 			}
@@ -216,6 +228,7 @@ func consumeMulti(i int, list chan NodeData, closed chan bool, cntSum chan int, 
 		}
 	}
 FINISH:
+	fh.Close()
 	fmt.Printf("close multi consumer...%d, write cost time record len=%d, \n", i, len(costWtDoneArr))
 	cntSum <- idx
 	costSum <- costWtDoneArr
@@ -428,13 +441,13 @@ func showResult(finishRecord chan bool, cntCh chan int, costCh chan []time.Durat
 }
 
 func commonModel(list chan NodeData, doneTest, finishRecord chan bool, cntCh chan int, costCh chan []time.Duration, mode int) {
-	os.Remove(*wtFile)
-	fh, err := os.OpenFile(*wtFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	os.Remove(gConf.AppendWriteFile)
+	fh, err := os.OpenFile(gConf.AppendWriteFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
 	if err != nil {
 		fmt.Println("ERROR... open file err:", err.Error())
 		return
 	}
-	defer fh.Close()
+
 	_, err = os.Stat(*rdFile)
 	if os.IsNotExist(err) {
 		fmt.Println("ERROR... read file err:", err.Error())
@@ -472,6 +485,10 @@ func initConfig() (*DiskConfig, error) {
 		return nil, err
 	}
 
+	if conf.AppendWriteFile == "" {
+		conf.AppendWriteFile = defaultWriteFile
+	}
+
 	return &conf, nil
 }
 
@@ -483,46 +500,44 @@ var (
 	dirDown   = "vdb_f000%d.file"
 )
 
-func randomWrite(list chan NodeData, doneTest, finishRecord chan bool, cntCh chan int, costCh chan []time.Duration, mode int) {
-	dirPrefix := gConf.DirPrefix
+func checkWriteDir(dirPrefix string) {
 	s, err := os.Stat(dirPrefix)
 	if err != nil || !s.IsDir() {
 		fmt.Printf("ERROR... dir=%s, err=%v \n", dirPrefix, err)
 		panic(err)
 	}
+}
 
+func checkReadAndWriteDir() {
+	checkWriteDir(gConf.WriteDirPrefix)
+	checkWriteDir(gConf.ReadDirPrefix)
+	if gConf.ReadNumWhenWrite <= 0 || gConf.ReadByte <= 0 {
+		panic("ERROR... read_num_when_write and read_byte, it must greater than 0")
+	}
+
+}
+
+func randomWrite(list chan NodeData, doneTest, finishRecord chan bool, cntCh chan int, costCh chan []time.Duration, mode int) {
+	checkWriteDir(gConf.WriteDirPrefix)
 	commonModel(list, doneTest, finishRecord, cntCh, costCh, mode)
 }
 
-func randomRead() {
-}
-
-func randomReadAndWrite(list chan NodeData, doneTest, finishRecord chan bool, cntCh chan int, costCh chan []time.Duration, mode int) {
-	dirPrefix := gConf.DirPrefix
-	s, err := os.Stat(dirPrefix)
-	if err != nil || !s.IsDir() {
-		fmt.Printf("ERROR... dir=%s, err=%v \n", dirPrefix, err)
-		panic(err)
-	}
-	if gConf.ReadCntWhenWrite <= 0 {
-		panic("ERROR... read_cnt_when_write=%d, it must greater than 0")
-	}
-
-	for i := 0; i < gConf.ReadCntWhenWrite; i++ {
+func backgroundRead(doneTest chan bool) {
+	for i := 0; i < gConf.ReadNumWhenWrite; i++ {
 		go func() {
-			tk := time.NewTicker(gProductPeriod)
+			tk := time.NewTicker(gReadPeriod)
 			defer tk.Stop()
 
 			for {
-				fh, err := getRandomFile(gConf.ReadPrefix, os.O_RDONLY)
+				fh, err := getRandomFile(gConf.ReadDirPrefix, os.O_RDONLY)
 				if err != nil {
 					panic(err)
 				}
-				//fh, _ = os.OpenFile("test_dir_1/vdb.1_5.dir/vdb_f0003.file", os.O_RDONLY, 0o644)
+				// fh, _ = os.OpenFile("test_dir_1/vdb.1_5.dir/vdb_f0003.file", os.O_RDONLY, 0o644)
 
 				// io.Copy(ioutil.Discard, fh)
 				fi, err := fh.Stat()
-				rdByte := 1024 * 1024 * 4
+				rdByte := gConf.ReadByte
 				buf := make([]byte, rdByte)
 				rdByte, err = fh.ReadAt(buf, rand.Int63n(fi.Size()-int64(rdByte)))
 				fh.Close()
@@ -536,8 +551,16 @@ func randomReadAndWrite(list chan NodeData, doneTest, finishRecord chan bool, cn
 			}
 		}()
 	}
+}
 
+func randomReadAndWrite(list chan NodeData, doneTest, finishRecord chan bool, cntCh chan int, costCh chan []time.Duration, mode int) {
+	checkReadAndWriteDir()
+	backgroundRead(doneTest)
 	commonModel(list, doneTest, finishRecord, cntCh, costCh, mode)
+}
+
+func appendWriteByRead(list chan NodeData, doneTest, finishRecord chan bool, cntCh chan int, costCh chan []time.Duration, mode int) {
+	randomReadAndWrite(list, doneTest, finishRecord, cntCh, costCh, mode)
 }
 
 func getRandomFile(dirPrefix string, flag int) (*os.File, error) {
