@@ -18,9 +18,9 @@ import (
 // 2. 慢慢的周期往队列里扔数据。 查看长尾的效应
 
 const (
-	defaultIsSingleMode   = true             // 是否是单协程写
+	// defaultIsSingleMode   = true             // 是否是单协程写
 	defaultIsReservedData = false            // 预埋一批数据
-	defaultThreadNum      = 2                // 生产者的并发个数
+	defaultThreadNum      = 1                // 消费者的并发个数
 	defaultQueueSize      = 20               // 缓存队列的长度
 	defaultLoopTime       = 30               // 持续写盘的时间
 	defaultBatchCount     = 1                // 模拟客户端一次请求的总个数，固定IO大小
@@ -42,20 +42,20 @@ const (
 )
 
 var (
-	rdFile         = flag.String("r", defaultReadFile, "read from file")
-	wtFile         = flag.String("w", defaultWriteFile, "write to file")
-	isReservedData = flag.Bool("rm", defaultIsReservedData, "is reserved data mode")
-	isSingerWrite  = flag.Bool("sm", defaultIsSingleMode, "is single write mode")
-	goNum          = flag.Int("n", defaultThreadNum, "multi consumer num")
-	queueSize      = flag.Int("q", defaultQueueSize, "requst queue max size")
-	loopTime       = flag.Int("t", defaultLoopTime, "write disk elapsed time")
-	batchCount     = flag.Int("b", defaultBatchCount, "total request data count, many datas at once")
-	showInterval   = flag.Int("i", defaultShowInterval, "show interval")
-	delayArrLen    = flag.Int("d", defaultRecordDelay, "record delay array length")
-	model          = flag.Int("m", defaultModel, "test model: 1:append write; 2:random write; 3:random read ; 4: random read and write")
+	rdFile         = flag.String("r", defaultReadFile, "Read from file")
+	wtFile         = flag.String("w", defaultWriteFile, "Write to file")
+	isReservedData = flag.Bool("rm", defaultIsReservedData, "is Reserved data Mode")
+	//isSingerWrite  = flag.Bool("sm", defaultIsSingleMode, "is single write mode")
+	consumerNum  = flag.Int("c", defaultThreadNum, "multi Consumer num")
+	queueSize    = flag.Int("q", defaultQueueSize, "requst Queue max size")
+	loopTime     = flag.Int("t", defaultLoopTime, "write disk elapsed Time")
+	batchCount   = flag.Int("b", defaultBatchCount, "total request data count, Batch datas at once")
+	showInterval = flag.Int("i", defaultShowInterval, "show Interval")
+	delayArrLen  = flag.Int("d", defaultRecordDelay, "record Delay array length")
+	model        = flag.Int("m", defaultModel, "test Model: 1:append write; 2:random write; 3:random read ; 4: random read and write")
 	// consumeInterval := flag.String("ci", DefaultInterval, "consume interval")
-	productInterval = flag.String("pi", defaultInterval, "product interval")
-	confFile        = flag.String("f", defaultConfigFile, "config file")
+	productInterval = flag.String("pi", defaultInterval, "Product Interval")
+	confFile        = flag.String("f", defaultConfigFile, "config File")
 
 	gTotalReqCnt   int // 单协程下统计写入请求的总个数
 	gProductPeriod time.Duration
@@ -80,8 +80,8 @@ type DiskConfig struct {
 func parseFlag() (err error) {
 	flag.Parse()
 	fmt.Printf("parse flag: readFile=%s, writeFile=%s, consumerNum=%d, QmaxSiz=%d, eelapsedTime=%d, interval=%d, "+
-		"batchDataAtOnce=%d, productInterval=%s, delayArrLen=%d, isSingleMode=%v , isReservedData=%v \n",
-		*rdFile, *wtFile, *goNum, *queueSize, *queueSize, *showInterval, *batchCount, *productInterval, *delayArrLen, *isSingerWrite, *isReservedData)
+		"batchDataAtOnce=%d, productInterval=%s, delayArrLen=%d, isReservedData=%v \n",
+		*rdFile, *wtFile, *consumerNum, *queueSize, *queueSize, *showInterval, *batchCount, *productInterval, *delayArrLen, *isReservedData)
 
 	gProductPeriod, err = time.ParseDuration(*productInterval)
 	if err != nil {
@@ -97,10 +97,10 @@ func main() {
 	if err = parseFlag(); err != nil {
 		fmt.Println("ERROR... fail to parse flag.", err)
 	}
-	doneTest := make(chan bool)     // 结束测试
-	finishRecord := make(chan bool) // 单协程closed完毕
-	cntCh := make(chan int, *goNum) // 多协程统计写请求总个数
-	costCh := make(chan []time.Duration, *goNum)
+	doneTest := make(chan bool)           // 结束测试
+	finishRecord := make(chan bool)       // 单协程closed完毕
+	cntCh := make(chan int, *consumerNum) // 多协程统计写请求总个数
+	costCh := make(chan []time.Duration, *consumerNum)
 	list := make(chan NodeData, *queueSize) // list := newListQueue()
 	if *isReservedData && *batchCount > 1 {
 		list = make(chan NodeData, *batchCount)
@@ -280,7 +280,7 @@ func productDataPeriod(i int, list chan NodeData, closed chan bool, datas []byte
 	rand.Seed(time.Now().UnixNano())
 
 	// 先生产够一批，和多线程个数匹配的数据
-	for i := 0; i < *goNum; i++ {
+	for i := 0; i < *consumerNum; i++ {
 		node := NodeData{
 			data: string(datas),
 			time: time.Now(),
@@ -385,7 +385,7 @@ FINAL:
 }
 
 func showResult(finishRecord chan bool, cntCh chan int, costCh chan []time.Duration) {
-	if *isSingerWrite {
+	if *consumerNum > 1 {
 		// waitTime := time.Now()
 		fmt.Printf("main go: single consumer done... cnt=%d, gMaxDequeue=%v \n", gTotalReqCnt, gMaxDequeue)
 		// fmt.Println("waiting consumer close...")
@@ -394,14 +394,14 @@ func showResult(finishRecord chan bool, cntCh chan int, costCh chan []time.Durat
 	} else {
 		// multi thread consume
 		cnt := 0
-		for i := 0; i < *goNum; i++ {
+		for i := 0; i < *consumerNum; i++ {
 			cnt += <-cntCh
 		}
 		fmt.Printf("multi consumer done... write cnt: %d , gMaxDequeue=%v \n", cnt, gMaxDequeue)
 
 		cnt = 0
-		costUn := make([][]time.Duration, *goNum)
-		for i := 0; i < *goNum; i++ {
+		costUn := make([][]time.Duration, *consumerNum)
+		for i := 0; i < *consumerNum; i++ {
 			// costEach := <-costCh
 			// costTm = append(costTm, costEach...)
 			costUn[i] = <-costCh
@@ -410,7 +410,7 @@ func showResult(finishRecord chan bool, cntCh chan int, costCh chan []time.Durat
 
 		costTm := make([]time.Duration, cnt)
 		for i := 0; i < cnt; {
-			for j := 0; j < *goNum; j++ {
+			for j := 0; j < *consumerNum; j++ {
 				if len(costUn[j]) > 0 {
 					costTm[i] = costUn[j][0]
 					costUn[j] = costUn[j][1:]
@@ -442,10 +442,10 @@ func commonModel(list chan NodeData, doneTest, finishRecord chan bool, cntCh cha
 	// 改为单个生产者
 	go productMulti(0, list, doneTest)
 
-	if *isSingerWrite { // 单个消费者
+	if *consumerNum > 1 { // 单个消费者
 		go consumeOne(list, doneTest, finishRecord, fh, mode)
 	} else { // 测试多线程写
-		for i := 0; i < *goNum; i++ {
+		for i := 0; i < *consumerNum; i++ {
 			go consumeMulti(i, list, doneTest, cntCh, costCh, fh, mode)
 		}
 	}
