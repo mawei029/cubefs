@@ -43,6 +43,9 @@ const (
 	DefaultMetricReportIntervalS        = 30              // 30 Sec
 	DefaultBlockBufferSize              = 64 * 1024       // 64k
 	DefaultCompactEmptyRateThreshold    = float64(0.8)    // 80% rate
+	defaultWriteThreadCnt               = 4
+	defaultReadThreadCnt                = 8
+	defaultIOSchedulerCntCnt            = 64
 )
 
 // Config for disk
@@ -77,8 +80,10 @@ type RuntimeConfig struct {
 	MetricReportIntervalS        int64   `json:"metric_report_interval_S"`
 	BlockBufferSize              int64   `json:"block_buffer_size"`
 	EnableDataInspect            bool    `json:"enable_data_inspect"`
-	WriteThreadCnt               uint32  `json:"write_thread_count"`
-	ReadThreadCnt                uint32  `json:"read_thread_count"`
+	WriteThreadCnt               int     `json:"write_thread_count"`
+	ReadThreadCnt                int     `json:"read_thread_count"`
+	WriteSchedulerCnt            int     `json:"write_scheduler_cnt"`
+	ReadSchedulerCnt             int     `json:"read_scheduler_cnt"`
 
 	DataQos qos.Config `json:"data_qos"`
 }
@@ -170,5 +175,16 @@ func InitConfig(conf *Config) error {
 		conf.BlockBufferSize = DefaultBlockBufferSize
 	}
 
+	fixConfigItemInt(&conf.WriteThreadCnt, defaultWriteThreadCnt)
+	fixConfigItemInt(&conf.ReadThreadCnt, defaultReadThreadCnt)
+	fixConfigItemInt(&conf.WriteSchedulerCnt, defaultIOSchedulerCntCnt)
+	fixConfigItemInt(&conf.ReadSchedulerCnt, defaultIOSchedulerCntCnt)
+
 	return nil
+}
+
+func fixConfigItemInt(actual *int, defaultVal int) {
+	if *actual <= 0 {
+		*actual = defaultVal
+	}
 }

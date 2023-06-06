@@ -174,6 +174,7 @@ func (ds *DiskStorage) Close(ctx context.Context) {
 		}
 
 		ds.closed = true
+	}()
 
 	ds.writePool.Close()
 	ds.readPool.Close()
@@ -502,16 +503,10 @@ func newDiskStorage(ctx context.Context, conf core.Config) (ds *DiskStorage, err
 	}
 
 	// setting pools
-	if conf.WriteThreadCnt == 0 {
-		conf.WriteThreadCnt = 2
-	}
-	if conf.ReadThreadCnt == 0 {
-		conf.ReadThreadCnt = 4
-	}
-	writePool := taskpool.New(int(conf.WriteThreadCnt), int(conf.WriteThreadCnt))
-	readPool := taskpool.New(int(conf.ReadThreadCnt), int(conf.ReadThreadCnt))
-	writeScheduler := iopool.NewShardedIoScheduler(1024, writePool)  // TODO , config it 1024
-	readScheduler := iopool.NewShardedIoScheduler(1024, readPool)
+	writePool := taskpool.New(conf.WriteThreadCnt, conf.WriteThreadCnt)
+	readPool := taskpool.New(conf.ReadThreadCnt, conf.ReadThreadCnt)
+	writeScheduler := iopool.NewShardedIoScheduler(conf.WriteSchedulerCnt, writePool) // TODO , config it 1024
+	readScheduler := iopool.NewShardedIoScheduler(conf.ReadSchedulerCnt, readPool)
 
 	ds = &DiskStorage{
 		DiskID:           dm.DiskID,
