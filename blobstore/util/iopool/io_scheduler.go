@@ -21,6 +21,7 @@ import (
 
 	"github.com/cubefs/cubefs/blobstore/util/taskpool"
 )
+
 // TODO add ut
 type IoScheduler interface {
 	Schedule(task *IoTask)
@@ -65,7 +66,7 @@ func (cb *FileController) swapTasks() {
 	cb.pendingTasks, cb.tasks = cb.tasks, cb.pendingTasks
 }
 
-func (cb *FileController) exec() {  // runLoop()
+func (cb *FileController) exec() { // runLoop()
 	for {
 		cb.swapTasks()
 		if len(cb.tasks) != 0 {
@@ -79,7 +80,7 @@ func (cb *FileController) exec() {  // runLoop()
 			}
 			// sync file
 			if isSync {
-				cb.tasks[0].Sync()  // TODO only sync tasks[0]?
+				cb.tasks[0].Sync() // TODO only sync tasks[0]?
 			}
 			// complete tasks
 			for _, task := range cb.tasks {
@@ -100,7 +101,7 @@ func (cb *FileController) exec() {  // runLoop()
 			// }()
 			// if ret {
 			// 	cb.run = false
-				return
+			return
 			// }
 		}
 	}
@@ -114,9 +115,9 @@ func (cb *FileController) Submit(task *IoTask, pool taskpool.TaskPool) {
 		// defer cb.routineLock.Unlock()
 		// if !cb.run {
 		// 	cb.run = true
-			pool.Run(func() {
-				cb.exec()
-			})
+		pool.Run(func() {
+			cb.exec()
+		})
 		// }
 	}
 }
@@ -124,7 +125,7 @@ func (cb *FileController) Submit(task *IoTask, pool taskpool.TaskPool) {
 type SimpleIoScheduler struct {
 	pool            taskpool.TaskPool
 	controllerTable map[uint64]*FileController
-	tabelLock       *sync.RWMutex  // TODO tabel->table
+	tabelLock       *sync.RWMutex // TODO tabel->table
 }
 
 func (scheduler *SimpleIoScheduler) getControllerLockless(id uint64) *FileController {
@@ -178,12 +179,9 @@ func (scheduler *ShardedIoScheduler) Schedule(task *IoTask) {
 	scheduler.subScheduler[index].Schedule(task)
 }
 
-func NewShardedIoScheduler(count uint32, pool taskpool.TaskPool) *ShardedIoScheduler {
-	if count == 0 {
-		count = 64  // TODO config it 64
-	}
+func NewShardedIoScheduler(count int, pool taskpool.TaskPool) *ShardedIoScheduler {
 	schedulers := make([]IoScheduler, 0, count)
-	for i := uint32(0); i < count; i++ {
+	for i := 0; i < count; i++ {
 		schedulers = append(schedulers, NewSimpleIoScheduler(pool))
 	}
 	return &ShardedIoScheduler{
