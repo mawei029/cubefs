@@ -36,8 +36,10 @@ import (
 	"github.com/cubefs/cubefs/blobstore/common/proto"
 	"github.com/cubefs/cubefs/blobstore/common/trace"
 	"github.com/cubefs/cubefs/blobstore/util/errors"
+	"github.com/cubefs/cubefs/blobstore/util/iopool"
 	"github.com/cubefs/cubefs/blobstore/util/limit"
 	"github.com/cubefs/cubefs/blobstore/util/limit/keycount"
+	"github.com/cubefs/cubefs/blobstore/util/taskpool"
 )
 
 const (
@@ -100,6 +102,14 @@ type DiskStorage struct {
 
 	CreateAt     int64
 	LastUpdateAt int64
+
+	// io pools
+	writePool taskpool.TaskPool
+	readPool  taskpool.TaskPool
+
+	// io schedulers
+	writeScheduler iopool.IoScheduler
+	readScheduler  iopool.IoScheduler
 }
 
 func (ds *DiskStorage) IsRegister() bool {
@@ -164,7 +174,9 @@ func (ds *DiskStorage) Close(ctx context.Context) {
 		}
 
 		ds.closed = true
-	}()
+
+	ds.writePool.Close()
+	ds.readPool.Close()
 }
 
 func (ds *DiskStorage) DiskInfo() (info bnapi.DiskInfo) {
@@ -320,7 +332,7 @@ func (dsw *DiskStorageWrapper) CreateChunk(ctx context.Context, vuid proto.Vuid,
 	}
 
 	// create chunk storage
-	cs, err = chunk.NewChunkStorage(ctx, ds.DataPath, vm, func(option *core.Option) {
+	cs, err = chunk.NewChunkStorage(ctx, ds.DataPath, vm, dsw.readScheduler, dsw.writeScheduler, func(option *core.Option) {
 		option.CreateDataIfMiss = true
 		option.DB = ds.SuperBlock.db
 		option.Conf = ds.Conf
@@ -489,6 +501,18 @@ func newDiskStorage(ctx context.Context, conf core.Config) (ds *DiskStorage, err
 		return nil, err
 	}
 
+	// setting pools
+	if conf.WriteThreadCnt == 0 {
+		conf.WriteThreadCnt = 2
+	}
+	if conf.ReadThreadCnt == 0 {
+		conf.ReadThreadCnt = 4
+	}
+	writePool := taskpool.New(int(conf.WriteThreadCnt), int(conf.WriteThreadCnt))
+	readPool := taskpool.New(int(conf.ReadThreadCnt), int(conf.ReadThreadCnt))
+	writeScheduler := iopool.NewShardedIoScheduler(1024, writePool)  // TODO , config it 1024
+	readScheduler := iopool.NewShardedIoScheduler(1024, readPool)
+
 	ds = &DiskStorage{
 		DiskID:           dm.DiskID,
 		SuperBlock:       sb,
@@ -504,6 +528,10 @@ func newDiskStorage(ctx context.Context, conf core.Config) (ds *DiskStorage, err
 		dataQos:          dataQos,
 		CreateAt:         dm.Ctime,
 		LastUpdateAt:     dm.Mtime,
+		writePool:        writePool,
+		readPool:         readPool,
+		writeScheduler:   writeScheduler,
+		readScheduler:    readScheduler,
 	}
 
 	if err = ds.fillDiskUsage(ctx); err != nil {
@@ -639,7 +667,7 @@ func (dsw *DiskStorageWrapper) RestoreChunkStorage(ctx context.Context) (err err
 				return err
 			}
 		}
-		cs, err := chunk.NewChunkStorage(ctx, ds.DataPath, vm, func(o *core.Option) {
+		cs, err := chunk.NewChunkStorage(ctx, ds.DataPath, vm, ds.readScheduler, ds.writeScheduler, func(o *core.Option) {
 			o.Conf = ds.Conf
 			o.DB = sb.db
 			o.Disk = dsw
