@@ -80,8 +80,8 @@ type RuntimeConfig struct {
 	MetricReportIntervalS        int64   `json:"metric_report_interval_S"`
 	BlockBufferSize              int64   `json:"block_buffer_size"`
 	EnableDataInspect            bool    `json:"enable_data_inspect"`
-	WriteThreadCnt               int     `json:"write_thread_count"`
-	ReadThreadCnt                int     `json:"read_thread_count"`
+	WriteThreadCnt               int     `json:"write_thread_cnt"`
+	ReadThreadCnt                int     `json:"read_thread_cnt"`
 	WriteSchedulerCnt            int     `json:"write_scheduler_cnt"`
 	ReadSchedulerCnt             int     `json:"read_scheduler_cnt"`
 
