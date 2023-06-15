@@ -39,7 +39,6 @@ import (
 	"github.com/cubefs/cubefs/blobstore/util/iopool"
 	"github.com/cubefs/cubefs/blobstore/util/limit"
 	"github.com/cubefs/cubefs/blobstore/util/limit/keycount"
-	"github.com/cubefs/cubefs/blobstore/util/taskpool"
 )
 
 const (
@@ -102,10 +101,6 @@ type DiskStorage struct {
 
 	CreateAt     int64
 	LastUpdateAt int64
-
-	// io pools
-	writePool taskpool.TaskPool
-	readPool  taskpool.TaskPool
 
 	// io schedulers
 	writeScheduler iopool.IoScheduler
@@ -176,8 +171,8 @@ func (ds *DiskStorage) Close(ctx context.Context) {
 		ds.closed = true
 	}()
 
-	ds.writePool.Close()
-	ds.readPool.Close()
+	ds.writeScheduler.Close()
+	ds.readScheduler.Close()
 }
 
 func (ds *DiskStorage) DiskInfo() (info bnapi.DiskInfo) {
@@ -503,10 +498,8 @@ func newDiskStorage(ctx context.Context, conf core.Config) (ds *DiskStorage, err
 	}
 
 	// setting pools
-	writePool := taskpool.New(conf.WriteThreadCnt, conf.WriteThreadCnt)
-	readPool := taskpool.New(conf.ReadThreadCnt, conf.ReadThreadCnt)
-	writeScheduler := iopool.NewShardedIoScheduler(conf.WriteSchedulerCnt, writePool) // TODO , config it 1024
-	readScheduler := iopool.NewShardedIoScheduler(conf.ReadSchedulerCnt, readPool)
+	writeScheduler := iopool.NewQueueIoScheduler(conf.WriteQueueLen, conf.WriteThreadCnt) // TODO , config it 1024
+	readScheduler := iopool.NewQueueIoScheduler(conf.ReadQueueLen, conf.ReadThreadCnt)
 
 	ds = &DiskStorage{
 		DiskID:           dm.DiskID,
@@ -523,8 +516,6 @@ func newDiskStorage(ctx context.Context, conf core.Config) (ds *DiskStorage, err
 		dataQos:          dataQos,
 		CreateAt:         dm.Ctime,
 		LastUpdateAt:     dm.Mtime,
-		writePool:        writePool,
-		readPool:         readPool,
 		writeScheduler:   writeScheduler,
 		readScheduler:    readScheduler,
 	}

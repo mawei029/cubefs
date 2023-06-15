@@ -17,6 +17,7 @@ package core
 import (
 	"context"
 	"errors"
+	"github.com/cubefs/cubefs/blobstore/util/defaulter"
 
 	cmapi "github.com/cubefs/cubefs/blobstore/api/clustermgr"
 	"github.com/cubefs/cubefs/blobstore/blobnode/base/qos"
@@ -44,7 +45,8 @@ const (
 	DefaultBlockBufferSize              = 64 * 1024       // 64k
 	DefaultCompactEmptyRateThreshold    = float64(0.8)    // 80% rate
 	defaultWriteThreadCnt               = 4
-	defaultReadThreadCnt                = 8
+	defaultReadThreadCnt                = 4
+	defaultIOQueueLength                = 128
 	defaultIOSchedulerCntCnt            = 64
 )
 
@@ -82,8 +84,8 @@ type RuntimeConfig struct {
 	EnableDataInspect            bool    `json:"enable_data_inspect"`
 	WriteThreadCnt               int     `json:"write_thread_cnt"`
 	ReadThreadCnt                int     `json:"read_thread_cnt"`
-	WriteSchedulerCnt            int     `json:"write_scheduler_cnt"`
-	ReadSchedulerCnt             int     `json:"read_scheduler_cnt"`
+	WriteQueueLen                int     `json:"write_queue_len"`
+	ReadQueueLen                 int     `json:"read_queue_len"`
 
 	DataQos qos.Config `json:"data_qos"`
 }
@@ -175,16 +177,10 @@ func InitConfig(conf *Config) error {
 		conf.BlockBufferSize = DefaultBlockBufferSize
 	}
 
-	fixConfigItemInt(&conf.WriteThreadCnt, defaultWriteThreadCnt)
-	fixConfigItemInt(&conf.ReadThreadCnt, defaultReadThreadCnt)
-	fixConfigItemInt(&conf.WriteSchedulerCnt, defaultIOSchedulerCntCnt)
-	fixConfigItemInt(&conf.ReadSchedulerCnt, defaultIOSchedulerCntCnt)
+	defaulter.LessOrEqual(&conf.WriteThreadCnt, defaultWriteThreadCnt)
+	defaulter.LessOrEqual(&conf.ReadThreadCnt, defaultReadThreadCnt)
+	defaulter.LessOrEqual(&conf.WriteQueueLen, defaultIOQueueLength)
+	defaulter.LessOrEqual(&conf.ReadQueueLen, defaultIOQueueLength)
 
 	return nil
-}
-
-func fixConfigItemInt(actual *int, defaultVal int) {
-	if *actual <= 0 {
-		*actual = defaultVal
-	}
 }
