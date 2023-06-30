@@ -1,0 +1,15 @@
+2023/06/30 19:56:43.107736 [INFO] /home/oppo/code/cubefs/blobstore/tools/scheduler/getKafka.go:89 start delete msg: [&{ClusterID:100 Bid:4500960552 Vid:46404 Retry:67 Time:1686047019 ReqId:dHkEAGg_EbbUCmYX BlobDelStages:{Stages:map[0:2 1:2 2:2 3:2 4:2 5:2 6:2 7:2 8:2 9:2 10:2 11:2 12:2 13:1 14:2 15:2 16:2 17:2 18:2 19:2 20:2 21:2 22:2 23:2 24:2 25:2 26:2]}}]
+2023/06/30 19:56:43.108250 [INFO] /home/oppo/code/cubefs/blobstore/tools/scheduler/getKafka.go:89 start delete msg: [&{ClusterID:100 Bid:1100960552 Vid:46404 Retry:69 Time:1686047019 ReqId:dHkEAGg_EbbUCmYX BlobDelStages:{Stages:map[0:2 1:2 2:2 3:2 4:2 5:2 6:2 7:2 8:2 9:2 10:2 11:2 12:2 13:1 14:2 15:2 16:2 17:2 18:2 19:2 20:2 21:2 22:2 23:2 24:2 25:2 26:2]}}]
+2023/06/30 19:56:43.118088 [INFO] /home/oppo/code/cubefs/blobstore/tools/scheduler/getKafka.go:89 start delete msg: [&{ClusterID:100 Bid:4500960552 Vid:46404 Retry:70 Time:1686047019 ReqId:dHkEAGg_EbbUCmYX BlobDelStages:{Stages:map[0:2 1:2 2:2 3:2 4:2 5:2 6:2 7:2 8:2 9:2 10:2 11:2 12:2 13:1 14:2 15:2 16:2 17:2 18:2 19:2 20:2 21:2 22:2 23:2 24:2 25:2 26:2]}}]
+2023/06/30 19:58:16.685523 [INFO] /home/oppo/code/cubefs/blobstore/tools/scheduler/getKafka.go:119 receive signal: interrupt, stop service...
+2023/06/30 19:58:16.685567 [INFO] /home/oppo/code/cubefs/blobstore/tools/scheduler/getKafka.go:204 [5ffe7250821c2321:3e038b8aaa309057] start close kafka consumer: group[SCHEDULER-dg_blob_delete_failed]
+2023/06/30 19:58:16.957757 [INFO] /home/oppo/code/cubefs/blobstore/tools/scheduler/getKafka.go:121 stop...
+
+start delete msg: [&{ClusterID:100 Bid:4785610885 Vid:45326 Retry:4 Time:1687919774 ReqId:dHkEAPSYJIUXsmwX BlobDelStages:{Stages:map[]} blobStages:{Stages:map[3:1 5:1 11:1]}}]
+start delete msg: [&{ClusterID:100 Bid:4500960552 Vid:46404 Retry:67 Time:1686047019 ReqId:dHkEAGg_EbbUCmYX BlobDelStages:{Stages:map[0:2 1:2 2:2 3:2 4:2 5:2 6:2 7:2 8:2 9:2 10:2 11:2 12:2 13:1 14:2 15:2 16:2 17:2 18:2 19:2 20:2 21:2 22:2 23:2 24:2 25:2 26:2]}}]
+
+
+2023/07/03 11:16:23.164264 [INFO] /home/mw/code/cubefs/blobstore/tools/scheduler/getKafka.go:90 start json delete msg: {"cluster_id":100,"bid":4598496687,"vid":5776,"retry":1,"time":1686880787,"req_id":"fwwAADL8DnMjAWkX","blob_del_stages":{"stages":{"0":2,"1":2,"10":2,"11":2,"2":2,"3":2,"4":2,"5":2,"6":2,"7":2,"8":2,"9":1}}}
+2023/07/03 11:16:23.164285 [INFO] /home/mw/code/cubefs/blobstore/tools/scheduler/getKafka.go:90 start json delete msg: {"cluster_id":100,"bid":4598591635,"vid":5893,"retry":1,"time":1686880786,"req_id":"tBICAJYYJ0UjAWkX","blob_del_stages":{"stages":{"0":2,"1":2,"10":1,"11":2,"2":2,"3":2,"4":2,"5":2,"6":2,"7":2,"8":2,"9":2}}}
+2023/07/03 11:16:23.164317 [INFO] /home/mw/code/cubefs/blobstore/tools/scheduler/getKafka.go:90 start json delete msg: {"cluster_id":100,"bid":4598543195,"vid":5783,"retry":1,"time":1686880800,"req_id":"dHkEAKyvK6QmAWkX","blob_del_stages":{"stages":{"0":2,"1":2,"10":2,"11":2,"2":2,"3":2,"4":1,"5":1,"6":2,"7":2,"8":2,"9":2}}}
+
