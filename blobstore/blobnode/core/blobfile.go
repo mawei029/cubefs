@@ -31,6 +31,7 @@ type RawFile interface {
 	Fd() uintptr
 	ReadAt(b []byte, off int64) (n int, err error)
 	WriteAt(b []byte, off int64) (n int, err error)
+	// Write(b[]byte)  offset  //
 	Stat() (info os.FileInfo, err error)
 	Sync() error
 	Close() error
@@ -73,12 +74,16 @@ func (ef *blobFile) ReadAt(b []byte, off int64) (n int, err error) {
 }
 
 func (ef *blobFile) WriteAt(b []byte, off int64) (n int, err error) {
+	// ctx
 	if ef.writeScheduler != nil {
 		task := iopool.NewWriteIoTask(ef.file, uint64(ef.Fd()), uint64(off), b, false)
 		ef.writeScheduler.Schedule(task)
 		n, err = task.WaitAndClose()
 	} else {
 		n, err = ef.file.WriteAt(b, off)
+		//fi := os.Open("")
+		//fi.Write()
+
 	}
 	ef.handleError(err)
 	return

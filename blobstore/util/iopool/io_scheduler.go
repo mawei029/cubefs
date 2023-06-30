@@ -26,13 +26,13 @@ type IoScheduler interface {
 
 // queue
 type QueueIoScheduler struct {
-	queue chan *IoTask
+	queue chan func() IoPoolResult
 	pool  taskpool.TaskPool
 }
 
 func NewQueueIoScheduler(queueLen, threadCnt int) *QueueIoScheduler {
 	s := &QueueIoScheduler{
-		queue: make(chan *IoTask, queueLen), // queueLen
+		queue: make(chan func() IoPoolResult, queueLen), // queueLen
 		pool:  taskpool.New(threadCnt, threadCnt),
 	}
 	s.pool.Run(func() {
@@ -41,8 +41,14 @@ func NewQueueIoScheduler(queueLen, threadCnt int) *QueueIoScheduler {
 	return s
 }
 
-func (s *QueueIoScheduler) Schedule(task *IoTask) {
-	s.queue <- task
+type IoPoolResult struct {
+	offset int // 返回写入的位置
+	n      int // 返回实际写的长度
+	err    error
+}
+
+func (s *QueueIoScheduler) Schedule(taskFn func() IoPoolResult) {
+	s.queue <- taskFn
 }
 
 func (s *QueueIoScheduler) Close() {
@@ -51,10 +57,11 @@ func (s *QueueIoScheduler) Close() {
 
 func (s *QueueIoScheduler) runLoop() {
 	for task := range s.queue {
-		task.Exec()
-		if task.isSync {
-			task.Sync()
-		}
-		task.Complete()
+		//task.Exec()
+		//if task.isSync {
+		//	task.Sync()
+		//}
+		//task.Complete()
+		task()
 	}
 }

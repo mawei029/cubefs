@@ -311,7 +311,7 @@ func (cd *datafile) Write(ctx context.Context, shard *core.Shard) error {
 	phySize := core.Alignphysize(int64(shard.Size))
 
 	// allocate space
-	pos, err := cd.allocSpace(phySize)
+	pos, err := cd.allocSpace(phySize) // remove
 	if err != nil {
 		return err
 	}
@@ -330,7 +330,8 @@ func (cd *datafile) Write(ctx context.Context, shard *core.Shard) error {
 	}
 
 	start = time.Now()
-	_, err = qoswAt.WriteAt(headerbuf, pos)
+
+	_, err = qoswAt.WriteAt(headerbuf, pos) // (ctx, headerbuf, pos)
 	span.AppendTrackLog("hdr.w", start, err)
 	if err != nil {
 		return err
