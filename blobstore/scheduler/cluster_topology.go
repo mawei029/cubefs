@@ -180,6 +180,17 @@ type ClusterTopologyMgr struct {
 	taskStatsMgr *base.ClusterTopologyStatsMgr
 }
 
+func NewClusterTopologyMgr1(topologyClient client.ClusterMgrAPI, cID proto.ClusterID) IClusterTopology {
+	cfg1 := &clusterTopologyConfig{
+		ClusterID:            cID,
+		Leader:               true,
+		UpdateInterval:       1 * time.Minute,
+		VolumeUpdateInterval: 10 * time.Second,
+	}
+
+	return NewClusterTopologyMgr(topologyClient, cfg1)
+}
+
 // NewClusterTopologyMgr returns cluster topology manager
 func NewClusterTopologyMgr(topologyClient client.ClusterMgrAPI, cfg *clusterTopologyConfig) IClusterTopology {
 	mgr := &ClusterTopologyMgr{
