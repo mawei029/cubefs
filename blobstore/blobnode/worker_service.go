@@ -82,8 +82,7 @@ type WorkerConfig struct {
 	// scheduler client config
 	Scheduler scheduler.Config `json:"scheduler"`
 	// blbonode client config
-	BlobNode         bnapi.Config     `json:"blobnode"`
-	BlobnodeLimitReq LimitRequestConf `json:"blobnode_limit_req"`
+	BlobNode bnapi.Config `json:"blobnode"`
 
 	DroppedBidRecord *recordlog.Config `json:"dropped_bid_record"`
 }
@@ -101,8 +100,6 @@ type WorkerService struct {
 
 	schedulerCli scheduler.IScheduler
 	blobNodeCli  client.IBlobNode
-
-	limitReq *LimitRequestMgr
 }
 
 func (cfg *WorkerConfig) checkAndFix() {
@@ -118,10 +115,6 @@ func (cfg *WorkerConfig) checkAndFix() {
 	fixConfigItemInt64(&cfg.Scheduler.ClientTimeoutMs, 1000)
 	fixConfigItemInt64(&cfg.Scheduler.HostSyncIntervalMs, 1000)
 	fixConfigItemInt64(&cfg.BlobNode.ClientTimeoutMs, 1000)
-	fixConfigItemInt(&cfg.BlobnodeLimitReq.Concurrency, 4)
-	fixConfigItemInt64(&cfg.BlobnodeLimitReq.QueueCnt, 100)
-	fixConfigItemInt64(&cfg.BlobnodeLimitReq.TimeoutS, 5)
-	fixConfigItemInt64(&cfg.BlobnodeLimitReq.WaitIntervalMs, 20)
 }
 
 func fixConfigItemInt(actual *int, defaultVal int) {
@@ -161,8 +154,6 @@ func NewWorkerService(cfg *WorkerConfig, service cmapi.APIService, clusterID pro
 		return nil, err
 	}
 
-	limitReq := NewLimitRequestMgr(cfg.BlobnodeLimitReq)
-
 	svr := &WorkerService{
 		Closer:       closer.New(),
 		WorkerConfig: *cfg,
@@ -174,8 +165,6 @@ func NewWorkerService(cfg *WorkerConfig, service cmapi.APIService, clusterID pro
 
 		shardRepairLimit: shardRepairLimit,
 		shardRepairer:    shardRepairer,
-
-		limitReq: limitReq,
 	}
 
 	go svr.Run()
@@ -215,7 +204,6 @@ func (s *WorkerService) Run() {
 	// task lease
 	s.taskRunnerMgr.RenewalTaskLoop(s.Done())
 	s.loopAcquireTask()
-	s.limitReq.Run()
 }
 
 func (s *WorkerService) loopAcquireTask() {

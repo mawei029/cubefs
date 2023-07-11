@@ -512,7 +512,7 @@ func (s *Service) ShardPut(c *rpc.Context) {
 
 	start = time.Now()
 
-	err = s.WorkerService.limitReq.write(ctx, cs, shard) // err = cs.Write(ctx, shard)
+	err = cs.Write(ctx, shard)
 	span.AppendTrackLog("disk.put", start, err)
 	if err != nil {
 		span.Errorf("Failed to put shard, args: %+v, err: %v", args, err)
