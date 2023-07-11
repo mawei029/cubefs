@@ -296,10 +296,6 @@ Crc:       %d
 `, b.Bid, b.Vuid, b.Flag, b.Size, b.Crc)
 }
 
-func (b *Shard) KeyString() string {
-	return fmt.Sprintf("%d_%d_%d_%d_%d", b.Bid, b.Vuid, b.Flag, b.Size, b.Crc)
-}
-
 func (b *Shard) init() {
 	b.Flag = bnapi.ShardStatusNormal
 }
