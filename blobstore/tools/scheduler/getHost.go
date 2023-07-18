@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"flag"
+	"fmt"
 	cmapi "github.com/cubefs/cubefs/blobstore/api/clustermgr"
 	"github.com/cubefs/cubefs/blobstore/common/config"
 	"github.com/cubefs/cubefs/blobstore/common/proto"
@@ -33,7 +34,10 @@ func (m *BlobDelMgr) getHost(vid proto.Vid, idx int, bid uint64, hosts map[strin
 		return errOutOfIndex
 	}
 
-	log.Infof("bad vid:%d, index:%d, bid:%d, location: %+v", vid, idx, bid, volume.VunitLocations[idx])
+	// /shard/markdelete/diskid/298/vuid/193905291165699/bid/4500926655
+	//log.Infof("bad vid:%d, index:%d, bid:%d, location: %+v \n", vid, idx, bid, volume.VunitLocations[idx])
+	fmt.Printf("curl %s/shard/markdelete/diskid/%d/vuid/%d/bid/%d \t ; bad vid:%d, index:%d \n",
+		volume.VunitLocations[idx].Host, volume.VunitLocations[idx].DiskID, volume.VunitLocations[idx].Vuid, bid, vid, idx)
 	hosts[volume.VunitLocations[idx].Host]++
 	return nil
 }
@@ -51,7 +55,7 @@ func NewBlobDelMgr(cluster scheduler.IClusterTopology) (*BlobDelMgr, error) {
 
 var (
 	conf1     BlobDelConfig
-	confFile1 = flag.String("f", "kafka.conf", "config filename")
+	confFile1 = flag.String("f", "parseKafka.conf", "config filename")
 )
 
 type BlobDelConfig struct {
@@ -73,18 +77,17 @@ var mgr *BlobDelMgr
 
 func initMgr() {
 	flag.Parse()
-	//*confFile = "/home/oppo/code/cubefs/blobstore/tools/scheduler/kafka.conf"
 	confBytes, err := ioutil.ReadFile(*confFile1)
 	if err != nil {
 		log.Fatalf("read config file failed, filename: %s, err: %v", *confFile1, err)
 	}
 
-	log.Infof("Config file %s:\n%s", *confFile1, confBytes)
+	fmt.Printf("Config file %s:\n%s \n", *confFile1, confBytes)
 	if err = config.LoadData(&conf1, confBytes); err != nil {
 		log.Fatalf("load config failed, error: %+v", err)
 	}
 	log.SetOutputLevel(conf1.LogLevel)
-	log.Infof("Config: %+v", conf1)
+	fmt.Printf("Config: %+v \n", conf1)
 
 	clusterMgrCli := client.NewClusterMgrClient(&conf1.ClusterMgr)
 	//topoConf := &clusterTopologyConfig{
@@ -138,5 +141,5 @@ func getAllHost(rets map[uint64]KafkaMsg, mode int) {
 		}
 	}
 
-	log.Infof("all hostLen:%d, hosts: %+v", len(hosts), hosts)
+	fmt.Printf("all hostLen:%d, hosts: %+v \n", len(hosts), hosts)
 }

@@ -158,7 +158,11 @@ func ReadLinesV2(path string) (rets map[uint64]KafkaMsg, err error) {
 			break
 		}
 
-		parseMsg(*parseMode, line, rets)
+		err1 = parseMsg(*parseMode, line, rets)
+		if err1 != nil {
+			err = err1
+			break
+		}
 	} // end for
 
 	var msgs []KafkaMsg
@@ -181,11 +185,14 @@ var (
 	msgFile   = flag.String("l", "msgKafka.log", "msg kafka File filename")
 	parseMode = flag.Int("m", jsonMsgMode, "parse msg mode, default json mode")
 	retry     = flag.Int("r", 0, "msg retry time")
-	eclen     = flag.Int("e", 27, "ec len")
+	//eclen     = flag.Int("e", 27, "ec len")
 )
 
 func main() {
 	flag.Parse()
+	// local debug
+	//*confFile1 = "/home/oppo/code/cubefs/blobstore/tools/scheduler/parseKafka.conf"
+	//*msgFile = "/home/oppo/code/cubefs/blobstore/tools/scheduler/msgKafka.log" // "/home/oppo/Documents/msgKafka1.log"
 	initMgr()
 
 	////local debug
@@ -200,10 +207,12 @@ func main() {
 	//log.SetOutputLevel(1)
 	//path := "/home/oppo/code/cubefs/blobstore/tools/scheduler/msgKafka.log"
 
+	fmt.Println("")
 	rets, err := ReadLinesV2(*msgFile)
 	fmt.Printf("err: %+v, len: %d\n", err, len(rets))
 	//log.Infof("err: %+v, len: %d, rets: %+v", err, len(rets), rets)
 
 	//initMgr()
+	fmt.Println("")
 	getAllHost(rets, *parseMode)
 }
