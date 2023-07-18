@@ -22,7 +22,7 @@ import (
 
 var (
 	conf     BlobDeleteConfig
-	confFile = flag.String("f", "kafka.conf", "config filename")
+	confFile = flag.String("f", "getKafka.conf", "config filename")
 )
 
 type BlobDeleteKafkaConfig struct {
@@ -97,7 +97,7 @@ func main() {
 	//parseFile()
 
 	flag.Parse()
-	//*confFile = "/home/oppo/code/cubefs/blobstore/tools/scheduler/kafka.conf"
+	//*confFile = "/home/oppo/code/cubefs/blobstore/tools/scheduler/getKafka.conf"
 	confBytes, err := ioutil.ReadFile(*confFile)
 	if err != nil {
 		log.Fatalf("read config file failed, filename: %s, err: %v", *confFile, err)
