@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 )
 
 const defaultBatchDelSize = 100
@@ -38,8 +37,10 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// *filePath = "/home/oppo/code/cubefs/blobstore/tools/scheduler/kafka.conf"
-	defer fmt.Printf("done, totalCnt=%d, failCnt=%d \n", total, fail)
+	//*filePath = "/home/oppo/code/cubefs/blobstore/tools/scheduler/getKafka.conf"
+	defer func() {
+		fmt.Printf("done, totalCnt=%d, failCnt=%d \n", total, fail)
+	}()
 	err := readFile(*filePath)
 	if err != nil {
 		panic(err)
@@ -103,7 +104,6 @@ func readFile(path string) (err error) {
 		}
 
 		if total%*delBatch == 0 {
-			// jin du todo, ctrl +c
 			fail += sendDelMsg(&rets)
 			rets.Locations = rets.Locations[:0]
 		}
