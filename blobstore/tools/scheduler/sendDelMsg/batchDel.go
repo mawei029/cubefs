@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -17,8 +18,9 @@ const defaultBatchDelSize = 100
 
 var (
 	filePath    = flag.String("f", "8M.json", "location file path")
-	delBatch    = flag.Int("d", 100, "access send delete msg batch size")
-	total, fail = 0, 0
+	delBatch    = flag.Int64("d", 100, "access send delete msg batch size")
+	MaxCnt      = flag.Int64("max", math.MaxInt64, "max handle location count")
+	total, fail = int64(0), int64(0)
 )
 
 func main() {
@@ -84,6 +86,10 @@ func readFile(path string) (err error) {
 
 	reader := bufio.NewReader(file)
 	for {
+		if total >= *MaxCnt {
+			return
+		}
+
 		total++
 		line, err1 := reader.ReadString('\n')
 		if err1 == io.EOF {
@@ -125,7 +131,7 @@ func parseMsg(line string, rets *DeleteArgs) error {
 	return nil
 }
 
-func sendDelMsg(rets *DeleteArgs) int {
+func sendDelMsg(rets *DeleteArgs) int64 {
 	// curl -XPOST --header 'Content-Type: application/json' 127.0.0.1:9500/delete -d '{"locations":[{"cluster_id":11,"code_mode":2,"size":8,"blob_size":8388608,"crc":2724760903,"blobs":[{"min_bid":66000305,"vid":3240,"count":1}]}]}'
 	url := "http://127.0.0.1:9500/delete"
 	data, err := json.Marshal(rets)
