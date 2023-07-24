@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
-	"time"
 
 	"github.com/Shopify/sarama"
 
@@ -16,7 +15,7 @@ import (
 var (
 	conf         ToolConfig
 	kafkaVersion = sarama.V2_1_0_0
-	confPath     = flag.String("f", "kafka_tool.conf", "kafka config path")
+	confPath     = flag.String("f", "kafka_offset.conf", "kafka config path")
 )
 
 type ToolConfig struct {
@@ -45,7 +44,7 @@ func defaultKafkaCfg() *sarama.Config {
 	return cfg
 }
 
-func main() {
+func debugTest() {
 	conf = ToolConfig{
 		ClusterID: 1,
 		Kafka: KafkaConfig{
@@ -81,6 +80,24 @@ func main() {
 	json.Unmarshal(data2, &conf)
 	fmt.Println(conf)
 
+	//for _, topic := range conf.Kafka.Topic {
+	//	partitions, err := consumer.Partitions(topic)
+	//	if err != nil {
+	//		panic(err)
+	//	}
+	//
+	//	for _, pid := range partitions {
+	//		oldestOffset, err1 := client.GetOffset(topic, pid, sarama.OffsetOldest)
+	//		consumeOffset, err2 := client.GetOffset(topic, pid, time.Now().UnixMilli())
+	//		newestOffset, err3 := client.GetOffset(topic, pid, sarama.OffsetNewest)
+	//		log.Printf("topic=%s, partition=%d, offset=[%d, %d, %d], errs=[%+v, %+v, %+v] \n",
+	//			topic, pid, oldestOffset, consumeOffset, newestOffset, err1, err2, err3)
+	//	}
+	//}
+}
+
+func main() {
+	//debugTest()
 	flag.Parse()
 	confBytes, err := ioutil.ReadFile(*confPath)
 	if err != nil {
@@ -104,18 +121,38 @@ func main() {
 		panic(err)
 	}
 
+	// get consumer offset
+	admin, err := sarama.NewClusterAdmin(conf.Kafka.BrokerList, defaultKafkaCfg())
+	if err != nil {
+		panic(err)
+	}
+	defer admin.Close()
+
+	fmt.Println("offset[consumer, oldest, newest, latency]")
 	for _, topic := range conf.Kafka.Topic {
+		groupID := fmt.Sprintf("%s-%s", "SCHEDULER", topic)
 		partitions, err := consumer.Partitions(topic)
 		if err != nil {
 			panic(err)
 		}
 
-		for _, pid := range partitions {
-			oldestOffset, err1 := client.GetOffset(topic, pid, sarama.OffsetOldest)
-			consumeOffset, err2 := client.GetOffset(topic, pid, time.Now().UnixMilli())
-			newestOffset, err3 := client.GetOffset(topic, pid, sarama.OffsetNewest)
-			log.Printf("topic=%s, partition=%d, offset=[%d, %d, %d], errs=[%+v, %+v, %+v] \n",
-				topic, pid, oldestOffset, consumeOffset, newestOffset, err1, err2, err3)
+		topicPartitions := map[string][]int32{
+			topic: partitions,
 		}
+		offsets, err := admin.ListConsumerGroupOffsets(groupID, topicPartitions)
+		if err != nil {
+			panic(err)
+		}
+
+		for _, partitionOffsets := range offsets.Blocks {
+			for partition, offset := range partitionOffsets { // offset is consumer offset
+				oldestOffset, err1 := client.GetOffset(topic, partition, sarama.OffsetOldest)
+				newestOffset, err3 := client.GetOffset(topic, partition, sarama.OffsetNewest)
+				fmt.Printf("Topic: %s, Partition: %d, offset=[%d, %d, %d], latency=%d, errs=[nil, %+v, %+v] \n",
+					topic, partition, offset.Offset, oldestOffset, newestOffset, newestOffset-offset.Offset, err1, err3)
+			}
+		}
+		fmt.Println("one end...")
 	}
+	fmt.Println("all end...")
 }
