@@ -21,13 +21,14 @@ import (
 )
 
 var (
-	conf     BlobDeleteConfig
-	confFile = flag.String("f", "getKafka.conf", "config filename")
+	conf       BlobDeleteConfig
+	confFile   = flag.String("f", "getKafka.conf", "config filename")
+	onceCommit = flag.Bool("onceCommit", false, "only get once msg, and commit it")
 )
 
 type BlobDeleteKafkaConfig struct {
 	BrokerList  []string `json:"broker_list"`
-	Topic       string   `json:"topic"`
+	Topic       []string `json:"topic"`
 	TopicNormal string   `json:"topic_normal"`
 	TopicFailed string   `json:"topic_failed"`
 	//FailMsgSenderTimeoutMs int64    `json:"fail_msg_sender_timeout_ms"`
@@ -42,14 +43,11 @@ type BlobDeleteConfig struct {
 	//ClusterMgr cmapi.Config          `json:"cluster_mgr"`
 }
 
-func (cfg *BlobDeleteConfig) topics() []string {
-	return []string{cfg.Kafka.TopicNormal, cfg.Kafka.TopicFailed}
-}
-
 type BlobDeleteMgr struct {
 	cfg *BlobDeleteConfig
 	//kafkaConsumerClient base.KafkaConsumer
 	kafkaConsumerClient *KafkaCli
+	consumers           []*KafkaConsumer
 }
 
 // NewBlobDeleteMgr returns blob delete manager
@@ -66,14 +64,15 @@ func NewBlobDeleteMgr(cfg *BlobDeleteConfig) (*BlobDeleteMgr, error) {
 }
 
 func (mgr *BlobDeleteMgr) startConsumer() error {
-	//for _, topic := range mgr.cfg.topics() {
-	mgr.kafkaConsumerClient.StartKafkaConsumer(mgr.cfg.Kafka.Topic, mgr.Consume)
-	//_, err := mgr.kafkaConsumerClient.StartKafkaConsumer(mgr.cfg.Kafka.Topic, topic, mgr.Consume)
-	//if err != nil {
-	//	return err
-	//}
-	//mgr.consumers = append(mgr.consumers, consumer)
-	//}
+	//mgr.kafkaConsumerClient.StartKafkaConsumer(mgr.cfg.Kafka.Topic, mgr.Consume)
+
+	for _, topic := range mgr.cfg.Kafka.Topic {
+		consumer, err := mgr.kafkaConsumerClient.StartKafkaConsumer(topic, mgr.Consume)
+		if err != nil {
+			return err
+		}
+		mgr.consumers = append(mgr.consumers, consumer)
+	}
 	return nil
 }
 
@@ -89,6 +88,10 @@ func (mgr *BlobDeleteMgr) Consume(msg *sarama.ConsumerMessage) {
 	log.Infof("start json delete msg: %s", string(data))
 	//log.Infof("start struct delete msg: [%+v]", delMsg)
 	//return true
+
+	//if *onceCommit {
+	//	os.Exit(0)
+	//}
 }
 
 // 根据配置模拟client读取kafka消息startConsumer
@@ -150,7 +153,7 @@ type KafkaConsumer struct {
 	cancel context.CancelFunc
 }
 
-func (cli *KafkaCli) StartKafkaConsumer(topic string, fn func(msg *sarama.ConsumerMessage)) {
+func (cli *KafkaCli) StartKafkaConsumer(topic string, fn func(msg *sarama.ConsumerMessage)) (*KafkaConsumer, error) {
 	/**
 	 * Construct a new Sarama configuration.
 	 * The Kafka cluster version has to be defined before the consumer/producer is initialized.
@@ -177,7 +180,7 @@ func (cli *KafkaCli) StartKafkaConsumer(topic string, fn func(msg *sarama.Consum
 
 	client, err := sarama.NewConsumerGroup(cli.Brokers, group, config)
 	if err != nil {
-		span.Panicf("creating consumer group client failed: err[%+v]", err)
+		span.Panicf("creating consumer group client failed: err[%+v], group[%s]", err, group)
 	}
 
 	go func() {
@@ -194,6 +197,10 @@ func (cli *KafkaCli) StartKafkaConsumer(topic string, fn func(msg *sarama.Consum
 			}
 			consumer.ready = make(chan bool)
 			span.Warnf("rebalance happens: topic[%s], consumer_group[%s]", topic, group)
+			if *onceCommit {
+				//os.Exit(0)
+				return
+			}
 		}
 	}()
 	groupConsumer := &KafkaConsumer{
@@ -203,7 +210,7 @@ func (cli *KafkaCli) StartKafkaConsumer(topic string, fn func(msg *sarama.Consum
 		span:   span,
 	}
 	cli.consumers = append(cli.consumers, groupConsumer)
-	return
+	return groupConsumer, nil
 }
 
 func (cli *KafkaCli) Close() {
@@ -254,6 +261,13 @@ func (consumer *Consumer) ConsumeClaim(session sarama.ConsumerGroupSession, clai
 			log.Debugf("Message claimed: value[%s], timestamp[%v], topic[%s], partition[%d], offset[%d]", string(message.Value), message.Timestamp, message.Topic, message.Partition, message.Offset)
 			consumer.ConsumeFn(message)
 			session.MarkMessage(message, "")
+
+			if *onceCommit {
+				log.Warnf("consumer will commit and close, topic[%s], partition[%d], offset[%d]", message.Topic, message.Partition, message.Offset)
+				session.Commit()
+				os.Exit(0)
+				return nil
+			}
 
 		// Should return when `session.Context()` is done.
 		// If not, will raise `ErrRebalanceInProgress` or `read tcp <ip>:<port>: i/o timeout` when kafka rebalance. see:
