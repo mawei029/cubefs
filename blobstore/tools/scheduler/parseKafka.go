@@ -188,6 +188,7 @@ var (
 	//eclen     = flag.Int("e", 27, "ec len")
 )
 
+// 根据日志解析出来没有两阶段删除的blobnode对应的BID
 func main() {
 	flag.Parse()
 	// local debug

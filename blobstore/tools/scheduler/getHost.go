@@ -101,6 +101,7 @@ func initMgr() {
 	//mgr.getHost(vid, idx)
 }
 
+// 根据日志解析出来没有两阶段删除的blobnode对应的host
 func getAllHost(rets map[uint64]KafkaMsg, mode int) {
 	hosts := map[string]int{}
 

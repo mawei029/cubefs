@@ -91,6 +91,7 @@ func (mgr *BlobDeleteMgr) Consume(msg *sarama.ConsumerMessage) {
 	//return true
 }
 
+// 根据配置模拟client读取kafka消息startConsumer
 func main() {
 	//path := "/home/oppo/code/cubefs/blobstore/tools/scheduler/msgKafka.log"
 	//ReadLinesV2(path)
@@ -158,7 +159,7 @@ func (cli *KafkaCli) StartKafkaConsumer(topic string, fn func(msg *sarama.Consum
 	config := sarama.NewConfig()
 	config.Version = VERSION
 	config.Consumer.Offsets.Initial = sarama.OffsetOldest
-	config.Consumer.Offsets.AutoCommit.Enable = false
+	config.Consumer.Offsets.AutoCommit.Enable = false // 不自动提交
 	config.Consumer.Group.Rebalance.Retry.Max = 10
 
 	/**
