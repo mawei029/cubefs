@@ -23,9 +23,10 @@ var (
 	total, fail = int64(0), int64(0)
 )
 
+// 批量调用access接口发送删除消息到kafka
 func main() {
 	flag.Parse()
-	if *delBatch < 0 {
+	if *delBatch <= 0 {
 		*delBatch = defaultBatchDelSize
 	}
 
@@ -131,6 +132,7 @@ func parseMsg(line string, rets *DeleteArgs) error {
 	return nil
 }
 
+// 批量调用access接口发送删除消息到kafka
 func sendDelMsg(rets *DeleteArgs) int64 {
 	// curl -XPOST --header 'Content-Type: application/json' 127.0.0.1:9500/delete -d '{"locations":[{"cluster_id":11,"code_mode":2,"size":8,"blob_size":8388608,"crc":2724760903,"blobs":[{"min_bid":66000305,"vid":3240,"count":1}]}]}'
 	url := "http://127.0.0.1:9500/delete"
