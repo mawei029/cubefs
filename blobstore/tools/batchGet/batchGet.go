@@ -10,19 +10,19 @@ import (
 	"math"
 	"net/http"
 	"os"
-	"os/signal"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
 var (
-	filePath    = flag.String("src", "8M.json", "bid `location file path")
+	filePath    = flag.String("src", "4M.json", "bid `location file path")
 	host        = flag.String("host", "127.0.0.1:9500", "accessSvr ip+port")
 	concurrency = flag.Int("c", 1, "access concurrency")
-	getBatch    = flag.Int64("get", 10, "access send get msg batch count")
+	getBatch    = flag.Int64("batch", 10, "access send get msg batch count")
 	maxCnt      = flag.Int64("max", math.MaxInt64, "max handle bid location count")
-	printSec    = flag.Int("p", 0, "print status interval sec")
+	printSec    = flag.Int("printS", 0, "print status interval sec")           // loop print interval
+	sendMill    = flag.Int("sendMs", 240, "interval ms between each send msg") // interval ms between each send msg
+	failSec     = flag.Int("failS", 2, "interval second at fail")              // interval second at fail
 
 	total, fail = int64(0), int64(0)
 	msgCh       chan string
@@ -36,13 +36,13 @@ func main() {
 	}
 
 	// 2. wait for signal
-	ch := make(chan os.Signal, 1)
-	go func() {
-		signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
-		sig := <-ch
-		fmt.Printf("stop service... signal=%s, total=%d, fail=%d \n", sig.String(), total, fail)
-		os.Exit(0)
-	}()
+	//ch := make(chan os.Signal, 1)
+	//go func() {
+	//	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
+	//	sig := <-ch
+	//	fmt.Printf("stop service... signal=%s, total=%d, fail=%d \n", sig.String(), total, fail)
+	//	os.Exit(0)
+	//}()
 
 	//loop print
 	go func() {
@@ -134,36 +134,40 @@ func handleFile(path string) (err error) {
 func sendMsgConcurrency() {
 	url := "http://" + *host + "/get" // curl -XPOST -d ''$line'' -H "Content-Type: application/json"  http://127.0.0.1:9500/get
 
+	doOneMsg := func(msg string, failNum int64) {
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer([]byte(msg)))
+		if err != nil {
+			panic(err)
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			panic(err)
+		}
+		defer resp.Body.Close()
+
+		time.Sleep(time.Millisecond * time.Duration(*sendMill))
+
+		if resp.StatusCode != http.StatusOK {
+			failNum++
+			atomic.AddInt64(&fail, 1)
+
+			// slow down
+			if failNum > 1 {
+				failNum = 0
+				time.Sleep(time.Second * time.Duration(*failSec))
+			}
+		}
+	}
+
 	for i := 0; i < *concurrency; i++ {
 		go func() {
 			failLoc := int64(0)
 
-			for ch := range msgCh {
-				req, err := http.NewRequest("POST", url, bytes.NewBuffer([]byte(ch)))
-				if err != nil {
-					panic(err)
-				}
-
-				req.Header.Set("Content-Type", "application/json")
-				client := &http.Client{}
-				resp, err := client.Do(req)
-				if err != nil {
-					panic(err)
-				}
-				defer resp.Body.Close()
-
-				time.Sleep(time.Microsecond * 400)
-
-				if resp.StatusCode != http.StatusOK {
-					failLoc++
-					atomic.AddInt64(&fail, 1)
-
-					// slow down
-					if failLoc%10 == 0 {
-						failLoc = 0
-						time.Sleep(time.Second * 2)
-					}
-				}
+			for msg := range msgCh {
+				doOneMsg(msg, failLoc)
 			}
 		}()
 	}
