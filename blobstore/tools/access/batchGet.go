@@ -15,7 +15,7 @@ import (
 )
 
 var (
-	filePath    = flag.String("src", "4M.json", "bid `location file path")
+	filePath    = flag.String("src", "4M.json", "bid location file path")
 	host        = flag.String("host", "127.0.0.1:9500", "accessSvr ip+port")
 	concurrency = flag.Int("c", 1, "access concurrency")
 	getBatch    = flag.Int64("batch", 10, "access send get msg batch count")
