@@ -1,35 +1,70 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
-	"github.com/cubefs/cubefs/blobstore/common/proto"
 	"io/ioutil"
+	"math/rand"
+	"net/http"
+	"os"
+	"strings"
+	"time"
 
+	"github.com/cubefs/cubefs/blobstore/api/blobnode"
 	cmapi "github.com/cubefs/cubefs/blobstore/api/clustermgr"
 	"github.com/cubefs/cubefs/blobstore/common/config"
-	"github.com/cubefs/cubefs/blobstore/scheduler"
-	"github.com/cubefs/cubefs/blobstore/scheduler/client"
+	"github.com/cubefs/cubefs/blobstore/common/proto"
 	"github.com/cubefs/cubefs/blobstore/util/log"
 )
 
 var (
 	confFile = flag.String("f", "blobnode_test.conf", "config file path")
+	dataSize = flag.String("d", "4K", "data size")
 
-	conf BlobnodeTestConf
+	dataBuff []byte
+	conf     BlobnodeTestConf
+	mgr      *BlobnodeMgr
+
+	fileSize = map[string]int{
+		"4B":   4,
+		"4K":   1 << 12,
+		"64K":  1 << 15,
+		"128K": 1 << 16,
+		"1M":   1 << 20,
+		"4M":   1 << 22,
+		"8M":   1 << 23,
+		"16M":  1 << 24,
+	}
 )
 
 type BlobnodeTestConf struct {
 	ClusterID  proto.ClusterID `json:"cluster_id"` // uint32
 	LogLevel   log.Level       `json:"log_level"`  // int
-	MyHost     string          `json:"my_host"`
+	Host       string          `json:"host"`       // dist blobnode host
 	ClusterMgr cmapi.Config    `json:"cluster_mgr"`
 }
 
 type ClusterMgrConf struct {
 }
 
+type BlobnodeMgr struct {
+	clusterID proto.ClusterID
+	host      string
+	//hostMap   map[string][]*client.DiskInfoSimple
+	hostDiskMap   map[string][]*blobnode.DiskInfo          // host -> disks
+	diskMap       map[proto.DiskID]*blobnode.DiskInfo      // disk id -> disk info
+	diskChunkMap  map[proto.DiskID][]*blobnode.ChunkInfo   // disk id -> chunks
+	chunkMap      map[blobnode.ChunkId]*blobnode.ChunkInfo // chunk id -> chunk info
+	clusterMgrCli *cmapi.Client
+	blobnodeCli   blobnode.StorageAPI
+}
+
+// POST /shard/put/diskid/{diskid}/vuid/{vuid}/bid/{bid}/size/{size}?iotype={iotype}
+// GET /shard/stat/diskid/{diskid}/vuid/{vuidValue}/bid/{bidValue}
+// GET /shard/list/diskid/{diskid}/vuid/{vuid}/startbid/{bid}/status/{status}/count/{count}
+// GET /shard/get/diskid/{diskid}/vuid/{vuid}/bid/{bid}?iotype={iotype}
 func main() {
 	// 1. flag parse
 	flag.Parse()
@@ -39,10 +74,15 @@ func main() {
 
 	ctx := context.Background()
 	initConfMgr(ctx)
+	initData()
 
-	// 根据host拿到该节点的disk，拿到vuid，申请chunk，用本地file的构造data数据，生成唯一bid, 开始put, 记录location
+	// 用本地file的构造data数据
+	// 根据host拿到该节点的disk，拿到vuid，申请chunk
+	// 生成唯一bid, 开始put, 记录location
+	mgr.put(ctx)
 
 	// 根据location, 开始Get
+	mgr.get(ctx)
 }
 
 func invalidArgs() error {
@@ -62,11 +102,143 @@ func initConfMgr(ctx context.Context) {
 	log.SetOutputLevel(conf.LogLevel)
 	fmt.Printf("Config: %+v \n", conf)
 
-	clusterMgrCli := client.NewClusterMgrClient(&conf.ClusterMgr)
-	clusterMgrCli.ListClusterDisks(ctx)
+	//clusterMgrCli := client.NewClusterMgrClient(&conf.ClusterMgr)
+	//disks, err := clusterMgrCli.ListClusterDisks(ctx)
+	//if err != nil {
+	//	log.Fatalf("Fail to list cluster disk, err: %+v", err)
+	//}
+	//mgr = newBlobnodeMgr(disks, conf.ClusterID)
+	mgr = newBlobnodeMgr(ctx)
+}
 
-	topologyMgr := scheduler.NewClusterTopologyMgr1(clusterMgrCli, conf.ClusterID)
-	topologyMgr.GetIDCs()
-	//mgr, _ = NewBlobDelMgr(topologyMgr)
-	////mgr.getHost(vid, idx)
+func initData() {
+	size := fileSize[strings.ToUpper(*dataSize)]
+	if size == 0 {
+		log.Fatalf("not support data size %d", *dataSize)
+	}
+
+	f, err := os.Open("filename.txt")
+	if err != nil {
+		log.Fatalf("%+v", err)
+	}
+
+	buff := make([]byte, size)
+	n, err := f.Read(buff)
+	if err != nil {
+		log.Fatalf("%d, %+v", n, err)
+	}
+}
+
+//func newBlobnodeMgr(disks []*client.DiskInfoSimple, cid proto.ClusterID) *BlobnodeMgr {
+func newBlobnodeMgr(ctx context.Context) *BlobnodeMgr {
+	mgr = &BlobnodeMgr{
+		clusterID:     conf.ClusterID,
+		host:          conf.Host,
+		hostDiskMap:   make(map[string][]*blobnode.DiskInfo),
+		diskMap:       make(map[proto.DiskID]*blobnode.DiskInfo),
+		diskChunkMap:  make(map[proto.DiskID][]*blobnode.ChunkInfo),
+		chunkMap:      make(map[blobnode.ChunkId]*blobnode.ChunkInfo),
+		blobnodeCli:   blobnode.New(&blobnode.Config{}),
+		clusterMgrCli: cmapi.New(&conf.ClusterMgr),
+	}
+
+	disks, err := mgr.clusterMgrCli.ListHostDisk(ctx, conf.Host)
+	if err != nil {
+		log.Fatalf("Fail to list cluster disk, err: %+v", err)
+	}
+
+	for i := range disks {
+		if mgr.clusterID != disks[i].ClusterID {
+			log.Errorf("the disk does not belong to this cluster: cluster_id[%d], disk[%+v]", mgr.clusterID, disks[i])
+			continue
+		}
+		mgr.addDisks(disks[i])
+		mgr.addChunks(ctx, disks[i])
+	}
+
+	return mgr
+}
+
+//func (mgr *BlobnodeMgr) addDisks(disk *client.DiskInfoSimple) {
+func (mgr *BlobnodeMgr) addDisks(disk *blobnode.DiskInfo) {
+	//idc := disk.Idc
+	//if _, ok := mgr.diskMap[idc]; !ok {
+	//	mgr.diskMap[disk.Idc] = []*client.DiskInfoSimple{}
+	//}
+	//mgr.diskMap[idc] = append(mgr.diskMap[idc], disk)
+	//
+	//if _, ok := mgr.hostMap[disk.Host]; !ok {
+	//	mgr.hostMap[disk.Host] = []*client.DiskInfoSimple{}
+	//}
+	//mgr.hostMap[disk.Host] = append(mgr.hostMap[disk.Host], disk)
+	host := disk.Host
+	if _, ok := mgr.hostDiskMap[host]; !ok {
+		mgr.hostDiskMap[host] = []*blobnode.DiskInfo{}
+	}
+	mgr.hostDiskMap[host] = append(mgr.hostDiskMap[host], disk)
+
+	mgr.diskMap[disk.DiskID] = disk
+}
+
+func (mgr *BlobnodeMgr) addChunks(ctx context.Context, disk *blobnode.DiskInfo) {
+	cis, err := mgr.blobnodeCli.ListChunks(ctx, conf.Host, &blobnode.ListChunkArgs{DiskID: disk.DiskID})
+	if err != nil {
+		log.Fatalf("Fail to list host disk chunks, err: %+v", err)
+	}
+
+	mgr.diskChunkMap[disk.DiskID] = cis
+	for i, v := range cis {
+		mgr.chunkMap[v.Id] = cis[i]
+	}
+}
+
+// POST /shard/put/diskid/{diskid}/vuid/{vuid}/bid/{bid}/size/{size}?iotype={iotype}
+func (mgr *BlobnodeMgr) put(ctx context.Context) {
+	bidStart := genId()
+	size := fileSize[strings.ToUpper(*dataSize)]
+	cnt := uint64(0)
+
+	for _, disks := range mgr.hostDiskMap {
+		for _, disk := range disks {
+			for _, chunk := range mgr.diskChunkMap[disk.DiskID] {
+				urlStr := fmt.Sprintf("%v/shard/put/diskid/%v/vuid/%v/bid/%v/size/%v?iotype=%d",
+					mgr.host, disk.DiskID, chunk.Vuid, bidStart+cnt, size, blobnode.NormalIO)
+
+				cnt++
+				doPost(urlStr)
+				return
+			}
+		}
+	}
+}
+
+func (mgr *BlobnodeMgr) get(ctx context.Context) {
+
+}
+
+func genId() uint64 {
+	//uid, _ := uuid.New().MarshalBinary()
+	//return binary.LittleEndian.Uint64(uid[0:8])
+
+	//uid := time.Now().UnixMilli() // +2
+	uid := time.Now().Unix() // +5
+	return uint64(uid*100000) + uint64(rand.Intn(10000))
+}
+
+func doPost(url string) {
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(dataBuff))
+	if err != nil {
+		panic(err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		panic(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+	}
 }
