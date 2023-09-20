@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -21,9 +22,10 @@ import (
 )
 
 var (
-	confFile = flag.String("f", "blobnode_test.conf", "config file path")
-	dataSize = flag.String("d", "4B", "data size")
-	readFile = flag.String("r", "test.log", "read data from file path")
+	confFile    = flag.String("f", "blobnode_test.conf", "config file path")
+	dataSize    = flag.String("d", "4B", "data size")
+	readFile    = flag.String("r", "test.log", "read data from file path")
+	concurrency = flag.Int("c", 1, "go concurrency")
 
 	dataBuff []byte
 	conf     BlobnodeTestConf
@@ -48,15 +50,13 @@ type BlobnodeTestConf struct {
 	ClusterMgr cmapi.Config    `json:"cluster_mgr"`
 }
 
-type ClusterMgrConf struct {
-}
-
 type BlobnodeMgr struct {
 	clusterID proto.ClusterID
 	host      string
 	//hostMap   map[string][]*client.DiskInfoSimple
-	hostDiskMap   map[string][]*blobnode.DiskInfo          // host -> disks
-	diskMap       map[proto.DiskID]*blobnode.DiskInfo      // disk id -> disk info
+	hostDiskMap map[string][]*blobnode.DiskInfo // host -> disks
+	//diskMap       map[proto.DiskID]*blobnode.DiskInfo      // disk id -> disk info
+	diskMap       []*blobnode.DiskInfo
 	diskChunkMap  map[proto.DiskID][]*blobnode.ChunkInfo   // disk id -> chunks
 	chunkMap      map[blobnode.ChunkId]*blobnode.ChunkInfo // chunk id -> chunk info
 	clusterMgrCli *cmapi.Client
@@ -80,20 +80,19 @@ func main() {
 
 	// 2. init mgr, read data
 	ctx := context.Background()
-	initConfMgr(ctx)
-	initData()
+	initConfMgr(ctx) // 根据host拿到该节点的disk，拿到vuid
+	initData()       // 用本地file的构造data数据
 
 	printDebugInfo() // debug
 
-	// 用本地file的构造data数据
-	// 根据host拿到该节点的disk，拿到vuid，申请chunk
-	// 生成唯一bid, 开始put, 记录location
+	// 生成唯一bid, 开始put, 记录location. 空间不够时候则申请chunk
 	mgr.put(ctx)
 
 	// 根据location, 开始Get
 	mgr.get(ctx)
 
 	// delete shard bid
+	mgr.delete(ctx)
 }
 
 func invalidArgs() error {
@@ -147,7 +146,7 @@ func newBlobnodeMgr(ctx context.Context) *BlobnodeMgr {
 		clusterID:     conf.ClusterID,
 		host:          conf.Host,
 		hostDiskMap:   make(map[string][]*blobnode.DiskInfo),
-		diskMap:       make(map[proto.DiskID]*blobnode.DiskInfo),
+		diskMap:       make([]*blobnode.DiskInfo, 0),
 		diskChunkMap:  make(map[proto.DiskID][]*blobnode.ChunkInfo),
 		chunkMap:      make(map[blobnode.ChunkId]*blobnode.ChunkInfo),
 		blobnodeCli:   blobnode.New(&blobnode.Config{}),
@@ -159,6 +158,7 @@ func newBlobnodeMgr(ctx context.Context) *BlobnodeMgr {
 		log.Fatalf("Fail to list cluster disk, err: %+v", err)
 	}
 
+	mgr.diskMap = make([]*blobnode.DiskInfo, 0, len(disks))
 	for i := range disks {
 		if mgr.clusterID != disks[i].ClusterID {
 			log.Errorf("the disk does not belong to this cluster: cluster_id[%d], disk[%+v]", mgr.clusterID, disks[i])
@@ -167,6 +167,8 @@ func newBlobnodeMgr(ctx context.Context) *BlobnodeMgr {
 		mgr.addDisks(disks[i])
 		mgr.addChunks(ctx, disks[i])
 	}
+
+	mgr.sortDisk()
 
 	return mgr
 }
@@ -189,7 +191,8 @@ func (mgr *BlobnodeMgr) addDisks(disk *blobnode.DiskInfo) {
 	}
 	mgr.hostDiskMap[host] = append(mgr.hostDiskMap[host], disk)
 
-	mgr.diskMap[disk.DiskID] = disk
+	// mgr.diskMap[disk.DiskID] = disk
+	mgr.diskMap = append(mgr.diskMap, disk)
 }
 
 func (mgr *BlobnodeMgr) addChunks(ctx context.Context, disk *blobnode.DiskInfo) {
@@ -204,14 +207,28 @@ func (mgr *BlobnodeMgr) addChunks(ctx context.Context, disk *blobnode.DiskInfo) 
 	}
 }
 
+func (mgr *BlobnodeMgr) sortDisk() {
+	sort.SliceStable(mgr.diskMap, func(i, j int) bool {
+		return mgr.diskMap[i].DiskID < mgr.diskMap[j].DiskID
+	})
+
+	for _, chunks := range mgr.diskChunkMap {
+		sort.SliceStable(chunks, func(i, j int) bool {
+			return chunks[i].Free > chunks[j].Free
+		})
+	}
+}
+
 // POST /shard/put/diskid/{diskid}/vuid/{vuid}/bid/{bid}/size/{size}?iotype={iotype}
 func (mgr *BlobnodeMgr) put(ctx context.Context) {
 	bidStart := genId()
 	size := fileSize[strings.ToUpper(*dataSize)]
 	cnt := uint64(0)
 
-	for _, disks := range mgr.hostDiskMap {
-		for _, disk := range disks {
+	//for _, disks := range mgr.hostDiskMap {
+	//	for _, disk := range disks {
+	for _, disk := range mgr.diskMap {
+		go func() { // one disk, one go concurrency
 			for _, chunk := range mgr.diskChunkMap[disk.DiskID] {
 				if chunk.Free < uint64(size) {
 					continue
@@ -229,11 +246,17 @@ func (mgr *BlobnodeMgr) put(ctx context.Context) {
 				cnt++
 				return
 			}
-		}
+		}()
 	}
+	//	}
+	//}
 }
 
 func (mgr *BlobnodeMgr) get(ctx context.Context) {
+
+}
+
+func (mgr *BlobnodeMgr) delete(ctx context.Context) {
 
 }
 
@@ -281,13 +304,16 @@ func doPost(url string) {
 func printDebugInfo() {
 	log.Debugf("mgr, host: %s, clusterID: %d", mgr.host, mgr.clusterID)
 	log.Debugf("hostDiskMap:%+v, diskMap:%+v, lenDisk:%d ", mgr.hostDiskMap, mgr.diskMap, len(mgr.diskMap))
-	for id, val := range mgr.diskMap {
-		log.Debugf("Id:%d, disk:%+v", id, *val)
-		break
+	for idx, val := range mgr.diskMap {
+		log.Debugf("idx:%d, ID:%d, disk:%+v", idx, val.DiskID, *val)
 	}
 
 	for id, val := range mgr.diskChunkMap {
-		log.Debugf("diskId:%d, lenChunk:%d", id, len(val))
+		if len(val) > 0 {
+			log.Debugf("diskId:%d, lenChunk:%d, chunk[0] free:%d", id, len(val), val[0].Free)
+		} else {
+			log.Debugf("diskId:%d, lenChunk:%d", id, len(val))
+		}
 	}
 
 	for id, val := range mgr.chunkMap {
