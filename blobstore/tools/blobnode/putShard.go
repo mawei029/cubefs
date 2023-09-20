@@ -244,6 +244,7 @@ func (mgr *BlobnodeMgr) sortDisk() {
 // POST /shard/put/diskid/{diskid}/vuid/{vuid}/bid/{bid}/size/{size}?iotype={iotype}
 func (mgr *BlobnodeMgr) put(ctx context.Context) {
 	bidStart = genId()
+	fmt.Println("bid start: ", bidStart)
 	size := fileSize[strings.ToUpper(*dataSize)]
 
 	//for _, disks := range mgr.hostDiskMap {
@@ -374,9 +375,24 @@ func genId() uint64 {
 	return uint64(uid*100000) + uint64(rand.Intn(10000))
 }
 
+const (
+	strVal = "abcdefghijklmnopqrstuvwxyz_ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789"
+	_4K    = 4096
+)
+
 func doPost(url string, operation string) int {
 	//fmt.Printf("do post once, %s\n", url)
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(dataBuff))
+	buff := make([]byte, len(dataBuff))
+	copy(buff, dataBuff)
+
+	if len(dataBuff) >= _4K {
+		rand.Seed(time.Now().UnixNano())
+		for i := 0; i < len(dataBuff); i += _4K {
+			buff[i] = strVal[rand.Intn(len(strVal))]
+		}
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(buff))
 	if err != nil {
 		panic(err)
 	}
@@ -424,12 +440,14 @@ func doGet(url string, operation string) int {
 	buf := make([]byte, rsp.ContentLength)
 	if rsp.ContentLength > 0 && rsp.Body != nil {
 		io.LimitReader(rsp.Body, rsp.ContentLength).Read(buf)
+		io.CopyN(ioutil.Discard, rsp.Body, rsp.ContentLength)
 	}
 	for key, val := range rsp.Header {
 		if key == "Crc" {
 			fmt.Println("do http get, crc=", val)
 		}
 	}
+
 	//fmt.Printf("do http get, url:%s, resp body: %s, resp:%+v\n", url, string(buf), rsp)
 	fmt.Printf("do http get, url:%s, resp:%+v\n", url, rsp)
 	return http.StatusOK
