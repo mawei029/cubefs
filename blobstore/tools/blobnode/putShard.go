@@ -30,15 +30,13 @@ var (
 	dataSize    = flag.String("d", "4B", "data size")
 	readFile    = flag.String("r", "test.log", "read data from file path")
 	concurrency = flag.Int("c", 1, "go concurrency")
-	getDelay    = flag.Int("delay", 1, "get delay number")
-	bidBegin    = flag.Duration("bid", 0, "bid start")
+	getDelay    = flag.Int("delay", 10, "get delay number")
+	bidStart    = flag.Duration("bid", 0, "bid start")
 	mode        = flag.String("m", "put", "operation mode")
 
 	dataBuff []byte
 	conf     BlobnodeTestConf
 	mgr      *BlobnodeMgr
-	wgPut    sync.WaitGroup
-	bidStart uint64
 
 	fileSize = map[string]int{
 		"4B":   4,
@@ -53,21 +51,23 @@ var (
 )
 
 type BlobnodeTestConf struct {
-	ClusterID proto.ClusterID `json:"cluster_id"` // uint32
 	//LogLevel   log.Level       `json:"log_level"`  // int
-	Host       string       `json:"host"` // dist blobnode host
-	ClusterMgr cmapi.Config `json:"cluster_mgr"`
+	ClusterID  proto.ClusterID               `json:"cluster_id"` // uint32
+	Host       string                        `json:"host"`       // dist blobnode host
+	ClusterMgr cmapi.Config                  `json:"cluster_mgr"`
+	Vuids      map[proto.DiskID][]proto.Vuid `json:"vuids"`
 }
 
 type BlobnodeMgr struct {
-	clusterID proto.ClusterID
-	host      string
 	//hostMap   map[string][]*client.DiskInfoSimple
-	hostDiskMap map[string][]*blobnode.DiskInfo // host -> disks
 	//diskMap       map[proto.DiskID]*blobnode.DiskInfo      // disk id -> disk info
-	diskMap       []*blobnode.DiskInfo
-	diskChunkMap  map[proto.DiskID][]*blobnode.ChunkInfo   // disk id -> chunks
-	chunkMap      map[blobnode.ChunkId]*blobnode.ChunkInfo // chunk id -> chunk info
+
+	conf         BlobnodeTestConf
+	hostDiskMap  map[string][]*blobnode.DiskInfo // host -> disks
+	diskMap      []*blobnode.DiskInfo
+	diskChunkMap map[proto.DiskID][]*blobnode.ChunkInfo   // disk id -> chunks
+	chunkMap     map[blobnode.ChunkId]*blobnode.ChunkInfo // chunk id -> chunk info
+
 	clusterMgrCli *cmapi.Client
 	blobnodeCli   blobnode.StorageAPI
 }
@@ -87,26 +87,34 @@ func main() {
 		panic(err)
 	}
 
+	debugNewMgr()
+	*mode = "delete"
+	*bidStart = 1234567890
+	*readFile = "/home/oppo/code/cubefs/blobstore/tools/blobnode/blobnode_test.conf"
+
 	// 2. init mgr, read data
 	ctx := context.Background()
-	initConfMgr(ctx) // 根据host拿到该节点的disk，拿到vuid
-	initData()       // 用本地file的构造data数据
+	// initConfMgr(ctx) // 根据host拿到该节点的disk，拿到vuid
+	initData() // 用本地file的构造data数据
 
 	//printDebugInfo() // debug
 
-	// 生成唯一bid, 开始put, 记录location. 空间不够时候则申请chunk
-	mgr.put(ctx)
+	switch *mode {
+	case "all":
+		mgr.allOp(ctx)
+	case "put":
+		mgr.onlyPut(ctx)
+	case "get":
+		mgr.onlyGet(ctx)
+	case "delete":
+		mgr.onlyDelete(ctx)
+	default:
+		panic(errors.New("invalid op mode"))
+	}
 
-	// 根据location, 开始Get
-	mgr.get(ctx)
-
+	fmt.Println("main sleep wait...")
 	ch := make(chan int)
 	<-ch
-	// delete shard bid
-	mgr.delete(ctx)
-
-	fmt.Println("main sleep...")
-	time.Sleep(time.Second * 10)
 }
 
 func invalidArgs() error {
@@ -159,8 +167,7 @@ func initData() {
 //func newBlobnodeMgr(disks []*client.DiskInfoSimple, cid proto.ClusterID) *BlobnodeMgr {
 func newBlobnodeMgr(ctx context.Context) *BlobnodeMgr {
 	mgr = &BlobnodeMgr{
-		clusterID:     conf.ClusterID,
-		host:          conf.Host,
+		conf:          conf,
 		hostDiskMap:   make(map[string][]*blobnode.DiskInfo),
 		diskMap:       make([]*blobnode.DiskInfo, 0),
 		diskChunkMap:  make(map[proto.DiskID][]*blobnode.ChunkInfo),
@@ -177,8 +184,8 @@ func newBlobnodeMgr(ctx context.Context) *BlobnodeMgr {
 
 	mgr.diskMap = make([]*blobnode.DiskInfo, 0, len(disks))
 	for i := range disks {
-		if mgr.clusterID != disks[i].ClusterID {
-			fmt.Printf("the disk does not belong to this cluster: cluster_id[%d], disk[%+v] \n", mgr.clusterID, disks[i])
+		if mgr.conf.ClusterID != disks[i].ClusterID {
+			fmt.Printf("the disk does not belong to this cluster: cluster_id[%d], disk[%+v] \n", mgr.conf.ClusterID, disks[i])
 			continue
 		}
 		mgr.addDisks(disks[i])
@@ -227,118 +234,146 @@ func (mgr *BlobnodeMgr) sortDisk() {
 	}
 }
 
-// POST /shard/put/diskid/{diskid}/vuid/{vuid}/bid/{bid}/size/{size}?iotype={iotype}
-func (mgr *BlobnodeMgr) put(ctx context.Context) {
-	bidStart = genId()
+func (mgr *BlobnodeMgr) allOp(ctx context.Context) {
+	*bidStart = time.Duration(genId())
 	fmt.Println("bid start: ", bidStart)
-	size := fileSize[strings.ToUpper(*dataSize)]
 
-	//for _, disks := range mgr.hostDiskMap {
-	//	for _, disk := range disks {
-	//var wg sync.WaitGroup
-	for _, disk := range mgr.diskMap {
-		//wg.Add(1)
-		dkId := disk.DiskID
-		for idx, chunk := range mgr.diskChunkMap[dkId] {
-			if idx >= *concurrency {
-				break
-			}
-			offset := uint64(0)
-			wgPut.Add(1)
+	// 生成唯一bid, 开始put, 记录location. 空间不够时候则申请chunk
+	var wg sync.WaitGroup
+	mgr.put(ctx, &wg)
+	wg.Wait()
 
-			go func(chunkIdx int, vuid proto.Vuid, off uint64, diskId proto.DiskID) {
+	// 根据location, 开始Get
+	mgr.get(ctx)
 
-				defer wgPut.Done()
-				for {
-					// PUT
-					bid := bidStart + atomic.LoadUint64(&off)
-					urlStr := fmt.Sprintf("%v/shard/put/diskid/%v/vuid/%v/bid/%v/size/%v?iotype=%d",
-						mgr.host, diskId, vuid, bid, size, blobnode.NormalIO)
-					errCode := doPost(urlStr, "Put")
-					if errCode == errorcode.CodeChunkNoSpace {
-						// alloc vuid, set vuid
-						for idx := chunkIdx + 1; idx < len(mgr.diskChunkMap[diskId]); idx++ {
-							if mgr.diskChunkMap[diskId][idx].Free > uint64(size) {
-								vuid = mgr.diskChunkMap[diskId][idx].Vuid
-								chunkIdx = idx
-								break
-							}
-						}
-						continue
-					}
-					//return
-
-					time.Sleep(time.Millisecond * 40)
-					if atomic.AddUint64(&off, 1) > uint64(*getDelay) {
-						//wgPut.Done()
-						return
-					}
-				}
-			}(idx, chunk.Vuid, offset, dkId)
-		}
-	}
-	//	}
-	//}
-
-	//wg.Wait()
+	ch := make(chan int)
+	<-ch
+	// delete shard bid
+	mgr.delete(ctx)
 }
 
-func (mgr *BlobnodeMgr) get(ctx context.Context) {
-	//ctx.Done()
-	wgPut.Wait()
+func (mgr *BlobnodeMgr) onlyGet(ctx context.Context) {
+	if *bidStart == 0 {
+		panic(errors.New("invalid get: invalid bid start"))
+	}
+	mgr.get(ctx)
+}
 
+func (mgr *BlobnodeMgr) onlyDelete(ctx context.Context) {
+	if *bidStart == 0 {
+		panic(errors.New("invalid get: invalid bid start"))
+	}
+	mgr.delete(ctx)
+}
+
+func (mgr *BlobnodeMgr) onlyPut(ctx context.Context) {
+	*bidStart = time.Duration(genId())
+	fmt.Println("bid start: ", bidStart)
+
+	mgr.put(ctx, nil)
+}
+
+func (mgr *BlobnodeMgr) loopCommon(ctx context.Context, wg *sync.WaitGroup, fn func(int, proto.Vuid, proto.DiskID, *sync.WaitGroup)) {
 	for _, disk := range mgr.diskMap {
 		dkId := disk.DiskID
+		cnt := 0
 
 		for idx, chunk := range mgr.diskChunkMap[dkId] {
-			if idx >= *concurrency {
+			if cnt >= *concurrency {
 				break
 			}
 
-			go func(chunkIdx int, vuid proto.Vuid, diskId proto.DiskID) {
-				off := uint64(0)
-				for {
-					// GET
-					bid := bidStart + atomic.LoadUint64(&off)
-					urlStr := fmt.Sprintf("%v/shard/get/diskid/%v/vuid/%v/bid/%v?iotype=%d", mgr.host, diskId, vuid, bid, blobnode.NormalIO)
-					eCode := doGet(urlStr, "Get")
-					if eCode == errorcode.CodeBidNotFound {
-						//continue
-					}
-
-					time.Sleep(time.Millisecond * 40)
-					if atomic.AddUint64(&off, 1) > uint64(*getDelay) {
-						atomic.StoreUint64(&off, 0)
+			vuid := chunk.Vuid
+			if len(mgr.conf.Vuids) > 0 { // len(nil) 0
+				for _, cVuid := range mgr.conf.Vuids[dkId] {
+					if chunk.Vuid == cVuid {
+						vuid = cVuid
+						break
 					}
 				}
-			}(idx, chunk.Vuid, dkId)
+			}
+
+			if wg != nil {
+				wg.Add(1)
+			}
+
+			cnt++
+			go fn(idx, vuid, dkId, wg)
+		}
+	}
+}
+
+// POST /shard/put/diskid/{diskid}/vuid/{vuid}/bid/{bid}/size/{size}?iotype={iotype}
+func (mgr *BlobnodeMgr) put(ctx context.Context, wg *sync.WaitGroup) {
+	mgr.loopCommon(ctx, wg, mgr.singlePut)
+}
+func (mgr *BlobnodeMgr) get(ctx context.Context) {
+	mgr.loopCommon(ctx, nil, mgr.singleGet)
+}
+
+func (mgr *BlobnodeMgr) singlePut(chunkIdx int, vuid proto.Vuid, diskId proto.DiskID, wg *sync.WaitGroup) {
+	off := uint64(0)
+	size := fileSize[strings.ToUpper(*dataSize)]
+
+	if wg != nil {
+		defer wg.Done()
+	}
+
+	for {
+		// PUT
+		bid := uint64(*bidStart) + atomic.LoadUint64(&off)
+		urlStr := fmt.Sprintf("%v/shard/put/diskid/%v/vuid/%v/bid/%v/size/%v?iotype=%d",
+			mgr.conf.Host, diskId, vuid, bid, size, blobnode.NormalIO)
+		errCode := doPost(urlStr, "Put")
+		if errCode == errorcode.CodeChunkNoSpace {
+			// alloc vuid, set vuid
+			for idx := chunkIdx + 1; idx < len(mgr.diskChunkMap[diskId]); idx++ {
+				if mgr.diskChunkMap[diskId][idx].Free > uint64(size) {
+					vuid = mgr.diskChunkMap[diskId][idx].Vuid
+					chunkIdx = idx
+					break
+				}
+			}
+			continue
+		}
+		//return
+
+		time.Sleep(time.Millisecond * 40)
+		if atomic.AddUint64(&off, 1) > uint64(*getDelay) {
+			return
+		}
+	}
+}
+
+func (mgr *BlobnodeMgr) singleGet(chunkIdx int, vuid proto.Vuid, diskId proto.DiskID, wg *sync.WaitGroup) {
+	off := uint64(0)
+	for {
+		// GET
+		bid := uint64(*bidStart) + atomic.LoadUint64(&off)
+		urlStr := fmt.Sprintf("%v/shard/get/diskid/%v/vuid/%v/bid/%v?iotype=%d", mgr.conf.Host, diskId, vuid, bid, blobnode.NormalIO)
+		eCode := doGet(urlStr, "Get")
+		if eCode == errorcode.CodeBidNotFound {
+			//continue
+		}
+
+		time.Sleep(time.Millisecond * 40)
+		if atomic.AddUint64(&off, 1) > uint64(*getDelay) {
+			atomic.StoreUint64(&off, 0)
 		}
 	}
 }
 
 func (mgr *BlobnodeMgr) delete(ctx context.Context) {
-	time.Sleep(time.Second * 10)
+	mgr.loopCommon(ctx, nil, mgr.singleDel)
+}
 
-	for _, disk := range mgr.diskMap {
-		offset := uint64(0)
-
-		for i := 0; i < *concurrency; i++ {
-			go func(off uint64, diskId proto.DiskID) { // one disk, one go concurrency
-				for _, chunk := range mgr.diskChunkMap[diskId] {
-					if atomic.LoadUint64(&off) > uint64(*getDelay) {
-						return
-					}
-
-					bid := bidStart + atomic.LoadUint64(&off)
-					urlStr := fmt.Sprintf("%v/shard/markdelete/diskid/%v/vuid/%v/bid/%v", mgr.host, diskId, chunk.Vuid, bid)
-					doPost(urlStr, "markDelete")
-					urlStr = fmt.Sprintf("%v/shard/delete/diskid/%v/vuid/%v/bid/%v", mgr.host, disk.DiskID, chunk.Vuid, bid)
-					doPost(urlStr, "delete")
-
-					atomic.AddUint64(&off, 1)
-				}
-			}(offset, disk.DiskID)
-		}
+func (mgr *BlobnodeMgr) singleDel(chunkIdx int, vuid proto.Vuid, diskId proto.DiskID, wg *sync.WaitGroup) {
+	for off := uint64(0); off < 100; off++ {
+		bid := uint64(*bidStart) + off
+		urlStr := fmt.Sprintf("%v/shard/markdelete/diskid/%v/vuid/%v/bid/%v", mgr.conf.Host, diskId, vuid, bid)
+		doPost(urlStr, "markDelete")
+		urlStr = fmt.Sprintf("%v/shard/delete/diskid/%v/vuid/%v/bid/%v", mgr.conf.Host, diskId, vuid, bid)
+		doPost(urlStr, "delete")
 	}
 }
 
@@ -430,7 +465,7 @@ func doGet(url string, operation string) int {
 }
 
 func printDebugInfo() {
-	fmt.Printf("mgr, host: %s, clusterID: %d\n", mgr.host, mgr.clusterID)
+	fmt.Printf("mgr, host: %s, clusterID: %d\n", mgr.conf.Host, mgr.conf.ClusterID)
 	fmt.Printf("hostDiskMap:%+v, diskMap:%+v, lenDisk:%d \n", mgr.hostDiskMap, mgr.diskMap, len(mgr.diskMap))
 	for idx, val := range mgr.diskMap {
 		fmt.Printf("idx:%d, ID:%d, disk:%+v\n", idx, val.DiskID, *val)
@@ -448,4 +483,26 @@ func printDebugInfo() {
 		fmt.Printf("Id:%s, chunk:%+v\n", id.String(), *val)
 		break
 	}
+}
+
+func debugNewMgr() {
+	mgr = &BlobnodeMgr{
+		conf: BlobnodeTestConf{
+			Vuids: map[proto.DiskID][]proto.Vuid{
+				167: {1111},
+				168: {1234},
+			},
+		},
+		diskMap:      make([]*blobnode.DiskInfo, 1),
+		diskChunkMap: make(map[proto.DiskID][]*blobnode.ChunkInfo),
+	}
+
+	mgr.diskMap[0] = &blobnode.DiskInfo{
+		DiskHeartBeatInfo: blobnode.DiskHeartBeatInfo{
+			DiskID: 168,
+		},
+	}
+	mgr.diskChunkMap[168] = make([]*blobnode.ChunkInfo, 2)
+	mgr.diskChunkMap[168][0] = &blobnode.ChunkInfo{Vuid: 1234}
+	mgr.diskChunkMap[168][1] = &blobnode.ChunkInfo{Vuid: 5678}
 }
