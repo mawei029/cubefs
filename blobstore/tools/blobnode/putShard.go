@@ -12,6 +12,8 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cubefs/cubefs/blobstore/api/blobnode"
@@ -26,10 +28,13 @@ var (
 	dataSize    = flag.String("d", "4B", "data size")
 	readFile    = flag.String("r", "test.log", "read data from file path")
 	concurrency = flag.Int("c", 1, "go concurrency")
+	getDelay    = flag.Int("delay", 1, "get delay number")
 
 	dataBuff []byte
 	conf     BlobnodeTestConf
 	mgr      *BlobnodeMgr
+	wgPut    sync.WaitGroup
+	bidStart uint64
 
 	fileSize = map[string]int{
 		"4B":   4,
@@ -91,6 +96,8 @@ func main() {
 	// 根据location, 开始Get
 	mgr.get(ctx)
 
+	ch := make(chan int)
+	<-ch
 	// delete shard bid
 	mgr.delete(ctx)
 }
@@ -221,39 +228,79 @@ func (mgr *BlobnodeMgr) sortDisk() {
 
 // POST /shard/put/diskid/{diskid}/vuid/{vuid}/bid/{bid}/size/{size}?iotype={iotype}
 func (mgr *BlobnodeMgr) put(ctx context.Context) {
-	bidStart := genId()
+	bidStart = genId()
 	size := fileSize[strings.ToUpper(*dataSize)]
-	cnt := uint64(0)
 
 	//for _, disks := range mgr.hostDiskMap {
 	//	for _, disk := range disks {
+	//var wg sync.WaitGroup
 	for _, disk := range mgr.diskMap {
-		go func() { // one disk, one go concurrency
-			for _, chunk := range mgr.diskChunkMap[disk.DiskID] {
-				if chunk.Free < uint64(size) {
-					continue
+		//wg.Add(1)
+		offset := uint64(0)
+		wgPut.Add(1)
+
+		for i := 0; i < *concurrency; i++ {
+			go func(off uint64) { // one disk, one go concurrency
+				//defer wg.Done()
+				for _, chunk := range mgr.diskChunkMap[disk.DiskID] {
+					if chunk.Free < uint64(size) {
+						continue
+					}
+
+					// PUT
+					bid := bidStart + atomic.LoadUint64(&off)
+					urlStr := fmt.Sprintf("%v/shard/put/diskid/%v/vuid/%v/bid/%v/size/%v?iotype=%d",
+						mgr.host, disk.DiskID, chunk.Vuid, bid, size, blobnode.NormalIO)
+					doPost(urlStr)
+
+					//urlStr = fmt.Sprintf("%v/shard/markdelete/diskid/%v/vuid/%v/bid/%v", mgr.host, disk.DiskID, chunk.Vuid, bid)
+					//doPost(urlStr)
+					//urlStr = fmt.Sprintf("%v/shard/delete/diskid/%v/vuid/%v/bid/%v", mgr.host, disk.DiskID, chunk.Vuid, bid)
+					//doPost(urlStr)
+
+					atomic.AddUint64(&off, 1)
+					//return
+
+					if atomic.LoadUint64(&off) > uint64(*getDelay) {
+						wgPut.Done()
+					}
 				}
-
-				urlStr := fmt.Sprintf("%v/shard/put/diskid/%v/vuid/%v/bid/%v/size/%v?iotype=%d",
-					mgr.host, disk.DiskID, chunk.Vuid, bidStart+cnt, size, blobnode.NormalIO)
-				doPost(urlStr)
-
-				urlStr = fmt.Sprintf("%v/shard/markdelete/diskid/%v/vuid/%v/bid/%v", mgr.host, disk.DiskID, chunk.Vuid, bidStart+cnt)
-				doPost(urlStr)
-				urlStr = fmt.Sprintf("%v/shard/delete/diskid/%v/vuid/%v/bid/%v", mgr.host, disk.DiskID, chunk.Vuid, bidStart+cnt)
-				doPost(urlStr)
-
-				cnt++
-				return
-			}
-		}()
+			}(offset)
+		}
 	}
 	//	}
 	//}
+
+	//wg.Wait()
 }
 
 func (mgr *BlobnodeMgr) get(ctx context.Context) {
+	//ctx.Done()
+	wgPut.Wait()
+	size := fileSize[strings.ToUpper(*dataSize)]
 
+	for _, disk := range mgr.diskMap {
+		offset := uint64(0)
+
+		for i := 0; i < *concurrency; i++ {
+			go func(off uint64) { // one disk, one go concurrency
+				for _, chunk := range mgr.diskChunkMap[disk.DiskID] {
+					if chunk.Free < uint64(size) {
+						continue
+					}
+
+					// GET
+					bid := bidStart + atomic.LoadUint64(&off)
+					urlStr := fmt.Sprintf("%v/shard/put/diskid/%v/vuid/%v/bid/%v/size/%v?iotype=%d",
+						mgr.host, disk.DiskID, chunk.Vuid, bid, size, blobnode.NormalIO)
+					doGet(urlStr)
+					if atomic.AddUint64(&off, 1) > uint64(*getDelay) {
+						atomic.StoreUint64(&off, 0)
+					}
+				}
+			}(offset)
+		}
+	}
 }
 
 func (mgr *BlobnodeMgr) delete(ctx context.Context) {
@@ -299,6 +346,24 @@ func doPost(url string) {
 		io.LimitReader(resp.Body, resp.ContentLength).Read(buf)
 	}
 	log.Debugf("do post, resp body: %s, resp:%+v", string(buf), resp)
+}
+
+func doGet(url string) {
+	client := http.Client{}
+	rsp, err := client.Get(url)
+	if err != nil {
+		panic(err)
+	}
+	defer rsp.Body.Close()
+
+	if rsp.StatusCode != http.StatusOK {
+		log.Warnf("fail to put, status code:%d", rsp.StatusCode)
+	}
+	buf := make([]byte, rsp.ContentLength)
+	if rsp.ContentLength > 0 && rsp.Body != nil {
+		io.LimitReader(rsp.Body, rsp.ContentLength).Read(buf)
+	}
+	log.Debugf("do post, resp body: %s, resp:%+v", string(buf), rsp)
 }
 
 func printDebugInfo() {
