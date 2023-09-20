@@ -19,8 +19,10 @@ import (
 	"github.com/cubefs/cubefs/blobstore/api/blobnode"
 	cmapi "github.com/cubefs/cubefs/blobstore/api/clustermgr"
 	"github.com/cubefs/cubefs/blobstore/common/config"
+	errorcode "github.com/cubefs/cubefs/blobstore/common/errors"
 	"github.com/cubefs/cubefs/blobstore/common/proto"
-	"github.com/cubefs/cubefs/blobstore/util/log"
+	//"github.com/cubefs/cubefs/blobstore/util/log"
+	"github.com/cubefs/cubefs/util/errors"
 )
 
 var (
@@ -49,10 +51,10 @@ var (
 )
 
 type BlobnodeTestConf struct {
-	ClusterID  proto.ClusterID `json:"cluster_id"` // uint32
-	LogLevel   log.Level       `json:"log_level"`  // int
-	Host       string          `json:"host"`       // dist blobnode host
-	ClusterMgr cmapi.Config    `json:"cluster_mgr"`
+	ClusterID proto.ClusterID `json:"cluster_id"` // uint32
+	//LogLevel   log.Level       `json:"log_level"`  // int
+	Host       string       `json:"host"` // dist blobnode host
+	ClusterMgr cmapi.Config `json:"cluster_mgr"`
 }
 
 type BlobnodeMgr struct {
@@ -88,7 +90,7 @@ func main() {
 	initConfMgr(ctx) // 根据host拿到该节点的disk，拿到vuid
 	initData()       // 用本地file的构造data数据
 
-	printDebugInfo() // debug
+	//printDebugInfo() // debug
 
 	// 生成唯一bid, 开始put, 记录location. 空间不够时候则申请chunk
 	mgr.put(ctx)
@@ -100,23 +102,38 @@ func main() {
 	<-ch
 	// delete shard bid
 	mgr.delete(ctx)
+
+	fmt.Println("main sleep...")
+	time.Sleep(time.Second * 10)
 }
 
 func invalidArgs() error {
+	if _, ok := fileSize[strings.ToUpper(*dataSize)]; !ok {
+		return errors.NewErrorf("not support data size %d", *dataSize)
+	}
+	if *concurrency <= 0 {
+		return errors.New("invalid concurrency")
+	}
+	if *getDelay <= 0 {
+		return errors.New("invalid delay")
+	}
+
 	return nil
 }
 
 func initConfMgr(ctx context.Context) {
 	confBytes, err := ioutil.ReadFile(*confFile)
 	if err != nil {
-		log.Fatalf("read config file failed, filename: %s, err: %v", *confFile, err)
+		fmt.Printf("read config file failed, filename: %s, err: %v\n", *confFile, err)
+		panic(err)
 	}
 
 	fmt.Printf("Config file %s:\n%s \n", *confFile, confBytes)
 	if err = config.LoadData(&conf, confBytes); err != nil {
-		log.Fatalf("load config failed, error: %+v", err)
+		fmt.Printf("load config failed, error: %+v", err)
+		panic(err)
 	}
-	log.SetOutputLevel(conf.LogLevel)
+	// log.SetOutputLevel(conf.LogLevel)
 	fmt.Printf("Config: %+v \n", conf)
 
 	//clusterMgrCli := client.NewClusterMgrClient(&conf.ClusterMgr)
@@ -130,21 +147,17 @@ func initConfMgr(ctx context.Context) {
 
 func initData() {
 	size := fileSize[strings.ToUpper(*dataSize)]
-	if size == 0 {
-		log.Fatalf("not support data size %d", *dataSize)
-	}
-
 	f, err := os.Open(*readFile)
 	if err != nil {
-		log.Fatalf("%+v", err)
+		panic(err)
 	}
 
 	dataBuff = make([]byte, size) //buff := make([]byte, size)
-	n, err := f.Read(dataBuff)
+	_, err = f.Read(dataBuff)
 	if err != nil {
-		log.Fatalf("%d, %+v", n, err)
+		panic(err)
 	}
-	log.Infof("read file, dataBuff len=%d (which size will be put) ", len(dataBuff))
+	fmt.Printf("read file, dataBuff len=%d (which size will be put) \n", len(dataBuff))
 }
 
 //func newBlobnodeMgr(disks []*client.DiskInfoSimple, cid proto.ClusterID) *BlobnodeMgr {
@@ -162,13 +175,14 @@ func newBlobnodeMgr(ctx context.Context) *BlobnodeMgr {
 
 	disks, err := mgr.clusterMgrCli.ListHostDisk(ctx, conf.Host)
 	if err != nil {
-		log.Fatalf("Fail to list cluster disk, err: %+v", err)
+		fmt.Printf("Fail to list cluster disk, err: %+v\n", err)
+		panic(err)
 	}
 
 	mgr.diskMap = make([]*blobnode.DiskInfo, 0, len(disks))
 	for i := range disks {
 		if mgr.clusterID != disks[i].ClusterID {
-			log.Errorf("the disk does not belong to this cluster: cluster_id[%d], disk[%+v]", mgr.clusterID, disks[i])
+			fmt.Printf("the disk does not belong to this cluster: cluster_id[%d], disk[%+v] \n", mgr.clusterID, disks[i])
 			continue
 		}
 		mgr.addDisks(disks[i])
@@ -205,7 +219,8 @@ func (mgr *BlobnodeMgr) addDisks(disk *blobnode.DiskInfo) {
 func (mgr *BlobnodeMgr) addChunks(ctx context.Context, disk *blobnode.DiskInfo) {
 	cis, err := mgr.blobnodeCli.ListChunks(ctx, conf.Host, &blobnode.ListChunkArgs{DiskID: disk.DiskID})
 	if err != nil {
-		log.Fatalf("Fail to list host disk chunks, err: %+v", err)
+		fmt.Printf("Fail to list host disk chunks, err: %+v\n", err)
+		panic(err)
 	}
 
 	mgr.diskChunkMap[disk.DiskID] = cis
@@ -240,32 +255,47 @@ func (mgr *BlobnodeMgr) put(ctx context.Context) {
 		wgPut.Add(1)
 
 		for i := 0; i < *concurrency; i++ {
-			go func(off uint64) { // one disk, one go concurrency
-				//defer wg.Done()
-				for _, chunk := range mgr.diskChunkMap[disk.DiskID] {
-					if chunk.Free < uint64(size) {
-						continue
-					}
+			go func(off uint64, diskId proto.DiskID) { // one disk, one go concurrency
+				defer wgPut.Done()
 
+				vuid := proto.Vuid(0)
+				chunkIdx := 0
+				for idx, chunk := range mgr.diskChunkMap[diskId] {
+					if chunk.Free < uint64(size) {
+						panic(errors.New("chunk no space"))
+						// alloc vuid, set vuid
+					}
+					vuid = chunk.Vuid
+					chunkIdx = idx
+					break
+				}
+
+				for {
 					// PUT
 					bid := bidStart + atomic.LoadUint64(&off)
 					urlStr := fmt.Sprintf("%v/shard/put/diskid/%v/vuid/%v/bid/%v/size/%v?iotype=%d",
-						mgr.host, disk.DiskID, chunk.Vuid, bid, size, blobnode.NormalIO)
-					doPost(urlStr)
-
-					//urlStr = fmt.Sprintf("%v/shard/markdelete/diskid/%v/vuid/%v/bid/%v", mgr.host, disk.DiskID, chunk.Vuid, bid)
-					//doPost(urlStr)
-					//urlStr = fmt.Sprintf("%v/shard/delete/diskid/%v/vuid/%v/bid/%v", mgr.host, disk.DiskID, chunk.Vuid, bid)
-					//doPost(urlStr)
-
-					atomic.AddUint64(&off, 1)
+						mgr.host, diskId, vuid, bid, size, blobnode.NormalIO)
+					errCode := doPost(urlStr, "Put")
+					if errCode == errorcode.CodeChunkNoSpace {
+						// alloc vuid, set vuid
+						for idx := chunkIdx + 1; idx < len(mgr.diskChunkMap[diskId]); idx++ {
+							if mgr.diskChunkMap[diskId][idx].Free > uint64(size) {
+								vuid = mgr.diskChunkMap[diskId][idx].Vuid
+								chunkIdx = idx
+								break
+							}
+						}
+						continue
+					}
 					//return
 
-					if atomic.LoadUint64(&off) > uint64(*getDelay) {
-						wgPut.Done()
+					time.Sleep(time.Millisecond * 40)
+					if atomic.AddUint64(&off, 1) > uint64(*getDelay) {
+						//wgPut.Done()
+						return
 					}
 				}
-			}(offset)
+			}(offset, disk.DiskID)
 		}
 	}
 	//	}
@@ -277,34 +307,62 @@ func (mgr *BlobnodeMgr) put(ctx context.Context) {
 func (mgr *BlobnodeMgr) get(ctx context.Context) {
 	//ctx.Done()
 	wgPut.Wait()
-	size := fileSize[strings.ToUpper(*dataSize)]
 
 	for _, disk := range mgr.diskMap {
 		offset := uint64(0)
 
 		for i := 0; i < *concurrency; i++ {
-			go func(off uint64) { // one disk, one go concurrency
-				for _, chunk := range mgr.diskChunkMap[disk.DiskID] {
-					if chunk.Free < uint64(size) {
-						continue
-					}
+			go func(off uint64, diskId proto.DiskID) { // one disk, one go concurrency
+				vuid := proto.Vuid(0)
+				for _, chunk := range mgr.diskChunkMap[diskId] {
+					vuid = chunk.Vuid
+					break
+				}
 
+				for {
 					// GET
 					bid := bidStart + atomic.LoadUint64(&off)
-					urlStr := fmt.Sprintf("%v/shard/put/diskid/%v/vuid/%v/bid/%v/size/%v?iotype=%d",
-						mgr.host, disk.DiskID, chunk.Vuid, bid, size, blobnode.NormalIO)
-					doGet(urlStr)
+					urlStr := fmt.Sprintf("%v/shard/get/diskid/%v/vuid/%v/bid/%v?iotype=%d", mgr.host, diskId, vuid, bid, blobnode.NormalIO)
+					eCode := doGet(urlStr, "Get")
+					if eCode == errorcode.CodeBidNotFound {
+						//continue
+					}
+
+					time.Sleep(time.Millisecond * 40)
 					if atomic.AddUint64(&off, 1) > uint64(*getDelay) {
 						atomic.StoreUint64(&off, 0)
 					}
 				}
-			}(offset)
+
+			}(offset, disk.DiskID)
 		}
 	}
 }
 
 func (mgr *BlobnodeMgr) delete(ctx context.Context) {
+	time.Sleep(time.Second * 10)
 
+	for _, disk := range mgr.diskMap {
+		offset := uint64(0)
+
+		for i := 0; i < *concurrency; i++ {
+			go func(off uint64, diskId proto.DiskID) { // one disk, one go concurrency
+				for _, chunk := range mgr.diskChunkMap[diskId] {
+					if atomic.LoadUint64(&off) > uint64(*getDelay) {
+						return
+					}
+
+					bid := bidStart + atomic.LoadUint64(&off)
+					urlStr := fmt.Sprintf("%v/shard/markdelete/diskid/%v/vuid/%v/bid/%v", mgr.host, diskId, chunk.Vuid, bid)
+					doPost(urlStr, "markDelete")
+					urlStr = fmt.Sprintf("%v/shard/delete/diskid/%v/vuid/%v/bid/%v", mgr.host, disk.DiskID, chunk.Vuid, bid)
+					doPost(urlStr, "delete")
+
+					atomic.AddUint64(&off, 1)
+				}
+			}(offset, disk.DiskID)
+		}
+	}
 }
 
 func genId() uint64 {
@@ -316,8 +374,8 @@ func genId() uint64 {
 	return uint64(uid*100000) + uint64(rand.Intn(10000))
 }
 
-func doPost(url string) {
-	log.Infof("put once, %s", url)
+func doPost(url string, operation string) int {
+	//fmt.Printf("do post once, %s\n", url)
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(dataBuff))
 	if err != nil {
 		panic(err)
@@ -337,18 +395,21 @@ func doPost(url string) {
 	//	crc = ret.Crc
 	//}
 
-	if resp.StatusCode != http.StatusOK {
-		log.Warnf("fail to put, status code:%d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK { // || resp.StatusCode == errorcode.CodeChunkNoSpace { // 627
+		fmt.Printf("fail to http post, status code:%d, operation: %s, url:%s\n", resp.StatusCode, operation, url)
+		return resp.StatusCode
 	}
 
 	buf := make([]byte, resp.ContentLength)
 	if resp.ContentLength > 0 && resp.Body != nil {
 		io.LimitReader(resp.Body, resp.ContentLength).Read(buf)
 	}
-	log.Debugf("do post, resp body: %s, resp:%+v", string(buf), resp)
+	//fmt.Printf("do http post, resp body: %s, resp:%+v\n", string(buf), resp)
+	return http.StatusOK
 }
 
-func doGet(url string) {
+func doGet(url string, operation string) int {
+	//fmt.Printf("do get once, %s\n", url)
 	client := http.Client{}
 	rsp, err := client.Get(url)
 	if err != nil {
@@ -357,32 +418,40 @@ func doGet(url string) {
 	defer rsp.Body.Close()
 
 	if rsp.StatusCode != http.StatusOK {
-		log.Warnf("fail to put, status code:%d", rsp.StatusCode)
+		fmt.Printf("fail to http get, status code:%d, operation: %s, url:%s\n", rsp.StatusCode, operation, url)
+		return rsp.StatusCode
 	}
 	buf := make([]byte, rsp.ContentLength)
 	if rsp.ContentLength > 0 && rsp.Body != nil {
 		io.LimitReader(rsp.Body, rsp.ContentLength).Read(buf)
 	}
-	log.Debugf("do post, resp body: %s, resp:%+v", string(buf), rsp)
+	for key, val := range rsp.Header {
+		if key == "Crc" {
+			fmt.Println("do http get, crc=", val)
+		}
+	}
+	//fmt.Printf("do http get, url:%s, resp body: %s, resp:%+v\n", url, string(buf), rsp)
+	fmt.Printf("do http get, url:%s, resp:%+v\n", url, rsp)
+	return http.StatusOK
 }
 
 func printDebugInfo() {
-	log.Debugf("mgr, host: %s, clusterID: %d", mgr.host, mgr.clusterID)
-	log.Debugf("hostDiskMap:%+v, diskMap:%+v, lenDisk:%d ", mgr.hostDiskMap, mgr.diskMap, len(mgr.diskMap))
+	fmt.Printf("mgr, host: %s, clusterID: %d\n", mgr.host, mgr.clusterID)
+	fmt.Printf("hostDiskMap:%+v, diskMap:%+v, lenDisk:%d \n", mgr.hostDiskMap, mgr.diskMap, len(mgr.diskMap))
 	for idx, val := range mgr.diskMap {
-		log.Debugf("idx:%d, ID:%d, disk:%+v", idx, val.DiskID, *val)
+		fmt.Printf("idx:%d, ID:%d, disk:%+v\n", idx, val.DiskID, *val)
 	}
 
 	for id, val := range mgr.diskChunkMap {
 		if len(val) > 0 {
-			log.Debugf("diskId:%d, lenChunk:%d, chunk[0] free:%d", id, len(val), val[0].Free)
+			fmt.Printf("diskId:%d, lenChunk:%d, chunk[0] free:%d, chunk[0]: %+v\n", id, len(val), val[0].Free, val[0])
 		} else {
-			log.Debugf("diskId:%d, lenChunk:%d", id, len(val))
+			fmt.Printf("diskId:%d, lenChunk:%d\n", id, len(val))
 		}
 	}
 
 	for id, val := range mgr.chunkMap {
-		log.Debugf("Id:%s, chunk:%+v", id.String(), *val)
+		fmt.Printf("Id:%s, chunk:%+v\n", id.String(), *val)
 		break
 	}
 }
