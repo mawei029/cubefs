@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"math/rand"
 	"net/http"
@@ -21,7 +22,8 @@ import (
 
 var (
 	confFile = flag.String("f", "blobnode_test.conf", "config file path")
-	dataSize = flag.String("d", "4K", "data size")
+	dataSize = flag.String("d", "4B", "data size")
+	readFile = flag.String("r", "test.log", "read data from file path")
 
 	dataBuff []byte
 	conf     BlobnodeTestConf
@@ -65,6 +67,10 @@ type BlobnodeMgr struct {
 // GET /shard/stat/diskid/{diskid}/vuid/{vuidValue}/bid/{bidValue}
 // GET /shard/list/diskid/{diskid}/vuid/{vuid}/startbid/{bid}/status/{status}/count/{count}
 // GET /shard/get/diskid/{diskid}/vuid/{vuid}/bid/{bid}?iotype={iotype}
+// POST /chunk/create/diskid/:diskid/vuid/:vuid"
+// POST  /chunk/release/diskid/:diskid/vuid/:vuid
+// POST "/shard/markdelete/diskid/:diskid/vuid/:vuid/bid/:bid"
+// POST "/shard/delete/diskid/:diskid/vuid/:vuid/bid/:bid"
 func main() {
 	// 1. flag parse
 	flag.Parse()
@@ -72,9 +78,12 @@ func main() {
 		panic(err)
 	}
 
+	// 2. init mgr, read data
 	ctx := context.Background()
 	initConfMgr(ctx)
 	initData()
+
+	printDebugInfo() // debug
 
 	// 用本地file的构造data数据
 	// 根据host拿到该节点的disk，拿到vuid，申请chunk
@@ -83,6 +92,8 @@ func main() {
 
 	// 根据location, 开始Get
 	mgr.get(ctx)
+
+	// delete shard bid
 }
 
 func invalidArgs() error {
@@ -117,16 +128,17 @@ func initData() {
 		log.Fatalf("not support data size %d", *dataSize)
 	}
 
-	f, err := os.Open("filename.txt")
+	f, err := os.Open(*readFile)
 	if err != nil {
 		log.Fatalf("%+v", err)
 	}
 
-	buff := make([]byte, size)
-	n, err := f.Read(buff)
+	dataBuff = make([]byte, size) //buff := make([]byte, size)
+	n, err := f.Read(dataBuff)
 	if err != nil {
 		log.Fatalf("%d, %+v", n, err)
 	}
+	log.Infof("read file, dataBuff len=%d (which size will be put) ", len(dataBuff))
 }
 
 //func newBlobnodeMgr(disks []*client.DiskInfoSimple, cid proto.ClusterID) *BlobnodeMgr {
@@ -201,11 +213,20 @@ func (mgr *BlobnodeMgr) put(ctx context.Context) {
 	for _, disks := range mgr.hostDiskMap {
 		for _, disk := range disks {
 			for _, chunk := range mgr.diskChunkMap[disk.DiskID] {
+				if chunk.Free < uint64(size) {
+					continue
+				}
+
 				urlStr := fmt.Sprintf("%v/shard/put/diskid/%v/vuid/%v/bid/%v/size/%v?iotype=%d",
 					mgr.host, disk.DiskID, chunk.Vuid, bidStart+cnt, size, blobnode.NormalIO)
+				doPost(urlStr)
+
+				urlStr = fmt.Sprintf("%v/shard/markdelete/diskid/%v/vuid/%v/bid/%v", mgr.host, disk.DiskID, chunk.Vuid, bidStart+cnt)
+				doPost(urlStr)
+				urlStr = fmt.Sprintf("%v/shard/delete/diskid/%v/vuid/%v/bid/%v", mgr.host, disk.DiskID, chunk.Vuid, bidStart+cnt)
+				doPost(urlStr)
 
 				cnt++
-				doPost(urlStr)
 				return
 			}
 		}
@@ -226,19 +247,51 @@ func genId() uint64 {
 }
 
 func doPost(url string) {
+	log.Infof("put once, %s", url)
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(dataBuff))
 	if err != nil {
 		panic(err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	req.ContentLength = int64(len(dataBuff))
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
 		panic(err)
 	}
 	defer resp.Body.Close()
+	//req.ContentLength = args.Size
+	//err = c.DoWith(ctx, req, ret, rpc.WithCrcEncode())
+	//if err == nil {
+	//	crc = ret.Crc
+	//}
 
 	if resp.StatusCode != http.StatusOK {
+		log.Warnf("fail to put, status code:%d", resp.StatusCode)
+	}
+
+	buf := make([]byte, resp.ContentLength)
+	if resp.ContentLength > 0 && resp.Body != nil {
+		io.LimitReader(resp.Body, resp.ContentLength).Read(buf)
+	}
+	log.Debugf("do post, resp body: %s, resp:%+v", string(buf), resp)
+}
+
+func printDebugInfo() {
+	log.Debugf("mgr, host: %s, clusterID: %d", mgr.host, mgr.clusterID)
+	log.Debugf("hostDiskMap:%+v, diskMap:%+v, lenDisk:%d ", mgr.hostDiskMap, mgr.diskMap, len(mgr.diskMap))
+	for id, val := range mgr.diskMap {
+		log.Debugf("Id:%d, disk:%+v", id, *val)
+		break
+	}
+
+	for id, val := range mgr.diskChunkMap {
+		log.Debugf("diskId:%d, lenChunk:%d", id, len(val))
+	}
+
+	for id, val := range mgr.chunkMap {
+		log.Debugf("Id:%s, chunk:%+v", id.String(), *val)
+		break
 	}
 }
