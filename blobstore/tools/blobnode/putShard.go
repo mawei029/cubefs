@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math"
 	"math/rand"
 	"net/http"
 	"os"
@@ -31,9 +32,11 @@ var (
 	readFile    = flag.String("r", "test.log", "read data from file path")
 	concurrency = flag.Int("c", 1, "go concurrency")
 	getDelay    = flag.Int("delay", 10, "get delay number")
-	bidStart    = flag.Duration("bid", 0, "bid start")
 	mode        = flag.String("m", "put", "operation mode")
+	maxPut      = flag.Int("max", math.MaxInt, "get delay number")
+	//bidStart    = flag.Duration("bid", 0, "bid start")
 
+	bidStart uint64
 	dataBuff []byte
 	conf     BlobnodeTestConf
 	mgr      *BlobnodeMgr
@@ -55,6 +58,7 @@ type BlobnodeTestConf struct {
 	ClusterID  proto.ClusterID               `json:"cluster_id"` // uint32
 	Host       string                        `json:"host"`       // dist blobnode host
 	ClusterMgr cmapi.Config                  `json:"cluster_mgr"`
+	BidStart   uint64                        `json:"bid_start"`
 	Vuids      map[proto.DiskID][]proto.Vuid `json:"vuids"`
 }
 
@@ -87,17 +91,17 @@ func main() {
 		panic(err)
 	}
 
-	debugNewMgr()
-	*mode = "delete"
-	*bidStart = 1234567890
-	*readFile = "/home/oppo/code/cubefs/blobstore/tools/blobnode/blobnode_test.conf"
+	//debugNewMgr()
+	//*mode = "delete"
+	//*bidStart = 1234567890
+	//*readFile = "/home/oppo/code/cubefs/blobstore/tools/blobnode/blobnode_test.conf"
 
 	// 2. init mgr, read data
 	ctx := context.Background()
-	// initConfMgr(ctx) // 根据host拿到该节点的disk，拿到vuid
-	initData() // 用本地file的构造data数据
+	initConfMgr(ctx) // 根据host拿到该节点的disk，拿到vuid
+	initData()       // 用本地file的构造data数据
 
-	//printDebugInfo() // debug
+	printDebugInfo() // debug
 
 	switch *mode {
 	case "all":
@@ -175,6 +179,7 @@ func newBlobnodeMgr(ctx context.Context) *BlobnodeMgr {
 		blobnodeCli:   blobnode.New(&blobnode.Config{}),
 		clusterMgrCli: cmapi.New(&conf.ClusterMgr),
 	}
+	bidStart = conf.BidStart
 
 	disks, err := mgr.clusterMgrCli.ListHostDisk(ctx, conf.Host)
 	if err != nil {
@@ -235,7 +240,7 @@ func (mgr *BlobnodeMgr) sortDisk() {
 }
 
 func (mgr *BlobnodeMgr) allOp(ctx context.Context) {
-	*bidStart = time.Duration(genId())
+	bidStart = genId()
 	fmt.Println("bid start: ", bidStart)
 
 	// 生成唯一bid, 开始put, 记录location. 空间不够时候则申请chunk
@@ -253,21 +258,21 @@ func (mgr *BlobnodeMgr) allOp(ctx context.Context) {
 }
 
 func (mgr *BlobnodeMgr) onlyGet(ctx context.Context) {
-	if *bidStart == 0 {
+	if bidStart == 0 {
 		panic(errors.New("invalid get: invalid bid start"))
 	}
 	mgr.get(ctx)
 }
 
 func (mgr *BlobnodeMgr) onlyDelete(ctx context.Context) {
-	if *bidStart == 0 {
+	if bidStart == 0 {
 		panic(errors.New("invalid get: invalid bid start"))
 	}
 	mgr.delete(ctx)
 }
 
 func (mgr *BlobnodeMgr) onlyPut(ctx context.Context) {
-	*bidStart = time.Duration(genId())
+	bidStart = genId()
 	fmt.Println("bid start: ", bidStart)
 
 	mgr.put(ctx, nil)
@@ -321,7 +326,7 @@ func (mgr *BlobnodeMgr) singlePut(chunkIdx int, vuid proto.Vuid, diskId proto.Di
 
 	for {
 		// PUT
-		bid := uint64(*bidStart) + atomic.LoadUint64(&off)
+		bid := bidStart + atomic.LoadUint64(&off)
 		urlStr := fmt.Sprintf("%v/shard/put/diskid/%v/vuid/%v/bid/%v/size/%v?iotype=%d",
 			mgr.conf.Host, diskId, vuid, bid, size, blobnode.NormalIO)
 		errCode := doPost(urlStr, "Put")
@@ -338,7 +343,7 @@ func (mgr *BlobnodeMgr) singlePut(chunkIdx int, vuid proto.Vuid, diskId proto.Di
 		}
 		//return
 
-		time.Sleep(time.Millisecond * 40)
+		time.Sleep(time.Millisecond * 100)
 		if atomic.AddUint64(&off, 1) > uint64(*getDelay) {
 			return
 		}
@@ -349,7 +354,7 @@ func (mgr *BlobnodeMgr) singleGet(chunkIdx int, vuid proto.Vuid, diskId proto.Di
 	off := uint64(0)
 	for {
 		// GET
-		bid := uint64(*bidStart) + atomic.LoadUint64(&off)
+		bid := bidStart + atomic.LoadUint64(&off)
 		urlStr := fmt.Sprintf("%v/shard/get/diskid/%v/vuid/%v/bid/%v?iotype=%d", mgr.conf.Host, diskId, vuid, bid, blobnode.NormalIO)
 		eCode := doGet(urlStr, "Get")
 		if eCode == errorcode.CodeBidNotFound {
@@ -369,7 +374,7 @@ func (mgr *BlobnodeMgr) delete(ctx context.Context) {
 
 func (mgr *BlobnodeMgr) singleDel(chunkIdx int, vuid proto.Vuid, diskId proto.DiskID, wg *sync.WaitGroup) {
 	for off := uint64(0); off < 100; off++ {
-		bid := uint64(*bidStart) + off
+		bid := bidStart + off
 		urlStr := fmt.Sprintf("%v/shard/markdelete/diskid/%v/vuid/%v/bid/%v", mgr.conf.Host, diskId, vuid, bid)
 		doPost(urlStr, "markDelete")
 		urlStr = fmt.Sprintf("%v/shard/delete/diskid/%v/vuid/%v/bid/%v", mgr.conf.Host, diskId, vuid, bid)
