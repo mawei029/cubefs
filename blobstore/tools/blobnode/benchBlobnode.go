@@ -39,7 +39,7 @@ var (
 	confFile    = flag.String("f", "blobnode_test.conf", "config file path")
 	dataSize    = flag.String("d", "4B", "data size")
 	readFile    = flag.String("s", "test.log", "src, read data from src file path")
-	concurrency = flag.Int("c", 1, "go concurrency")
+	concurrency = flag.Int("c", 1, "go concurrency per disk")
 	getDelay    = flag.Int("delay", 10, "get delay number")
 	mode        = flag.String("m", "put", "operation mode")
 	maxPut      = flag.Duration("max", math.MaxInt, "get delay number")
@@ -163,6 +163,10 @@ func initConfMgr(ctx context.Context) {
 }
 
 func initData() {
+	if *mode != "put" && *mode != "all" {
+		return
+	}
+
 	size := fileSize[strings.ToUpper(*dataSize)]
 	f, err := os.Open(*readFile)
 	if err != nil {
@@ -279,10 +283,12 @@ func (mgr *BlobnodeMgr) onlyDelete(ctx context.Context) {
 }
 
 func (mgr *BlobnodeMgr) onlyAlloc(ctx context.Context) {
+	log.SetOutputLevel(0)
 	mgr.alloc(ctx)
 }
 
 func (mgr *BlobnodeMgr) onlyRelease(ctx context.Context) {
+	log.SetOutputLevel(0)
 	mgr.release(ctx)
 }
 
@@ -365,7 +371,7 @@ func (mgr *BlobnodeMgr) alloc(ctx context.Context) {
 		return
 	}
 
-	// mgr.loopCommon(ctx, nil, mgr.singleAlloc)
+	mgr.loopCommon(ctx, nil, mgr.singleAlloc)
 }
 
 func (mgr *BlobnodeMgr) release(ctx context.Context) {
@@ -458,16 +464,28 @@ func (mgr *BlobnodeMgr) singleDel(chunkIdx int, vuid proto.Vuid, diskId proto.Di
 }
 
 const (
-	_16GB = 1 << 34
+	_16GB    = 1 << 34
+	maxRetry = 5
 )
 
 func (mgr *BlobnodeMgr) singleAlloc(chunkIdx int, vuid proto.Vuid, diskId proto.DiskID, wg *sync.WaitGroup) {
-	urlStr := fmt.Sprintf("%v/chunk/create/diskid/%v/vuid/%v?chunksize=%v", mgr.conf.Host, diskId, vuid, _16GB)
-	eCode := doPost(urlStr, "alloc")
+	urlStr, eCode := "", 0
+	// vuid = 0xFFFFF000001 // 0xFFF FF 000001
+
+	for i := 0; i < maxRetry; i++ {
+		urlStr = fmt.Sprintf("%v/chunk/create/diskid/%v/vuid/%v?chunksize=%v", mgr.conf.Host, diskId, vuid, _16GB)
+		eCode = doPost(urlStr, "alloc")
+
+		if eCode == errorcode.CodeAlreadyExist {
+			vuid++ // epoch+1
+			continue
+		}
+		break
+	}
+
 	if eCode != http.StatusOK {
 		panic(eCode)
 	}
-
 	urlStr = fmt.Sprintf("%v/chunk/stat/diskid/%v/vuid/%v", mgr.conf.Host, diskId, vuid)
 	eCode = doGet(urlStr, "alloc")
 }
