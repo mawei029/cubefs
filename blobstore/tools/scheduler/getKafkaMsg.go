@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	//"time"
 
@@ -33,7 +34,9 @@ type BlobDeleteKafkaConfig struct {
 	TopicFailed string   `json:"topic_failed"`
 	//FailMsgSenderTimeoutMs int64    `json:"fail_msg_sender_timeout_ms"`
 	//CommitIntervalMs       int      `json:"commit_interval_ms"`
-	MaxMessageBytes int `json:"max_message_bytes"`
+	MaxMessageBytes int    `json:"max_message_bytes"`
+	Version         string `json:"version"`
+	kafkaVersion    sarama.KafkaVersion
 }
 
 type BlobDeleteConfig struct {
@@ -55,6 +58,17 @@ func NewBlobDeleteMgr(cfg *BlobDeleteConfig) (*BlobDeleteMgr, error) {
 	mgr := &BlobDeleteMgr{
 		cfg: cfg,
 	}
+
+	if strings.TrimSpace(mgr.cfg.Kafka.Version) == "" {
+		mgr.cfg.Kafka.kafkaVersion = sarama.V2_1_0_0
+	} else {
+		kv, err := sarama.ParseKafkaVersion(mgr.cfg.Kafka.Version)
+		if err != nil {
+			log.Fatalf("error kafka version: %s, err: %+v", mgr.cfg.Kafka.Version, err)
+		}
+		mgr.cfg.Kafka.kafkaVersion = kv
+	}
+
 	//clusterMgrCli := client.NewClusterMgrClient(&conf.ClusterMgr)
 	//kafkaClient := base.NewKafkaConsumer(conf.Kafka.BrokerList, time.Duration(conf.Kafka.CommitIntervalMs)*time.Millisecond, clusterMgrCli)
 	kafkaClient := NewKafkaClient("SCHEDULER", conf.Kafka.BrokerList, cfg.Kafka.MaxMessageBytes)
@@ -67,7 +81,7 @@ func (mgr *BlobDeleteMgr) startConsumer() error {
 	//mgr.kafkaConsumerClient.StartKafkaConsumer(mgr.cfg.Kafka.Topic, mgr.Consume)
 
 	for _, topic := range mgr.cfg.Kafka.Topic {
-		consumer, err := mgr.kafkaConsumerClient.StartKafkaConsumer(topic, mgr.Consume)
+		consumer, err := mgr.kafkaConsumerClient.StartKafkaConsumer(topic, mgr.cfg.Kafka.kafkaVersion, mgr.Consume)
 		if err != nil {
 			return err
 		}
@@ -103,6 +117,7 @@ func main() {
 
 	flag.Parse()
 	//*confFile = "/home/oppo/code/cubefs/blobstore/tools/scheduler/getKafka.conf"
+	//*confFile = "/home/mw/code/cubefs/blobstore/tools/scheduler/getKafka.conf"
 	confBytes, err := ioutil.ReadFile(*confFile)
 	if err != nil {
 		log.Fatalf("read config file failed, filename: %s, err: %v", *confFile, err)
@@ -154,14 +169,14 @@ type KafkaConsumer struct {
 	cancel context.CancelFunc
 }
 
-func (cli *KafkaCli) StartKafkaConsumer(topic string, fn func(msg *sarama.ConsumerMessage)) (*KafkaConsumer, error) {
+func (cli *KafkaCli) StartKafkaConsumer(topic string, kVersion sarama.KafkaVersion, fn func(msg *sarama.ConsumerMessage)) (*KafkaConsumer, error) {
 	/**
 	 * Construct a new Sarama configuration.
 	 * The Kafka cluster version has to be defined before the consumer/producer is initialized.
 	 */
-	var VERSION = sarama.V2_1_0_0
+	//var VERSION = sarama.V2_1_0_0 // sarama.V2_1_0_0, sarama.V1_1_1_0, V0_10_0_0, V0_11_0_2
 	config := sarama.NewConfig()
-	config.Version = VERSION
+	config.Version = kVersion // 	config.Version = sarama.V0_11_0_2
 	config.Consumer.Offsets.Initial = sarama.OffsetOldest
 	config.Consumer.Offsets.AutoCommit.Enable = false // 不自动提交
 	config.Consumer.Group.Rebalance.Retry.Max = 10
@@ -213,6 +228,40 @@ func (cli *KafkaCli) StartKafkaConsumer(topic string, fn func(msg *sarama.Consum
 	cli.consumers = append(cli.consumers, groupConsumer)
 	return groupConsumer, nil
 }
+
+//func NewTopicConsumer(taskType proto.TaskType, cfg *KafkaConfig) (IConsumer, error) {
+//	consumers, err := NewKafkaPartitionConsumers(taskType, cfg)
+//	if err != nil {
+//		return nil, err
+//	}
+//	topicConsumer := &TopicConsumer{
+//		partitionsConsumers: consumers,
+//	}
+//	return topicConsumer, err
+//}
+//func NewKafkaPartitionConsumers(taskType proto.TaskType, cfg *KafkaConfig) ([]IConsumer, error) {
+//	var consumers []IConsumer
+//	consumer, err := sarama.NewConsumer(cfg.BrokerList, defaultKafkaCfg())
+//	if err != nil {
+//		return nil, fmt.Errorf("new consumer: err[%w]", err)
+//	}
+//	if len(cfg.Partitions) == 0 {
+//		partitions, err := consumer.Partitions(cfg.Topic)
+//		if err != nil {
+//			return nil, err
+//		}
+//		cfg.Partitions = partitions
+//	}
+//	for _, partition := range cfg.Partitions {
+//		partitionConsumer, err := newKafkaPartitionConsumer(taskType, consumer, cfg.Topic, partition)
+//		if err != nil {
+//			return nil, fmt.Errorf("new kafka partition consumer: err[%w]", err)
+//		}
+//		consumers = append(consumers, partitionConsumer)
+//	}
+//
+//	return consumers, nil
+//}
 
 func (cli *KafkaCli) Close() {
 	for _, c := range cli.consumers {
