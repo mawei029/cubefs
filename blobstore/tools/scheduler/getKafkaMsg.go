@@ -81,11 +81,12 @@ func (mgr *BlobDeleteMgr) Consume(msg *sarama.ConsumerMessage) {
 	var delMsg *proto.DeleteMsg
 	err := json.Unmarshal(msg.Value, &delMsg)
 	if err != nil {
-		log.Errorf("json err[%+v]", err)
+		log.Errorf("json err[%+v], msg.Value[%s], msg[%+v]", err, string(msg.Value), msg)
+		return
 	}
 
 	data, err := json.Marshal(delMsg)
-	log.Infof("start json delete msg: %s", string(data))
+	log.Infof("start json delete msg: %s, err: %+v", string(data), err)
 	//log.Infof("start struct delete msg: [%+v]", delMsg)
 	//return true
 
