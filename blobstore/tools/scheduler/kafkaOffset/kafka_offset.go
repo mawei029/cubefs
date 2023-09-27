@@ -6,10 +6,15 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"strings"
 
 	"github.com/Shopify/sarama"
 
 	"github.com/cubefs/cubefs/blobstore/common/config"
+)
+
+const (
+	defaultKafkaVersion = "2.1.0"
 )
 
 var (
@@ -28,6 +33,7 @@ type KafkaConfig struct {
 	MaxMessageBytes int      `json:"max_message_bytes"`
 	BrokerList      []string `json:"broker_list"`
 	Topic           []string `json:"topic"`
+	Version         string   `json:"version"`
 	//TopicNormal string   `json:"topic_normal"`
 	//TopicFailed string   `json:"topic_failed"`
 	//FailMsgSenderTimeoutMs int64    `json:"fail_msg_sender_timeout_ms"`
@@ -110,6 +116,13 @@ func main() {
 	//if err = LoadData(&conf, confBytes); err != nil {
 	if err = config.LoadData(&conf, confBytes); err != nil {
 		log.Fatalf("load config failed, error: %+v", err)
+	}
+	//conf.Kafka.Version = defaultKafkaVersion
+	if strings.TrimSpace(conf.Kafka.Version) != "" {
+		kafkaVersion, err = sarama.ParseKafkaVersion(conf.Kafka.Version)
+		if err != nil {
+			log.Fatalf("parse kafka version failed, error: %+v, version: %s", err, conf.Kafka.Version)
+		}
 	}
 	log.Printf("Config: %+v", conf)
 
