@@ -67,7 +67,7 @@ func main() {
 		log.Fatalf("Fail to new ScKafkaMgr, err: %+v", err)
 	}
 
-	go mgr.loopSendToNewKafka()
+	go mgr.loopSendToNewKafka(context.Background())
 	mgr.startConsumer()
 }
 
@@ -176,7 +176,7 @@ func (mgr *ScKafkaMgr) addToAllMsgs(delMsg *proto.DeleteMsg) {
 	}
 }
 
-func (mgr *ScKafkaMgr) loopSendToNewKafka() {
+func (mgr *ScKafkaMgr) loopSendToNewKafka(ctx context.Context) {
 	tm := time.NewTimer(time.Second * time.Duration(mgr.cfg.Interval))
 	defer tm.Stop()
 
@@ -185,6 +185,8 @@ func (mgr *ScKafkaMgr) loopSendToNewKafka() {
 		case <-tm.C:
 			mgr.sendToKafka()
 			tm.Reset(time.Second * time.Duration(mgr.cfg.Interval))
+		case <-ctx.Done():
+			return
 		}
 	}
 }
