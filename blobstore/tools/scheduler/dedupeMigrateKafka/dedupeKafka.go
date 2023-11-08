@@ -218,7 +218,7 @@ func (mgr *ScKafkaMgr) loopSendToNewKafka(ctx context.Context) {
 	for {
 		select {
 		case <-tm.C:
-			mgr.sendToKafka(loop)
+			mgr.sendToKafka(&loop)
 			tm.Reset(time.Millisecond * time.Duration(mgr.cfg.IntervalMs))
 		case <-ctx.Done():
 			return
@@ -245,10 +245,10 @@ func (mgr *ScKafkaMgr) cleanSendMsgs() {
 	mgr.sendMsgs = make(map[string]*proto.DeleteMsg)
 }
 
-func (mgr *ScKafkaMgr) sendToKafka(loop int) {
+func (mgr *ScKafkaMgr) sendToKafka(loop *int) {
 	span := trace.SpanFromContextSafe(context.Background())
 	sendMsgs, consumeCnt, repeatedCnt, sendCnt := mgr.getSendMsgs()
-	//span.Debugf("consume=%d, send=%d, repeated=%d, sendMsgs=%d", consumeCnt, sendCnt, repeatedCnt, len(sendMsgs))
+	// span.Debugf("consume=%d, send=%d, repeated=%d, sendMsgs=%d", consumeCnt, sendCnt, repeatedCnt, len(sendMsgs))
 	if len(sendMsgs) < mgr.cfg.Batch {
 		return
 	}
@@ -275,8 +275,8 @@ func (mgr *ScKafkaMgr) sendToKafka(loop int) {
 	}
 
 	wg.Wait()
-	loop++
-	span.Infof("count \t %d: consume=%d, send=%d, repeated=%d, sendFail=%d", loop, consumeCnt, sendCnt, repeatedCnt, atomic.LoadInt64(&mgr.failCnt))
+	*loop++
+	span.Infof("count \t %d: consume=%d, send=%d, repeated=%d, sendFail=%d", *loop, consumeCnt, sendCnt, repeatedCnt, atomic.LoadInt64(&mgr.failCnt))
 	mgr.cleanSendMsgs()
 }
 

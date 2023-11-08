@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"testing"
 	"time"
 
@@ -16,10 +15,7 @@ import (
 
 //go:generate mockgen -destination=./base_mock_test.go -package=main -mock_names KafkaConsumer=MockKafkaConsumer,GroupConsumer=MockGroupConsumer,IProducer=MockProducer github.com/cubefs/cubefs/blobstore/scheduler/base KafkaConsumer,GroupConsumer,IProducer
 
-var (
-	any     = gomock.Any()
-	errMock = errors.New("fake error")
-)
+var any = gomock.Any() // errMock = errors.New("fake error")
 
 func TestDedupeKafkaConsume(t *testing.T) {
 	mgr := &ScKafkaMgr{
@@ -61,11 +57,11 @@ func TestDedupeKafkaConsume(t *testing.T) {
 	producer.EXPECT().SendMessage(any).Times(len(mgr.sendMsgs)).Return(nil)
 	mgr.newMsgSender = producer
 
-	mgr.cfg.IntervalMs = defaultIntervalMs
+	mgr.cfg.IntervalMs = 200
 	ctx, cancle := context.WithTimeout(context.Background(), time.Second*2)
 	go mgr.loopSendToNewKafka(ctx)
 
-	time.Sleep(time.Second * 3)
+	time.Sleep(time.Second * 1)
 	cancle()
 	require.Equal(t, 0, len(mgr.sendMsgs))
 }
@@ -75,8 +71,8 @@ func TestNewScKafkaMgr(t *testing.T) {
 	ctx := context.Background()
 
 	conf = ToolConfig{
-		Batch:      3,
-		IntervalMs: 1000,
+		Batch:      2,
+		IntervalMs: 200,
 		NewKafka: KafkaConfig{
 			BrokerList: []string{"192.168.0.12:9095"},
 			Topic:      "test_del",
@@ -86,8 +82,8 @@ func TestNewScKafkaMgr(t *testing.T) {
 
 	sender := NewMockProducer(ctr)
 	sender.EXPECT().SendMessage(any).Times(100).Return(nil)
-	//consumerCli := NewMockGroupConsumer(ctr)
-	//consumerCli := NewMockKafkaConsumer(ctr)
+	// consumerCli := NewMockGroupConsumer(ctr)
+	// consumerCli := NewMockKafkaConsumer(ctr)
 
 	mgr := newScKafkaMgr(&conf, sender, nil)
 	go mgr.loopSendToNewKafka(ctx)
@@ -99,17 +95,24 @@ func TestNewScKafkaMgr(t *testing.T) {
 	}
 	kafkaMsgBt, err := json.Marshal(delMsg)
 	require.Nil(t, err)
-	kMsg := &sarama.ConsumerMessage{}
-	msgs := make([]*sarama.ConsumerMessage, 0)
+	kMsg := &sarama.ConsumerMessage{Value: kafkaMsgBt}
+	msgs := []*sarama.ConsumerMessage{kMsg}
+
 	bid := delMsg.Bid
 	for i := 0; i < 100; i++ {
 		delMsg.Bid = bid + proto.BlobID(i)
 		kafkaMsgBt, _ = json.Marshal(delMsg)
-		kMsg = &sarama.ConsumerMessage{Value: kafkaMsgBt}
+		kMsg := &sarama.ConsumerMessage{Value: kafkaMsgBt}
 		msgs = append(msgs, kMsg)
+
+		if i%40 == 0 {
+			mgr.Consume(msgs)
+			msgs = msgs[:0]
+			time.Sleep(time.Millisecond * time.Duration(mgr.cfg.IntervalMs*2))
+		}
 	}
 	mgr.Consume(msgs)
 
-	time.Sleep(time.Second * 3)
+	time.Sleep(time.Second * 1)
 	require.Nil(t, err)
 }
