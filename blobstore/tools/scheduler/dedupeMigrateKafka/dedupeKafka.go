@@ -24,24 +24,26 @@ import (
 )
 
 const (
-	defaultInterval = 2
-	defaultBatch    = 100
+	defaultIntervalMs = 1000
+	defaultBatch      = 100
 )
 
 var (
 	conf           ToolConfig
 	defaultVersion = sarama.V2_1_0_0
+	maxBatch       = defaultBatch
+	cIntervalMs    = defaultIntervalMs
 	confPath       = flag.String("f", "dedupeKafka.conf", "config path: dedupe and migrate kafka msg")
 )
 
 type ToolConfig struct {
-	ClusterID uint32      `json:"cluster_id"`
-	Batch     int         `json:"batch"`
-	Interval  int         `json:"interval"`
-	MaxCount  int64       `json:"max_count"`
-	LogLevel  log.Level   `json:"log_level"`
-	OldKafka  KafkaConfig `json:"old_kafka"`
-	NewKafka  KafkaConfig `json:"new_kafka"`
+	ClusterID  uint32      `json:"cluster_id"`
+	Batch      int         `json:"batch"`
+	IntervalMs int         `json:"interval_ms"`
+	MaxCount   int64       `json:"max_count"`
+	LogLevel   log.Level   `json:"log_level"`
+	OldKafka   KafkaConfig `json:"old_kafka"`
+	NewKafka   KafkaConfig `json:"new_kafka"`
 }
 
 type KafkaConfig struct {
@@ -93,8 +95,8 @@ func readConf() {
 	parseVersion(&conf.NewKafka)
 	log.SetOutputLevel(conf.LogLevel)
 
-	if conf.Interval <= 0 {
-		conf.Interval = defaultInterval
+	if conf.IntervalMs <= 0 {
+		conf.IntervalMs = defaultIntervalMs
 	}
 	if conf.Batch <= 0 {
 		conf.Batch = defaultBatch
@@ -103,6 +105,8 @@ func readConf() {
 		conf.MaxCount = math.MaxInt64
 	}
 
+	maxBatch = conf.Batch
+	cIntervalMs = conf.IntervalMs
 	log.Infof("file: %s, config: %+v", *confPath, conf)
 }
 
@@ -161,55 +165,61 @@ func (mgr *ScKafkaMgr) startConsumer() {
 	}
 }
 
-func (mgr *ScKafkaMgr) Consume(msg *sarama.ConsumerMessage) {
+func (mgr *ScKafkaMgr) Consume(msgs []*sarama.ConsumerMessage) {
 	span, _ := trace.StartSpanFromContext(context.Background(), "consume")
 
-	if atomic.LoadInt64(&mgr.consumeCnt) > mgr.cfg.MaxCount {
+	if mgr.needExit() {
 		span.Warnf("Stopping... max consume count=%d, consumeCnt=%d", mgr.cfg.MaxCount, atomic.LoadInt64(&mgr.consumeCnt))
 		time.Sleep(time.Second * 5)
 		os.Exit(0)
 	}
 
-	var delMsg *proto.DeleteMsg
-	err := json.Unmarshal(msg.Value, &delMsg)
-	if err != nil {
-		log.Errorf("Fail to unmarshal json, err[%+v], msg.Value[%s], msg[%+v]", err, string(msg.Value), msg)
-		return
+	delMsg := make([]*proto.DeleteMsg, len(msgs))
+	for i := range msgs {
+		err := json.Unmarshal(msgs[i].Value, &delMsg[i])
+		if err != nil {
+			log.Errorf("Fail to unmarshal json, err[%+v], msg.Value[%s], msg[%+v]", err, string(msgs[i].Value), msgs[i])
+			return
+		}
 	}
 
 	// span.Debugf("delMsg=%+v", delMsg)
 	mgr.addToAllMsgs(delMsg)
 }
 
-func (mgr *ScKafkaMgr) addToAllMsgs(delMsg *proto.DeleteMsg) {
-	key := fmt.Sprintf("%d_%d_%d", delMsg.ClusterID, delMsg.Vid, delMsg.Bid)
-
+func (mgr *ScKafkaMgr) addToAllMsgs(delMsg []*proto.DeleteMsg) {
 	mgr.allMsgLk.Lock()
 	defer mgr.allMsgLk.Unlock()
 
-	mgr.consumeCnt++
-	_, ok := mgr.allMsgs[key]
-	if ok {
-		mgr.repeatedCnt++
-		return
-	}
+	key := ""
+	for i := range delMsg {
+		key = fmt.Sprintf("%d_%d_%d", delMsg[i].ClusterID, delMsg[i].Vid, delMsg[i].Bid)
 
-	if !ok {
-		mgr.allMsgs[key] = struct{}{}
-		mgr.sendMsgs[key] = delMsg
-		mgr.sendCnt++
+		mgr.consumeCnt++
+		_, ok := mgr.allMsgs[key]
+		if ok {
+			mgr.repeatedCnt++
+			continue
+		}
+
+		if !ok {
+			mgr.allMsgs[key] = struct{}{}
+			mgr.sendMsgs[key] = delMsg[i]
+			mgr.sendCnt++
+		}
 	}
 }
 
 func (mgr *ScKafkaMgr) loopSendToNewKafka(ctx context.Context) {
-	tm := time.NewTimer(time.Second * time.Duration(mgr.cfg.Interval))
+	tm := time.NewTimer(time.Millisecond * time.Duration(mgr.cfg.IntervalMs))
 	defer tm.Stop()
 
+	loop := 0
 	for {
 		select {
 		case <-tm.C:
-			mgr.sendToKafka()
-			tm.Reset(time.Second * time.Duration(mgr.cfg.Interval))
+			mgr.sendToKafka(loop)
+			tm.Reset(time.Millisecond * time.Duration(mgr.cfg.IntervalMs))
 		case <-ctx.Done():
 			return
 		}
@@ -235,37 +245,51 @@ func (mgr *ScKafkaMgr) cleanSendMsgs() {
 	mgr.sendMsgs = make(map[string]*proto.DeleteMsg)
 }
 
-func (mgr *ScKafkaMgr) sendToKafka() {
+func (mgr *ScKafkaMgr) sendToKafka(loop int) {
 	span := trace.SpanFromContextSafe(context.Background())
 	sendMsgs, consumeCnt, repeatedCnt, sendCnt := mgr.getSendMsgs()
-	// span.Debugf("consume=%d, send=%d, repeated=%d, sendMsgs=%d", consumeCnt, sendCnt, repeatedCnt, len(sendMsgs))
+	//span.Debugf("consume=%d, send=%d, repeated=%d, sendMsgs=%d", consumeCnt, sendCnt, repeatedCnt, len(sendMsgs))
 	if len(sendMsgs) < mgr.cfg.Batch {
 		return
 	}
 
-	loop := 0
+	var wg sync.WaitGroup
 	for _, msg := range sendMsgs {
-		b, err := json.Marshal(msg)
-		if err != nil {
-			span.Errorf("Fail to marshal kafka msg[%+v], err[%+v]", msg, err)
-			atomic.AddInt64(&mgr.failCnt, 1)
-			continue
-		}
+		wg.Add(1)
+		go func(msg *proto.DeleteMsg) {
+			defer wg.Done()
 
-		err = mgr.newMsgSender.SendMessage(b)
-		if err != nil {
-			atomic.AddInt64(&mgr.failCnt, 1)
-			span.Errorf("Fail to send new kafka msg[%+v], err[%+v]", msg, err)
-		}
+			b, err := json.Marshal(msg)
+			if err != nil {
+				span.Errorf("Fail to marshal kafka msg[%+v], err[%+v]", msg, err)
+				atomic.AddInt64(&mgr.failCnt, 1)
+				return
+			}
+
+			err = mgr.newMsgSender.SendMessage(b)
+			if err != nil {
+				atomic.AddInt64(&mgr.failCnt, 1)
+				span.Errorf("Fail to send new kafka msg[%+v], err[%+v]", msg, err)
+			}
+		}(msg)
 	}
 
+	wg.Wait()
 	loop++
 	span.Infof("count \t %d: consume=%d, send=%d, repeated=%d, sendFail=%d", loop, consumeCnt, sendCnt, repeatedCnt, atomic.LoadInt64(&mgr.failCnt))
 	mgr.cleanSendMsgs()
 }
 
+func (mgr *ScKafkaMgr) needExit() bool {
+	if mgr.cfg.MaxCount != math.MaxInt64 && mgr.cfg.MaxCount != 0 && atomic.LoadInt64(&mgr.consumeCnt) > mgr.cfg.MaxCount {
+		return true
+	}
+
+	return false
+}
+
 type MyKafkaConsumer interface {
-	StartKafkaConsumer(kafkaConf KafkaConfig, fn func(msg *sarama.ConsumerMessage)) (*GroupConsumer, error)
+	StartKafkaConsumer(kafkaConf KafkaConfig, fn func(msg []*sarama.ConsumerMessage)) (*GroupConsumer, error)
 }
 
 type KafkaCli struct {
@@ -291,7 +315,7 @@ type GroupConsumer struct {
 	cancel context.CancelFunc
 }
 
-func (cli *KafkaCli) StartKafkaConsumer(kafkaConf KafkaConfig, fn func(msg *sarama.ConsumerMessage)) (*GroupConsumer, error) {
+func (cli *KafkaCli) StartKafkaConsumer(kafkaConf KafkaConfig, fn func(msg []*sarama.ConsumerMessage)) (*GroupConsumer, error) {
 	cfg := sarama.NewConfig()
 	cfg.Version = kafkaConf.kafkaVersion
 	cfg.Consumer.Offsets.Initial = sarama.OffsetOldest
@@ -348,7 +372,7 @@ func (cli *KafkaCli) Close() {
 // Consumer represents a Sarama consumer group consumer
 type Consumer struct {
 	ready     chan bool
-	ConsumeFn func(msg *sarama.ConsumerMessage)
+	ConsumeFn func(msg []*sarama.ConsumerMessage)
 }
 
 // Setup is run at the beginning of a new session, before ConsumeClaim
@@ -372,6 +396,10 @@ func (consumer *Consumer) ConsumeClaim(session sarama.ConsumerGroupSession, clai
 	// The `ConsumeClaim` itself is called within a goroutine, see:
 	// https://github.com/Shopify/sarama/blob/main/consumer_group.go#L27-L29
 	span := trace.SpanFromContextSafe(session.Context())
+	msgs := make([]*sarama.ConsumerMessage, 0, maxBatch)
+	tm := time.NewTimer(time.Millisecond * time.Duration(cIntervalMs))
+	defer tm.Stop()
+
 	for {
 		select {
 		case message := <-claim.Messages():
@@ -380,9 +408,15 @@ func (consumer *Consumer) ConsumeClaim(session sarama.ConsumerGroupSession, clai
 				continue
 			}
 			log.Debugf("Message claimed: value[%s], timestamp[%v], topic[%s], partition[%d], offset[%d]", string(message.Value), message.Timestamp, message.Topic, message.Partition, message.Offset)
-			consumer.ConsumeFn(message)
-			session.MarkMessage(message, "")
-			session.Commit()
+			msgs = append(msgs, message)
+			if len(msgs) < maxBatch {
+				continue
+			}
+
+		case <-tm.C:
+			if len(msgs) == 0 {
+				continue
+			}
 
 		// Should return when `session.Context()` is done.
 		// If not, will raise `ErrRebalanceInProgress` or `read tcp <ip>:<port>: i/o timeout` when kafka rebalance. see:
@@ -390,5 +424,12 @@ func (consumer *Consumer) ConsumeClaim(session sarama.ConsumerGroupSession, clai
 		case <-session.Context().Done():
 			return nil
 		}
+
+		consumer.ConsumeFn(msgs)
+		session.MarkMessage(msgs[len(msgs)-1], "")
+		// session.Commit()
+
+		msgs = msgs[:0]
+		tm.Reset(time.Millisecond * time.Duration(100))
 	}
 }

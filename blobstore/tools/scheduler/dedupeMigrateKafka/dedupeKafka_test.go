@@ -36,16 +36,19 @@ func TestDedupeKafkaConsume(t *testing.T) {
 	kafkaMsgBt, err := json.Marshal(delMsg)
 	require.Nil(t, err)
 
-	msg := &sarama.ConsumerMessage{Value: kafkaMsgBt}
-	mgr.Consume(msg)
+	kafkaMsg := &sarama.ConsumerMessage{Value: kafkaMsgBt}
+	msgs := []*sarama.ConsumerMessage{kafkaMsg}
+	mgr.Consume(msgs)
 
+	msgs = msgs[:0]
 	bid := delMsg.Bid
 	for i := 0; i < 100; i++ {
 		delMsg.Bid = bid + proto.BlobID(i)
 		kafkaMsgBt, _ = json.Marshal(delMsg)
-		msg = &sarama.ConsumerMessage{Value: kafkaMsgBt}
-		mgr.Consume(msg)
+		kafkaMsg = &sarama.ConsumerMessage{Value: kafkaMsgBt}
+		msgs = append(msgs, kafkaMsg)
 	}
+	mgr.Consume(msgs)
 
 	require.Equal(t, int64(101), mgr.consumeCnt)
 	require.Equal(t, int64(1), mgr.repeatedCnt)
@@ -58,11 +61,11 @@ func TestDedupeKafkaConsume(t *testing.T) {
 	producer.EXPECT().SendMessage(any).Times(len(mgr.sendMsgs)).Return(nil)
 	mgr.newMsgSender = producer
 
-	mgr.cfg.Interval = 1
-	ctx, cancle := context.WithTimeout(context.Background(), time.Second*time.Duration(mgr.cfg.Interval*2))
+	mgr.cfg.IntervalMs = defaultIntervalMs
+	ctx, cancle := context.WithTimeout(context.Background(), time.Second*2)
 	go mgr.loopSendToNewKafka(ctx)
 
-	time.Sleep(time.Second * time.Duration(mgr.cfg.Interval*2))
+	time.Sleep(time.Second * 3)
 	cancle()
 	require.Equal(t, 0, len(mgr.sendMsgs))
 }
@@ -72,8 +75,8 @@ func TestNewScKafkaMgr(t *testing.T) {
 	ctx := context.Background()
 
 	conf = ToolConfig{
-		Batch:    3,
-		Interval: 1,
+		Batch:      3,
+		IntervalMs: 1000,
 		NewKafka: KafkaConfig{
 			BrokerList: []string{"192.168.0.12:9095"},
 			Topic:      "test_del",
@@ -96,15 +99,17 @@ func TestNewScKafkaMgr(t *testing.T) {
 	}
 	kafkaMsgBt, err := json.Marshal(delMsg)
 	require.Nil(t, err)
-	msg := &sarama.ConsumerMessage{}
+	kMsg := &sarama.ConsumerMessage{}
+	msgs := make([]*sarama.ConsumerMessage, 0)
 	bid := delMsg.Bid
 	for i := 0; i < 100; i++ {
 		delMsg.Bid = bid + proto.BlobID(i)
 		kafkaMsgBt, _ = json.Marshal(delMsg)
-		msg = &sarama.ConsumerMessage{Value: kafkaMsgBt}
-		mgr.Consume(msg)
+		kMsg = &sarama.ConsumerMessage{Value: kafkaMsgBt}
+		msgs = append(msgs, kMsg)
 	}
+	mgr.Consume(msgs)
 
-	time.Sleep(time.Second * 5)
+	time.Sleep(time.Second * 3)
 	require.Nil(t, err)
 }
