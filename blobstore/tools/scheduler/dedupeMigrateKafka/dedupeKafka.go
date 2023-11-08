@@ -6,8 +6,11 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"math"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Shopify/sarama"
@@ -35,6 +38,7 @@ type ToolConfig struct {
 	ClusterID uint32      `json:"cluster_id"`
 	Batch     int         `json:"batch"`
 	Interval  int         `json:"interval"`
+	MaxCount  int64       `json:"max_count"`
 	LogLevel  log.Level   `json:"log_level"`
 	OldKafka  KafkaConfig `json:"old_kafka"`
 	NewKafka  KafkaConfig `json:"new_kafka"`
@@ -44,6 +48,7 @@ type KafkaConfig struct {
 	BrokerList []string `json:"broker_list"`
 	Topic      string   `json:"topic"`
 
+	AutoCommit      bool   `json:"auto_commit"`
 	TimeoutMs       int64  `json:"timeout_ms"`
 	MaxMessageBytes int    `json:"max_message_bytes"`
 	Version         string `json:"version"`
@@ -69,6 +74,9 @@ func main() {
 
 	go mgr.loopSendToNewKafka(context.Background())
 	mgr.startConsumer()
+
+	ch := make(chan int)
+	<-ch
 }
 
 func readConf() {
@@ -91,6 +99,9 @@ func readConf() {
 	if conf.Batch <= 0 {
 		conf.Batch = defaultBatch
 	}
+	if conf.MaxCount <= 0 {
+		conf.MaxCount = math.MaxInt64
+	}
 
 	log.Infof("file: %s, config: %+v", *confPath, conf)
 }
@@ -110,7 +121,7 @@ func parseVersion(kafkaConf *KafkaConfig) {
 
 type ScKafkaMgr struct {
 	cfg                 *ToolConfig
-	kafkaConsumerClient *KafkaCli
+	kafkaConsumerClient MyKafkaConsumer
 	newMsgSender        base.IProducer
 
 	allMsgs  map[string]struct{}
@@ -120,6 +131,7 @@ type ScKafkaMgr struct {
 	consumeCnt  int64
 	sendCnt     int64
 	repeatedCnt int64
+	failCnt     int64
 }
 
 func NewScKafkaMgr(cfg *ToolConfig) (*ScKafkaMgr, error) {
@@ -127,15 +139,19 @@ func NewScKafkaMgr(cfg *ToolConfig) (*ScKafkaMgr, error) {
 	if err != nil {
 		return nil, err
 	}
-	mgr := &ScKafkaMgr{
+
+	mgr := newScKafkaMgr(cfg, newMsgSender, NewKafkaClient("SCHEDULER", conf.OldKafka.BrokerList, cfg.OldKafka.MaxMessageBytes))
+	return mgr, nil
+}
+
+func newScKafkaMgr(cfg *ToolConfig, sender base.IProducer, consumer MyKafkaConsumer) *ScKafkaMgr {
+	return &ScKafkaMgr{
 		cfg:                 cfg,
 		allMsgs:             make(map[string]struct{}),
 		sendMsgs:            make(map[string]*proto.DeleteMsg),
-		kafkaConsumerClient: NewKafkaClient("SCHEDULER", conf.OldKafka.BrokerList, cfg.OldKafka.MaxMessageBytes),
-		newMsgSender:        newMsgSender,
+		kafkaConsumerClient: consumer,
+		newMsgSender:        sender,
 	}
-
-	return mgr, nil
 }
 
 func (mgr *ScKafkaMgr) startConsumer() {
@@ -146,6 +162,14 @@ func (mgr *ScKafkaMgr) startConsumer() {
 }
 
 func (mgr *ScKafkaMgr) Consume(msg *sarama.ConsumerMessage) {
+	span, _ := trace.StartSpanFromContext(context.Background(), "consume")
+
+	if atomic.LoadInt64(&mgr.consumeCnt) > mgr.cfg.MaxCount {
+		span.Warnf("Stopping... max consume count=%d, consumeCnt=%d", mgr.cfg.MaxCount, atomic.LoadInt64(&mgr.consumeCnt))
+		time.Sleep(time.Second * 5)
+		os.Exit(0)
+	}
+
 	var delMsg *proto.DeleteMsg
 	err := json.Unmarshal(msg.Value, &delMsg)
 	if err != nil {
@@ -153,6 +177,7 @@ func (mgr *ScKafkaMgr) Consume(msg *sarama.ConsumerMessage) {
 		return
 	}
 
+	// span.Debugf("delMsg=%+v", delMsg)
 	mgr.addToAllMsgs(delMsg)
 }
 
@@ -211,40 +236,46 @@ func (mgr *ScKafkaMgr) cleanSendMsgs() {
 }
 
 func (mgr *ScKafkaMgr) sendToKafka() {
+	span := trace.SpanFromContextSafe(context.Background())
 	sendMsgs, consumeCnt, repeatedCnt, sendCnt := mgr.getSendMsgs()
+	// span.Debugf("consume=%d, send=%d, repeated=%d, sendMsgs=%d", consumeCnt, sendCnt, repeatedCnt, len(sendMsgs))
 	if len(sendMsgs) < mgr.cfg.Batch {
 		return
 	}
 
-	failCnt := 0
-	span := trace.SpanFromContextSafe(context.Background())
+	loop := 0
 	for _, msg := range sendMsgs {
 		b, err := json.Marshal(msg)
 		if err != nil {
 			span.Errorf("Fail to marshal kafka msg[%+v], err[%+v]", msg, err)
-			failCnt++
+			atomic.AddInt64(&mgr.failCnt, 1)
 			continue
 		}
 
 		err = mgr.newMsgSender.SendMessage(b)
 		if err != nil {
-			failCnt++
+			atomic.AddInt64(&mgr.failCnt, 1)
 			span.Errorf("Fail to send new kafka msg[%+v], err[%+v]", msg, err)
 		}
 	}
 
-	span.Infof("count: consume=%d, send=%d, repeated=%d, sendFail=%d", consumeCnt, sendCnt, repeatedCnt, failCnt)
+	loop++
+	span.Infof("count \t %d: consume=%d, send=%d, repeated=%d, sendFail=%d", loop, consumeCnt, sendCnt, repeatedCnt, atomic.LoadInt64(&mgr.failCnt))
 	mgr.cleanSendMsgs()
+}
+
+type MyKafkaConsumer interface {
+	StartKafkaConsumer(kafkaConf KafkaConfig, fn func(msg *sarama.ConsumerMessage)) (*GroupConsumer, error)
 }
 
 type KafkaCli struct {
 	ModuleName      string
 	Brokers         []string
-	consumers       []*KafkaConsumer
+	consumers       []*GroupConsumer
 	maxMessageBytes int
 }
 
-func NewKafkaClient(moduleName string, brokers []string, maxMessageBytes int) *KafkaCli {
+func NewKafkaClient(moduleName string, brokers []string, maxMessageBytes int) MyKafkaConsumer {
 	cli := &KafkaCli{
 		ModuleName:      moduleName,
 		Brokers:         brokers,
@@ -253,18 +284,18 @@ func NewKafkaClient(moduleName string, brokers []string, maxMessageBytes int) *K
 	return cli
 }
 
-type KafkaConsumer struct {
+type GroupConsumer struct {
 	group  string
 	client sarama.ConsumerGroup
 	span   trace.Span
 	cancel context.CancelFunc
 }
 
-func (cli *KafkaCli) StartKafkaConsumer(kafkaConf KafkaConfig, fn func(msg *sarama.ConsumerMessage)) (*KafkaConsumer, error) {
+func (cli *KafkaCli) StartKafkaConsumer(kafkaConf KafkaConfig, fn func(msg *sarama.ConsumerMessage)) (*GroupConsumer, error) {
 	cfg := sarama.NewConfig()
 	cfg.Version = kafkaConf.kafkaVersion
 	cfg.Consumer.Offsets.Initial = sarama.OffsetOldest
-	cfg.Consumer.Offsets.AutoCommit.Enable = false //
+	cfg.Consumer.Offsets.AutoCommit.Enable = kafkaConf.AutoCommit
 	cfg.Consumer.Group.Rebalance.Retry.Max = 10
 
 	consumer := Consumer{
@@ -293,7 +324,7 @@ func (cli *KafkaCli) StartKafkaConsumer(kafkaConf KafkaConfig, fn func(msg *sara
 			span.Warnf("rebalance happens: topic[%s], consumer_group[%s]", kafkaConf.Topic, group)
 		}
 	}()
-	groupConsumer := &KafkaConsumer{
+	groupConsumer := &GroupConsumer{
 		group:  group,
 		client: client,
 		cancel: cancel,

@@ -22,19 +22,6 @@ var (
 )
 
 func TestDedupeKafkaConsume(t *testing.T) {
-	//conf = ToolConfig{
-	//	Batch:    3,
-	//	Interval: 1,
-	//	NewKafka: KafkaConfig{
-	//		BrokerList: []string{"192.168.0.12:9095"},
-	//		Topic:      "test_del",
-	//		TimeoutMs:  100,
-	//	},
-	//}
-	//
-	//mgr, err := NewScKafkaMgr(&conf)
-	//require.Nil(t, err)
-
 	mgr := &ScKafkaMgr{
 		cfg:      &ToolConfig{Batch: 3},
 		allMsgs:  make(map[string]struct{}),
@@ -78,4 +65,46 @@ func TestDedupeKafkaConsume(t *testing.T) {
 	time.Sleep(time.Second * time.Duration(mgr.cfg.Interval*2))
 	cancle()
 	require.Equal(t, 0, len(mgr.sendMsgs))
+}
+
+func TestNewScKafkaMgr(t *testing.T) {
+	ctr := gomock.NewController(t)
+	ctx := context.Background()
+
+	conf = ToolConfig{
+		Batch:    3,
+		Interval: 1,
+		NewKafka: KafkaConfig{
+			BrokerList: []string{"192.168.0.12:9095"},
+			Topic:      "test_del",
+			TimeoutMs:  100,
+		},
+	}
+
+	sender := NewMockProducer(ctr)
+	sender.EXPECT().SendMessage(any).Times(100).Return(nil)
+	//consumerCli := NewMockGroupConsumer(ctr)
+	//consumerCli := NewMockKafkaConsumer(ctr)
+
+	mgr := newScKafkaMgr(&conf, sender, nil)
+	go mgr.loopSendToNewKafka(ctx)
+
+	delMsg := proto.DeleteMsg{
+		ClusterID: 1,
+		Vid:       10,
+		Bid:       100,
+	}
+	kafkaMsgBt, err := json.Marshal(delMsg)
+	require.Nil(t, err)
+	msg := &sarama.ConsumerMessage{}
+	bid := delMsg.Bid
+	for i := 0; i < 100; i++ {
+		delMsg.Bid = bid + proto.BlobID(i)
+		kafkaMsgBt, _ = json.Marshal(delMsg)
+		msg = &sarama.ConsumerMessage{Value: kafkaMsgBt}
+		mgr.Consume(msg)
+	}
+
+	time.Sleep(time.Second * 5)
+	require.Nil(t, err)
 }
