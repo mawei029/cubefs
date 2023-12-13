@@ -75,7 +75,7 @@ var (
 	ownerRegexp   = regexp.MustCompile("^[A-Za-z][A-Za-z0-9_]{0,45}$")
 
 	useConnPool           = true // for test
-	enableDirectDeleteVol = true
+	enableDirectDeleteVol = false
 	gConfig               *clusterConfig
 )
 
@@ -430,7 +430,7 @@ func (m *Server) checkConfig(cfg *config.Config) (err error) {
 	}
 	m.config.volDeletionDentryThreshold = uint64(threshold)
 
-	enableDirectDeleteVol = cfg.GetBoolWithDefault(cfgEnableDirectDeleteVol, true)
+	enableDirectDeleteVol = cfg.GetBoolWithDefault(cfgEnableDirectDeleteVol, false)
 
 	if err = m.config.checkRaftPartitionCanUseDifferentPort(m, cfg.GetBoolWithDefault(cfgRaftPartitionCanUseDifferentPort, false)); err != nil {
 		return err
