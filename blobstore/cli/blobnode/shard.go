@@ -119,21 +119,25 @@ func addCmdShard(cmd *grumble.Command) {
 		Help: "admin_set bid info",
 		Flags: func(f *grumble.Flags) {
 			blobnodeFlags(f)
+			f.Uint64L("diskid", 1, "disk id to set")
+			f.Uint64L("vuid", 1, "vuid")
+			f.Uint64L("bid", 1, "bid")
+			f.Uint64L("flag", 1, "flag")
 		},
-		Args: func(c *grumble.Args) {
-			c.Uint64("diskid", "disk id to mark")
-			c.Uint64("vuid", "vuid")
-			c.Uint64("bid", "bid")
-			c.Uint64("flag", "flag")
-		},
+		//Args: func(c *grumble.Args) {
+		//	c.Uint64("diskid", "disk id to mark")
+		//	c.Uint64("vuid", "vuid")
+		//	c.Uint64("bid", "bid")
+		//	c.Uint64("flag", "flag")
+		//},
 		Run: func(c *grumble.Context) error {
 			cli := blobnode.New(&blobnode.Config{})
 			host := c.Flags.String("host")
 			args := blobnode.SetShardFlagArgs{
-				DiskID: proto.DiskID(c.Args.Uint64("diskid")),
-				Vuid:   proto.Vuid(c.Args.Uint64("vuid")),
-				Bid:    proto.BlobID(c.Args.Uint64("bid")),
-				Flag:   blobnode.ShardStatus(c.Args.Uint64("flag")),
+				DiskID: proto.DiskID(c.Flags.Uint64("diskid")),       // proto.DiskID(c.Args.Uint64("diskid")),
+				Vuid:   proto.Vuid(c.Flags.Uint64("vuid")),           //proto.Vuid(c.Args.Uint64("vuid")),
+				Bid:    proto.BlobID(c.Flags.Uint64("bid")),          //proto.BlobID(c.Args.Uint64("bid")),
+				Flag:   blobnode.ShardStatus(c.Flags.Uint64("flag")), //blobnode.ShardStatus(c.Args.Uint64("flag")),
 			}
 			if !common.Confirm("to set bid info?") {
 				return nil
