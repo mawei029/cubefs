@@ -111,6 +111,7 @@ type Storage interface {
 	DecrPendingCnt()
 	Close(ctx context.Context)
 	Destroy(ctx context.Context)
+	SetFlag(ctx context.Context, bid proto.BlobID, flag bnapi.ShardStatus) (err error)
 }
 
 // chunk storage api
@@ -133,6 +134,7 @@ type ChunkAPI interface {
 	ListShards(ctx context.Context, startBid proto.BlobID, cnt int, status bnapi.ShardStatus) (infos []*bnapi.ShardInfo, next proto.BlobID, err error)
 	Sync(ctx context.Context) (err error)
 	SyncData(ctx context.Context) (err error)
+	SetBidFlag(ctx context.Context, bid proto.BlobID, flag bnapi.ShardStatus) (err error)
 	Close(ctx context.Context)
 
 	// compact

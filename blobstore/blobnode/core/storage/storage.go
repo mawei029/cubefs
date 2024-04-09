@@ -239,3 +239,20 @@ func (stg *storage) Destroy(ctx context.Context) {
 
 	meta, data = nil, nil
 }
+
+func (stg *storage) SetFlag(ctx context.Context, bid proto.BlobID, flag bnapi.ShardStatus) (err error) {
+	meta := stg.meta
+
+	shard, err := meta.Read(ctx, bid)
+	if err != nil {
+		return err
+	}
+
+	shard.Flag = flag
+	err = meta.Write(ctx, bid, shard)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}

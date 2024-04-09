@@ -516,6 +516,60 @@ func (s *Service) ShardPut(c *rpc.Context) {
 	c.RespondJSON(ret)
 }
 
+/*
+ *  method:         POST
+ *  url:            /shard/setshardflag/diskid/{diskid}/vuid/{vuid}/bid/{bid}/flag/{flag}
+ *  request body:   json.Marshal(SetShardFlagArgs)
+ */
+func (s *Service) ShardSetFlag(c *rpc.Context) {
+	args := new(bnapi.SetShardFlagArgs)
+	if err := c.ParseArgs(args); err != nil {
+		c.RespondError(err)
+		return
+	}
+
+	ctx := c.Request.Context()
+	span := trace.SpanFromContextSafe(ctx)
+
+	if !bnapi.IsValidDiskID(args.DiskID) {
+		c.RespondError(bloberr.ErrInvalidDiskId)
+		return
+	}
+
+	s.lock.RLock()
+	ds, exist := s.Disks[args.DiskID]
+	s.lock.RUnlock()
+	if !exist {
+		c.RespondError(bloberr.ErrNoSuchDisk)
+		return
+	}
+
+	cs, exist := ds.GetChunkStorage(args.Vuid)
+	if !exist {
+		c.RespondError(bloberr.ErrNoSuchVuid)
+		return
+	}
+
+	err := cs.AllowModify()
+	if err != nil {
+		span.Warnf("ChunkStorage can not mark delete: %v", err)
+		c.RespondError(err)
+		return
+	}
+
+	// set io type
+	ctx = bnapi.SetIoType(ctx, bnapi.NormalIO)
+	ctx = limitio.SetLimitTrack(ctx)
+
+	err = cs.SetBidFlag(ctx, args.Bid, args.Flag)
+	if err != nil {
+		err = handlerBidNotFoundErr(err)
+		span.Errorf("Failed to mark delete, err:%v", err)
+		c.RespondError(err)
+		return
+	}
+}
+
 func handlerBidNotFoundErr(err error) error {
 	if os.IsNotExist(err) {
 		return bloberr.ErrNoSuchBid

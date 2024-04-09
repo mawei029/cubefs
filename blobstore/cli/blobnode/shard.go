@@ -113,4 +113,36 @@ func addCmdShard(cmd *grumble.Command) {
 			return nil
 		},
 	})
+
+	chunkCommand.AddCommand(&grumble.Command{
+		Name: "admin_set",
+		Help: "admin_set bid info",
+		Flags: func(f *grumble.Flags) {
+			blobnodeFlags(f)
+		},
+		Args: func(c *grumble.Args) {
+			c.Uint64("diskid", "disk id to mark")
+			c.Uint64("vuid", "vuid")
+			c.Uint64("bid", "bid")
+			c.Uint64("flag", "flag")
+		},
+		Run: func(c *grumble.Context) error {
+			cli := blobnode.New(&blobnode.Config{})
+			host := c.Flags.String("host")
+			args := blobnode.SetShardFlagArgs{
+				DiskID: proto.DiskID(c.Args.Uint64("diskid")),
+				Vuid:   proto.Vuid(c.Args.Uint64("vuid")),
+				Bid:    proto.BlobID(c.Args.Uint64("bid")),
+				Flag:   blobnode.ShardStatus(c.Args.Uint64("flag")),
+			}
+			if !common.Confirm("to set bid info?") {
+				return nil
+			}
+			if err := cli.SetShardFlag(common.CmdContext(), host, &args); err != nil {
+				return err
+			}
+			fmt.Println("admin_set bid info success")
+			return nil
+		},
+	})
 }
