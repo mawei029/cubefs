@@ -22,7 +22,9 @@ import (
 	"github.com/cubefs/cubefs/blobstore/cmd"
 	"github.com/cubefs/cubefs/blobstore/common/config"
 	"github.com/cubefs/cubefs/blobstore/common/fileutil"
+	"github.com/cubefs/cubefs/blobstore/common/proto"
 	"github.com/cubefs/cubefs/blobstore/common/rpc"
+	"github.com/cubefs/cubefs/blobstore/util/defaulter"
 	"github.com/cubefs/cubefs/blobstore/util/log"
 )
 
@@ -57,7 +59,27 @@ func initConfig(args []string) (cfg *cmd.Config, err error) {
 		return nil, err
 	}
 
+	initPromeConf()
+
 	return &conf.Config, nil
+}
+
+func initPromeConf() {
+	metricCfg := &conf.Config.AuditLog.MetricConfig
+
+	defaulter.LessOrEqual(&metricCfg.MaxApiLevel, 3)
+	if metricCfg.Service == "" {
+		metricCfg.Service = proto.ServiceNameBlobNode
+	}
+	if len(metricCfg.SizeBuckets) == 0 {
+		metricCfg.SizeBuckets = []int64{0, 65536, 131072, 262144, 524288, 1048576, 4194304, 8388608, 16777216, 33554432}
+	}
+	if metricCfg.SetDefaultSwitch {
+		metricCfg.EnableHttpMethod = true
+		metricCfg.EnableReqLengthCnt = true
+		metricCfg.EnableRespLengthCnt = true
+		metricCfg.EnableRespDuration = true
+	}
 }
 
 func setUp() (*rpc.Router, []rpc.ProgressHandler) {
@@ -98,7 +120,7 @@ func NewHandler(service *Service) *rpc.Router {
 	rpc.Use(service.requestCounter) // first interceptor
 	r.Handle(http.MethodGet, "/stat", service.Stat, rpc.OptArgsQuery())
 	r.Handle(http.MethodGet, "/debug/stat", service.DebugStat, rpc.OptArgsQuery())
-	r.Handle(http.MethodPost, "/config/reload", service.configReload, rpc.OptArgsQuery())
+	r.Handle(http.MethodPost, "/config/reload", service.ConfigReload, rpc.OptArgsQuery())
 
 	r.Handle(http.MethodGet, "/disk/stat/diskid/:diskid", service.DiskStat, rpc.OptArgsURI())
 	r.Handle(http.MethodPost, "/disk/probe", service.DiskProbe, rpc.OptArgsBody())
@@ -121,6 +143,9 @@ func NewHandler(service *Service) *rpc.Router {
 
 	r.Handle(http.MethodPost, "/shard/repair", service.WorkerService.ShardRepair, rpc.OptArgsBody())
 	r.Handle(http.MethodGet, "/worker/stats", service.WorkerService.WorkerStats)
+	r.Handle(http.MethodPost, "/inspect/rate/:rate", service.SetInspectRate, rpc.OptArgsURI())
+	r.Handle(http.MethodGet, "/inspect/stat", service.GetInspectStat, rpc.OptArgsQuery())
+	r.Handle(http.MethodPost, "/shard/setshardflag/diskid/:diskid/vuid/:vuid/bid/:bid/flag/:flag", service.ShardSetFlag, rpc.OptArgsURI())
 
 	return r
 }
