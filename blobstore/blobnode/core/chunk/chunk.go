@@ -851,3 +851,31 @@ func (cs *chunk) setStg(stg core.Storage) {
 	wrapper := &storageWrapper{Storage: stg}
 	cs.stg.Store(wrapper)
 }
+
+func (cs *chunk) SetBidFlag(ctx context.Context, bid proto.BlobID, flag bnapi.ShardStatus) (err error) {
+	span := trace.SpanFromContextSafe(ctx)
+
+	// statistics
+	cs.stats.markdeleteBefore()
+	defer cs.stats.markdeleteAfter(time.Now())
+
+	cs.lock.RLock()
+
+	if cs.compacting {
+		cs.lock.RUnlock()
+		return bloberr.ErrChunkInCompact
+	}
+
+	stg := cs.GetStg()
+	defer cs.PutStg(stg)
+
+	cs.lock.RUnlock()
+
+	err = stg.SetFlag(ctx, bid, flag)
+	if err != nil {
+		span.Errorf("Failed set flag, bid:%d, err:%v", bid, err)
+		return err
+	}
+
+	return nil
+}

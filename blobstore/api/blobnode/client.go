@@ -103,6 +103,7 @@ type StorageAPI interface {
 	MarkDeleteShard(ctx context.Context, host string, args *DeleteShardArgs) (err error)
 	DeleteShard(ctx context.Context, host string, args *DeleteShardArgs) (err error)
 	ListShards(ctx context.Context, host string, args *ListShardsArgs) (sis []*ShardInfo, next proto.BlobID, err error)
+	SetShardFlag(ctx context.Context, host string, args *SetShardFlagArgs) (err error)
 
 	WorkerAPI
 }

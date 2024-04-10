@@ -242,3 +242,7 @@ func (stg *replicateStorage) Close(ctx context.Context) {
 func (stg *replicateStorage) Destroy(ctx context.Context) {
 	stg.masterStg.Destroy(ctx)
 }
+
+func (stg *replicateStorage) SetFlag(ctx context.Context, bid proto.BlobID, flag bnapi.ShardStatus) (err error) {
+	return stg.masterStg.SetFlag(ctx, bid, flag)
+}
