@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -30,14 +31,16 @@ var (
 	shardHeaderMagic = [4]byte{0xab, 0xcd, 0xef, 0xcc}
 	// shardFooterMagic = [4]byte{0xcc, 0xef, 0xcd, 0xab}
 
-	diskDir   = flag.String("disk", "/home/service/disks/data1", "disk dir")
-	chunkName = flag.String("chunk", "", "chunk file name")
+	diskDir   = flag.String("disk", "/home/service/var/data1/data", "disk dir")
+	chunkName = flag.String("chunk", "", "specified chunk file name[default empty]")
 	vuid      = flag.Int64("vuid", 0, "vuid value[0:find all, xxx:specified vuid]")
 	logLevel  = flag.Int("level", 1, "log level[0:debug,1:info,2:warn,3:err]")
+	maxChunk  = flag.Int("max", math.MaxInt, "the max number of chunks to walk")
 )
 
 func main() {
 	flag.Parse()
+	checkConf()
 	//*diskDir = "/home/oppo/Documents/testChunk/"
 	//*chunkName = "0000000000000001-17c4cb6d477ab32d"
 	//*vuid = 3
@@ -49,6 +52,12 @@ func main() {
 	}
 
 	walkAllChunk()
+}
+
+func checkConf() {
+	if *maxChunk <= 0 || *maxChunk > math.MaxInt {
+		panic("invalid max chunk num")
+	}
 }
 
 func readOneChunk() {
@@ -65,27 +74,33 @@ func walkAllChunk() {
 
 	chunkId := &bnapi.ChunkId{}
 	findVuid := false
+	cnt := 0
 	for _, file := range files {
 		if file.IsDir() {
 			continue
 		}
 
+		cnt++
 		chunkId = parseChunkNameStr(file.Name())
 		if *vuid == 0 { // read all file
+			if cnt >= *maxChunk {
+				fmt.Printf("Exceeded the maximum chunk count")
+				return
+			}
 			readSingleChunk(file.Name())
 			continue
 		}
 		// vuidStr := fmt.Sprintf(chunkId.VolumeUnitId().ToString())
 		if chunkId.VolumeUnitId().ToString() == strconv.FormatInt(*vuid, 10) { // find vuid
-			fmt.Printf("find vuid:%d \n", *vuid)
+			// fmt.Printf("find vuid:%d \n", *vuid)
 			readSingleChunk(file.Name())
 			findVuid = true
 			break
 		}
 	}
 
-	if *vuid != 0 && !findVuid {
-		fmt.Printf("cannot find vuid:%d \n", *vuid)
+	if *vuid != 0 {
+		fmt.Printf("vuid:%d is find:%v \n", *vuid, findVuid)
 	}
 }
 
