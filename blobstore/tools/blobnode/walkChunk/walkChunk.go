@@ -5,21 +5,21 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
-	bnapi "github.com/cubefs/cubefs/blobstore/api/blobnode"
-	"github.com/cubefs/cubefs/blobstore/util/log"
 	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"time"
+
+	bnapi "github.com/cubefs/cubefs/blobstore/api/blobnode"
+	"github.com/cubefs/cubefs/blobstore/util/log"
 )
 
 const (
-	_4k             = 4 * 1024
 	_pageSize       = 4 * 1024 // 4k
-	chunkHeaderSize = 29
-	shardHeaderSize = 32 // crc32 + magic + bid + vuid + size32 + padding
-	shardFooterSize = 8  // magic + crc32
+	chunkHeaderSize = 32       // magic + version_8 + parentChunk_128 + creatTime64 + padding24
+	shardHeaderSize = 32       // crc32 + magic + bid + vuid + size32 + padding32
+	shardFooterSize = 8        // magic + crc32
 	crc32Len        = 4
 	crc32BlockSize  = 64 * 1024
 	timeFormat      = "2006-01-02 15:04:05"
@@ -28,7 +28,7 @@ const (
 var (
 	chunkHeaderMagic = [4]byte{0x20, 0x21, 0x03, 0x18}
 	shardHeaderMagic = [4]byte{0xab, 0xcd, 0xef, 0xcc}
-	shardFooterMagic = [4]byte{0xcc, 0xef, 0xcd, 0xab}
+	// shardFooterMagic = [4]byte{0xcc, 0xef, 0xcd, 0xab}
 
 	diskDir   = flag.String("disk", "/home/service/disks/data1", "disk dir")
 	chunkName = flag.String("chunk", "", "chunk file name")
@@ -38,9 +38,9 @@ var (
 
 func main() {
 	flag.Parse()
-	*diskDir = "/home/oppo/Documents/testChunk/"
+	//*diskDir = "/home/oppo/Documents/testChunk/"
 	//*chunkName = "0000000000000001-17c4cb6d477ab32d"
-	*vuid = 3
+	//*vuid = 3
 	log.SetOutputLevel(log.Level(*logLevel))
 
 	if *chunkName != "" {
@@ -77,6 +77,7 @@ func walkAllChunk() {
 		}
 		// vuidStr := fmt.Sprintf(chunkId.VolumeUnitId().ToString())
 		if chunkId.VolumeUnitId().ToString() == strconv.FormatInt(*vuid, 10) { // find vuid
+			fmt.Printf("find vuid:%d \n", *vuid)
 			readSingleChunk(file.Name())
 			findVuid = true
 			break
@@ -102,10 +103,11 @@ func readSingleChunk(fileName string) {
 		panic(err)
 	}
 	ch := parseChunkMeta(data, n)
-	fmt.Printf("chunk header:%+v \n", ch)
+	log.Debugf("chunk header:%+v", ch)
+	// fmt.Printf("chunk version:%d, parent:%s \n", ch.version, ch.parentChunk)
 
 	data = make([]byte, shardHeaderSize)
-	off := int64(0 + _4k)
+	off := int64(0 + _pageSize)
 	for {
 		n, err = fh.ReadAt(data, off)
 		if err == io.EOF {
@@ -115,7 +117,8 @@ func readSingleChunk(fileName string) {
 			panic(err)
 		}
 		sh := parseShardHeader(data, n)
-		fmt.Printf("shard header:%+v, offset:%d \n", sh, off)
+		log.Debugf("shard header:%+v, offset:%d", sh, off)
+		fmt.Printf("shard bid:%d, vuid:%d, offset:%d, size:%d \n", sh.bid, sh.vuid, off, sh.size)
 		off += getShardTotalSize(sh.size, crc32BlockSize)
 		off = alignSize(off, _pageSize)
 	}
@@ -123,13 +126,19 @@ func readSingleChunk(fileName string) {
 
 func parseChunkNameStr(name string) *bnapi.ChunkId {
 	chunkId := &bnapi.ChunkId{}
-
 	if err := chunkId.Unmarshal([]byte(name)); err != nil {
 		panic(err)
 	}
 
-	fmt.Printf("chunkStr=%s, vuid=%d, tm=%d, time=%s\n",
-		chunkId, chunkId.VolumeUnitId(), chunkId.UnixTime(), time.Unix(0, int64(chunkId.UnixTime())).Format(timeFormat))
+	absFile := filepath.Join(*diskDir, name)
+	fileInfo, err := os.Stat(absFile)
+	if err != nil {
+		panic(err)
+	}
+
+	natureTm := time.Unix(0, int64(chunkId.UnixTime())).Format(timeFormat)
+	fmt.Printf("chunkStr=%s, vuid=%d, tm=%d, time=%s, size=%d \n",
+		chunkId, chunkId.VolumeUnitId(), chunkId.UnixTime(), natureTm, fileInfo.Size())
 	return chunkId
 }
 
