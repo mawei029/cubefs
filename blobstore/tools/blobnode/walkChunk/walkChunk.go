@@ -2,12 +2,10 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
@@ -15,11 +13,6 @@ import (
 	"time"
 
 	bnapi "github.com/cubefs/cubefs/blobstore/api/blobnode"
-	"github.com/cubefs/cubefs/blobstore/blobnode/core"
-	"github.com/cubefs/cubefs/blobstore/blobnode/core/disk"
-	"github.com/cubefs/cubefs/blobstore/blobnode/core/storage"
-	"github.com/cubefs/cubefs/blobstore/blobnode/db"
-	"github.com/cubefs/cubefs/blobstore/common/config"
 	"github.com/cubefs/cubefs/blobstore/util/log"
 )
 
@@ -31,27 +24,19 @@ const (
 	crc32Len        = 4
 	crc32BlockSize  = 64 * 1024
 	timeFormat      = "2006-01-02 15:04:05"
-	defaultLRUCache = 256 << 20 // 256 M
 )
 
 var (
 	chunkHeaderMagic = [4]byte{0x20, 0x21, 0x03, 0x18}
 	shardHeaderMagic = [4]byte{0xab, 0xcd, 0xef, 0xcc}
 	// shardFooterMagic = [4]byte{0xcc, 0xef, 0xcd, 0xab}
-	conf WalkChunkConf
 
 	diskDir   = flag.String("disk", "/home/service/var/data1/data", "disk dir")
 	chunkName = flag.String("chunk", "", "specified chunk file name[default empty]")
 	vuid      = flag.Int64("vuid", 0, "vuid value[0:find all, xxx:specified vuid]")
 	logLevel  = flag.Int("level", 1, "log level[0:debug,1:info,2:warn,3:err]")
 	maxChunk  = flag.Int("max", math.MaxInt, "the max number of chunks to walk")
-	confFile  = flag.String("f", "walkChunk.conf", "walk config")
 )
-
-type WalkChunkConf struct {
-	SuperPath string `json:"super_path"`
-	db.MetaConfig
-}
 
 func main() {
 	flag.Parse()
@@ -73,33 +58,10 @@ func checkConf() {
 	if *maxChunk <= 0 || *maxChunk > math.MaxInt {
 		panic("invalid max chunk num")
 	}
-
-	confBytes, err := ioutil.ReadFile(*confFile)
-	if err != nil {
-		log.Fatalf("read config file failed, filename: %s, err: %v", *confFile, err)
-	}
-
-	log.Debugf("Config file %s:\n%s", *confFile, confBytes)
-	if err = config.LoadData(&conf, confBytes); err != nil {
-		log.Fatalf("load config failed, error: %+v", err)
-	}
 }
 
 func readOneChunk() {
-	chunkId := parseChunkNameStr(*chunkName)
-
-	s, _ := loadSuperBlock()
-	sDb := s.GetDb()
-	ctx := context.Background()
-	cfg := &core.Config{
-		MetaConfig: db.MetaConfig{
-			SupportInline: false,
-			LRUCacheSize:  defaultLRUCache,
-		},
-	}
-	cm, err := storage.NewChunkMeta(ctx, cfg, core.VuidMeta{DiskID: 1, ChunkId: *chunkId}, sDb)
-	fmt.Println(cm, err)
-	cm.Read(ctx, 1024)
+	parseChunkNameStr(*chunkName)
 
 	readSingleChunk(*chunkName)
 }
@@ -110,7 +72,6 @@ func walkAllChunk() {
 		panic(err)
 	}
 
-	loadSuperBlock()
 	chunkId := &bnapi.ChunkId{}
 	findVuid := false
 	cnt := 0
@@ -150,12 +111,6 @@ func readSingleChunk(fileName string) {
 		panic(err)
 	}
 	defer fh.Close()
-
-	//cm, err := newChunkMeta(ctx, opt.Conf, vm, opt.DB)
-	//if err != nil {
-	//	span.Errorf("Failed new chunk meta. vm:%v, err:%v", vm, err)
-	//	return nil, err
-	//}
 
 	data := make([]byte, chunkHeaderSize)
 	n, err := fh.Read(data)
@@ -197,8 +152,8 @@ func parseChunkNameStr(name string) *bnapi.ChunkId {
 	}
 
 	natureTm := time.Unix(0, int64(chunkId.UnixTime())).Format(timeFormat)
-	fmt.Printf("chunkStr=%s, vuid=%d, idx=%d, tm=%d, time=%s, size=%d \n",
-		chunkId, chunkId.VolumeUnitId(), chunkId.VolumeUnitId().Index(), chunkId.UnixTime(), natureTm, fileInfo.Size())
+	fmt.Printf("chunkStr=%s, vuid=%d, tm=%d, time=%s, size=%d \n",
+		chunkId, chunkId.VolumeUnitId(), chunkId.UnixTime(), natureTm, fileInfo.Size())
 	return chunkId
 }
 
@@ -286,67 +241,3 @@ func (hdr *ShardHeader) Unmarshal(data []byte) error {
 
 	return nil
 }
-
-func loadSuperBlock() (s *disk.SuperBlock, err error) {
-	diskMetaPath := filepath.Join(*diskDir, conf.SuperPath)
-	coreCnf := core.Config{
-		MetaConfig: conf.MetaConfig,
-	}
-	checkPathExist(diskMetaPath)
-
-	// load super block，create or open
-	sb, err := disk.NewSuperBlock(diskMetaPath, &coreCnf)
-	if err != nil {
-		panic(err)
-		return nil, err
-	}
-	return sb, nil
-}
-
-func checkPathExist(path string) bool {
-	_, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			log.Fatal("path does not exist.")
-		} else {
-			log.Fatal("Error checking path existence: %+v", err)
-		}
-		return false
-	}
-	return true
-}
-
-//
-//type metafile struct {
-//	db db.MetaHandler // meta kv db
-//	id bnapi.ChunkId  // chunk id
-//	// shardkeyPool  sync.Pool      // shard key pool
-//	supportInline bool //
-//	closed        bool
-//}
-
-//
-//func newChunkMeta(config, diskId, chunkId, db) (cm *metafile, err error) {
-//	// check args
-//	if db == nil || config == nil {
-//		log.Fatalf("db handle <%v> or config <%v> is nil", meta, config)
-//	}
-//
-//	if diskId == proto.InvalidDiskID {
-//		log.Fatal("invalid disk id")
-//	}
-//
-//	cm = &metafile{
-//		id:            chunkId,
-//		db:            db, // super block.db
-//		supportInline: config.SupportInline,
-//		//shardkeyPool: sync.Pool{
-//		//	New: func() interface{} {
-//		//		return make([]byte, shardKeyLen)
-//		//	},
-//		//},
-//		closed: false,
-//	}
-//
-//	return cm, err
-//}
