@@ -392,7 +392,7 @@ func NewSuperBlock(dirpath string, conf *core.Config) (s *SuperBlock, err error)
 		return nil, bloberr.ErrInvalidParam
 	}
 
-	metadb, err := db.NewMetaHandler(dirpath, &conf.MetaConfig)
+	metadb, err := db.NewMetaHandler(dirpath, conf.MetaConfig)
 	if err != nil {
 		span.Errorf("new meta failed. path:<%s> err:%v", dirpath, err)
 		return nil, err

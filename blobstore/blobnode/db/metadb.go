@@ -132,18 +132,18 @@ func newRocksDB(path string, conf MetaConfig) (db rdb.KVStore, err error) {
 	return db, nil
 }
 
-func newMetaDB(path string, config *MetaConfig) (md *metadb, err error) {
+func newMetaDB(path string, config MetaConfig) (md *metadb, err error) {
 	span, _ := trace.StartSpanFromContextWithTraceID(context.Background(), "", "NewKVDB "+path)
 
-	span.Infof("path:%s, config:%v", path, *config)
+	span.Infof("path:%s, config:%v", path, config)
 
-	err = initConfig(config)
+	err = initConfig(&config)
 	if err != nil {
 		span.Errorf("Failed initconfig. err:%v", err)
 		return
 	}
 
-	rocksdb, err := newRocksDB(path, *config)
+	rocksdb, err := newRocksDB(path, config)
 	if err != nil {
 		span.Errorf("Failed New Rocksdb %v", err)
 		return nil, err
@@ -152,14 +152,14 @@ func newMetaDB(path string, config *MetaConfig) (md *metadb, err error) {
 	md = &metadb{
 		db:     rocksdb,
 		path:   path,
-		config: *config,
+		config: config,
 	}
 
-	span.Debugf("New KV(%s) DB(%v) success", path, *config)
+	span.Debugf("New KV(%s) DB(%v) success", path, config)
 
 	return md, nil
 }
 
-func NewMetaHandler(dirpath string, config *MetaConfig) (mh MetaHandler, err error) {
+func NewMetaHandler(dirpath string, config MetaConfig) (mh MetaHandler, err error) {
 	return newMetaDB(dirpath, config)
 }
