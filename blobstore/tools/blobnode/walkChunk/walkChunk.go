@@ -152,8 +152,8 @@ func parseChunkNameStr(name string) *bnapi.ChunkId {
 	}
 
 	natureTm := time.Unix(0, int64(chunkId.UnixTime())).Format(timeFormat)
-	fmt.Printf("chunkStr=%s, vuid=%d, tm=%d, time=%s, size=%d \n",
-		chunkId, chunkId.VolumeUnitId(), chunkId.UnixTime(), natureTm, fileInfo.Size())
+	fmt.Printf("chunkStr=%s, vuid=%d, idx=%d, tm=%d, time=%s, size=%d \n",
+		chunkId, chunkId.VolumeUnitId(), chunkId.VolumeUnitId().Index(), chunkId.UnixTime(), natureTm, fileInfo.Size())
 	return chunkId
 }
 
