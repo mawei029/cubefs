@@ -379,6 +379,10 @@ func (s *SuperBlock) Close(ctx context.Context) error {
 	return nil
 }
 
+func (s *SuperBlock) GetDb() db.MetaHandler {
+	return s.db
+}
+
 func NewSuperBlock(dirpath string, conf *core.Config) (s *SuperBlock, err error) {
 	span, _ := trace.StartSpanFromContextWithTraceID(context.Background(), "", dirpath)
 
