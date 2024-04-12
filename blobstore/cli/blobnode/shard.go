@@ -135,9 +135,9 @@ func addCmdShard(cmd *grumble.Command) {
 			host := c.Flags.String("host")
 			args := blobnode.SetShardFlagArgs{
 				DiskID: proto.DiskID(c.Flags.Uint64("diskid")),       // proto.DiskID(c.Args.Uint64("diskid")),
-				Vuid:   proto.Vuid(c.Flags.Uint64("vuid")),           //proto.Vuid(c.Args.Uint64("vuid")),
-				Bid:    proto.BlobID(c.Flags.Uint64("bid")),          //proto.BlobID(c.Args.Uint64("bid")),
-				Flag:   blobnode.ShardStatus(c.Flags.Uint64("flag")), //blobnode.ShardStatus(c.Args.Uint64("flag")),
+				Vuid:   proto.Vuid(c.Flags.Uint64("vuid")),           // proto.Vuid(c.Args.Uint64("vuid")),
+				Bid:    proto.BlobID(c.Flags.Uint64("bid")),          // proto.BlobID(c.Args.Uint64("bid")),
+				Flag:   blobnode.ShardStatus(c.Flags.Uint64("flag")), // blobnode.ShardStatus(c.Args.Uint64("flag")),
 			}
 			if !common.Confirm("to set bid info?") {
 				return nil
