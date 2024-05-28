@@ -162,6 +162,8 @@ func main() {
 			for partition, offset := range partitionOffsets { // offset is consumer offset
 				oldestOffset, err1 := client.GetOffset(topic, partition, sarama.OffsetOldest)
 				newestOffset, err3 := client.GetOffset(topic, partition, sarama.OffsetNewest)
+
+				// Topic: shard_repair_20001, Partition: 46, offset=[-1, 472, 543], latency=544, errs=[nil, <nil>, <nil>]
 				fmt.Printf("Topic: %s, Partition: %d, offset=[%d, %d, %d], latency=%d, errs=[nil, %+v, %+v] \n",
 					topic, partition, offset.Offset, oldestOffset, newestOffset, newestOffset-offset.Offset, err1, err3)
 			}

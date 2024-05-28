@@ -10,6 +10,8 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
+
 	//"time"
 
 	"github.com/Shopify/sarama"
@@ -315,6 +317,7 @@ func (consumer *Consumer) ConsumeClaim(session sarama.ConsumerGroupSession, clai
 			if *onceCommit {
 				log.Warnf("consumer will commit and close, topic[%s], partition[%d], offset[%d]", message.Topic, message.Partition, message.Offset)
 				session.Commit()
+				time.Sleep(time.Second)
 				os.Exit(0)
 				return nil
 			}
