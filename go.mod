@@ -34,6 +34,7 @@ require (
 	github.com/prometheus/client_golang v1.13.0
 	github.com/rs/xid v1.5.0
 	github.com/samsarahq/thunder v0.0.0-20211005041752-96f4331b7baa
+	github.com/spaolacci/murmur3 v0.0.0-20180118202830-f09979ecbc72
 	github.com/spf13/cobra v1.2.1
 	github.com/stretchr/testify v1.8.2
 	github.com/tecbot/gorocksdb v0.0.0-20191217155057-f0fad39f321c

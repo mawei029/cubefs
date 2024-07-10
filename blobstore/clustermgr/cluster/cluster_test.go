@@ -64,7 +64,7 @@ func TestDiskMgr_Normal(t *testing.T) {
 			diskInfo, err := testDiskMgr.GetDiskInfo(ctx, proto.DiskID(i))
 			require.NoError(t, err)
 			require.Equal(t, proto.DiskID(i), diskInfo.DiskID)
-			diskExist := testDiskMgr.CheckDiskInfoDuplicated(ctx, diskInfo, nodeInfo)
+			diskExist := testDiskMgr.CheckDiskInfoDuplicated(ctx, diskInfo.DiskID, &diskInfo.DiskInfo, &nodeInfo.NodeInfo)
 			require.Equal(t, apierrors.ErrExist, diskExist)
 		}
 
@@ -74,7 +74,7 @@ func TestDiskMgr_Normal(t *testing.T) {
 		diskInfo.DiskID = proto.DiskID(11)
 		nodeInfo, err = testDiskMgr.GetNodeInfo(ctx, proto.NodeID(1))
 		require.NoError(t, err)
-		duplicated := testDiskMgr.CheckDiskInfoDuplicated(ctx, diskInfo, nodeInfo)
+		duplicated := testDiskMgr.CheckDiskInfoDuplicated(ctx, diskInfo.DiskID, &diskInfo.DiskInfo, &nodeInfo.NodeInfo)
 		require.Equal(t, apierrors.ErrIllegalArguments, duplicated)
 
 		// test normal case
@@ -82,7 +82,7 @@ func TestDiskMgr_Normal(t *testing.T) {
 		diskInfo.Path += "notDuplicated"
 		nodeInfo, err = testDiskMgr.GetNodeInfo(ctx, proto.NodeID(1))
 		require.NoError(t, err)
-		duplicated = testDiskMgr.CheckDiskInfoDuplicated(ctx, diskInfo, nodeInfo)
+		duplicated = testDiskMgr.CheckDiskInfoDuplicated(ctx, diskInfo.DiskID, &diskInfo.DiskInfo, &nodeInfo.NodeInfo)
 		require.Equal(t, nil, duplicated)
 	}
 
@@ -97,7 +97,7 @@ func TestDiskMgr_Normal(t *testing.T) {
 		err := testDiskMgr.SetStatus(ctx, 1, proto.DiskStatusBroken, true)
 		require.NoError(t, err)
 
-		err = testDiskMgr.SwitchReadonly(1, true)
+		err = testDiskMgr.applySwitchReadonly(1, true)
 		require.NoError(t, err)
 
 		for i := 1; i < 2; i++ {
@@ -125,11 +125,11 @@ func TestDiskMgr_Dropping(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, 0, len(droppingList))
 
-		err = testDiskMgr.droppingDisk(ctx, 1)
+		err = testDiskMgr.applyDroppingDisk(ctx, 1)
 		require.NoError(t, err)
 
 		// add dropping disk repeatedly
-		err = testDiskMgr.droppingDisk(ctx, 1)
+		err = testDiskMgr.applyDroppingDisk(ctx, 1)
 		require.NoError(t, err)
 
 		// set status when disk is dropping, return ErrChangeDiskStatusNotAllow
@@ -151,17 +151,17 @@ func TestDiskMgr_Dropping(t *testing.T) {
 
 	// dropped
 	{
-		err := testDiskMgr.droppingDisk(ctx, 2)
+		err := testDiskMgr.applyDroppingDisk(ctx, 2)
 		require.NoError(t, err)
 		droppingList, err := testDiskMgr.ListDroppingDisk(ctx)
 		require.NoError(t, err)
 		require.Equal(t, 2, len(droppingList))
 
-		err = testDiskMgr.droppedDisk(ctx, 1)
+		err = testDiskMgr.applyDroppedDisk(ctx, 1)
 		require.NoError(t, err)
 
 		// add dropping disk 1 repeatedly
-		err = testDiskMgr.droppingDisk(ctx, 1)
+		err = testDiskMgr.applyDroppingDisk(ctx, 1)
 		require.NoError(t, err)
 
 		droppingList, err = testDiskMgr.ListDroppingDisk(ctx)
@@ -194,14 +194,14 @@ func TestDiskMgr_Heartbeat(t *testing.T) {
 		diskInfo.DiskHeartBeatInfo.FreeChunkCnt = 0
 		heartbeatInfos = append(heartbeatInfos, &diskInfo.DiskHeartBeatInfo)
 	}
-	err := testDiskMgr.heartBeatDiskInfo(ctx, heartbeatInfos)
+	err := testDiskMgr.applyHeartBeatDiskInfo(ctx, heartbeatInfos)
 	require.NoError(t, err)
 
 	// heartbeat check
 	for i := 1; i <= 10; i++ {
 		diskInfo, err := testDiskMgr.GetDiskInfo(ctx, proto.DiskID(i))
 		require.NoError(t, err)
-		require.Equal(t, diskInfo.Free/testDiskMgr.ChunkSize, diskInfo.FreeChunkCnt)
+		require.Equal(t, diskInfo.Free/testDiskMgr.cfg.ChunkSize, diskInfo.FreeChunkCnt)
 		require.Equal(t, int64(0), diskInfo.Free)
 	}
 
@@ -219,7 +219,7 @@ func TestDiskMgr_Heartbeat(t *testing.T) {
 
 	disk, _ = testDiskMgr.getDisk(proto.DiskID(2))
 	disk.lock.Lock()
-	disk.lastExpireTime = time.Now().Add(time.Duration(testDiskMgr.HeartbeatExpireIntervalS) * time.Second * -3)
+	disk.lastExpireTime = time.Now().Add(time.Duration(testDiskMgr.cfg.HeartbeatExpireIntervalS) * time.Second * -3)
 	disk.lock.Unlock()
 	disks = testDiskMgr.GetHeartbeatChangeDisks()
 	require.Equal(t, 2, len(disks))
@@ -236,48 +236,48 @@ func TestDiskMgr_ListDisks(t *testing.T) {
 	require.NoError(t, err)
 
 	{
-		ret, err := testDiskMgr.ListDiskInfo(ctx, &clustermgr.ListOptionArgs{Host: diskInfo.Host, Count: 1000})
+		ret, marker, err := testDiskMgr.ListDiskInfo(ctx, &clustermgr.ListOptionArgs{Host: diskInfo.Host, Count: 1000})
 		require.NoError(t, err)
-		require.Equal(t, 10, len(ret.Disks))
-		ret, err = testDiskMgr.ListDiskInfo(ctx, &clustermgr.ListOptionArgs{Host: diskInfo.Host, Count: 1000, Marker: ret.Marker})
+		require.Equal(t, 10, len(ret))
+		ret, _, err = testDiskMgr.ListDiskInfo(ctx, &clustermgr.ListOptionArgs{Host: diskInfo.Host, Count: 1000, Marker: marker})
 		require.NoError(t, err)
-		require.Equal(t, 0, len(ret.Disks))
+		require.Equal(t, 0, len(ret))
 
-		ret, err = testDiskMgr.ListDiskInfo(ctx, &clustermgr.ListOptionArgs{Status: proto.DiskStatusNormal, Count: 1000})
+		ret, _, err = testDiskMgr.ListDiskInfo(ctx, &clustermgr.ListOptionArgs{Status: proto.DiskStatusNormal, Count: 1000})
 		require.NoError(t, err)
-		require.Equal(t, 10, len(ret.Disks))
+		require.Equal(t, 10, len(ret))
 
-		ret, err = testDiskMgr.ListDiskInfo(ctx, &clustermgr.ListOptionArgs{Idc: diskInfo.Idc, Rack: diskInfo.Rack, Count: 1000})
+		ret, _, err = testDiskMgr.ListDiskInfo(ctx, &clustermgr.ListOptionArgs{Idc: diskInfo.Idc, Rack: diskInfo.Rack, Count: 1000})
 		require.NoError(t, err)
-		require.Equal(t, 10, len(ret.Disks))
+		require.Equal(t, 10, len(ret))
 
-		ret, err = testDiskMgr.ListDiskInfo(ctx, &clustermgr.ListOptionArgs{Idc: diskInfo.Idc, Count: 2})
+		ret, marker, err = testDiskMgr.ListDiskInfo(ctx, &clustermgr.ListOptionArgs{Idc: diskInfo.Idc, Count: 2})
 		require.NoError(t, err)
-		require.Equal(t, 2, len(ret.Disks))
-		ret, err = testDiskMgr.ListDiskInfo(ctx, &clustermgr.ListOptionArgs{Idc: diskInfo.Idc, Count: 1000, Marker: ret.Marker})
+		require.Equal(t, 2, len(ret))
+		ret, _, err = testDiskMgr.ListDiskInfo(ctx, &clustermgr.ListOptionArgs{Idc: diskInfo.Idc, Count: 1000, Marker: marker})
 		require.NoError(t, err)
-		require.Equal(t, 8, len(ret.Disks))
+		require.Equal(t, 8, len(ret))
 
-		ret, err = testDiskMgr.ListDiskInfo(ctx, &clustermgr.ListOptionArgs{Idc: diskInfo.Idc, Rack: diskInfo.Rack, Status: proto.DiskStatusNormal, Count: 1000})
+		ret, _, err = testDiskMgr.ListDiskInfo(ctx, &clustermgr.ListOptionArgs{Idc: diskInfo.Idc, Rack: diskInfo.Rack, Status: proto.DiskStatusNormal, Count: 1000})
 		require.NoError(t, err)
-		require.Equal(t, 10, len(ret.Disks))
+		require.Equal(t, 10, len(ret))
 
-		ret, err = testDiskMgr.ListDiskInfo(ctx, &clustermgr.ListOptionArgs{Idc: diskInfo.Idc, Rack: diskInfo.Rack, Status: proto.DiskStatusDropped, Count: 1000})
+		ret, _, err = testDiskMgr.ListDiskInfo(ctx, &clustermgr.ListOptionArgs{Idc: diskInfo.Idc, Rack: diskInfo.Rack, Status: proto.DiskStatusDropped, Count: 1000})
 		require.NoError(t, err)
-		require.Equal(t, 0, len(ret.Disks))
+		require.Equal(t, 0, len(ret))
 
-		ret, err = testDiskMgr.ListDiskInfo(ctx, &clustermgr.ListOptionArgs{Idc: diskInfo.Idc, Rack: diskInfo.Rack, Host: diskInfo.Host, Status: proto.DiskStatusDropped, Count: 1000})
+		ret, _, err = testDiskMgr.ListDiskInfo(ctx, &clustermgr.ListOptionArgs{Idc: diskInfo.Idc, Rack: diskInfo.Rack, Host: diskInfo.Host, Status: proto.DiskStatusDropped, Count: 1000})
 		require.NoError(t, err)
-		require.Equal(t, 0, len(ret.Disks))
+		require.Equal(t, 0, len(ret))
 	}
 
 	{
 		err := testDiskMgr.SetStatus(ctx, proto.DiskID(1), proto.DiskStatusBroken, true)
 		require.NoError(t, err)
 
-		ret, err := testDiskMgr.ListDiskInfo(ctx, &clustermgr.ListOptionArgs{Status: proto.DiskStatusBroken, Count: 1000})
+		ret, _, err := testDiskMgr.ListDiskInfo(ctx, &clustermgr.ListOptionArgs{Status: proto.DiskStatusBroken, Count: 1000})
 		require.NoError(t, err)
-		require.Equal(t, 1, len(ret.Disks))
+		require.Equal(t, 1, len(ret))
 	}
 }
 
@@ -288,20 +288,23 @@ func TestDiskMgr_AdminUpdateDisk(t *testing.T) {
 	initTestDiskMgrDisks(t, testDiskMgr, 1, 10, false, testIdcs[0])
 	_, ctx := trace.StartSpanFromContext(context.Background(), "")
 
-	diskInfo := &clustermgr.DiskInfo{
+	diskInfo := &clustermgr.BlobNodeDiskInfo{
 		DiskHeartBeatInfo: clustermgr.DiskHeartBeatInfo{
 			DiskID:       1,
 			MaxChunkCnt:  99,
 			FreeChunkCnt: 9,
 		},
-		Status: 1,
+		DiskInfo: clustermgr.DiskInfo{
+			Status: 1,
+		},
 	}
-	err := testDiskMgr.adminUpdateDisk(ctx, diskInfo)
+	err := testDiskMgr.applyAdminUpdateDisk(ctx, diskInfo)
 	require.NoError(t, err)
 
 	diskItem := testDiskMgr.allDisks[diskInfo.DiskID]
-	require.Equal(t, diskItem.info.MaxChunkCnt, diskInfo.MaxChunkCnt)
-	require.Equal(t, diskItem.info.FreeChunkCnt, diskInfo.FreeChunkCnt)
+	heartbeatInfo := diskItem.info.extraInfo.(*clustermgr.DiskHeartBeatInfo)
+	require.Equal(t, heartbeatInfo.MaxChunkCnt, diskInfo.MaxChunkCnt)
+	require.Equal(t, heartbeatInfo.FreeChunkCnt, diskInfo.FreeChunkCnt)
 	require.Equal(t, diskItem.info.Status, diskInfo.Status)
 
 	diskRecord, err := testDiskMgr.diskTbl.GetDisk(diskInfo.DiskID)
@@ -311,15 +314,17 @@ func TestDiskMgr_AdminUpdateDisk(t *testing.T) {
 	require.Equal(t, diskRecord.FreeChunkCnt, diskInfo.FreeChunkCnt)
 
 	// failed case, diskid not exisr
-	diskInfo1 := &clustermgr.DiskInfo{
+	diskInfo1 := &clustermgr.BlobNodeDiskInfo{
 		DiskHeartBeatInfo: clustermgr.DiskHeartBeatInfo{
 			DiskID:       199,
 			MaxChunkCnt:  99,
 			FreeChunkCnt: 9,
 		},
-		Status: 1,
+		DiskInfo: clustermgr.DiskInfo{
+			Status: 1,
+		},
 	}
-	err = testDiskMgr.adminUpdateDisk(ctx, diskInfo1)
+	err = testDiskMgr.applyAdminUpdateDisk(ctx, diskInfo1)
 	require.Error(t, err)
 }
 
@@ -331,36 +336,40 @@ func TestLoadData(t *testing.T) {
 	defer testDB.Close()
 
 	nr := normaldb.BlobNodeInfoRecord{
-		Version:   normaldb.NodeInfoVersionNormal,
-		NodeID:    proto.NodeID(1),
-		ClusterID: proto.ClusterID(1),
-		NodeSetID: proto.NodeSetID(2),
-		Status:    proto.NodeStatusDropped,
-		Role:      proto.NodeRoleBlobNode,
-		DiskType:  proto.DiskTypeHDD,
+		NodeInfoRecord: normaldb.NodeInfoRecord{
+			Version:   normaldb.NodeInfoVersionNormal,
+			NodeID:    proto.NodeID(1),
+			ClusterID: proto.ClusterID(1),
+			NodeSetID: proto.NodeSetID(2),
+			Status:    proto.NodeStatusDropped,
+			Role:      proto.NodeRoleBlobNode,
+			DiskType:  proto.DiskTypeHDD,
+		},
 	}
 	nodeTbl, err := normaldb.OpenBlobNodeTable(testDB)
 	require.NoError(t, err)
 	err = nodeTbl.UpdateNode(&nr)
 	require.NoError(t, err)
-	dr := normaldb.DiskInfoRecord{
-		Version:   normaldb.DiskInfoVersionNormal,
-		DiskID:    proto.DiskID(1),
-		NodeID:    proto.NodeID(1),
-		ClusterID: proto.ClusterID(1),
-		DiskSetID: proto.DiskSetID(2),
-		Status:    proto.DiskStatusRepaired,
+	blobNodeInfoRecord := normaldb.BlobNodeDiskInfoRecord{
+		DiskInfoRecord: normaldb.DiskInfoRecord{
+			Version:   normaldb.DiskInfoVersionNormal,
+			DiskID:    proto.DiskID(1),
+			NodeID:    proto.NodeID(1),
+			ClusterID: proto.ClusterID(1),
+			DiskSetID: proto.DiskSetID(2),
+			Status:    proto.DiskStatusRepaired,
+		},
 	}
 	diskTbl, err := normaldb.OpenBlobNodeDiskTable(testDB, true)
 	require.NoError(t, err)
-	err = diskTbl.AddDisk(&dr)
+	err = diskTbl.AddDisk(&blobNodeInfoRecord)
 	require.NoError(t, err)
-	diskMgr, err := New(testMockScopeMgr, testDB, testDiskMgrConfig)
+	blobNodeMgr, err := NewBlobNodeMgr(testMockScopeMgr, testDB, testDiskMgrConfig)
 	require.NoError(t, err)
 
 	_, ctx := trace.StartSpanFromContext(context.Background(), "")
-	topoInfo := diskMgr.GetTopoInfo(ctx)
-	blobNodeHDDNodeSets := topoInfo.AllNodeSets[proto.NodeRoleBlobNode.String()][proto.DiskTypeHDD.String()]
+	topoInfo := blobNodeMgr.GetTopoInfo(ctx)
+	blobNodeHDDNodeSets := topoInfo.AllNodeSets[proto.DiskTypeHDD.String()]
 	nodeSet, nodeSetExist := blobNodeHDDNodeSets[proto.NodeSetID(2)]
 	_, diskSetExist := nodeSet.DiskSets[proto.DiskSetID(2)]
 	require.Equal(t, nodeSetExist, true)

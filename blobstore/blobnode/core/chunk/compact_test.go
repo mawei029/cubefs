@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	cmapi "github.com/cubefs/cubefs/blobstore/api/clustermgr"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 
@@ -57,7 +58,7 @@ func (mock *diskMock) Status() (status proto.DiskStatus) {
 	return mock.status
 }
 
-func (mock *diskMock) DiskInfo() (info bnapi.DiskInfo) {
+func (mock *diskMock) DiskInfo() (info cmapi.BlobNodeDiskInfo) {
 	return
 }
 
@@ -105,7 +106,7 @@ func (mock *diskMock) ReleaseChunk(ctx context.Context, vuid proto.Vuid, force b
 	return
 }
 
-func (mock *diskMock) UpdateChunkStatus(ctx context.Context, vuid proto.Vuid, status bnapi.ChunkStatus) (err error) {
+func (mock *diskMock) UpdateChunkStatus(ctx context.Context, vuid proto.Vuid, status cmapi.ChunkStatus) (err error) {
 	return
 }
 
@@ -121,7 +122,7 @@ func (mock *diskMock) EnqueueCompact(ctx context.Context, vuid proto.Vuid) {
 	// do nothing
 }
 
-func (mock *diskMock) GcRubbishChunk(ctx context.Context) (mayBeLost []bnapi.ChunkId, err error) {
+func (mock *diskMock) GcRubbishChunk(ctx context.Context) (mayBeLost []cmapi.ChunkID, err error) {
 	return
 }
 
@@ -162,13 +163,13 @@ func createTestChunk(t *testing.T, ctx context.Context, diskRoot string, vuid pr
 	require.NoError(t, err)
 	require.NotNil(t, dbHandler)
 
-	chunkId := bnapi.NewChunkId(vuid)
+	chunkId := cmapi.NewChunkID(vuid)
 	vm := core.VuidMeta{
 		Vuid:    vuid,
 		DiskID:  12,
-		ChunkId: chunkId,
+		ChunkID: chunkId,
 		Mtime:   time.Now().UnixNano(),
-		Status:  bnapi.ChunkStatusNormal,
+		Status:  cmapi.ChunkStatusNormal,
 	}
 
 	conf := &core.Config{

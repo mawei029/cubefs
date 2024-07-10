@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cubefs/cubefs/blobstore/api/clustermgr"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 
@@ -56,7 +57,7 @@ func TestNewChunkData(t *testing.T) {
 	defer os.RemoveAll(testDir)
 
 	conf := &core.Config{}
-	chunkid := bnapi.NewChunkId(0)
+	chunkid := clustermgr.NewChunkID(0)
 	chunkname := chunkid.String()
 
 	chunkname = filepath.Join(testDir, chunkname)
@@ -109,7 +110,7 @@ func TestChunkData_Write(t *testing.T) {
 
 	ctx := context.Background()
 
-	chunkname := bnapi.NewChunkId(0).String()
+	chunkname := clustermgr.NewChunkID(0).String()
 
 	chunkname = filepath.Join(testDir, chunkname)
 	log.Info(chunkname)
@@ -178,7 +179,7 @@ func TestChunkData_ConcurrencyWrite(t *testing.T) {
 
 	ctx := context.Background()
 
-	chunkname := bnapi.NewChunkId(0).String()
+	chunkname := clustermgr.NewChunkID(0).String()
 
 	chunkname = filepath.Join(testDir, chunkname)
 	log.Info(chunkname)
@@ -261,7 +262,7 @@ func TestChunkData_Delete(t *testing.T) {
 
 	ctx := context.Background()
 
-	chunkname := bnapi.NewChunkId(0).String()
+	chunkname := clustermgr.NewChunkID(0).String()
 
 	chunkname = filepath.Join(testDir, chunkname)
 	log.Info(chunkname)
@@ -388,7 +389,7 @@ func TestChunkData_Destroy(t *testing.T) {
 
 	ctx := context.Background()
 
-	chunkname := bnapi.NewChunkId(0).String()
+	chunkname := clustermgr.NewChunkID(0).String()
 
 	chunkname = filepath.Join(testDir, chunkname)
 	log.Info(chunkname)
@@ -434,7 +435,7 @@ func TestParseMeta(t *testing.T) {
 
 	ctx := context.Background()
 
-	chunkname := bnapi.NewChunkId(0).String()
+	chunkname := clustermgr.NewChunkID(0).String()
 
 	chunkname = filepath.Join(testDir, chunkname)
 	log.Info(chunkname)
@@ -447,7 +448,7 @@ func TestParseMeta(t *testing.T) {
 	ctime := time.Now().UnixNano()
 	meta := core.VuidMeta{
 		Version:     0x1,
-		ParentChunk: bnapi.ChunkId{0x8},
+		ParentChunk: clustermgr.ChunkID{0x8},
 		Ctime:       ctime,
 	}
 
@@ -466,7 +467,7 @@ func TestParseMeta(t *testing.T) {
 	require.Equal(t, cd.header, cd1.header)
 	require.Equal(t, cd1.header.magic, chunkHeaderMagic)
 	require.Equal(t, cd1.header.version, uint8(0x1))
-	require.Equal(t, cd1.header.parentChunk, bnapi.ChunkId{0x8})
+	require.Equal(t, cd1.header.parentChunk, clustermgr.ChunkID{0x8})
 	require.Equal(t, cd1.header.createTime, ctime)
 
 	// scene 2
@@ -494,7 +495,7 @@ func TestParseMeta(t *testing.T) {
 func TestChunkHeader(t *testing.T) {
 	magic := chunkHeaderMagic
 	version := byte(0x2)
-	parent := bnapi.ChunkId{0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf, 0x0}
+	parent := clustermgr.ChunkID{0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf, 0x0}
 	createTime := time.Now().UnixNano()
 
 	hdr := ChunkHeader{

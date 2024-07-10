@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cubefs/cubefs/blobstore/api/clustermgr"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 
@@ -63,7 +64,7 @@ func TestNewChunkStorage(t *testing.T) {
 	}
 
 	vuid := proto.Vuid(1)
-	chunkid := bnapi.NewChunkId(vuid)
+	chunkid := clustermgr.NewChunkID(vuid)
 
 	err = core.EnsureDiskArea(testDir, "")
 	require.NoError(t, err)
@@ -80,9 +81,9 @@ func TestNewChunkStorage(t *testing.T) {
 	vm := core.VuidMeta{
 		Vuid:    vuid,
 		DiskID:  12,
-		ChunkId: chunkid,
+		ChunkID: chunkid,
 		Mtime:   time.Now().UnixNano(),
-		Status:  bnapi.ChunkStatusNormal,
+		Status:  clustermgr.ChunkStatusNormal,
 	}
 	ctr := gomock.NewController(t)
 	ioPool := taskpool.NewMockIoPool(ctr)
@@ -128,7 +129,7 @@ func TestChunkStorage_ReadWrite(t *testing.T) {
 	}
 
 	vuid := proto.Vuid(1)
-	chunkid := bnapi.NewChunkId(vuid)
+	chunkid := clustermgr.NewChunkID(vuid)
 
 	err = core.EnsureDiskArea(testDir, "")
 	require.NoError(t, err)
@@ -145,9 +146,9 @@ func TestChunkStorage_ReadWrite(t *testing.T) {
 	vm := core.VuidMeta{
 		Vuid:    vuid,
 		DiskID:  12,
-		ChunkId: chunkid,
+		ChunkID: chunkid,
 		Mtime:   time.Now().UnixNano(),
-		Status:  bnapi.ChunkStatusNormal,
+		Status:  clustermgr.ChunkStatusNormal,
 	}
 
 	ioPool := newIoPoolMock(t)
@@ -252,7 +253,7 @@ func TestChunkStorage_ReadWriteInline(t *testing.T) {
 	}
 
 	vuid := proto.Vuid(1)
-	chunkid := bnapi.NewChunkId(vuid)
+	chunkid := clustermgr.NewChunkID(vuid)
 
 	err = core.EnsureDiskArea(testDir, "")
 	require.NoError(t, err)
@@ -269,9 +270,9 @@ func TestChunkStorage_ReadWriteInline(t *testing.T) {
 	vm := core.VuidMeta{
 		Vuid:    vuid,
 		DiskID:  12,
-		ChunkId: chunkid,
+		ChunkID: chunkid,
 		Mtime:   time.Now().UnixNano(),
-		Status:  bnapi.ChunkStatusNormal,
+		Status:  clustermgr.ChunkStatusNormal,
 	}
 
 	ioPool := newIoPoolMock(t)
@@ -370,7 +371,7 @@ func TestChunkStorage_DeleteOp(t *testing.T) {
 	}
 
 	vuid := proto.Vuid(1)
-	chunkid := bnapi.NewChunkId(vuid)
+	chunkid := clustermgr.NewChunkID(vuid)
 
 	err = core.EnsureDiskArea(testDir, "")
 	require.NoError(t, err)
@@ -387,9 +388,9 @@ func TestChunkStorage_DeleteOp(t *testing.T) {
 	vm := core.VuidMeta{
 		Vuid:    vuid,
 		DiskID:  12,
-		ChunkId: chunkid,
+		ChunkID: chunkid,
 		Mtime:   time.Now().UnixNano(),
-		Status:  bnapi.ChunkStatusNormal,
+		Status:  clustermgr.ChunkStatusNormal,
 	}
 
 	ioPool := newIoPoolMock(t)
@@ -481,7 +482,7 @@ func TestChunkStorage_Finalizer(t *testing.T) {
 	}
 
 	vuid := proto.Vuid(1)
-	chunkid := bnapi.NewChunkId(vuid)
+	chunkid := clustermgr.NewChunkID(vuid)
 
 	err = core.EnsureDiskArea(testDir, "")
 	require.NoError(t, err)
@@ -498,9 +499,9 @@ func TestChunkStorage_Finalizer(t *testing.T) {
 	vm := core.VuidMeta{
 		Vuid:    vuid,
 		DiskID:  12,
-		ChunkId: chunkid,
+		ChunkID: chunkid,
 		Mtime:   time.Now().UnixNano(),
-		Status:  bnapi.ChunkStatusNormal,
+		Status:  clustermgr.ChunkStatusNormal,
 	}
 	ioPool := newIoPoolMock(t)
 	ioQos, _ := qos.NewIoQueueQos(qos.Config{ReadQueueDepth: 2, WriteQueueDepth: 2, WriteChanQueCnt: 2})
