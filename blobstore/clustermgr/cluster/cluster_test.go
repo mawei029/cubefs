@@ -12,7 +12,7 @@
 // implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-package diskmgr
+package cluster
 
 import (
 	"context"
@@ -26,7 +26,6 @@ import (
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 
-	"github.com/cubefs/cubefs/blobstore/api/blobnode"
 	"github.com/cubefs/cubefs/blobstore/api/clustermgr"
 	"github.com/cubefs/cubefs/blobstore/clustermgr/persistence/normaldb"
 	apierrors "github.com/cubefs/cubefs/blobstore/common/errors"
@@ -187,7 +186,7 @@ func TestDiskMgr_Heartbeat(t *testing.T) {
 	initTestDiskMgrDisks(t, testDiskMgr, 1, 10, false, testIdcs[0])
 	_, ctx := trace.StartSpanFromContext(context.Background(), "")
 
-	heartbeatInfos := make([]*blobnode.DiskHeartBeatInfo, 0)
+	heartbeatInfos := make([]*clustermgr.DiskHeartBeatInfo, 0)
 	for i := 1; i <= 10; i++ {
 		diskInfo, err := testDiskMgr.GetDiskInfo(ctx, proto.DiskID(i))
 		require.NoError(t, err)
@@ -289,8 +288,8 @@ func TestDiskMgr_AdminUpdateDisk(t *testing.T) {
 	initTestDiskMgrDisks(t, testDiskMgr, 1, 10, false, testIdcs[0])
 	_, ctx := trace.StartSpanFromContext(context.Background(), "")
 
-	diskInfo := &blobnode.DiskInfo{
-		DiskHeartBeatInfo: blobnode.DiskHeartBeatInfo{
+	diskInfo := &clustermgr.DiskInfo{
+		DiskHeartBeatInfo: clustermgr.DiskHeartBeatInfo{
 			DiskID:       1,
 			MaxChunkCnt:  99,
 			FreeChunkCnt: 9,
@@ -312,8 +311,8 @@ func TestDiskMgr_AdminUpdateDisk(t *testing.T) {
 	require.Equal(t, diskRecord.FreeChunkCnt, diskInfo.FreeChunkCnt)
 
 	// failed case, diskid not exisr
-	diskInfo1 := &blobnode.DiskInfo{
-		DiskHeartBeatInfo: blobnode.DiskHeartBeatInfo{
+	diskInfo1 := &clustermgr.DiskInfo{
+		DiskHeartBeatInfo: clustermgr.DiskHeartBeatInfo{
 			DiskID:       199,
 			MaxChunkCnt:  99,
 			FreeChunkCnt: 9,
@@ -331,7 +330,7 @@ func TestLoadData(t *testing.T) {
 	require.NoError(t, err)
 	defer testDB.Close()
 
-	nr := normaldb.NodeInfoRecord{
+	nr := normaldb.BlobNodeInfoRecord{
 		Version:   normaldb.NodeInfoVersionNormal,
 		NodeID:    proto.NodeID(1),
 		ClusterID: proto.ClusterID(1),
@@ -340,7 +339,7 @@ func TestLoadData(t *testing.T) {
 		Role:      proto.NodeRoleBlobNode,
 		DiskType:  proto.DiskTypeHDD,
 	}
-	nodeTbl, err := normaldb.OpenNodeTable(testDB)
+	nodeTbl, err := normaldb.OpenBlobNodeTable(testDB)
 	require.NoError(t, err)
 	err = nodeTbl.UpdateNode(&nr)
 	require.NoError(t, err)
@@ -352,7 +351,7 @@ func TestLoadData(t *testing.T) {
 		DiskSetID: proto.DiskSetID(2),
 		Status:    proto.DiskStatusRepaired,
 	}
-	diskTbl, err := normaldb.OpenDiskTable(testDB, true)
+	diskTbl, err := normaldb.OpenBlobNodeDiskTable(testDB, true)
 	require.NoError(t, err)
 	err = diskTbl.AddDisk(&dr)
 	require.NoError(t, err)
