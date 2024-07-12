@@ -234,6 +234,22 @@ func TestChunkStorage_ReadWrite(t *testing.T) {
 	shard.Body = bytes.NewReader(shardData)
 	err = cs.Write(ctx, shard)
 	require.NoError(t, err)
+
+	// normal read
+	buff := bytes.NewBuffer(make([]byte, shardSize))
+	shard.Writer = buff
+	nn, err := cs.Read(ctx, shard)
+	require.NoError(t, err)
+	require.Equal(t, int64(shardSize), nn)
+
+	// read cancel
+	buff = bytes.NewBuffer(make([]byte, shardSize))
+	shard.Writer = buff
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	nn, err = cs.Read(ctx, shard)
+	require.ErrorIs(t, context.Canceled, err)
+	require.Equal(t, int64(0), nn)
 }
 
 func TestChunkStorage_ReadWriteInline(t *testing.T) {

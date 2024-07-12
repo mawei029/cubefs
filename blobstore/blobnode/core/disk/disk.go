@@ -500,7 +500,9 @@ func newDiskStorage(ctx context.Context, conf core.Config) (ds *DiskStorage, err
 		Namespace: "blobstore",
 		Subsystem: "blobnode",
 	}
+	// default: 1 queue, 1 thread, 32 depth;  qos max wait cnt 32*2
 	writePool := taskpool.NewWritePool(conf.WriteThreadCnt, conf.WriteQueueDepth, metricConf)
+	// default: 1 queue, 4 thread, 64 depth;  qos max wait cnt 64*2
 	readPool := taskpool.NewReadPool(conf.ReadThreadCnt, conf.ReadQueueDepth, metricConf)
 
 	ds = &DiskStorage{

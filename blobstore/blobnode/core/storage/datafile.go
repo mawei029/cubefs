@@ -34,6 +34,7 @@ import (
 	"github.com/cubefs/cubefs/blobstore/blobnode/core"
 	"github.com/cubefs/cubefs/blobstore/common/crc32block"
 	bloberr "github.com/cubefs/cubefs/blobstore/common/errors"
+	"github.com/cubefs/cubefs/blobstore/common/iostat"
 	"github.com/cubefs/cubefs/blobstore/common/trace"
 	"github.com/cubefs/cubefs/blobstore/util/log"
 	"github.com/cubefs/cubefs/blobstore/util/taskpool"
@@ -337,7 +338,7 @@ func (cd *datafile) Write(ctx context.Context, shard *core.Shard) error {
 
 	start = time.Now()
 
-	_, err = qoswAt.WriteAt(headerbuf, pos) // qos write to raw
+	_, err = qoswAt.WriteAtCtx(ctx, headerbuf, pos) // qos write to raw
 	span.AppendTrackLog("hdr.w", start, err)
 	if err != nil {
 		return err
@@ -389,7 +390,7 @@ func (cd *datafile) Write(ctx context.Context, shard *core.Shard) error {
 	pos = w.Offset
 	start = time.Now()
 
-	_, err = qoswAt.WriteAt(footerbuf, pos)
+	_, err = qoswAt.WriteAtCtx(ctx, footerbuf, pos)
 	span.AppendTrackLog("fo.w", start, err)
 	if err != nil {
 		return err
@@ -522,10 +523,9 @@ func (cd *datafile) qosReaderAt(ctx context.Context, reader io.ReaderAt) io.Read
 	return cd.ioQos.ReaderAt(ctx, ioType, reader)
 }
 
-func (cd *datafile) qosWriterAt(ctx context.Context, writer io.WriterAt) io.WriterAt {
+func (cd *datafile) qosWriterAt(ctx context.Context, writer iostat.WriterAtCtx) iostat.WriterAtCtx {
 	ioType := bnapi.GetIoType(ctx)
-	w := cd.ioQos.WriterAt(ctx, ioType, writer)
-	return w
+	return cd.ioQos.WriterAt(ctx, ioType, writer)
 }
 
 func (cd *datafile) qosWriter(ctx context.Context, writer io.Writer) io.Writer {

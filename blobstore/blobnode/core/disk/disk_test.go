@@ -154,6 +154,10 @@ func TestRunCompact(t *testing.T) {
 		AllocDiskID:      getDiskIDFn,
 		NotifyCompacting: setChunkCompactFn,
 		HandleIOError:    handleIOErrorFn,
+		RuntimeConfig: core.RuntimeConfig{
+			WriteQueueDepth: 64,
+			ReadQueueDepth:  128,
+		},
 	}
 	ds, err := NewDiskStorage(ctx, diskConfig)
 	require.NoError(t, err)
@@ -301,6 +305,10 @@ func TestDiskStorage_CompactChunkFile2(t *testing.T) {
 		AllocDiskID:      getDiskIDFn,
 		NotifyCompacting: setChunkCompactFn,
 		HandleIOError:    handleIOErrorFn,
+		RuntimeConfig: core.RuntimeConfig{
+			WriteQueueDepth: 64,
+			ReadQueueDepth:  128,
+		},
 	}
 	ds, err := NewDiskStorage(ctx, diskConfig)
 	require.NoError(t, err)
