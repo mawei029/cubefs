@@ -5,6 +5,7 @@ go 1.17
 replace (
 	github.com/jacobsa/fuse => ./depends/jacobsa/fuse
 	github.com/spf13/cobra => ./depends/spf13/cobra
+	github.com/tecbot/gorocksdb v0.0.0-20191217155057-f0fad39f321c => github.com/Cloudstriff/gorocksdb v1.0.1
 )
 
 require (
@@ -76,7 +77,7 @@ require (
 	github.com/facebookgo/subset v0.0.0-20200203212716-c811ad88dec4 // indirect
 	github.com/go-playground/locales v0.14.1 // indirect
 	github.com/go-playground/universal-translator v0.18.1 // indirect
-	github.com/gogo/protobuf v1.3.2 // indirect
+	github.com/gogo/protobuf v1.3.2
 	github.com/golang/snappy v0.0.4 // indirect
 	github.com/gorilla/websocket v1.4.2 // indirect
 	github.com/graphql-go/graphql v0.8.0 // indirect
