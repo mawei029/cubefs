@@ -125,11 +125,14 @@ func TestDiskMgr_Dropping(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, 0, len(droppingList))
 
-		err = testDiskMgr.applyDroppingDisk(ctx, 1)
+		err = testDiskMgr.applySwitchReadonly(1, true)
+		require.NoError(t, err)
+
+		_, err = testDiskMgr.applyDroppingDisk(ctx, 1, true)
 		require.NoError(t, err)
 
 		// add dropping disk repeatedly
-		err = testDiskMgr.applyDroppingDisk(ctx, 1)
+		_, err = testDiskMgr.applyDroppingDisk(ctx, 1, true)
 		require.NoError(t, err)
 
 		// set status when disk is dropping, return ErrChangeDiskStatusNotAllow
@@ -151,7 +154,10 @@ func TestDiskMgr_Dropping(t *testing.T) {
 
 	// dropped
 	{
-		err := testDiskMgr.applyDroppingDisk(ctx, 2)
+		err := testDiskMgr.applySwitchReadonly(2, true)
+		require.NoError(t, err)
+
+		_, err = testDiskMgr.applyDroppingDisk(ctx, 2, true)
 		require.NoError(t, err)
 		droppingList, err := testDiskMgr.ListDroppingDisk(ctx)
 		require.NoError(t, err)
@@ -161,7 +167,7 @@ func TestDiskMgr_Dropping(t *testing.T) {
 		require.NoError(t, err)
 
 		// add dropping disk 1 repeatedly
-		err = testDiskMgr.applyDroppingDisk(ctx, 1)
+		_, err = testDiskMgr.applyDroppingDisk(ctx, 1, true)
 		require.NoError(t, err)
 
 		droppingList, err = testDiskMgr.ListDroppingDisk(ctx)
