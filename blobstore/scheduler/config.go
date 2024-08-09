@@ -55,6 +55,8 @@ const (
 	defaultMaxBatchSize           = 10
 	defaultBatchIntervalSec       = 2
 
+	defaultAppliedIndexThreshold = uint64(10)
+
 	defaultTaskLimitPerDisk = 1
 
 	defaultTickInterval   = uint32(1)
@@ -202,6 +204,8 @@ func (c *Config) fixConfig() (err error) {
 		return err
 	}
 	c.fixRegisterConfig()
+
+	c.fixShardDiskRepairConfig()
 	return nil
 }
 
@@ -307,4 +311,9 @@ func (c *Config) fixRegisterConfig() {
 	defaulter.LessOrEqual(&c.ServiceRegister.TickInterval, defaultTickInterval)
 	defaulter.LessOrEqual(&c.ServiceRegister.HeartbeatTicks, defaultHeartbeatTicks)
 	defaulter.LessOrEqual(&c.ServiceRegister.ExpiresTicks, defaultExpiresTicks)
+}
+
+func (c *Config) fixShardDiskRepairConfig() {
+	defaulter.LessOrEqual(&c.ShardDiskRepair.AppliedIndexThreshold, defaultAppliedIndexThreshold)
+	c.ShardDiskRepair.CheckAndFix()
 }
