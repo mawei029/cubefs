@@ -315,10 +315,16 @@ build_blobstore_cli() {
     popd >/dev/null
 }
 
+build_shardnode() {
+    pushd $SrcPath/blobstore/cmd/shardnode >/dev/null
+    CGO_ENABLED=1 go build ${MODFLAGS} -gcflags=all=-trimpath=${BlobPath} -asmflags=all=-trimpath=${BlobPath} -ldflags="${LDFlags}" -o ${BuildBinPath}/blobstore .
+    popd >/dev/null
+}
+
 build_blobstore() {
     pushd $SrcPath >/dev/null
     echo -n "build blobstore    "
-    build_clustermgr && build_blobnode && build_access && build_scheduler && build_proxy && build_blobstore_cli && echo "success" || echo "failed"
+    build_clustermgr && build_blobnode && build_access && build_scheduler && build_proxy && build_blobstore_cli && build_shardnode && echo "success" || echo "failed"
     popd >/dev/null
 }
 
