@@ -26,6 +26,7 @@ import (
 	"github.com/dustin/go-humanize"
 	"github.com/fatih/color"
 
+	"github.com/cubefs/cubefs/blobstore/api/clustermgr"
 	"github.com/cubefs/cubefs/blobstore/cli/common"
 	"github.com/cubefs/cubefs/blobstore/cli/common/args"
 	"github.com/cubefs/cubefs/blobstore/cli/common/cfmt"
@@ -149,6 +150,32 @@ func cmdBlob(c *grumble.Context) (err error) {
 	return nil
 }
 
+func cmdBlobNode(c *grumble.Context) (err error) {
+	if c.Flags.String("chunkName") != "" {
+		str := c.Flags.String("chunkName")
+		chunkId, err := parseChunkNameStr(str)
+		t := time.Unix(0, int64(chunkId.UnixTime())).Format("2006-01-02 15:04:05")
+		fmt.Printf("vuid=%d, timestamp=%d, time=%s\n", chunkId.VolumeUnitId(), chunkId.UnixTime(), t)
+		return err
+	}
+
+	return nil
+}
+
+func parseChunkNameStr(name string) (chunkId clustermgr.ChunkID, err error) {
+	const chunkFileLen = 33 // 16+1+16, vuid-timestamp
+
+	if len(name) != chunkFileLen {
+		return chunkId, fmt.Errorf("chunk file name length not match, file:%s", name)
+	}
+
+	if err = chunkId.Unmarshal([]byte(name)); err != nil {
+		return chunkId, err
+	}
+
+	return chunkId, nil
+}
+
 func registerUtil(app *grumble.App) {
 	utilCommand := &grumble.Command{
 		Name:     "util",
@@ -195,6 +222,15 @@ func registerUtil(app *grumble.App) {
 			f.String("b", "byteToStr", "", "BlobName/ShardKeys []byte -> string")
 			f.String("s", "strToByte", "", "BlobName/ShardKeys string -> []byte")
 			f.Uint64("u", "suidToStr", 0, "suid -> string")
+		},
+	})
+
+	utilCommand.AddCommand(&grumble.Command{
+		Name: "bn",
+		Help: "parse blobnode tools",
+		Run:  cmdBlobNode,
+		Flags: func(f *grumble.Flags) {
+			f.String("c", "chunkName", "", "chunk file name -> vuid")
 		},
 	})
 

@@ -12,7 +12,7 @@ import (
 	"strconv"
 	"time"
 
-	bnapi "github.com/cubefs/cubefs/blobstore/api/blobnode"
+	cmapi "github.com/cubefs/cubefs/blobstore/api/clustermgr"
 	"github.com/cubefs/cubefs/blobstore/util/log"
 )
 
@@ -72,7 +72,7 @@ func walkAllChunk() {
 		panic(err)
 	}
 
-	chunkId := &bnapi.ChunkId{}
+	chunkId := &cmapi.ChunkID{}
 	findVuid := false
 	cnt := 0
 	for _, file := range files {
@@ -139,8 +139,8 @@ func readSingleChunk(fileName string) {
 	}
 }
 
-func parseChunkNameStr(name string) *bnapi.ChunkId {
-	chunkId := &bnapi.ChunkId{}
+func parseChunkNameStr(name string) *cmapi.ChunkID {
+	chunkId := &cmapi.ChunkID{}
 	if err := chunkId.Unmarshal([]byte(name)); err != nil {
 		panic(err)
 	}
@@ -195,7 +195,7 @@ func alignSize(p int64, bound int64) (r int64) {
 type ChunkHeader struct {
 	magic       [4]byte
 	version     byte
-	parentChunk bnapi.ChunkId
+	parentChunk cmapi.ChunkID
 	createTime  int64
 }
 
