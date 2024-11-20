@@ -9,6 +9,7 @@ import (
 	"time"
 
 	bnapi "github.com/cubefs/cubefs/blobstore/api/blobnode"
+	cmapi "github.com/cubefs/cubefs/blobstore/api/clustermgr"
 	"github.com/cubefs/cubefs/blobstore/blobnode/core"
 	"github.com/cubefs/cubefs/blobstore/blobnode/core/disk"
 	"github.com/cubefs/cubefs/blobstore/blobnode/core/storage"
@@ -54,7 +55,7 @@ func main() {
 	defer s.Close(ctx)
 	sDb := s.GetDb()
 
-	cm, err := storage.NewChunkMeta(ctx, &cfg, core.VuidMeta{DiskID: args.diskId, ChunkId: chunkId}, sDb)
+	cm, err := storage.NewChunkMeta(ctx, &cfg, core.VuidMeta{DiskID: args.diskId, ChunkID: chunkId}, sDb)
 	log.Infof("cm=%+v, err=%+v", cm, err)
 	fmt.Println("get chunk meta db success")
 
@@ -108,7 +109,7 @@ func checkConf() *opArgs {
 	}
 }
 
-func findChunkName(args *opArgs) bnapi.ChunkId {
+func findChunkName(args *opArgs) cmapi.ChunkID {
 	files, err := os.ReadDir(args.dPath)
 	if err != nil {
 		panic(err)
@@ -129,8 +130,8 @@ func findChunkName(args *opArgs) bnapi.ChunkId {
 	panic("can not find vuid -> chunk file")
 }
 
-func parseChunkNameStr(name string) *bnapi.ChunkId {
-	chunkId := &bnapi.ChunkId{}
+func parseChunkNameStr(name string) *cmapi.ChunkID {
+	chunkId := &cmapi.ChunkID{}
 	if err := chunkId.Unmarshal([]byte(name)); err != nil {
 		panic(err)
 	}

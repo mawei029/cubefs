@@ -291,3 +291,21 @@ func convertEIO(err error) error {
 
 	return err
 }
+
+type SetShardFlagArgs struct {
+	DiskID proto.DiskID `json:"diskid"`
+	Vuid   proto.Vuid   `json:"vuid"`
+	Bid    proto.BlobID `json:"bid"`
+	Flag   ShardStatus  `json:"flag"`
+}
+
+func (c *client) SetShardFlag(ctx context.Context, host string, args *SetShardFlagArgs) (err error) {
+	if !IsValidDiskID(args.DiskID) {
+		err = bloberr.ErrInvalidDiskId
+		return
+	}
+
+	urlStr := fmt.Sprintf("%v/shard/setshardflag/diskid/%v/vuid/%v/bid/%v/flag/%v", host, args.DiskID, args.Vuid, args.Bid, args.Flag)
+	err = c.PostWith(ctx, urlStr, nil, rpc.NoneBody)
+	return
+}
