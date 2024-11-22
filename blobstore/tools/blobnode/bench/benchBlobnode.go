@@ -25,6 +25,7 @@ import (
 	errorcode "github.com/cubefs/cubefs/blobstore/common/errors"
 	"github.com/cubefs/cubefs/blobstore/common/proto"
 	"github.com/cubefs/cubefs/blobstore/util/log"
+	"github.com/cubefs/cubefs/blobstore/util/taskpool"
 	"github.com/cubefs/cubefs/util/errors"
 )
 
@@ -39,6 +40,7 @@ import (
 // POST /chunk/create/diskid/:diskid/vuid/:vuid?chunksize={size}
 // POST /chunk/release/diskid/:diskid/vuid/:vuid?force={flag}
 // GET /chunk/stat/diskid/:diskid/vuid/:vuid
+// GET /chunk/list/diskid/:diskid
 
 var (
 	confFile      = flag.String("f", "bench_blobnode.conf", "config file path")
@@ -81,6 +83,7 @@ type BlobnodeTestConf struct {
 	PutBidStart uint64                        `json:"put_bid_start"`
 	MaxCnt      uint64                        `json:"max_cnt"` // max count per concurrence
 	PrintSec    int                           `json:"print_sec"`
+	PerVuid     int                           `json:"per_vuid"` // concurrence for per vuid/chunk
 	Vuids       map[proto.DiskID][]proto.Vuid `json:"vuids"`
 }
 
@@ -165,6 +168,9 @@ func invalidArgs() error {
 	}
 	if conf.MaxCnt == 0 { // fix it
 		conf.MaxCnt = math.MaxInt64
+	}
+	if conf.PerVuid == 0 {
+		conf.PerVuid = 1
 	}
 
 	return nil
@@ -468,6 +474,11 @@ func (mgr *BlobnodeMgr) release(ctx context.Context) {
 	}
 }
 
+type putRet struct {
+	errCode int
+	bid     uint64
+}
+
 func (mgr *BlobnodeMgr) singlePut(chunkIdx int, vuid proto.Vuid, diskId proto.DiskID, wg *sync.WaitGroup) {
 	off := uint64(0)
 	size := fileSize[strings.ToUpper(*dataSize)]
@@ -479,37 +490,63 @@ func (mgr *BlobnodeMgr) singlePut(chunkIdx int, vuid proto.Vuid, diskId proto.Di
 	file := getFile(vuid, diskId)
 	defer file.Close()
 
+	tp := taskpool.New(mgr.conf.PerVuid, mgr.conf.PerVuid)
+	defer tp.Close()
+	retCh := make(chan putRet, mgr.conf.PerVuid)
+	retry := make([]uint64, 0, mgr.conf.PerVuid)
+
 	for {
-		// PUT
-		bid := mgr.conf.PutBidStart + off
-		urlStr := fmt.Sprintf("%v/shard/put/diskid/%v/vuid/%v/bid/%v/size/%v?iotype=%d",
-			mgr.conf.Host, diskId, vuid, bid, size, bnapi.NormalIO)
-		errCode := doPost(urlStr, "Put")
-		time.Sleep(time.Millisecond * time.Duration(*putIntervalMs))
+		for i := 0; i < mgr.conf.PerVuid; i++ {
+			tp.Run(func() {
+				// PUT
+				bid := mgr.conf.PutBidStart + atomic.LoadUint64(&off)
+				urlStr := fmt.Sprintf("%v/shard/put/diskid/%v/vuid/%v/bid/%v/size/%v?iotype=%d",
+					mgr.conf.Host, diskId, vuid, bid, size, bnapi.NormalIO)
+				errCode := doPost(urlStr, "Put")
+				retCh <- putRet{errCode: errCode, bid: bid}
+				time.Sleep(time.Millisecond * time.Duration(*putIntervalMs))
+			})
+		}
 
-		if errCode == errorcode.CodeChunkNoSpace {
-			// panic(errCode)
-			// alloc vuid, set vuid
-			for idx := chunkIdx + *concurrency; idx < len(mgr.diskChunkMap[diskId]); idx++ {
-				if mgr.diskChunkMap[diskId][idx].Free > uint64(size) {
-					vuid = mgr.diskChunkMap[diskId][idx].Vuid
-					chunkIdx = idx
-					break
+		hasError := false
+		for i := 0; i < mgr.conf.PerVuid; i++ {
+			ret := <-retCh
+			if ret.errCode == errorcode.CodeChunkNoSpace {
+				// panic(errCode)
+				// alloc vuid, set vuid
+				for idx := chunkIdx + *concurrency; idx < len(mgr.diskChunkMap[diskId]); idx++ {
+					if mgr.diskChunkMap[diskId][idx].Free > uint64(size) {
+						vuid = mgr.diskChunkMap[diskId][idx].Vuid
+						chunkIdx = idx
+						break
+					}
 				}
+				hasError = true
+				retry = append(retry, ret.bid)
+				continue
 			}
-			continue
+
+			//
+			if ret.errCode == errorcode.CodeOverload {
+				hasError = true
+				continue
+			}
+
+			atomic.AddUint64(&putCnt, 1)
+			atomic.AddUint64(&off, 1)
+			// file.WriteString(urlStr + "\n")
+			if isWait && off >= uint64(*getDelay) {
+				isWait = false
+				wg.Done()
+			}
+
+			if off >= uint64(mgr.conf.MaxCnt) {
+				return
+			}
 		}
 
-		atomic.AddUint64(&putCnt, 1)
-		off++
-		file.WriteString(urlStr + "\n")
-		if isWait && off > uint64(*getDelay) {
-			isWait = false
-			wg.Done()
-		}
+		if hasError {
 
-		if off > uint64(mgr.conf.MaxCnt) {
-			return
 		}
 	}
 }
@@ -530,7 +567,7 @@ func (mgr *BlobnodeMgr) singleGet(chunkIdx int, vuid proto.Vuid, diskId proto.Di
 
 		atomic.AddUint64(&getCnt, 1)
 		off++
-		if off > uint64(*getDelay) {
+		if off >= uint64(*getDelay) {
 			off = 0
 		}
 	}
@@ -622,8 +659,7 @@ func doPost(url string, operation string) int {
 
 	req.Header.Set("Content-Type", "application/json")
 	req.ContentLength = int64(len(dataBuff))
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		panic(err)
 	}
@@ -649,8 +685,7 @@ func doPost(url string, operation string) int {
 
 func doGet(url string, operation string) int {
 	log.Debugf("do get once, %s", url)
-	client := http.Client{}
-	rsp, err := client.Get(url)
+	rsp, err := http.DefaultClient.Get(url)
 	if err != nil {
 		panic(err)
 	}
