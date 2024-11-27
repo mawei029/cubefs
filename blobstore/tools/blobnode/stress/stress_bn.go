@@ -2,16 +2,17 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"math/rand"
 	"net/http"
 	"sync"
 	"time"
-
-	"github.com/link1st/go-stress-testing/model"
-	"github.com/link1st/go-stress-testing/server"
+	//"github.com/link1st/go-stress-testing/model"
+	//"github.com/link1st/go-stress-testing/server"
 )
+
+//"github.com/link1st/go-stress-testing/model"
+//"github.com/link1st/go-stress-testing/server"
 
 const (
 	baseURL       = "http://ip:port/put" // 替换为你的 IP 和端口
@@ -84,10 +85,10 @@ func main() {
 	//model.NewRequest(requestURL)
 	//server.Dispose()
 	requestFunc()
-	request, err := model.NewRequest("", "", 0, 0, false, "", nil, "", 0, false, false, false)
-	if err != nil {
-		return
-	}
-	request.Print()
-	server.Dispose(context.Background(), 1, 2, request)
+	//request, err := model.NewRequest("", "", 0, 0, false, "", nil, "", 0, false, false, false)
+	//if err != nil {
+	//	return
+	//}
+	//request.Print()
+	//server.Dispose(context.Background(), 1, 2, request)
 }
