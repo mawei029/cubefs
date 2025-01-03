@@ -10,6 +10,7 @@ import (
 	"io/ioutil"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -50,6 +51,7 @@ const (
 	opModeDel
 	opModeAlloc
 	opModeRelease
+	opModeRandomGet
 
 	overloadSleepMs = 100
 )
@@ -67,6 +69,7 @@ var (
 	fileSize = map[string]int{
 		"4B":   4,
 		"4K":   4 << 10,
+		"32K":  32 << 10,
 		"64K":  64 << 10,
 		"128K": 128 << 10,
 		"1M":   1 << 20,
@@ -85,10 +88,11 @@ type BlobnodeTestConf struct {
 	Mode       opMode `json:"mode"` // operation mode[0:invalid,put,get,delete,alloc,release]
 	BidStart   uint64 `json:"bid_start"`
 	MaxCnt     uint64 `json:"max_cnt"`      // max bid count, per concurrence
-	MaxReadCnt uint64 `json:"max_read_cnt"` // max read count, per concurrence
+	MaxReadCnt uint64 `json:"max_read_cnt"` // max read count, per concurrence, may be beyond MaxCnt
 	PerDisk    int    `json:"per_disk"`     // concurrence for per disk
 	PerVuid    int    `json:"per_vuid"`     // concurrence for per vuid/chunk
 	Interval   int    `json:"interval"`     // do request interval
+	Random     bool   `json:"random"`       // random read bid
 
 	DataSize string `json:"data_size"` // data size[4B,4K,64K,128K,1M,4M,8M,16M]
 	SrcFile  string `json:"src_file"`  // src, read data from src file path
@@ -199,6 +203,10 @@ func checkConfig() error {
 	//	conf.Interval = 10
 	//}
 
+	if conf.Host == "" {
+		conf.Host = getLocalHost()
+	}
+
 	return nil
 }
 
@@ -238,6 +246,36 @@ func initData() {
 		panic(err)
 	}
 	log.Infof("read file, dataBuff len=%d (which size will be put)", len(dataBuff))
+}
+
+func getLocalHost() string {
+	localIp := ""
+
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		log.Error("Error:", err)
+		return ""
+	}
+
+	for _, iface := range interfaces {
+		if iface.Name == "bond0" {
+			addrs, err := iface.Addrs()
+			if err != nil {
+				log.Error("Error:", err)
+				return ""
+			}
+
+			for _, addr := range addrs {
+				if ipNet, ok := addr.(*net.IPNet); ok && ipNet.IP.To4() != nil {
+					fmt.Println("bond0 IPv4 Address:", ipNet.IP.String())
+					localIp = ipNet.IP.String()
+					break
+				}
+			}
+		}
+	}
+
+	return fmt.Sprintf("http://%s:8889", localIp)
 }
 
 //func newBlobnodeMgr(disks []*client.DiskInfoSimple, cid proto.ClusterID) *BlobnodeMgr {
@@ -375,13 +413,13 @@ func (mgr *BlobnodeMgr) onlyDelete(ctx context.Context) {
 }
 
 func (mgr *BlobnodeMgr) onlyAlloc(ctx context.Context) {
-	log.SetOutputLevel(0)
+	// log.SetOutputLevel(0)
 	mgr.alloc(ctx)
 	os.Exit(1)
 }
 
 func (mgr *BlobnodeMgr) onlyRelease(ctx context.Context) {
-	log.SetOutputLevel(0)
+	// log.SetOutputLevel(0)
 	mgr.release(ctx)
 	os.Exit(1)
 }
@@ -574,9 +612,14 @@ func (mgr *BlobnodeMgr) multiGet(chunkIdx int, vuid proto.Vuid, diskId proto.Dis
 				if cnt >= mgr.conf.MaxReadCnt {
 					return
 				}
-				off += step
-				if off >= mgr.conf.MaxCnt {
-					off = 0
+
+				if mgr.conf.Random {
+					off = uint64((bidIdx + 1) * rand.Intn(int(mgr.conf.MaxCnt/step)))
+				} else {
+					off += step
+					if off >= mgr.conf.MaxCnt {
+						off = 0
+					}
 				}
 			default:
 				panic(fmt.Errorf("errCode=%d", eCode))
@@ -788,6 +831,11 @@ func (l *SingleDisk) dump(diskId proto.DiskID) {
 	defer file.Close()
 
 	json.NewEncoder(file).Encode(l)
+	fmt.Printf("dump log to file: %s, detail disk vuid info: ", fPath)
+	for i := range l.Vuids {
+		fmt.Printf("%d,", l.Vuids[i].Vuid)
+	}
+	fmt.Println("")
 }
 
 func genId() uint64 {
