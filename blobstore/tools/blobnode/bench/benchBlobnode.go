@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"io/ioutil"
 	"math"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -92,7 +94,8 @@ type BlobnodeTestConf struct {
 	PerDisk    int    `json:"per_disk"`     // concurrence for per disk
 	PerVuid    int    `json:"per_vuid"`     // concurrence for per vuid/chunk
 	Interval   int    `json:"interval"`     // do request interval
-	Random     bool   `json:"random"`       // random read bid
+	Random     bool   `json:"random"`       // random read bid ; random write src data
+	Check      bool   `json:"check"`        // check read data crc32
 
 	DataSize string `json:"data_size"` // data size[4B,4K,64K,128K,1M,4M,8M,16M]
 	SrcFile  string `json:"src_file"`  // src, read data from src file path
@@ -163,7 +166,8 @@ func main() {
 	}
 	mgr.stat.Report()
 
-	log.Infof("putCntTotal=%d, getCntTotal=%d, timeCost=%d ms\n", atomic.LoadUint64(&putCnt), atomic.LoadUint64(&getCnt), time.Since(now).Milliseconds())
+	// log.Infof("putCntTotal=%d, getCntTotal=%d, timeCost=%d ms\n", atomic.LoadUint64(&putCnt), atomic.LoadUint64(&getCnt), time.Since(now).Milliseconds())
+	fmt.Printf("putCntTotal=%d, getCntTotal=%d, timeCost=%d ms\n", atomic.LoadUint64(&putCnt), atomic.LoadUint64(&getCnt), time.Since(now).Milliseconds())
 	os.Exit(1)
 }
 
@@ -187,7 +191,7 @@ func checkConfig() error {
 	if conf.MaxCnt == 0 { // fix it
 		conf.MaxCnt = math.MaxInt64
 	}
-	if conf.MaxReadCnt == 0 || conf.MaxReadCnt < conf.MaxCnt {
+	if conf.MaxReadCnt == 0 { // || conf.MaxReadCnt < conf.MaxCnt {
 		conf.MaxReadCnt = conf.MaxCnt
 	}
 	if conf.PerDisk <= 0 {
@@ -546,7 +550,7 @@ func (mgr *BlobnodeMgr) multiPut(chunkIdx int, vuid proto.Vuid, diskId proto.Dis
 			url := fmt.Sprintf("%v/shard/put/diskid/%v/vuid/%v/bid/%v/size/%v?iotype=%d",
 				mgr.conf.Host, diskId, vuid, bid+off, size, bnapi.NormalIO)
 			start := time.Now()
-			eCode := doPost(url, "Put")
+			eCode := mgr.doPost(url, "Put")
 			mgr.stat.Set(time.Since(start))
 
 			switch eCode {
@@ -596,7 +600,7 @@ func (mgr *BlobnodeMgr) multiGet(chunkIdx int, vuid proto.Vuid, diskId proto.Dis
 		for {
 			urlStr := fmt.Sprintf("%v/shard/get/diskid/%v/vuid/%v/bid/%v?iotype=%d", mgr.conf.Host, diskId, vuid, bid+off, bnapi.NormalIO)
 			start := time.Now()
-			eCode := doGet(urlStr, "Get")
+			eCode := mgr.doGet(urlStr, "Get")
 			mgr.stat.Set(time.Now().Sub(start))
 
 			switch eCode {
@@ -650,7 +654,7 @@ func (mgr *BlobnodeMgr) singlePut(chunkIdx int, vuid proto.Vuid, diskId proto.Di
 	// bid already exist?
 	bidLast := mgr.conf.BidStart + mgr.conf.MaxCnt - 1
 	url := fmt.Sprintf("%s/shard/stat/diskid/%d/vuid/%d/bid/%d", mgr.conf.Host, diskId, vuid, bidLast)
-	errCode := doGet(url, "Get")
+	errCode := mgr.doGet(url, "Get")
 	//if errCode != errorcode.CodeBidNotFound {
 	//	log.Warnf("bid already exist, errCode:%d, last bid:%d", errCode, bidLast)
 	//	return
@@ -661,7 +665,7 @@ func (mgr *BlobnodeMgr) singlePut(chunkIdx int, vuid proto.Vuid, diskId proto.Di
 		url = fmt.Sprintf("%v/shard/put/diskid/%v/vuid/%v/bid/%v/size/%v?iotype=%d",
 			mgr.conf.Host, diskId, vuid, bid, size, bnapi.NormalIO)
 		start := time.Now()
-		errCode = doPost(url, "Put")
+		errCode = mgr.doPost(url, "Put")
 		mgr.stat.Set(time.Since(start))
 
 		switch errCode {
@@ -714,7 +718,7 @@ func (mgr *BlobnodeMgr) singleGet(chunkIdx int, vuid proto.Vuid, diskId proto.Di
 		bid := mgr.conf.BidStart + off
 		urlStr := fmt.Sprintf("%v/shard/get/diskid/%v/vuid/%v/bid/%v?iotype=%d", mgr.conf.Host, diskId, vuid, bid, bnapi.NormalIO)
 		start := time.Now()
-		eCode := doGet(urlStr, "Get")
+		eCode := mgr.doGet(urlStr, "Get")
 		mgr.stat.Set(time.Now().Sub(start))
 
 		switch eCode {
@@ -747,9 +751,9 @@ func (mgr *BlobnodeMgr) singleDel(chunkIdx int, vuid proto.Vuid, diskId proto.Di
 	for off := uint64(0); off < mgr.conf.MaxCnt; off++ {
 		bid := mgr.conf.BidStart + off
 		urlStr := fmt.Sprintf("%v/shard/markdelete/diskid/%v/vuid/%v/bid/%v", mgr.conf.Host, diskId, vuid, bid)
-		eCode := doPost(urlStr, "markDelete")
+		eCode := mgr.doPost(urlStr, "markDelete")
 		urlStr = fmt.Sprintf("%v/shard/delete/diskid/%v/vuid/%v/bid/%v", mgr.conf.Host, diskId, vuid, bid)
-		eCode = doPost(urlStr, "delete")
+		eCode = mgr.doPost(urlStr, "delete")
 		time.Sleep(time.Millisecond * time.Duration(mgr.conf.Interval))
 
 		if eCode != http.StatusOK {
@@ -769,7 +773,7 @@ func (mgr *BlobnodeMgr) singleAlloc(chunkIdx int, vuid proto.Vuid, diskId proto.
 
 	for i := 0; i < maxRetry; i++ {
 		urlStr = fmt.Sprintf("%v/chunk/create/diskid/%v/vuid/%v?chunksize=%v", mgr.conf.Host, diskId, vuid, _16GB)
-		eCode = doPost(urlStr, "alloc")
+		eCode = mgr.doPost(urlStr, "alloc")
 
 		if eCode == errorcode.CodeAlreadyExist {
 			vuid++ // epoch+1
@@ -782,7 +786,7 @@ func (mgr *BlobnodeMgr) singleAlloc(chunkIdx int, vuid proto.Vuid, diskId proto.
 	}
 
 	urlStr = fmt.Sprintf("%v/chunk/stat/diskid/%v/vuid/%v", mgr.conf.Host, diskId, vuid)
-	eCode = doGet(urlStr, "alloc")
+	eCode = mgr.doGet(urlStr, "alloc")
 	if eCode != http.StatusOK {
 		panic(eCode)
 	}
@@ -790,13 +794,13 @@ func (mgr *BlobnodeMgr) singleAlloc(chunkIdx int, vuid proto.Vuid, diskId proto.
 
 func (mgr *BlobnodeMgr) singleRelease(chunkIdx int, vuid proto.Vuid, diskId proto.DiskID) {
 	urlStr := fmt.Sprintf("%v/chunk/release/diskid/%v/vuid/%v?force=%v", mgr.conf.Host, diskId, vuid, true)
-	eCode := doPost(urlStr, "release")
+	eCode := mgr.doPost(urlStr, "release")
 	if eCode != http.StatusOK {
 		panic(eCode)
 	}
 
 	urlStr = fmt.Sprintf("%v/chunk/stat/diskid/%v/vuid/%v", mgr.conf.Host, diskId, vuid)
-	eCode = doGet(urlStr, "stat")
+	eCode = mgr.doGet(urlStr, "stat")
 	if eCode != http.StatusOK {
 		panic(eCode)
 	}
@@ -854,21 +858,27 @@ const (
 	// _64B   = 64
 )
 
-func doPost(url string, operation string) int {
+func (mgr *BlobnodeMgr) doPost(url string, operation string) int {
 	log.Debugf("do post once, %s", url)
+
 	buff := make([]byte, 0, 1)
 	if operation == "Put" {
-		buff = make([]byte, len(dataBuff))
-		copy(buff, dataBuff)
+		if mgr.conf.Random {
+			buff = make([]byte, len(dataBuff))
+			copy(buff, dataBuff)
 
-		// mock random put data
-		if len(dataBuff) >= _256B {
-			rand.Seed(time.Now().UnixNano())
-			for i := 0; i < len(dataBuff); i += _256B {
-				buff[i] = strVal[rand.Intn(len(strVal))]
+			// mock random put data
+			if len(dataBuff) >= _256B {
+				rand.Seed(time.Now().UnixNano())
+				for i := 0; i < len(dataBuff); i += _256B {
+					buff[i] = strVal[rand.Intn(len(strVal))]
+				}
 			}
+		} else {
+			buff = dataBuff
 		}
 	}
+	// fmt.Printf("111: %s\n", buff)
 
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(buff))
 	if err != nil {
@@ -876,7 +886,7 @@ func doPost(url string, operation string) int {
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.ContentLength = int64(len(dataBuff))
+	req.ContentLength = int64(len(buff))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		panic(err)
@@ -901,7 +911,7 @@ func doPost(url string, operation string) int {
 	return http.StatusOK
 }
 
-func doGet(url string, operation string) int {
+func (mgr *BlobnodeMgr) doGet(url string, operation string) int {
 	log.Debugf("do get once, %s", url)
 	rsp, err := http.DefaultClient.Get(url)
 	if err != nil {
@@ -913,17 +923,36 @@ func doGet(url string, operation string) int {
 		log.Warnf("fail to http get, status code:%d, operation: %s, url:%s", rsp.StatusCode, operation, url)
 		return rsp.StatusCode
 	}
-	// buf := make([]byte, rsp.ContentLength)
 	crc := rsp.Header.Get("Crc")
 	if rsp.ContentLength > 0 && rsp.Body != nil {
 		//io.LimitReader(rsp.Body, rsp.ContentLength).Read(buf) // not have limiter
 		//io.CopyN(ioutil.Discard, rsp.Body, rsp.ContentLength)
+		//buf := make([]byte, rsp.ContentLength)
+		dst := bytes.NewBuffer([]byte{})
 		rd := io.LimitReader(rsp.Body, rsp.ContentLength)
-		io.CopyN(ioutil.Discard, rd, rsp.ContentLength)
+		//n, err := io.ReadAll(rsp.Body)
 		// http get, operation: Get, url:http://ip:8889/shard/get/diskid/653/vuid/8127987705146507265/bid/47?iotype=0, response:1048576, dst:1048576, crc:1561641303
-		// log.Infof("http get, operation: %s, url:%s, response:%d, dst:%d, crc:%s", operation, url, rsp.ContentLength, len(buf), crc)
+		//log.Infof("http get, operation: %s, url:%s, response:%d, dst:%d, crc:%s, data:%s", operation, url, rsp.ContentLength, len(buf), crc, buf[len(buf)-1])
+		//log.Infof("get data, url:%s, len:%d, crc:%s, data:%s, n:%d, err:%+v", url, rsp.ContentLength, crc, dst.String(), n, err)
+		if mgr.conf.Check {
+			crc32 := crc32.NewIEEE()
+			body := io.TeeReader(rd, crc32)
+			n, err := io.CopyN(dst, body, rsp.ContentLength)
+			crcSum := crc32.Sum32()
+			crcNum, _ := strconv.Atoi(crc)
+			log.Infof("get data, url:%s, len:%d, expectCrc:%d, crcSum32:%d, n:%d, err:%+v", url, rsp.ContentLength, crcNum, crcSum, n, err)
+			if crcNum != int(crcSum) {
+				log.Warnf("get data, crc not match, expect:%d, actual:%d, url:%s, len:%d, n:%d, err:%+v",
+					crcNum, crcSum, url, rsp.ContentLength, n, err)
+			}
+		} else {
+			n, err := io.CopyN(ioutil.Discard, rd, rsp.ContentLength)
+			if err != nil {
+				log.Warnf("get data error, url:%s, len:%d, n:%d, err:%+v", url, rsp.ContentLength, n, err)
+			}
+		}
 	}
-	log.Debugf("do http get, crc=%s", crc) // !(EXTRA []string=[119067115])
+	//log.Debugf("do http get, crc=%s", crc) // !(EXTRA []string=[119067115])
 	//for key, val := range rsp.Header {
 	//	if key == "Crc" {
 	//		log.Debugf("do http get, crc=%v", val) // !(EXTRA []string=[119067115])
@@ -931,7 +960,7 @@ func doGet(url string, operation string) int {
 	//}
 
 	//log.Debugf("do http get, url:%s, resp body: %s, resp:%+v", url, string(buf), rsp)
-	log.Debugf("do http get, url:%s, resp:%+v", url, rsp)
+	log.Debugf("do http get, url:%s, crc=%s, resp:%+v", url, crc, rsp)
 	return http.StatusOK
 }
 
