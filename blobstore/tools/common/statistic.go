@@ -6,12 +6,13 @@ import (
 	"time"
 )
 
-func NewTimeStatistic(module string, unitUs time.Duration, intervalNum int) *TimeStatistic {
+func NewTimeStatistic(module string, unitUs time.Duration, intervalNum, concurrence int) *TimeStatistic {
 	return &TimeStatistic{
 		module:      module,
 		buckets:     make([]int64, intervalNum+1),
 		unitUs:      unitUs,
 		intervalNum: intervalNum,
+		concurrence: concurrence,
 	}
 }
 
@@ -22,6 +23,7 @@ type TimeStatistic struct {
 	unitUs        time.Duration
 	totalReqNum   int64
 	totalTimeCost int64
+	concurrence   int
 }
 
 func (t *TimeStatistic) Set(costUs time.Duration) {
@@ -35,8 +37,9 @@ func (t *TimeStatistic) Set(costUs time.Duration) {
 }
 
 func (t *TimeStatistic) Report() {
-	fmt.Printf("%s time cost[avg]: %fus\n", t.module, float64(t.totalTimeCost)/float64(t.totalReqNum)/float64(time.Microsecond))
-	fmt.Printf("%s total request: %d, QPS: %f\n", t.module, t.totalReqNum, float64(time.Second)/(float64(t.totalTimeCost)/float64(t.totalReqNum)))
+	avgNum := float64(t.totalTimeCost) / float64(t.totalReqNum)
+	fmt.Printf("%s time cost[avg]: %fus, total time: %fms\n", t.module, avgNum/float64(time.Microsecond), float64(t.totalTimeCost)/float64(time.Millisecond)/float64(t.concurrence))
+	fmt.Printf("%s total request: %d, QPS: %f, total QPS: %f\n", t.module, t.totalReqNum, float64(time.Second)/(avgNum), float64(t.concurrence)*float64(time.Second)/(avgNum))
 
 	p99ReqStartOffset := t.totalReqNum * 99 / 100
 	p999ReqStartOffset := t.totalReqNum * 999 / 1000

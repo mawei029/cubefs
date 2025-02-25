@@ -53,7 +53,8 @@ const (
 	opModeDel
 	opModeAlloc
 	opModeRelease
-	opModeRandomGet
+	opModePutFullDisk
+	// opModeRandomGet
 
 	overloadSleepMs = 100
 )
@@ -91,6 +92,7 @@ type BlobnodeTestConf struct {
 	BidStart   uint64 `json:"bid_start"`
 	MaxCnt     uint64 `json:"max_cnt"`      // max bid count, per concurrence
 	MaxReadCnt uint64 `json:"max_read_cnt"` // max read count, per concurrence, may be beyond MaxCnt
+	MaxRound   int    `json:"max_round"`    // max put round, keep writing data until the disk is full
 	PerDisk    int    `json:"per_disk"`     // concurrence for per disk
 	PerVuid    int    `json:"per_vuid"`     // concurrence for per vuid/chunk
 	Interval   int    `json:"interval"`     // do request interval
@@ -155,7 +157,9 @@ func main() {
 		mgr.onlyAlloc(ctx)
 	case opModeRelease:
 		mgr.onlyRelease(ctx)
-
+	// keep writing data until the disk is full
+	case opModePutFullDisk:
+		mgr.putFullDisk(ctx)
 	default:
 		panic(errors.New("invalid op mode"))
 	}
@@ -166,8 +170,8 @@ func main() {
 	}
 	mgr.stat.Report()
 
-	// log.Infof("putCntTotal=%d, getCntTotal=%d, timeCost=%d ms\n", atomic.LoadUint64(&putCnt), atomic.LoadUint64(&getCnt), time.Since(now).Milliseconds())
 	fmt.Printf("putCntTotal=%d, getCntTotal=%d, timeCost=%d ms\n", atomic.LoadUint64(&putCnt), atomic.LoadUint64(&getCnt), time.Since(now).Milliseconds())
+	log.Infof("putCntTotal=%d, getCntTotal=%d, timeCost=%d ms\n", atomic.LoadUint64(&putCnt), atomic.LoadUint64(&getCnt), time.Since(now).Milliseconds())
 	os.Exit(1)
 }
 
@@ -193,6 +197,9 @@ func checkConfig() error {
 	}
 	if conf.MaxReadCnt == 0 { // || conf.MaxReadCnt < conf.MaxCnt {
 		conf.MaxReadCnt = conf.MaxCnt
+	}
+	if conf.MaxRound == 0 {
+		conf.MaxRound = 1
 	}
 	if conf.PerDisk <= 0 {
 		conf.PerDisk = 1
@@ -234,22 +241,21 @@ func initConfMgr(ctx context.Context) {
 }
 
 func initData() {
-	if conf.Mode != opModePut { // put, all, putGet
-		return
-	}
+	// put, put until full
+	if conf.Mode == opModePut || conf.Mode == opModePutFullDisk {
+		size := fileSize[strings.ToUpper(conf.DataSize)]
+		f, err := os.Open(conf.SrcFile)
+		if err != nil {
+			panic(err)
+		}
 
-	size := fileSize[strings.ToUpper(conf.DataSize)]
-	f, err := os.Open(conf.SrcFile)
-	if err != nil {
-		panic(err)
+		dataBuff = make([]byte, size) //buff := make([]byte, size)
+		_, err = f.Read(dataBuff)
+		if err != nil {
+			panic(err)
+		}
+		log.Infof("read file, dataBuff len=%d (which size will be put)", len(dataBuff))
 	}
-
-	dataBuff = make([]byte, size) //buff := make([]byte, size)
-	_, err = f.Read(dataBuff)
-	if err != nil {
-		panic(err)
-	}
-	log.Infof("read file, dataBuff len=%d (which size will be put)", len(dataBuff))
 }
 
 func getLocalHost() string {
@@ -298,7 +304,7 @@ func newBlobnodeMgr(ctx context.Context) *BlobnodeMgr {
 		blobnodeCli:   bnapi.New(&bnapi.Config{}),
 		clusterMgrCli: cmapi.New(&conf.ClusterMgr),
 
-		stat: statistic.NewTimeStatistic("bench", 20000*time.Microsecond, 300),
+		stat: statistic.NewTimeStatistic("bench", 20000*time.Microsecond, 300, conf.PerDisk),
 	}
 	//bidStart = conf.BidStart
 
@@ -306,6 +312,7 @@ func newBlobnodeMgr(ctx context.Context) *BlobnodeMgr {
 	if err != nil {
 		log.Fatalf("Fail to list cluster disk, err: %+v", err)
 	}
+	log.Debugf("cm all disks:%+v", disks)
 
 	allDisk := make(map[proto.DiskID]*cmapi.BlobNodeDiskInfo)
 	for i := range disks {
@@ -318,6 +325,7 @@ func newBlobnodeMgr(ctx context.Context) *BlobnodeMgr {
 		for _, disk := range disks {
 			allDisk[disk.DiskID] = disk
 		}
+		log.Debugf("disk info:%+v", *disks[i])
 	}
 
 	disks = mgr.removeRedundantDiskID(allDisk)
@@ -338,6 +346,9 @@ func (mgr *BlobnodeMgr) removeRedundantDiskID(allDisks map[proto.DiskID]*cmapi.B
 		id, exist := uniq[disk.Path]
 		// this id is monotonically increasing, so we take the latest(maximum) diskID in the same path
 		if !exist || id < disk.DiskID {
+			if disk.Status != proto.DiskStatusNormal {
+				continue
+			}
 			uniq[disk.Path] = disk.DiskID
 		}
 	}
@@ -428,6 +439,32 @@ func (mgr *BlobnodeMgr) onlyRelease(ctx context.Context) {
 	os.Exit(1)
 }
 
+func (mgr *BlobnodeMgr) putFullDisk(ctx context.Context) {
+	// keep writing data until the disk is full
+	if mgr.conf.BidStart == 0 {
+		mgr.conf.BidStart = 1
+	}
+	log.Infof("start put... put until full disk:%d, bid start: %d", mgr.conf.DiskId, mgr.conf.BidStart)
+
+	mgr.conf.Vuids = make(map[proto.DiskID][]proto.Vuid)
+	for round := 0; round < mgr.conf.MaxRound; round++ {
+		// alloc and replace new vuid for diskID
+		mgr.alloc(ctx)
+		// time.Sleep(time.Second)
+		log.Infof("start put, round:%d, bid start: %d, vuids: %+v", round, mgr.conf.BidStart, mgr.conf.Vuids)
+		mgr.put(ctx)
+
+		for i := 0; i < cap(mgr.done); i++ {
+			<-mgr.done
+		}
+		log.Infof("end put, round:%d", round)
+		atomic.StoreUint64(&putCnt, 0)
+		atomic.StoreUint64(&getCnt, 0)
+	}
+	close(mgr.done)
+	log.Info("end, put until full disk, max round")
+}
+
 func (mgr *BlobnodeMgr) loopAllDisk(ctx context.Context, fn func(int, proto.Vuid, proto.DiskID)) {
 	for _, disk := range mgr.diskMap {
 		dkId := disk.DiskID
@@ -510,7 +547,9 @@ func (mgr *BlobnodeMgr) alloc(ctx context.Context) {
 			mgr.singleAlloc(0, vuid, diskId)
 			loc.Vuids[i].Vuid = vuid
 		}
-		loc.dump(diskId)
+		vuids := loc.dump(diskId)
+
+		mgr.conf.Vuids[diskId] = vuids
 		return
 	}
 
@@ -772,6 +811,7 @@ func (mgr *BlobnodeMgr) singleAlloc(chunkIdx int, vuid proto.Vuid, diskId proto.
 	// vuid = 0xFFFFF000001 // 0xFFF FF 000001
 
 	for i := 0; i < maxRetry; i++ {
+		// mgr.conf.ChunkSize
 		urlStr = fmt.Sprintf("%v/chunk/create/diskid/%v/vuid/%v?chunksize=%v", mgr.conf.Host, diskId, vuid, _16GB)
 		eCode = mgr.doPost(urlStr, "alloc")
 
@@ -816,7 +856,7 @@ type SingleDisk struct {
 	Vuids []SingleChunk
 }
 
-func (l *SingleDisk) dump(diskId proto.DiskID) {
+func (l *SingleDisk) dump(diskId proto.DiskID) []proto.Vuid {
 	pwd, err := os.Getwd()
 	if err != nil {
 		panic(err)
@@ -834,12 +874,16 @@ func (l *SingleDisk) dump(diskId proto.DiskID) {
 	}
 	defer file.Close()
 
+	vuids := make([]proto.Vuid, len(l.Vuids))
 	json.NewEncoder(file).Encode(l)
 	fmt.Printf("dump log to file: %s, detail disk vuid info: ", fPath)
 	for i := range l.Vuids {
 		fmt.Printf("%d,", l.Vuids[i].Vuid)
+		vuids[i] = l.Vuids[i].Vuid
 	}
 	fmt.Println("")
+
+	return vuids
 }
 
 func genId() uint64 {
