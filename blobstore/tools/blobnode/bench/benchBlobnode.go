@@ -133,7 +133,7 @@ func main() {
 	//*mode = "put"
 	//*bidStart = 1234567890
 	//*readFile = "/home/mw/code/cubefs/blobstore/tools/blobnode/blobnode_test.conf"
-	//*readFile = "/home/oppo/code/cubefs/blobstore/tools/blobnode/blobnode_test.conf"
+	//*confFile = "/home/mw/code/cubefs/blobstore/tools/blobnode/bench/bench_blobnode.conf"
 
 	// 2. init mgr, read data
 	ctx := context.Background()
@@ -189,6 +189,9 @@ func checkConfig() error {
 		conf.PrintSec = 1
 	}
 
+	if ds, err := strconv.Atoi(conf.DataSize); err == nil {
+		fileSize[conf.DataSize] = ds
+	}
 	if _, ok := fileSize[strings.ToUpper(conf.DataSize)]; !ok {
 		return errors.NewErrorf("not support data size %d", conf.DataSize)
 	}
