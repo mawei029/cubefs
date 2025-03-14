@@ -65,6 +65,7 @@ var (
 	//bidStart uint64
 	getCnt   uint64
 	putCnt   uint64
+	delCnt   uint64
 	dataBuff []byte
 	conf     BlobnodeTestConf
 	mgr      *BlobnodeMgr
@@ -171,7 +172,8 @@ func main() {
 	mgr.stat.Report()
 
 	fmt.Printf("putCntTotal=%d, getCntTotal=%d, timeCost=%d ms\n", atomic.LoadUint64(&putCnt), atomic.LoadUint64(&getCnt), time.Since(now).Milliseconds())
-	log.Infof("putCntTotal=%d, getCntTotal=%d, timeCost=%d ms\n", atomic.LoadUint64(&putCnt), atomic.LoadUint64(&getCnt), time.Since(now).Milliseconds())
+	log.Infof("putCntTotal=%d, getCntTotal=%d, delCntTotal=%d, timeCost=%d ms\n",
+		atomic.LoadUint64(&putCnt), atomic.LoadUint64(&getCnt), atomic.LoadUint64(&delCnt), time.Since(now).Milliseconds())
 	os.Exit(1)
 }
 
@@ -469,6 +471,7 @@ func (mgr *BlobnodeMgr) putFullDisk(ctx context.Context) {
 }
 
 func (mgr *BlobnodeMgr) loopAllDisk(ctx context.Context, fn func(int, proto.Vuid, proto.DiskID)) {
+	total := 0
 	for _, disk := range mgr.diskMap {
 		dkId := disk.DiskID
 		cnt := 0
@@ -481,7 +484,10 @@ func (mgr *BlobnodeMgr) loopAllDisk(ctx context.Context, fn func(int, proto.Vuid
 			cnt++
 			go fn(idx, chunk.Vuid, dkId)
 		}
+		total += cnt
 	}
+
+	mgr.done = make(chan struct{}, total)
 }
 
 func (mgr *BlobnodeMgr) loopSpecificDiskVuid(ctx context.Context, fn func(int, proto.Vuid, proto.DiskID)) {
@@ -512,7 +518,7 @@ func (mgr *BlobnodeMgr) serialLoopSpecific(ctx context.Context, fn func(int, pro
 // POST /shard/put/diskid/{diskid}/vuid/{vuid}/bid/{bid}/size/{size}?iotype={iotype}
 func (mgr *BlobnodeMgr) put(ctx context.Context) {
 	if len(mgr.conf.Vuids) > 0 {
-		mgr.loopSpecificDiskVuid(ctx, mgr.multiPut) // mgr.singlePut)
+		mgr.loopSpecificDiskVuid(ctx, mgr.putParallel) // mgr.singlePut)
 		return
 	}
 
@@ -521,7 +527,7 @@ func (mgr *BlobnodeMgr) put(ctx context.Context) {
 }
 func (mgr *BlobnodeMgr) get(ctx context.Context) {
 	if len(mgr.conf.Vuids) > 0 { // for get
-		mgr.loopSpecificDiskVuid(ctx, mgr.multiGet) // mgr.singleGet)
+		mgr.loopSpecificDiskVuid(ctx, mgr.getParallel) // mgr.singleGet)
 		return
 	}
 
@@ -530,7 +536,7 @@ func (mgr *BlobnodeMgr) get(ctx context.Context) {
 
 func (mgr *BlobnodeMgr) delete(ctx context.Context) {
 	if len(mgr.conf.Vuids) > 0 {
-		mgr.loopSpecificDiskVuid(ctx, mgr.singleDel)
+		mgr.loopSpecificDiskVuid(ctx, mgr.delParallel)
 		return
 	}
 
@@ -573,7 +579,7 @@ func (mgr *BlobnodeMgr) release(ctx context.Context) {
 	}
 }
 
-func (mgr *BlobnodeMgr) multiPut(chunkIdx int, vuid proto.Vuid, diskId proto.DiskID) {
+func (mgr *BlobnodeMgr) putParallel(chunkIdx int, vuid proto.Vuid, diskId proto.DiskID) {
 	var wg sync.WaitGroup
 	step := uint64(mgr.conf.PerVuid)
 
@@ -625,7 +631,7 @@ func (mgr *BlobnodeMgr) multiPut(chunkIdx int, vuid proto.Vuid, diskId proto.Dis
 	mgr.done <- struct{}{}
 }
 
-func (mgr *BlobnodeMgr) multiGet(chunkIdx int, vuid proto.Vuid, diskId proto.DiskID) {
+func (mgr *BlobnodeMgr) getParallel(chunkIdx int, vuid proto.Vuid, diskId proto.DiskID) {
 	var wg sync.WaitGroup
 	step := uint64(mgr.conf.PerVuid)
 
@@ -678,6 +684,63 @@ func (mgr *BlobnodeMgr) multiGet(chunkIdx int, vuid proto.Vuid, diskId proto.Dis
 		wg.Add(1)
 		bidIdx := i
 		go singleGet(bidIdx, vuid, diskId)
+	}
+	wg.Wait()
+	mgr.done <- struct{}{}
+}
+
+func (mgr *BlobnodeMgr) delParallel(chunkIdx int, vuid proto.Vuid, diskId proto.DiskID) {
+	var wg sync.WaitGroup
+	step := uint64(mgr.conf.PerVuid)
+
+	judgeErrCode := func(eCode int) bool {
+		switch eCode {
+		case errorcode.CodeOverload:
+			time.Sleep(time.Millisecond * overloadSleepMs)
+			return false // not success
+		case http.StatusOK, errorcode.CodeShardMarkDeleted:
+			return true // true, ok
+		default:
+			panic(eCode)
+		}
+	}
+
+	singleDel := func(bidIdx int, vuid proto.Vuid, diskId proto.DiskID) {
+		bid, off := mgr.conf.BidStart+uint64(bidIdx), uint64(0)
+		defer func() {
+			if bidIdx == int(step) {
+				log.Infof("diskID=%d, vuid=%d, bid start=%d, count=%d", diskId, vuid, mgr.conf.BidStart, off)
+			}
+			wg.Done()
+		}()
+
+		for off < mgr.conf.MaxCnt {
+			urlStr := fmt.Sprintf("%v/shard/markdelete/diskid/%v/vuid/%v/bid/%v", mgr.conf.Host, diskId, vuid, bid+off)
+			eCode := mgr.doPost(urlStr, "markDelete")
+			if !judgeErrCode(eCode) {
+				continue
+			}
+			off += step
+			time.Sleep(time.Millisecond * time.Duration(mgr.conf.Interval))
+		}
+
+		for off = uint64(0); off < mgr.conf.MaxCnt; {
+			urlStr := fmt.Sprintf("%v/shard/delete/diskid/%v/vuid/%v/bid/%v", mgr.conf.Host, diskId, vuid, bid+off)
+			eCode := mgr.doPost(urlStr, "delete")
+			if !judgeErrCode(eCode) {
+				continue
+			}
+
+			off += step
+			atomic.AddUint64(&delCnt, 1)
+			time.Sleep(time.Millisecond * time.Duration(mgr.conf.Interval))
+		}
+	}
+
+	for i := 0; i < mgr.conf.PerVuid; i++ {
+		wg.Add(1)
+		bidIdx := i
+		go singleDel(bidIdx, vuid, diskId)
 	}
 	wg.Wait()
 	mgr.done <- struct{}{}
@@ -790,17 +853,25 @@ func (mgr *BlobnodeMgr) singleGet(chunkIdx int, vuid proto.Vuid, diskId proto.Di
 }
 
 func (mgr *BlobnodeMgr) singleDel(chunkIdx int, vuid proto.Vuid, diskId proto.DiskID) {
-	for off := uint64(0); off < mgr.conf.MaxCnt; off++ {
+	off := uint64(0)
+	defer func() {
+		log.Infof("diskID=%d, vuid=%d, bid start=%d, count=%d", diskId, vuid, mgr.conf.BidStart, off)
+		mgr.done <- struct{}{}
+	}()
+
+	for ; off < mgr.conf.MaxCnt; off++ {
 		bid := mgr.conf.BidStart + off
 		urlStr := fmt.Sprintf("%v/shard/markdelete/diskid/%v/vuid/%v/bid/%v", mgr.conf.Host, diskId, vuid, bid)
 		eCode := mgr.doPost(urlStr, "markDelete")
 		urlStr = fmt.Sprintf("%v/shard/delete/diskid/%v/vuid/%v/bid/%v", mgr.conf.Host, diskId, vuid, bid)
 		eCode = mgr.doPost(urlStr, "delete")
-		time.Sleep(time.Millisecond * time.Duration(mgr.conf.Interval))
 
 		if eCode != http.StatusOK {
 			panic(eCode)
 		}
+
+		atomic.AddUint64(&delCnt, 1)
+		time.Sleep(time.Millisecond * time.Duration(mgr.conf.Interval))
 	}
 }
 
@@ -1087,7 +1158,7 @@ func loopPrintStat() {
 			select {
 			case <-tk.C:
 				idx++
-				fmt.Printf("idx:%d, putCnt=%d, getCnt=%d \n", idx, atomic.LoadUint64(&putCnt), atomic.LoadUint64(&getCnt))
+				fmt.Printf("idx:%d, putCnt=%d, getCnt=%d, delCnt=%d \n", idx, atomic.LoadUint64(&putCnt), atomic.LoadUint64(&getCnt), atomic.LoadUint64(&delCnt))
 			}
 		}
 	}()
