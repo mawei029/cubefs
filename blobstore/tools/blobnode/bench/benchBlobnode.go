@@ -48,12 +48,14 @@ import (
 type opMode int
 
 const (
-	opModePut = opMode(iota + 1)
-	opModeGet
-	opModeDel
-	opModeAlloc
-	opModeRelease
-	opModePutFullDisk
+	opModePut         = opMode(iota + 1) // 1
+	opModeGet                            // 2
+	opModeDel                            // 3
+	opModeAlloc                          // 4
+	opModeRelease                        // 5
+	opModePutFullDisk                    // 6
+	opModeGetFullDisk                    // 7
+	opModeDelFullDisk                    // 8
 	// opModeRandomGet
 
 	overloadSleepMs = 100
@@ -161,6 +163,10 @@ func main() {
 	// keep writing data until the disk is full
 	case opModePutFullDisk:
 		mgr.putFullDisk(ctx)
+	case opModeGetFullDisk:
+		mgr.getFullDisk(ctx)
+	case opModeDelFullDisk:
+		mgr.delFullDisk(ctx)
 	default:
 		panic(errors.New("invalid op mode"))
 	}
@@ -470,6 +476,16 @@ func (mgr *BlobnodeMgr) putFullDisk(ctx context.Context) {
 	log.Info("end, put until full disk, max round")
 }
 
+func (mgr *BlobnodeMgr) getFullDisk(ctx context.Context) {
+	mgr.loopSerialDiskVuid(ctx, mgr.getSerial)
+	return
+}
+
+func (mgr *BlobnodeMgr) delFullDisk(ctx context.Context) {
+	mgr.loopSerialDiskVuid(ctx, mgr.delSerial)
+	return
+}
+
 func (mgr *BlobnodeMgr) loopAllDisk(ctx context.Context, fn func(int, proto.Vuid, proto.DiskID)) {
 	total := 0
 	for _, disk := range mgr.diskMap {
@@ -507,12 +523,32 @@ func (mgr *BlobnodeMgr) loopSpecificDiskVuid(ctx context.Context, fn func(int, p
 	mgr.done = make(chan struct{}, total)
 }
 
-func (mgr *BlobnodeMgr) serialLoopSpecific(ctx context.Context, fn func(int, proto.Vuid, proto.DiskID)) {
+func (mgr *BlobnodeMgr) loopSpecificSerial(ctx context.Context, fn func(int, proto.Vuid, proto.DiskID)) {
 	for dkId, chunks := range mgr.conf.Vuids {
 		for idx, vuid := range chunks {
 			fn(idx, vuid, dkId)
 		}
 	}
+}
+
+func (mgr *BlobnodeMgr) loopSerialDiskVuid(ctx context.Context, fn func(int, proto.Vuid, proto.DiskID, chan struct{})) {
+	total := 0
+	for dkId, chunks := range mgr.conf.Vuids {
+		total += len(chunks)
+		log.Infof("loopSerialDiskVuid, diskId:%d, chunks count:%d", dkId, len(chunks))
+	}
+	mgr.done = make(chan struct{}, total)
+
+	for dkId, chunks := range mgr.conf.Vuids {
+		threadCh := make(chan struct{}, mgr.conf.PerDisk)
+
+		for idx, vuid := range chunks {
+			threadCh <- struct{}{}
+			log.Infof("start work, idx:%d, diskId:%d, vuid:%d", idx, dkId, vuid)
+			go fn(idx, vuid, dkId, threadCh)
+		}
+	}
+	log.Info("end to loopSerialDiskVuid")
 }
 
 // POST /shard/put/diskid/{diskid}/vuid/{vuid}/bid/{bid}/size/{size}?iotype={iotype}
@@ -564,7 +600,7 @@ func (mgr *BlobnodeMgr) alloc(ctx context.Context) {
 
 	if len(mgr.conf.Vuids) > 0 {
 		//mgr.loopSpecificDiskVuid(ctx, nil, mgr.singleAlloc)
-		mgr.serialLoopSpecific(ctx, mgr.singleAlloc)
+		mgr.loopSpecificSerial(ctx, mgr.singleAlloc)
 		return
 	}
 
@@ -574,7 +610,7 @@ func (mgr *BlobnodeMgr) alloc(ctx context.Context) {
 func (mgr *BlobnodeMgr) release(ctx context.Context) {
 	if len(mgr.conf.Vuids) > 0 {
 		//mgr.loopSpecificDiskVuid(ctx, nil, mgr.singleRelease)
-		mgr.serialLoopSpecific(ctx, mgr.singleRelease)
+		mgr.loopSpecificSerial(ctx, mgr.singleRelease)
 		return
 	}
 }
@@ -744,6 +780,16 @@ func (mgr *BlobnodeMgr) delParallel(chunkIdx int, vuid proto.Vuid, diskId proto.
 	}
 	wg.Wait()
 	mgr.done <- struct{}{}
+}
+
+func (mgr *BlobnodeMgr) getSerial(chunkIdx int, vuid proto.Vuid, diskId proto.DiskID, concurrence chan struct{}) {
+	mgr.getParallel(chunkIdx, vuid, diskId)
+	<-concurrence
+}
+
+func (mgr *BlobnodeMgr) delSerial(chunkIdx int, vuid proto.Vuid, diskId proto.DiskID, concurrence chan struct{}) {
+	mgr.delParallel(chunkIdx, vuid, diskId)
+	<-concurrence
 }
 
 func (mgr *BlobnodeMgr) singlePut(chunkIdx int, vuid proto.Vuid, diskId proto.DiskID) {
