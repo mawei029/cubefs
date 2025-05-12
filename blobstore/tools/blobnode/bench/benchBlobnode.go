@@ -457,6 +457,11 @@ func (mgr *BlobnodeMgr) putFullDisk(ctx context.Context) {
 	}
 	log.Infof("start put... put until full disk:%d, bid start: %d", mgr.conf.DiskId, mgr.conf.BidStart)
 
+	if len(mgr.conf.Vuids) != 0 {
+		mgr.loopSerialDiskVuid(ctx, mgr.putSerial)
+		return
+	}
+
 	mgr.conf.Vuids = make(map[proto.DiskID][]proto.Vuid)
 	for round := 0; round < mgr.conf.MaxRound; round++ {
 		// alloc and replace new vuid for diskID
@@ -477,11 +482,21 @@ func (mgr *BlobnodeMgr) putFullDisk(ctx context.Context) {
 }
 
 func (mgr *BlobnodeMgr) getFullDisk(ctx context.Context) {
+	if len(mgr.conf.Vuids) == 0 {
+		log.Errorf("getFullDisk, no vuid")
+		return
+	}
+
 	mgr.loopSerialDiskVuid(ctx, mgr.getSerial)
 	return
 }
 
 func (mgr *BlobnodeMgr) delFullDisk(ctx context.Context) {
+	if len(mgr.conf.Vuids) == 0 {
+		log.Errorf("delFullDisk, no vuid")
+		return
+	}
+
 	mgr.loopSerialDiskVuid(ctx, mgr.delSerial)
 	return
 }
@@ -756,17 +771,15 @@ func (mgr *BlobnodeMgr) delParallel(chunkIdx int, vuid proto.Vuid, diskId proto.
 			if !judgeErrCode(eCode) {
 				continue
 			}
-			off += step
-			time.Sleep(time.Millisecond * time.Duration(mgr.conf.Interval))
-		}
 
-		for off = uint64(0); off < mgr.conf.MaxCnt; {
-			urlStr := fmt.Sprintf("%v/shard/delete/diskid/%v/vuid/%v/bid/%v", mgr.conf.Host, diskId, vuid, bid+off)
-			eCode := mgr.doPost(urlStr, "delete")
+		RAW_DEL:
+			urlStr = fmt.Sprintf("%v/shard/delete/diskid/%v/vuid/%v/bid/%v", mgr.conf.Host, diskId, vuid, bid+off)
+			eCode = mgr.doPost(urlStr, "delete")
 			if !judgeErrCode(eCode) {
-				continue
+				goto RAW_DEL
 			}
 
+			// after ok, next one
 			off += step
 			atomic.AddUint64(&delCnt, 1)
 			time.Sleep(time.Millisecond * time.Duration(mgr.conf.Interval))
@@ -780,6 +793,11 @@ func (mgr *BlobnodeMgr) delParallel(chunkIdx int, vuid proto.Vuid, diskId proto.
 	}
 	wg.Wait()
 	mgr.done <- struct{}{}
+}
+
+func (mgr *BlobnodeMgr) putSerial(chunkIdx int, vuid proto.Vuid, diskId proto.DiskID, concurrence chan struct{}) {
+	mgr.putParallel(chunkIdx, vuid, diskId)
+	<-concurrence
 }
 
 func (mgr *BlobnodeMgr) getSerial(chunkIdx int, vuid proto.Vuid, diskId proto.DiskID, concurrence chan struct{}) {
