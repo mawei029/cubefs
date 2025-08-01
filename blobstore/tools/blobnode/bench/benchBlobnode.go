@@ -25,7 +25,7 @@ import (
 	bnapi "github.com/cubefs/cubefs/blobstore/api/blobnode"
 	cmapi "github.com/cubefs/cubefs/blobstore/api/clustermgr"
 	"github.com/cubefs/cubefs/blobstore/common/config"
-	errorcode "github.com/cubefs/cubefs/blobstore/common/errors"
+	errcode "github.com/cubefs/cubefs/blobstore/common/errors"
 	"github.com/cubefs/cubefs/blobstore/common/proto"
 	statistic "github.com/cubefs/cubefs/blobstore/tools/common"
 	"github.com/cubefs/cubefs/blobstore/util/log"
@@ -40,23 +40,25 @@ import (
 // GET /shard/stat/diskid/{diskid}/vuid/{vuidValue}/bid/{bidValue}
 // GET /shard/list/diskid/{diskid}/vuid/{vuid}/startbid/{bid}/status/{status}/count/{count}
 
-// POST /chunk/create/diskid/:diskid/vuid/:vuid?chunksize={size}
-// POST /chunk/release/diskid/:diskid/vuid/:vuid?force={flag}
+// POST /chunk/create/diskid/:diskid/vuid/:vuid?chunksize={size}  // alloc
+// POST /chunk/release/diskid/:diskid/vuid/:vuid?force={flag}     // release
 // GET /chunk/stat/diskid/:diskid/vuid/:vuid
 // GET /chunk/list/diskid/:diskid
 
 type opMode int
 
 const (
-	opModePut         = opMode(iota + 1) // 1
-	opModeGet                            // 2
-	opModeDel                            // 3
-	opModeAlloc                          // 4
-	opModeRelease                        // 5
-	opModePutFullDisk                    // 6
-	opModeGetFullDisk                    // 7
-	opModeDelFullDisk                    // 8
-	opModeMixed                          // 9 - Mixed read/write/delete operations
+	opModePut      = opMode(1 << iota) // 1
+	opModeGet                          // 2
+	opModeDel                          // 4
+	opModeAlloc                        // 8
+	opModeRelease                      // 16
+	opModeFullDisk                     // 32
+
+	opModePutFullDisk = opModePut | opModeFullDisk        // 33
+	opModeGetFullDisk = opModeGet | opModeFullDisk        // 34
+	opModeDelFullDisk = opModeDel | opModeFullDisk        // 36
+	opModeMixed       = opModePut | opModeGet | opModeDel // 7 - Mixed read/write/delete operations
 
 	overloadSleepMs = 100
 )
@@ -91,16 +93,17 @@ type BlobnodeTestConf struct {
 	Host       string          `json:"host"`       // dist blobnode host
 	ClusterMgr cmapi.Config    `json:"cluster_mgr"`
 
-	Mode       opMode `json:"mode"` // operation mode[0:invalid,put,get,delete,alloc,release]
-	BidStart   uint64 `json:"bid_start"`
-	MaxCnt     uint64 `json:"max_cnt"`      // max bid count, per concurrence
-	MaxReadCnt uint64 `json:"max_read_cnt"` // max read count, per concurrence, may be beyond MaxCnt
-	MaxRound   int    `json:"max_round"`    // max put round, keep writing data until the disk is full
-	PerDisk    int    `json:"per_disk"`     // concurrence for per disk
-	PerVuid    int    `json:"per_vuid"`     // concurrence for per vuid/chunk
-	Interval   int    `json:"interval"`     // do request interval
-	Random     bool   `json:"random"`       // random read bid ; random write src data
-	Check      bool   `json:"check"`        // check read data crc32
+	Mode        opMode `json:"mode"` // operation mode[0:invalid,put,get,delete,alloc,release]
+	BidStart    uint64 `json:"bid_start"`
+	MaxCnt      uint64 `json:"max_cnt"`      // max bid count, per concurrence
+	MaxReadCnt  uint64 `json:"max_read_cnt"` // max read count, per concurrence, may be beyond MaxCnt
+	MaxRound    int    `json:"max_round"`    // max put round, keep writing data until the disk is full
+	MaxChunkCnt int    `json:"max_chunk_cnt"`
+	PerDisk     int    `json:"per_disk"` // concurrence for per disk
+	PerVuid     int    `json:"per_vuid"` // concurrence for per vuid/chunk
+	Interval    int    `json:"interval"` // do request interval
+	Random      bool   `json:"random"`   // random read bid ; random write src data
+	Check       bool   `json:"check"`    // check read data crc32
 
 	DataSize string `json:"data_size"` // data size[4B,4K,64K,128K,1M,4M,8M,16M]
 	SrcFile  string `json:"src_file"`  // src, read data from src file path
@@ -132,11 +135,11 @@ func main() {
 	// 1. flag parse
 	flag.Parse()
 
-	//debugNewMgr()
-	//*mode = "put"
-	//*bidStart = 1234567890
-	//*readFile = "/home/mw/code/cubefs/blobstore/tools/blobnode/blobnode_test.conf"
-	//*confFile = "/home/mw/code/cubefs/blobstore/tools/blobnode/bench/bench_blobnode.conf"
+	// debugNewMgr()
+	// *mode = "put"
+	// *bidStart = 1234567890
+	// *readFile = "/home/mw/code/cubefs/blobstore/tools/blobnode/blobnode_test.conf"
+	// *confFile = "/home/oppo/code/cubefs/blobstore/tools/blobnode/bench/bench_blobnode.conf"
 
 	// 2. init mgr, read data
 	ctx := context.Background()
@@ -255,7 +258,7 @@ func initConfMgr(ctx context.Context) {
 
 func initData() {
 	// put, put until full
-	if conf.Mode == opModePut || conf.Mode == opModePutFullDisk {
+	if conf.Mode == opModePut || conf.Mode&opModePut != 0 {
 		size := fileSize[strings.ToUpper(conf.DataSize)]
 		f, err := os.Open(conf.SrcFile)
 		if err != nil {
@@ -267,8 +270,8 @@ func initData() {
 		if err != nil {
 			panic(err)
 		}
-		log.Infof("read file, dataBuff len=%d (which size will be put)", len(dataBuff))
 	}
+	log.Infof("read file, dataBuff len=%d (which size will be put)", len(dataBuff))
 }
 
 func getLocalHost() string {
@@ -466,6 +469,8 @@ func (mgr *BlobnodeMgr) putFullDisk(ctx context.Context) {
 
 	// mgr.conf.Vuids = make(map[proto.DiskID][]proto.Vuid)
 	for round := 0; round < mgr.conf.MaxRound; round++ {
+		atomic.StoreUint64(&putCnt, 0)
+		atomic.StoreUint64(&getCnt, 0)
 		// alloc and replace new vuid for diskID
 		mgr.alloc(ctx)
 		// time.Sleep(time.Second)
@@ -476,8 +481,6 @@ func (mgr *BlobnodeMgr) putFullDisk(ctx context.Context) {
 			<-mgr.done
 		}
 		log.Infof("end put, round:%d", round)
-		atomic.StoreUint64(&putCnt, 0)
-		atomic.StoreUint64(&getCnt, 0)
 	}
 	close(mgr.done)
 	log.Info("end, put until full disk, max round")
@@ -659,10 +662,10 @@ func (mgr *BlobnodeMgr) putParallel(chunkIdx int, vuid proto.Vuid, diskId proto.
 			mgr.stat.Set(time.Since(start))
 
 			switch eCode {
-			case errorcode.CodeOverload:
+			case errcode.CodeOverload:
 				time.Sleep(time.Millisecond * overloadSleepMs)
 				continue
-			case errorcode.CodeChunkNoSpace:
+			case errcode.CodeChunkNoSpace:
 				log.Warnf("chunk no space, errCode:%d, last bid:%d", eCode, bid+off)
 				return
 			case http.StatusOK:
@@ -709,10 +712,10 @@ func (mgr *BlobnodeMgr) getParallel(chunkIdx int, vuid proto.Vuid, diskId proto.
 			mgr.stat.Set(time.Now().Sub(start))
 
 			switch eCode {
-			case errorcode.CodeOverload:
+			case errcode.CodeOverload:
 				time.Sleep(time.Millisecond * overloadSleepMs)
 				continue
-			case errorcode.CodeBidNotFound:
+			case errcode.CodeBidNotFound:
 				log.Warnf("bid not found, errCode:%d, last bid:%d", eCode, bid+off)
 				return
 			case http.StatusOK:
@@ -752,10 +755,10 @@ func (mgr *BlobnodeMgr) delParallel(chunkIdx int, vuid proto.Vuid, diskId proto.
 
 	judgeErrCode := func(eCode int) bool {
 		switch eCode {
-		case errorcode.CodeOverload:
+		case errcode.CodeOverload:
 			time.Sleep(time.Millisecond * overloadSleepMs)
 			return false // not success
-		case http.StatusOK, errorcode.CodeShardMarkDeleted:
+		case http.StatusOK, errcode.CodeShardMarkDeleted:
 			return true // true, ok
 		default:
 			panic(eCode)
@@ -830,7 +833,7 @@ func (mgr *BlobnodeMgr) singlePut(chunkIdx int, vuid proto.Vuid, diskId proto.Di
 	bidLast := mgr.conf.BidStart + mgr.conf.MaxCnt - 1
 	url := fmt.Sprintf("%s/shard/stat/diskid/%d/vuid/%d/bid/%d", mgr.conf.Host, diskId, vuid, bidLast)
 	errCode := mgr.doGet(url, "Get")
-	//if errCode != errorcode.CodeBidNotFound {
+	//if errCode != errcode.CodeBidNotFound {
 	//	log.Warnf("bid already exist, errCode:%d, last bid:%d", errCode, bidLast)
 	//	return
 	//}
@@ -844,10 +847,10 @@ func (mgr *BlobnodeMgr) singlePut(chunkIdx int, vuid proto.Vuid, diskId proto.Di
 		mgr.stat.Set(time.Since(start))
 
 		switch errCode {
-		case errorcode.CodeOverload:
+		case errcode.CodeOverload:
 			time.Sleep(time.Millisecond * overloadSleepMs)
 			continue
-		case errorcode.CodeChunkNoSpace:
+		case errcode.CodeChunkNoSpace:
 			log.Warnf("chunk no space, errCode:%d, last bid:%d", errCode, bid+off)
 			return
 			// alloc vuid, set vuid
@@ -897,10 +900,10 @@ func (mgr *BlobnodeMgr) singleGet(chunkIdx int, vuid proto.Vuid, diskId proto.Di
 		mgr.stat.Set(time.Now().Sub(start))
 
 		switch eCode {
-		case errorcode.CodeOverload:
+		case errcode.CodeOverload:
 			time.Sleep(time.Millisecond * overloadSleepMs)
 			continue
-		case errorcode.CodeBidNotFound:
+		case errcode.CodeBidNotFound:
 			// panic(eCode)
 			log.Warnf("bid not found, errCode:%d, last bid:%d", eCode, bid+off)
 			return
@@ -959,7 +962,7 @@ func (mgr *BlobnodeMgr) singleAlloc(chunkIdx int, vuid proto.Vuid, diskId proto.
 		urlStr = fmt.Sprintf("%v/chunk/create/diskid/%v/vuid/%v?chunksize=%v", mgr.conf.Host, diskId, vuid, _16GB)
 		eCode = mgr.doPost(urlStr, "alloc")
 
-		if eCode == errorcode.CodeAlreadyExist {
+		if eCode == errcode.CodeAlreadyExist {
 			vuid++ // epoch+1
 			continue
 		}
@@ -985,7 +988,7 @@ func (mgr *BlobnodeMgr) singleRelease(chunkIdx int, vuid proto.Vuid, diskId prot
 
 	urlStr = fmt.Sprintf("%v/chunk/stat/diskid/%v/vuid/%v", mgr.conf.Host, diskId, vuid)
 	eCode = mgr.doGet(urlStr, "stat")
-	if eCode != http.StatusOK {
+	if eCode != http.StatusOK && eCode != errcode.CodeVuidNotFound {
 		panic(eCode)
 	}
 }
@@ -1066,7 +1069,7 @@ func (mgr *BlobnodeMgr) doPost(url string, operation string) int {
 			buff = dataBuff
 		}
 	}
-	// fmt.Printf("111: %s\n", buff)
+	log.Debugf("do post, op: %s, buff len: %d\n", operation, len(buff))
 
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(buff))
 	if err != nil {
@@ -1074,7 +1077,7 @@ func (mgr *BlobnodeMgr) doPost(url string, operation string) int {
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.ContentLength = int64(len(buff))
+	// req.ContentLength = int64(len(buff))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		panic(err)
@@ -1086,7 +1089,7 @@ func (mgr *BlobnodeMgr) doPost(url string, operation string) int {
 	//	crc = ret.Crc
 	//}
 
-	if resp.StatusCode != http.StatusOK { // || resp.StatusCode == errorcode.CodeChunkNoSpace { // 627
+	if resp.StatusCode != http.StatusOK { // || resp.StatusCode == errcode.CodeChunkNoSpace { // 627
 		log.Warnf("fail to http post, status code:%d, operation: %s, url:%s", resp.StatusCode, operation, url)
 		return resp.StatusCode
 	}
@@ -1236,6 +1239,7 @@ func loopPrintStat() {
 
 // MixedOperationState tracks the state of chunks in mixed operations
 type MixedOperationState struct {
+	idx        int
 	vuid       proto.Vuid
 	diskID     proto.DiskID
 	startBid   uint64
@@ -1245,37 +1249,44 @@ type MixedOperationState struct {
 
 // mixedOperations performs mixed read/write/delete operations
 func (mgr *BlobnodeMgr) mixedOperations(ctx context.Context) {
-	const chunkCount = 20      // 分配的chunk数量
-	const concurrentWrites = 2 // 并发写入数量
+	chunkCount := mgr.conf.MaxChunkCnt   // 分配的chunk数量
+	concurrentWrites := mgr.conf.PerDisk // 并发写入chunk数量
 
-	for {
+	for round := 0; round < mgr.conf.MaxRound; round++ {
+		atomic.StoreUint64(&putCnt, 0)
+		atomic.StoreUint64(&getCnt, 0)
+		atomic.StoreUint64(&delCnt, 0)
+
 		// Step 1: Allocate chunks
 		chunks := make([]*MixedOperationState, chunkCount)
 		log.Info("Allocating chunks...")
 		for i := 0; i < chunkCount; i++ {
-			diskID := mgr.diskMap[0].DiskID // Use first disk for simplicity
+			diskID := mgr.conf.DiskId // mgr.diskMap[0].DiskID // Use first disk for simplicity
 			vuid := proto.Vuid(time.Now().UnixNano() + int64(i))
-			mgr.singleAlloc(0, vuid, diskID)
+			mgr.singleAlloc(i, vuid, diskID)
 			chunks[i] = &MixedOperationState{
+				idx:        i,
 				vuid:       vuid,
 				diskID:     diskID,
-				startBid:   genId(),
+				startBid:   1, // genId(),
 				writtenBid: 0,
 				isWritten:  false,
 			}
 		}
+		log.Infof("chunk len=%d, chunk[0]=%v\n", len(chunks), *chunks[0])
 
 		// Step 2: Start initial concurrent writes
-		var wg sync.WaitGroup
+		var wgWt, wgRd sync.WaitGroup
 		writeChan := make(chan *MixedOperationState, chunkCount)
 		readChan := make(chan *MixedOperationState, chunkCount)
 		doneChan := make(chan struct{})
+		mgr.done = make(chan struct{}, concurrentWrites)
 
 		// Launch write workers
 		for i := 0; i < concurrentWrites; i++ {
-			wg.Add(1)
+			wgWt.Add(1)
 			go func() {
-				defer wg.Done()
+				defer wgWt.Done()
 				for chunk := range writeChan {
 					mgr.mixedWrite(ctx, chunk)
 					chunk.isWritten = true
@@ -1285,24 +1296,29 @@ func (mgr *BlobnodeMgr) mixedOperations(ctx context.Context) {
 		}
 
 		// Launch read worker
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for chunk := range readChan {
-				if chunk.isWritten {
-					mgr.mixedRead(ctx, chunk)
+		for i := 0; i < concurrentWrites; i++ {
+			wgRd.Add(1)
+			go func() {
+				defer wgRd.Done()
+				for chunk := range readChan {
+					if chunk.isWritten {
+						mgr.mixedRead(ctx, chunk)
+					}
 				}
-			}
-		}()
+			}()
+		}
 
 		// Feed initial chunks to writers
 		for i := 0; i < chunkCount; i++ {
 			writeChan <- chunks[i]
 		}
+		close(writeChan)
 
 		// Wait for all operations to complete
 		go func() {
-			wg.Wait()
+			wgWt.Wait()
+			close(readChan)
+			wgRd.Wait()
 			close(doneChan)
 		}()
 
@@ -1320,97 +1336,41 @@ func (mgr *BlobnodeMgr) mixedOperations(ctx context.Context) {
 		}
 
 		log.Infof("Completed one round of mixed operations. Put: %d, Get: %d, Delete: %d",
-			atomic.LoadUint64(&putCnt),
-			atomic.LoadUint64(&getCnt),
-			atomic.LoadUint64(&delCnt))
+			atomic.LoadUint64(&putCnt), atomic.LoadUint64(&getCnt), atomic.LoadUint64(&delCnt))
+		// for i := 0; i < cap(mgr.done); i++ {
+		//	<-mgr.done
+		// }
+		log.Infof("end round:%d", round)
 	}
+	close(mgr.done)
+	log.Info("end, mix operation, max round")
 }
 
-// mixedWrite writes data to a chunk
-func (mgr *BlobnodeMgr) mixedWrite(ctx context.Context, chunk *MixedOperationState) {
-	size := fileSize[strings.ToUpper(mgr.conf.DataSize)]
-	bid := chunk.startBid + chunk.writtenBid
-
-	url := fmt.Sprintf("%v/shard/put/diskid/%v/vuid/%v/bid/%v/size/%v?iotype=%d",
-		mgr.conf.Host, chunk.diskID, chunk.vuid, bid, size, bnapi.NormalIO)
-
-	start := time.Now()
-	errCode := mgr.doPost(url, "Put")
-	mgr.stat.Set(time.Since(start))
-
-	switch errCode {
-	case errorcode.CodeOverload:
-		time.Sleep(time.Millisecond * overloadSleepMs)
-		mgr.mixedWrite(ctx, chunk) // Retry
-	case errorcode.CodeChunkNoSpace:
-		log.Warnf("chunk no space, errCode:%d, bid:%d", errCode, bid)
-		return
-	case http.StatusOK:
-		atomic.AddUint64(&putCnt, 1)
-		chunk.writtenBid++
-	default:
-		log.Errorf("write failed with error code: %d", errCode)
-	}
+func (mgr *BlobnodeMgr) mixedWrite(ctx context.Context, chunkInfo *MixedOperationState) {
+	// threadCh := make(chan struct{}, mgr.conf.PerDisk)
+	//
+	// for idx, vuid := range chunks {
+	//	threadCh <- struct{}{}
+	//	log.Infof("start work, idx:%d, diskId:%d, vuid:%d", idx, dkId, vuid)
+	//	go fn(idx, vuid, dkId, threadCh)
+	// }
+	log.Infof("start put, idx:%d, vuid:%d, diskID:%d", chunkInfo.idx, chunkInfo.vuid, chunkInfo.diskID)
+	mgr.putParallel(chunkInfo.idx, chunkInfo.vuid, chunkInfo.diskID)
+	<-mgr.done
 }
 
-// mixedRead reads data from a chunk
-func (mgr *BlobnodeMgr) mixedRead(ctx context.Context, chunk *MixedOperationState) {
-	for i := uint64(0); i < chunk.writtenBid; i++ {
-		bid := chunk.startBid + i
-		url := fmt.Sprintf("%v/shard/get/diskid/%v/vuid/%v/bid/%v?iotype=%d",
-			mgr.conf.Host, chunk.diskID, chunk.vuid, bid, bnapi.NormalIO)
-
-		start := time.Now()
-		errCode := mgr.doGet(url, "Get")
-		mgr.stat.Set(time.Since(start))
-
-		switch errCode {
-		case errorcode.CodeOverload:
-			time.Sleep(time.Millisecond * overloadSleepMs)
-			i-- // Retry this bid
-			continue
-		case errorcode.CodeBidNotFound:
-			log.Warnf("bid not found, errCode:%d, bid:%d", errCode, bid)
-			return
-		case http.StatusOK:
-			atomic.AddUint64(&getCnt, 1)
-		default:
-			log.Errorf("read failed with error code: %d", errCode)
-			return
-		}
-	}
+func (mgr *BlobnodeMgr) mixedRead(ctx context.Context, chunkInfo *MixedOperationState) {
+	log.Infof("start get, idx:%d, vuid:%d, diskID:%d", chunkInfo.idx, chunkInfo.vuid, chunkInfo.diskID)
+	mgr.getParallel(chunkInfo.idx, chunkInfo.vuid, chunkInfo.diskID)
+	<-mgr.done
 }
 
-// mixedDelete deletes a chunk and its data
-func (mgr *BlobnodeMgr) mixedDelete(ctx context.Context, chunk *MixedOperationState) {
-	for i := uint64(0); i < chunk.writtenBid; i++ {
-		bid := chunk.startBid + i
+func (mgr *BlobnodeMgr) mixedDelete(ctx context.Context, chunkInfo *MixedOperationState) {
+	log.Infof("start del, idx:%d, vuid:%d, diskID:%d", chunkInfo.idx, chunkInfo.vuid, chunkInfo.diskID)
+	mgr.delParallel(chunkInfo.idx, chunkInfo.vuid, chunkInfo.diskID)
 
-		// Mark delete
-		urlStr := fmt.Sprintf("%v/shard/markdelete/diskid/%v/vuid/%v/bid/%v",
-			mgr.conf.Host, chunk.diskID, chunk.vuid, bid)
-		errCode := mgr.doPost(urlStr, "markDelete")
-		if errCode != http.StatusOK && errCode != errorcode.CodeShardMarkDeleted {
-			log.Errorf("mark delete failed with error code: %d", errCode)
-			continue
-		}
+	log.Infof("start release, idx:%d, vuid:%d, diskID:%d", chunkInfo.idx, chunkInfo.vuid, chunkInfo.diskID)
+	mgr.singleRelease(chunkInfo.idx, chunkInfo.vuid, chunkInfo.diskID)
 
-		// Delete
-		urlStr = fmt.Sprintf("%v/shard/delete/diskid/%v/vuid/%v/bid/%v",
-			mgr.conf.Host, chunk.diskID, chunk.vuid, bid)
-		errCode = mgr.doPost(urlStr, "delete")
-		if errCode == http.StatusOK {
-			atomic.AddUint64(&delCnt, 1)
-		} else {
-			log.Errorf("delete failed with error code: %d", errCode)
-		}
-	}
-
-	// Release chunk
-	urlStr := fmt.Sprintf("%v/chunk/release/diskid/%v/vuid/%v?force=%v",
-		mgr.conf.Host, chunk.diskID, chunk.vuid, true)
-	errCode := mgr.doPost(urlStr, "release")
-	if errCode != http.StatusOK {
-		log.Errorf("chunk release failed with error code: %d", errCode)
-	}
+	<-mgr.done
 }
