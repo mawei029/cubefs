@@ -893,6 +893,19 @@ func (mp *metaPartition) fsmAppendObjExtentsWithCheck(inoParam *Inode) (status u
 	fsmIno.Generation++
 	fsmIno.ModifyTime = inoParam.ModifyTime
 
+	// Send discard extent to channel for async deletion
+	if !discardExtent.IsEmpty() {
+		select {
+		case mp.objExtDelCh <- []proto.ObjExtentKey{discardExtent}:
+			log.LogDebugf("action[fsmAppendObjExtentsWithCheck] mp[%v] inode[%v] discard extent sent to delete channel: %v",
+				mpId, inoId, discardExtent)
+		default:
+			// Channel is full, log warning but don't block
+			log.LogWarnf("action[fsmAppendObjExtentsWithCheck] mp[%v] inode[%v] objExtDelCh is full, discard extent may not be deleted: %v",
+				mpId, inoId, discardExtent)
+		}
+	}
+
 	if log.EnableDebug() {
 		log.LogDebugf("action[fsmAppendObjExtentsWithCheck] mp[%v] inode[%v] success, finalEks count[%v] gen[%v] ino[%v]",
 			mpId, inoId, len(finalEks), fsmIno.Generation, fsmIno.String())

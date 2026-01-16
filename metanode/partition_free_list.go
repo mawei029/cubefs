@@ -78,6 +78,7 @@ func (mp *metaPartition) startFreeList() (err error) {
 	go mp.deleteWorker()
 	go mp.startRecycleInodeDelFile()
 	mp.startToDeleteExtents()
+	mp.startToDeleteObjExtents()
 	return
 }
 
@@ -720,7 +721,10 @@ func (mp *metaPartition) doBatchDeleteExtentsByPartition(partitionID uint64, ext
 	return
 }
 
-const maxDelCntOnce = 512
+const (
+	maxDelCntOnce      = 512
+	maxDelObjExtentCnt = 500 // Maximum number of obj extents to delete in one batch
+)
 
 func (mp *metaPartition) doBatchDeleteObjExtentsInEBS(allInodes []*Inode, isMigration bool) (shouldCommit []*Inode, shouldPushToFreeList []*Inode) {
 	shouldCommit = make([]*Inode, 0, len(allInodes))
@@ -784,8 +788,8 @@ func (mp *metaPartition) deleteObjExtents(oeks []proto.ObjExtentKey) (err error)
 
 	total := len(oeks)
 
-	for i := 0; i < total; i += maxDelCntOnce {
-		max := util.Min(i+maxDelCntOnce, total)
+	for i := 0; i < total; i += maxDelObjExtentCnt {
+		max := util.Min(i+maxDelObjExtentCnt, total)
 		err = blobClient.Delete(oeks[i:max])
 		if err != nil {
 			log.LogErrorf("[deleteObjExtents] vol(%v) mp(%v) delete ebs eks fail, cnt(%d), err(%s)",
@@ -795,6 +799,68 @@ func (mp *metaPartition) deleteObjExtents(oeks []proto.ObjExtentKey) (err error)
 	}
 
 	return err
+}
+
+// startToDeleteObjExtents starts a goroutine to consume discard obj extents from channel and delete them in batches
+func (mp *metaPartition) startToDeleteObjExtents() {
+	go mp.deleteObjExtentsFromChan()
+}
+
+// deleteObjExtentsFromChan consumes obj extents from objExtDelCh and deletes them in batches
+func (mp *metaPartition) deleteObjExtentsFromChan() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.LogErrorf("[deleteObjExtentsFromChan] mp(%v) panic: %v", mp.config.PartitionId, r)
+		}
+	}()
+
+	var batch []proto.ObjExtentKey
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-mp.stopC:
+			// Flush remaining extents before exit
+			if len(batch) > 0 {
+				mp.deleteObjExtentsBatch(batch)
+			}
+			return
+		case <-ticker.C:
+			// Periodically flush batch if it has extents
+			if len(batch) > 0 {
+				mp.deleteObjExtentsBatch(batch)
+				batch = batch[:0] // Reset batch
+			}
+		case oeks := <-mp.objExtDelCh:
+			if len(oeks) == 0 {
+				continue
+			}
+			// Add to batch
+			batch = append(batch, oeks...)
+			// If batch reaches max size, delete immediately
+			if len(batch) >= maxDelObjExtentCnt {
+				mp.deleteObjExtentsBatch(batch)
+				batch = batch[:0] // Reset batch
+			}
+		}
+	}
+}
+
+// deleteObjExtentsBatch deletes a batch of obj extents
+func (mp *metaPartition) deleteObjExtentsBatch(oeks []proto.ObjExtentKey) {
+	if len(oeks) == 0 {
+		return
+	}
+
+	err := mp.deleteObjExtents(oeks)
+	if err != nil {
+		log.LogErrorf("[deleteObjExtentsBatch] mp(%v) failed to delete %d obj extents: %v",
+			mp.config.PartitionId, len(oeks), err)
+	} else {
+		log.LogDebugf("[deleteObjExtentsBatch] mp(%v) successfully deleted %d obj extents",
+			mp.config.PartitionId, len(oeks))
+	}
 }
 
 func (mp *metaPartition) startRecycleInodeDelFile() {

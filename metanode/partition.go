@@ -541,6 +541,7 @@ type metaPartition struct {
 	freeList                  *freeList // free inode list
 	freeHybridList            *freeList // to store inode delay to delete migration keys
 	extDelCh                  chan []proto.ExtentKey
+	objExtDelCh               chan []proto.ObjExtentKey
 	extReset                  chan struct{}
 	vol                       *Vol
 	manager                   *metadataManager
@@ -1037,6 +1038,7 @@ func NewMetaPartition(conf *MetaPartitionConfig, manager *metadataManager) MetaP
 		freeList:       newFreeList(),
 		freeHybridList: newFreeList(),
 		extDelCh:       make(chan []proto.ExtentKey, defaultDelExtentsCnt),
+		objExtDelCh:    make(chan []proto.ObjExtentKey, defaultDelExtentsCnt),
 		syncAtimeCh:    make(chan uint64, defaultSyncInodeAtimeCnt),
 		extReset:       make(chan struct{}),
 		vol:            NewVol(),
