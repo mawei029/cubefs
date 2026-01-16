@@ -2241,6 +2241,12 @@ type AppendExtParam struct {
 	isMigration      bool
 }
 
+type AppendObjExtParam struct {
+	ek             proto.ObjExtentKey
+	ct             int64
+	discardExtents []proto.ObjExtentKey
+}
+
 func (i *Inode) AppendExtentWithCheck(param *AppendExtParam) (delExtents []proto.ExtentKey, status uint8) {
 	param.ek.SetSeq(param.mpVer)
 	log.LogDebugf("action[AppendExtentWithCheck] mpId[%v].mpver [%v] inode[%v] and fsm ver [%v],ek [%v],hist len %v",

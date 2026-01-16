@@ -43,6 +43,10 @@ type ObjExtentKey struct {
 	ModGen uint64
 }
 
+func (k *ObjExtentKey) IsEmpty() bool {
+	return k.Size == 0
+}
+
 // String returns the string format of the extentKey.
 func (k ObjExtentKey) String() string {
 	return fmt.Sprintf("ObjExtentKey{FileOffset(%v),Cid(%v),CodeMode(%v),BlobSize(%v),BlobsLen(%v),Blobs(%v),Size(%v),Crc(%v)}", k.FileOffset, k.Cid, k.CodeMode, k.BlobSize, k.BlobsLen, k.Blobs, k.Size, k.Crc)

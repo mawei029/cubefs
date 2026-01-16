@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"time"
 
 	"github.com/cubefs/cubefs/datanode/storage"
@@ -816,6 +817,170 @@ func (mp *metaPartition) fsmAppendObjExtents(dbHandle interface{}, inoParam *Ino
 	}
 
 	return
+}
+
+func (mp *metaPartition) fsmAppendObjExtentsWithCheck(inoParam *Inode) (status uint8) {
+	mpId := mp.config.PartitionId
+	inoId := inoParam.Inode
+
+	// Get and validate inode
+	item := mp.inodeTree.CopyGet(inoParam)
+	if item == nil {
+		log.LogInfof("action[fsmAppendObjExtentsWithCheck] mp[%v] inode[%v] not exist", mpId, inoId)
+		return proto.OpNotExistErr
+	}
+
+	fsmIno := item.(*Inode)
+	if fsmIno.ShouldDelete() {
+		log.LogInfof("action[fsmAppendObjExtentsWithCheck] mp[%v] inode[%v] already deleted", mpId, inoId)
+		return proto.OpNotExistErr
+	}
+
+	if log.EnableDebug() {
+		log.LogDebugf("action[fsmAppendObjExtentsWithCheck] mp[%v] inode[%v] ino[%v], req[%v]", mpId, inoId, fsmIno.String(), inoParam.String())
+	}
+
+	// Update storage class
+	if err := fsmIno.updateStorageClass(inoParam.StorageClass, false); err != nil {
+		log.LogErrorf("action[fsmAppendObjExtentsWithCheck] mp[%v] inode[%v] updateStorageClass failed: %v", mpId, inoId, err)
+		return proto.OpMismatchStorageClass
+	}
+
+	// Extract new extent and discard extent from input
+	// Rule: allEks[0] is newExtent, allEks[1] (if exists) is discardExtent
+	var allEks []proto.ObjExtentKey
+	if inoParam.HybridCloudExtents.sortedEks != nil {
+		if sortedEks, ok := inoParam.HybridCloudExtents.sortedEks.(*SortedObjExtents); ok && len(sortedEks.eks) > 0 {
+			allEks = sortedEks.CopyExtents()
+		}
+	}
+
+	// Validate input extents count
+	if len(allEks) == 0 || len(allEks) > 2 {
+		log.LogErrorf("action[fsmAppendObjExtentsWithCheck] mp[%v] inode[%v] OpArgMismatchErr: no or too many extents provided, allEks %v", mpId, inoId, allEks)
+		return proto.OpArgMismatchErr
+	}
+
+	newExtent := allEks[0]
+	var discardExtent proto.ObjExtentKey
+	if len(allEks) == 2 {
+		discardExtent = allEks[1]
+	}
+
+	log.LogDebugf("action[fsmAppendObjExtentsWithCheck] mp[%v] inode[%v] newExtent[%v] discardExtent[%v]", mpId, inoId, newExtent, discardExtent)
+
+	// Get existing extents from FSM inode (SortedObjExtents maintains sorted order)
+	var existExtents []proto.ObjExtentKey
+	if fsmIno.HybridCloudExtents.sortedEks != nil {
+		if sortedEks, ok := fsmIno.HybridCloudExtents.sortedEks.(*SortedObjExtents); ok {
+			existExtents = sortedEks.CopyExtents()
+		}
+	}
+
+	// Check conflicts and append/update extent
+	status, finalEks := mp.appendObjExtentsCheck(mpId, inoId, existExtents, newExtent, discardExtent)
+	if status != proto.OpOk {
+		return status
+	}
+
+	// Update inode extents
+	fsmIno.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks(finalEks)
+	size := fsmIno.HybridCloudExtents.sortedEks.(*SortedObjExtents).Size()
+	if fsmIno.Size < size {
+		fsmIno.Size = size
+	}
+
+	fsmIno.Generation++
+	fsmIno.ModifyTime = inoParam.ModifyTime
+
+	if log.EnableDebug() {
+		log.LogDebugf("action[fsmAppendObjExtentsWithCheck] mp[%v] inode[%v] success, finalEks count[%v] gen[%v] ino[%v]",
+			mpId, inoId, len(finalEks), fsmIno.Generation, fsmIno.String())
+	}
+
+	return proto.OpOk
+}
+
+// appendObjExtentsCheck checks conflicts between existing extents and new extent, then appends/updates accordingly.
+// It is used to handle the conflict between existing extents and new extent, and the conflict between the discard extent and the existing extents.
+// Returns (status, finalEks) where status is OpOk on success, OpConflictExtentsErr on conflict.
+func (mp *metaPartition) appendObjExtentsCheck(mpId uint64, inoId uint64, existingExtents []proto.ObjExtentKey, newExtent, discardExtent proto.ObjExtentKey) (status uint8, finalEks []proto.ObjExtentKey) {
+	newStart := newExtent.FileOffset
+	newEnd := newExtent.FileOffset + newExtent.Size
+	hasDiscardExtent := !discardExtent.IsEmpty()
+
+	// Initialize finalEks with existing extents
+	finalEks = make([]proto.ObjExtentKey, len(existingExtents))
+	copy(finalEks, existingExtents)
+
+	// Check for overlap with existing extents
+	lastIdx := len(existingExtents) - 1
+	for i, existingEk := range existingExtents {
+
+		if existingEk.IsEquals(&newExtent) {
+			log.LogWarnf("action[appendObjExtentsCheck] mp[%v] ino[%v] exact match: existingEk[%v] newExtent[%v] already updated", mpId, inoId, existingEk, newExtent)
+			return proto.OpOk, finalEks
+		}
+
+		existingStart := existingEk.FileOffset
+		existingEnd := existingEk.FileOffset + existingEk.Size
+
+		// Check for overlap: ranges overlap if they share any common point
+		if newStart >= existingEnd || newEnd <= existingStart {
+			continue // No overlap with this extent
+		}
+
+		// Found overlap, validate conflict rules
+		isLastExisting := (i == lastIdx)
+		offsetMatch := (newStart == existingStart)
+		sizeMatch := (newEnd == existingEnd)
+		sizeLarger := (newEnd > existingEnd)
+
+		// Rule 1: Exact match (offset and size)
+		if offsetMatch && sizeMatch {
+			if !existingEk.IsEquals(&discardExtent) {
+				log.LogErrorf("action[appendObjExtentsConflict] mp[%v] ino[%v] OpConflictExtentsErr: exact match but discard extent mismatch. existingEk[%v] discardExtent[%v]",
+					mpId, inoId, existingEk, discardExtent)
+				return proto.OpConflictExtentsErr, finalEks
+			}
+			finalEks[i] = newExtent
+			log.LogDebugf("action[appendObjExtentsConflict] mp[%v] ino[%v] exact match replaced: existingEk[%v] -> newExtent[%v]", mpId, inoId, existingEk, newExtent)
+			return proto.OpOk, finalEks
+		}
+
+		// Rule 2: Last extent - offset matches, new size can be larger
+		if isLastExisting && offsetMatch && sizeLarger {
+			if !existingEk.IsEquals(&discardExtent) {
+				log.LogErrorf("action[appendObjExtentsConflict] mp[%v] ino[%v] OpConflictExtentsErr: last extent extended but discard extent mismatch. existingEk[%v] discardExtent[%v]",
+					mpId, inoId, existingEk, discardExtent)
+				return proto.OpConflictExtentsErr, finalEks
+			}
+			finalEks[i] = newExtent
+			log.LogDebugf("action[appendObjExtentsConflict] mp[%v] ino[%v] last extent extended: existingEk[%v] -> newExtent[%v]", mpId, inoId, existingEk, newExtent)
+			return proto.OpOk, finalEks
+		}
+
+		// Other overlap scenarios are conflicts
+		log.LogErrorf("action[appendObjExtentsConflict] mp[%v] ino[%v] OpConflictExtentsErr: invalid overlap. existingEk[%v] newExtent[%v]",
+			mpId, inoId, existingEk, newExtent)
+		return proto.OpConflictExtentsErr, finalEks
+	}
+
+	// No overlap found with any existing extent
+	// Validate that discardExtent is empty
+	if hasDiscardExtent {
+		log.LogErrorf("action[appendObjExtentsConflict] mp[%v] ino[%v] OpConflictExtentsErr: no overlap but discard extent provided. newExtent[%v] discardExtent[%v]",
+			mpId, inoId, newExtent, discardExtent)
+		return proto.OpConflictExtentsErr, finalEks
+	}
+
+	// Append new extent at the correct position (maintain sorted order)
+	finalEks = append(finalEks, newExtent)
+	sort.Slice(finalEks, func(i, j int) bool {
+		return finalEks[i].FileOffset < finalEks[j].FileOffset
+	})
+	log.LogDebugf("action[appendObjExtentsConflict] mp[%v] ino[%v] new extent appended: newExtent[%v], finalEks eks[%v]", mpId, inoId, newExtent, finalEks)
+	return proto.OpOk, finalEks
 }
 
 func (mp *metaPartition) fsmExtentsTruncate(dbHandle interface{}, ino *Inode) (resp *InodeResponse, err error) {

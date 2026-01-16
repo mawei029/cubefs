@@ -720,10 +720,40 @@ func (ap *AppendExtentKeyWithCheckRequest) EkString() string {
 
 // AppendObjExtentKeyRequest defines the request to append an obj extent key.
 type AppendObjExtentKeysRequest struct {
-	VolName     string         `json:"vol"`
-	PartitionID uint64         `json:"pid"`
-	Inode       uint64         `json:"ino"`
-	Extents     []ObjExtentKey `json:"ek"`
+	VolName       string         `json:"vol"`
+	PartitionID   uint64         `json:"pid"`
+	Inode         uint64         `json:"ino"`
+	Extents       []ObjExtentKey `json:"ek"`
+	DiscardExtent ObjExtentKey   `json:"dek"`
+	IsOverwrite   bool           `json:"isOverwrite"`
+}
+
+// EkString returns a string representation of extent-related fields.
+// Field mappings:
+//   - VolName -> vol
+//   - PartitionID -> pid
+//   - Inode -> ino
+//   - Extents -> ek
+//   - DiscardExtent -> dek
+//   - IsOverwrite -> isOverwrite
+func (ap *AppendObjExtentKeysRequest) EkString() string {
+	if ap == nil {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("[vol:%v,pid:%v,ino:%v,", ap.VolName, ap.PartitionID, ap.Inode))
+	sb.WriteString("ek:")
+	for _, ek := range ap.Extents {
+		sb.WriteString(ek.String())
+	}
+	sb.WriteString(",dek:")
+	if !ap.DiscardExtent.IsEmpty() {
+		sb.WriteString(ap.DiscardExtent.String())
+	}
+	sb.WriteString(fmt.Sprintf(",isOverwrite:%v]", ap.IsOverwrite))
+
+	return sb.String()
 }
 
 // GetExtentsRequest defines the reques to get extents.

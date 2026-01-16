@@ -1881,10 +1881,55 @@ func (m *metadataManager) opMetaBatchObjExtentsAdd(conn net.Conn, p *Packet, rem
 	if err != nil || handledByProxy {
 		return
 	}
-	err = mp.BatchObjExtentAppend(req, p)
-	_ = m.respondToClientWithVer(conn, p)
-	log.LogDebugf("%s [opMetaBatchObjExtentsAdd] req: %d - %v, resp: %v, body: %s",
-		remoteAddr, p.GetReqID(), req, p.GetResultMsg(), p.Data)
+	if err = m.checkMultiVersionStatus(mp, p); err != nil {
+		err = errors.NewErrorf("[%v],req[%v],err[%v]", p.GetOpMsgWithReqAndResult(), req, string(p.Data))
+		m.respondToClientWithVer(conn, p)
+		return
+	}
+
+	start := time.Now()
+	if mp.IsEnableAuditLog() {
+		appendMsg := req.EkString()
+		defer func() {
+			opErr := err
+			if opErr == nil && p.ResultCode != proto.OpOk {
+				opErr = fmt.Errorf("result %s", p.GetResultMsg())
+			}
+
+			auditlog.LogInodeOp(remoteAddr, mp.GetVolName(), p.GetOpMsg(), appendMsg, opErr, time.Since(start).Milliseconds(), req.Inode, 0)
+		}()
+	}
+
+	// If IsOverwrite is true, use BatchObjExtentAppendWithCheck
+	// Otherwise, use BatchObjExtentAppend
+	if req.IsOverwrite {
+		if err = mp.BatchObjExtentAppendWithCheck(req, p); err != nil {
+			errMsg := err.Error()
+			if strings.Contains(errMsg, "over quota") {
+				log.LogWarnf("%s [opMetaBatchObjExtentsAdd] BatchObjExtentAppendWithCheck: %s", remoteAddr, errMsg)
+			} else {
+				log.LogErrorf("%s [opMetaBatchObjExtentsAdd] BatchObjExtentAppendWithCheck: %s", remoteAddr, errMsg)
+			}
+		}
+	} else {
+		if err = mp.BatchObjExtentAppend(req, p); err != nil {
+			errMsg := err.Error()
+			if strings.Contains(errMsg, "over quota") {
+				log.LogWarnf("%s [opMetaBatchObjExtentsAdd] BatchObjExtentAppend: %s", remoteAddr, errMsg)
+			} else {
+				log.LogErrorf("%s [opMetaBatchObjExtentsAdd] BatchObjExtentAppend: %s", remoteAddr, errMsg)
+			}
+		}
+	}
+	m.updatePackRspSeq(mp, p)
+	if err = m.respondToClientWithVer(conn, p); err != nil {
+		log.LogErrorf("%s [opMetaBatchObjExtentsAdd] response error: %s, "+
+			"response to client: %s", remoteAddr, err.Error(), p.GetResultMsg())
+	}
+	if log.EnableDebug() {
+		log.LogDebugf("%s [opMetaBatchObjExtentsAdd] req: %d - %v, resp: %v, body: %s",
+			remoteAddr, p.GetReqID(), req, p.GetResultMsg(), p.Data)
+	}
 	return
 }
 

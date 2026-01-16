@@ -736,6 +736,75 @@ func (mp *metaPartition) BatchObjExtentAppend(req *proto.AppendObjExtentKeysRequ
 	return
 }
 
+// BatchObjExtentAppendWithCheck appends multiple obj extents with conflict check.
+func (mp *metaPartition) BatchObjExtentAppendWithCheck(req *proto.AppendObjExtentKeysRequest, p *Packet) (err error) {
+	status := mp.isOverQuota(req.Inode, true, false)
+	if status != 0 {
+		log.LogWarnf("BatchObjExtentAppendWithCheck fail status [%v]", status)
+		err = errors.New("BatchObjExtentAppendWithCheck is over quota")
+		reply := []byte(err.Error())
+		p.PacketErrorWithBody(status, reply)
+		return
+	}
+
+	var inoParm *Inode
+	if inoParm, _, err = mp.CheckQuota(req.Inode, p); err != nil {
+		log.LogErrorf("BatchObjExtentAppendWithCheck CheckQuota fail err [%v]", err)
+		return
+	}
+
+	if inoParm.StorageClass != proto.StorageClass_BlobStore {
+		err = errors.New(fmt.Sprintf("ino(%v) StorageClass(%v) donot support BatchObjExtentAppendWithCheck",
+			inoParm.Inode, inoParm.StorageClass))
+		log.LogErrorf("BatchObjExtentAppendWithCheck fail [%v]", err)
+		p.PacketErrorWithBody(proto.OpErr, []byte(err.Error()))
+		return
+	}
+
+	if log.EnableDebug() {
+		log.LogDebugf("BatchObjExtentAppendWithCheck: ino(%v) mp[%v] req[%v]",
+			req.Inode, req.PartitionID, req.EkString())
+	}
+	// can only be called when write into ebs
+	inoParm.StorageClass = proto.StorageClass_BlobStore
+	objExtents := req.Extents
+	discardExtent := req.DiscardExtent
+
+	if len(objExtents) != 1 {
+		err = errors.New("BatchObjExtentAppendWithCheck: extents is not one or more")
+		log.LogErrorf("BatchObjExtentAppendWithCheck fail, ino(%v) extents(%v) discardExtent(%v) err [%v]", req.Inode, objExtents, discardExtent, err)
+		p.PacketErrorWithBody(proto.OpArgMismatchErr, []byte(err.Error()))
+		return
+	}
+
+	// Merge sorted extents and discard extents into inode.extents
+	// All extents will be stored together, and FSM will distinguish them by range overlap
+	extents := make([]proto.ObjExtentKey, 0)
+	extents = append(extents, objExtents[0])
+	if !discardExtent.IsEmpty() {
+		extents = append(extents, discardExtent)
+	}
+
+	inoParm.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks(extents)
+
+	val, err := inoParm.Marshal()
+	if err != nil {
+		p.PacketErrorWithBody(proto.OpErr, []byte(err.Error()))
+		return
+	}
+
+	resp, err := mp.submit(opFSMObjExtentsAddWithCheck, val)
+	if err != nil {
+		p.PacketErrorWithBody(proto.OpAgain, []byte(err.Error()))
+		return
+	}
+
+	log.LogDebugf("BatchObjExtentAppendWithCheck: ino(%v) mp[%v] extents[%v] discardExtent[%v] rspcode(%v)",
+		req.Inode, req.PartitionID, objExtents[0], discardExtent, resp.(uint8))
+	p.PacketErrorWithBody(resp.(uint8), nil)
+	return
+}
+
 // func (mp *metaPartition) ExtentsDelete(req *proto.DelExtentKeyRequest, p *Packet) (err error) {
 // 	ino := NewInode(req.Inode, 0)
 // 	inode := mp.inodeTree.Get(ino).(*Inode)

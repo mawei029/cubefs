@@ -143,6 +143,7 @@ const (
 	opFSMUpdateSummaryInfo   = 31
 	opFSMUpdateXAttr         = 32
 	opFSMObjExtentsAdd       = 33
+	opFSMObjExtsAddWithCheck = 34
 	opFSMSentToChan          = 36
 
 	// Transaction operations

@@ -445,3 +445,354 @@ func TestFsmUnlinkFileInode_Rocksdb(t *testing.T) {
 func TestCleanRocksdbInodeTestDir(t *testing.T) {
 	os.RemoveAll(RocksdbInodeTestDir)
 }
+
+func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
+	// Setup test partition
+	mpC := &MetaPartitionConfig{
+		PartitionId:   1,
+		VolName:       "test_vol",
+		Start:         0,
+		End:           100,
+		PartitionType: 1,
+		RootDir:       "/tmp/test_mp",
+	}
+	metaM := &metadataManager{
+		nodeId:          1,
+		zoneName:        "test",
+		raftStore:       nil,
+		partitions:      make(map[uint64]MetaPartition),
+		metaNode:        &MetaNode{},
+		fileStatsConfig: &fileStatsConfig{},
+	}
+	partition := NewMetaPartition(mpC, metaM)
+	mp := partition.(*metaPartition)
+
+	// ==================== 基础错误场景 ====================
+	t.Run("error - inode not exist", func(t *testing.T) {
+		inoParam := NewInode(9999, 0)
+		inoParam.StorageClass = proto.StorageClass_BlobStore
+		inoParam.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{
+			{FileOffset: 0, Size: 100},
+		})
+		status := mp.fsmAppendObjExtentsWithCheck(inoParam)
+		require.Equal(t, proto.OpNotExistErr, status)
+	})
+
+	t.Run("error - empty or too many extents", func(t *testing.T) {
+		inoId := uint64(1001)
+		fsmIno := NewInode(inoId, 0)
+		fsmIno.StorageClass = proto.StorageClass_BlobStore
+		mp.inodeTree.ReplaceOrInsert(fsmIno, true)
+
+		// Empty extents
+		inoParam1 := NewInode(inoId, 0)
+		inoParam1.StorageClass = proto.StorageClass_BlobStore
+		inoParam1.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{})
+		status1 := mp.fsmAppendObjExtentsWithCheck(inoParam1)
+		require.Equal(t, proto.OpArgMismatchErr, status1)
+
+		// Too many extents
+		inoParam2 := NewInode(inoId, 0)
+		inoParam2.StorageClass = proto.StorageClass_BlobStore
+		inoParam2.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{
+			{FileOffset: 0, Size: 100},
+			{FileOffset: 100, Size: 100},
+			{FileOffset: 200, Size: 100},
+		})
+		status2 := mp.fsmAppendObjExtentsWithCheck(inoParam2)
+		require.Equal(t, proto.OpArgMismatchErr, status2)
+	})
+
+	// ==================== 成功场景 - 插入新数据 ====================
+	t.Run("success - insert to empty extents", func(t *testing.T) {
+		inoId := uint64(2001)
+		fsmIno := NewInode(inoId, 0)
+		fsmIno.StorageClass = proto.StorageClass_BlobStore
+		mp.inodeTree.ReplaceOrInsert(fsmIno, true)
+
+		inoParam := NewInode(inoId, 0)
+		inoParam.StorageClass = proto.StorageClass_BlobStore
+		inoParam.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{
+			{FileOffset: 0, Size: 100},
+		})
+
+		status := mp.fsmAppendObjExtentsWithCheck(inoParam)
+		require.Equal(t, proto.OpOk, status)
+
+		item := mp.inodeTree.CopyGet(fsmIno)
+		updatedIno := item.(*Inode)
+		sortedEks := updatedIno.HybridCloudExtents.sortedEks.(*SortedObjExtents)
+		extents := sortedEks.CopyExtents()
+		require.Equal(t, 1, len(extents))
+		require.Equal(t, uint64(0), extents[0].FileOffset)
+		require.Equal(t, uint64(100), extents[0].Size)
+	})
+
+	t.Run("success - insert before/after/middle", func(t *testing.T) {
+		inoId := uint64(2002)
+		fsmIno := NewInode(inoId, 0)
+		fsmIno.StorageClass = proto.StorageClass_BlobStore
+		fsmIno.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{
+			{FileOffset: 200, Size: 100},
+		})
+		mp.inodeTree.ReplaceOrInsert(fsmIno, true)
+
+		// Insert before
+		inoParam1 := NewInode(inoId, 0)
+		inoParam1.StorageClass = proto.StorageClass_BlobStore
+		inoParam1.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{
+			{FileOffset: 0, Size: 100},
+		})
+		status1 := mp.fsmAppendObjExtentsWithCheck(inoParam1)
+		require.Equal(t, proto.OpOk, status1)
+
+		// Insert after
+		inoParam2 := NewInode(inoId, 0)
+		inoParam2.StorageClass = proto.StorageClass_BlobStore
+		inoParam2.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{
+			{FileOffset: 500, Size: 100},
+		})
+		status2 := mp.fsmAppendObjExtentsWithCheck(inoParam2)
+		require.Equal(t, proto.OpOk, status2)
+
+		// Insert middle
+		inoParam3 := NewInode(inoId, 0)
+		inoParam3.StorageClass = proto.StorageClass_BlobStore
+		inoParam3.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{
+			{FileOffset: 350, Size: 100},
+		})
+		status3 := mp.fsmAppendObjExtentsWithCheck(inoParam3)
+		require.Equal(t, proto.OpOk, status3)
+
+		// Verify all extents
+		item := mp.inodeTree.CopyGet(fsmIno)
+		updatedIno := item.(*Inode)
+		sortedEks := updatedIno.HybridCloudExtents.sortedEks.(*SortedObjExtents)
+		extents := sortedEks.CopyExtents()
+		require.Equal(t, 4, len(extents))
+		require.Equal(t, uint64(0), extents[0].FileOffset)
+		require.Equal(t, uint64(200), extents[1].FileOffset)
+		require.Equal(t, uint64(350), extents[2].FileOffset)
+		require.Equal(t, uint64(500), extents[3].FileOffset)
+	})
+
+	// ==================== 成功场景 - 冲突检测（替换和扩展）====================
+	t.Run("success - exact match replace", func(t *testing.T) {
+		inoId := uint64(3001)
+		existingExtent := proto.ObjExtentKey{FileOffset: 0, Size: 100, Cid: 1, CodeMode: 1}
+		fsmIno := NewInode(inoId, 0)
+		fsmIno.StorageClass = proto.StorageClass_BlobStore
+		fsmIno.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{existingExtent})
+		mp.inodeTree.ReplaceOrInsert(fsmIno, true)
+
+		newExtent := proto.ObjExtentKey{FileOffset: 0, Size: 100, Cid: 2, CodeMode: 2}
+		inoParam := NewInode(inoId, 0)
+		inoParam.StorageClass = proto.StorageClass_BlobStore
+		inoParam.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{
+			newExtent,
+			existingExtent, // discard
+		})
+
+		status := mp.fsmAppendObjExtentsWithCheck(inoParam)
+		require.Equal(t, proto.OpOk, status)
+
+		item := mp.inodeTree.CopyGet(fsmIno)
+		updatedIno := item.(*Inode)
+		sortedEks := updatedIno.HybridCloudExtents.sortedEks.(*SortedObjExtents)
+		extents := sortedEks.CopyExtents()
+		require.Equal(t, 1, len(extents))
+		require.True(t, extents[0].IsEquals(&newExtent))
+	})
+
+	t.Run("success - extend last extent", func(t *testing.T) {
+		inoId := uint64(4001)
+		existingExtent := proto.ObjExtentKey{FileOffset: 0, Size: 100, Cid: 1, CodeMode: 1}
+		fsmIno := NewInode(inoId, 0)
+		fsmIno.StorageClass = proto.StorageClass_BlobStore
+		fsmIno.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{existingExtent})
+		mp.inodeTree.ReplaceOrInsert(fsmIno, true)
+
+		newExtent := proto.ObjExtentKey{FileOffset: 0, Size: 150, Cid: 2, CodeMode: 2}
+		inoParam := NewInode(inoId, 0)
+		inoParam.StorageClass = proto.StorageClass_BlobStore
+		inoParam.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{
+			newExtent,
+			existingExtent, // discard
+		})
+
+		status := mp.fsmAppendObjExtentsWithCheck(inoParam)
+		require.Equal(t, proto.OpOk, status)
+
+		item := mp.inodeTree.CopyGet(fsmIno)
+		updatedIno := item.(*Inode)
+		sortedEks := updatedIno.HybridCloudExtents.sortedEks.(*SortedObjExtents)
+		extents := sortedEks.CopyExtents()
+		require.Equal(t, 1, len(extents))
+		require.True(t, extents[0].IsEquals(&newExtent))
+		require.Equal(t, uint64(150), extents[0].Size)
+	})
+
+	// ==================== 错误场景 - 冲突检测 ====================
+	t.Run("error - no overlap but discard provided", func(t *testing.T) {
+		inoId := uint64(5001)
+		fsmIno := NewInode(inoId, 0)
+		fsmIno.StorageClass = proto.StorageClass_BlobStore
+		fsmIno.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{
+			{FileOffset: 0, Size: 100},
+		})
+		mp.inodeTree.ReplaceOrInsert(fsmIno, true)
+
+		inoParam := NewInode(inoId, 0)
+		inoParam.StorageClass = proto.StorageClass_BlobStore
+		inoParam.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{
+			{FileOffset: 500, Size: 100}, // no overlap
+			{FileOffset: 0, Size: 100},   // discard provided
+		})
+
+		status := mp.fsmAppendObjExtentsWithCheck(inoParam)
+		require.Equal(t, proto.OpConflictExtentsErr, status)
+	})
+
+	t.Run("error - discard extent mismatch", func(t *testing.T) {
+		inoId := uint64(5002)
+		existingExtent := proto.ObjExtentKey{FileOffset: 0, Size: 100, Cid: 1, CodeMode: 1}
+		fsmIno := NewInode(inoId, 0)
+		fsmIno.StorageClass = proto.StorageClass_BlobStore
+		fsmIno.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{existingExtent})
+		mp.inodeTree.ReplaceOrInsert(fsmIno, true)
+
+		// Exact match but discard mismatch
+		inoParam1 := NewInode(inoId, 0)
+		inoParam1.StorageClass = proto.StorageClass_BlobStore
+		inoParam1.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{
+			{FileOffset: 0, Size: 100, Cid: 2, CodeMode: 2},
+			{FileOffset: 0, Size: 100, Cid: 3, CodeMode: 3}, // discard mismatch
+		})
+		status1 := mp.fsmAppendObjExtentsWithCheck(inoParam1)
+		require.Equal(t, proto.OpConflictExtentsErr, status1)
+
+		// Extend last but discard mismatch
+		inoParam2 := NewInode(inoId, 0)
+		inoParam2.StorageClass = proto.StorageClass_BlobStore
+		inoParam2.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{
+			{FileOffset: 0, Size: 150, Cid: 2, CodeMode: 2},
+			{FileOffset: 0, Size: 100, Cid: 3, CodeMode: 3}, // discard mismatch
+		})
+		status2 := mp.fsmAppendObjExtentsWithCheck(inoParam2)
+		require.Equal(t, proto.OpConflictExtentsErr, status2)
+	})
+
+	t.Run("error - invalid overlap scenarios", func(t *testing.T) {
+		inoId := uint64(5003)
+		fsmIno := NewInode(inoId, 0)
+		fsmIno.StorageClass = proto.StorageClass_BlobStore
+		fsmIno.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{
+			{FileOffset: 0, Size: 100},
+			{FileOffset: 200, Size: 100},
+		})
+		mp.inodeTree.ReplaceOrInsert(fsmIno, true)
+
+		// Non-last extent extended
+		inoParam1 := NewInode(inoId, 0)
+		inoParam1.StorageClass = proto.StorageClass_BlobStore
+		inoParam1.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{
+			{FileOffset: 0, Size: 150}, // extend non-last
+			{FileOffset: 0, Size: 100},
+		})
+		status1 := mp.fsmAppendObjExtentsWithCheck(inoParam1)
+		require.Equal(t, proto.OpConflictExtentsErr, status1)
+
+		// Partial overlap
+		inoParam2 := NewInode(inoId, 0)
+		inoParam2.StorageClass = proto.StorageClass_BlobStore
+		inoParam2.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{
+			{FileOffset: 50, Size: 100}, // partial overlap
+			{FileOffset: 0, Size: 100},
+		})
+		status2 := mp.fsmAppendObjExtentsWithCheck(inoParam2)
+		require.Equal(t, proto.OpConflictExtentsErr, status2)
+	})
+
+	// ==================== 重复执行场景 - 幂等性测试 ====================
+	t.Run("success - repeat insert same extent", func(t *testing.T) {
+		inoId := uint64(6001)
+		fsmIno := NewInode(inoId, 0)
+		fsmIno.StorageClass = proto.StorageClass_BlobStore
+		mp.inodeTree.ReplaceOrInsert(fsmIno, true)
+
+		newExtent := proto.ObjExtentKey{FileOffset: 0, Size: 100, Cid: 1, CodeMode: 1}
+
+		// First execution
+		inoParam1 := NewInode(inoId, 0)
+		inoParam1.StorageClass = proto.StorageClass_BlobStore
+		inoParam1.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{newExtent})
+		status1 := mp.fsmAppendObjExtentsWithCheck(inoParam1)
+		require.Equal(t, proto.OpOk, status1)
+
+		// Second execution
+		inoParam2 := NewInode(inoId, 0)
+		inoParam2.StorageClass = proto.StorageClass_BlobStore
+		inoParam2.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{newExtent})
+		status2 := mp.fsmAppendObjExtentsWithCheck(inoParam2)
+		require.Equal(t, proto.OpOk, status2)
+
+		// Verify extent count remains 1
+		item := mp.inodeTree.CopyGet(fsmIno)
+		updatedIno := item.(*Inode)
+		sortedEks := updatedIno.HybridCloudExtents.sortedEks.(*SortedObjExtents)
+		extents := sortedEks.CopyExtents()
+		require.Equal(t, 1, len(extents))
+		require.True(t, extents[0].IsEquals(&newExtent))
+	})
+
+	t.Run("success - repeat replace and extend", func(t *testing.T) {
+		inoId := uint64(6002)
+		existingExtent := proto.ObjExtentKey{FileOffset: 0, Size: 100, Cid: 1, CodeMode: 1}
+		fsmIno := NewInode(inoId, 0)
+		fsmIno.StorageClass = proto.StorageClass_BlobStore
+		fsmIno.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{existingExtent})
+		mp.inodeTree.ReplaceOrInsert(fsmIno, true)
+
+		newExtent1 := proto.ObjExtentKey{FileOffset: 0, Size: 100, Cid: 2, CodeMode: 2}
+		newExtent2 := proto.ObjExtentKey{FileOffset: 0, Size: 150, Cid: 3, CodeMode: 3}
+
+		// First: exact match replace
+		inoParam1 := NewInode(inoId, 0)
+		inoParam1.StorageClass = proto.StorageClass_BlobStore
+		inoParam1.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{
+			newExtent1,
+			existingExtent,
+		})
+		status1 := mp.fsmAppendObjExtentsWithCheck(inoParam1)
+		require.Equal(t, proto.OpOk, status1)
+
+		// Second: repeat replace (should succeed)
+		inoParam2 := NewInode(inoId, 0)
+		inoParam2.StorageClass = proto.StorageClass_BlobStore
+		inoParam2.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{
+			newExtent1,
+			newExtent1,
+		})
+		status2 := mp.fsmAppendObjExtentsWithCheck(inoParam2)
+		require.Equal(t, proto.OpOk, status2)
+
+		// Third: extend further
+		inoParam3 := NewInode(inoId, 0)
+		inoParam3.StorageClass = proto.StorageClass_BlobStore
+		inoParam3.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{
+			newExtent2,
+			newExtent1,
+		})
+		status3 := mp.fsmAppendObjExtentsWithCheck(inoParam3)
+		require.Equal(t, proto.OpOk, status3)
+
+		// Verify final state
+		item := mp.inodeTree.CopyGet(fsmIno)
+		updatedIno := item.(*Inode)
+		sortedEks := updatedIno.HybridCloudExtents.sortedEks.(*SortedObjExtents)
+		extents := sortedEks.CopyExtents()
+		require.Equal(t, 1, len(extents))
+		require.True(t, extents[0].IsEquals(&newExtent2))
+		require.Equal(t, uint64(150), extents[0].Size)
+	})
+}
