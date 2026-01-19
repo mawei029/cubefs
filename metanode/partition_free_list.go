@@ -853,13 +853,23 @@ func (mp *metaPartition) deleteObjExtentsBatch(oeks []proto.ObjExtentKey) {
 		return
 	}
 
+	// Log first 5 extents for debugging
+	logExtents := oeks
+	if len(oeks) > 5 {
+		logExtents = oeks[:5]
+	}
+	extentInfo := make([]string, 0, len(logExtents))
+	for _, ek := range logExtents {
+		extentInfo = append(extentInfo, ek.String())
+	}
+
 	err := mp.deleteObjExtents(oeks)
 	if err != nil {
-		log.LogErrorf("[deleteObjExtentsBatch] mp(%v) failed to delete %d obj extents: %v",
-			mp.config.PartitionId, len(oeks), err)
+		log.LogErrorf("[deleteObjExtentsBatch] mp(%v) failed to delete %d obj extents, first 5: %v, err: %v",
+			mp.config.PartitionId, len(oeks), extentInfo, err)
 	} else {
-		log.LogDebugf("[deleteObjExtentsBatch] mp(%v) successfully deleted %d obj extents",
-			mp.config.PartitionId, len(oeks))
+		log.LogDebugf("[deleteObjExtentsBatch] mp(%v) successfully deleted %d obj extents, first 5: %v",
+			mp.config.PartitionId, len(oeks), extentInfo)
 	}
 }
 

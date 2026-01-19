@@ -1649,6 +1649,21 @@ func (mw *MetaWrapper) AppendExtentKeys(inode uint64, eks []proto.ExtentKey, sto
 	return nil
 }
 
+func (mw *MetaWrapper) AppendObjExtentKeysWithCheck(inode uint64, newExtent, discard proto.ObjExtentKey) error {
+	mp := mw.getPartitionByInode(inode)
+	if mp == nil {
+		return syscall.ENOENT
+	}
+
+	status, err := mw.appendObjExtentKeysWithCheck(mp, inode, newExtent, discard)
+	if err != nil || status != statusOK {
+		log.LogErrorf("AppendObjExtentKeysWithCheck: inode(%v) newExtent(%v) discard(%v) err(%v) status(%v)", inode, newExtent, discard, err, status)
+		return statusToErrno(status)
+	}
+	log.LogDebugf("AppendObjExtentKeysWithCheck: ino(%v) newExtent(%v) discard(%v)", inode, newExtent, discard)
+	return nil
+}
+
 // AppendObjExtentKeys append multiple obj extent key into specified inode with single request.
 func (mw *MetaWrapper) AppendObjExtentKeys(inode uint64, eks []proto.ObjExtentKey) error {
 	mp := mw.getPartitionByInode(inode)

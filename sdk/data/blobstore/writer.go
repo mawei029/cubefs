@@ -30,6 +30,7 @@ import (
 	"github.com/cubefs/cubefs/sdk/meta"
 	"github.com/cubefs/cubefs/util"
 	"github.com/cubefs/cubefs/util/buf"
+	"github.com/cubefs/cubefs/util/errors"
 	"github.com/cubefs/cubefs/util/log"
 	"github.com/cubefs/cubefs/util/stat"
 )
@@ -37,6 +38,11 @@ import (
 const (
 	MaxBufferSize = 512 * util.MB
 )
+
+type reqExtent struct {
+	Extents       proto.ObjExtentKey
+	DiscardExtent proto.ObjExtentKey
+}
 
 type wSliceErr struct {
 	err        error
@@ -65,6 +71,7 @@ type Writer struct {
 	dirty         bool
 	blockPosition int
 	limitManager  *manager.LimitManager
+	overwrite     bool
 }
 
 func NewWriter(config ClientConfig) (writer *Writer) {
@@ -127,10 +134,13 @@ func (writer *Writer) Write(ctx context.Context, offset int, data []byte, flags 
 	}
 	log.LogDebugf("TRACE blobStore Write Enter: ino(%v) offset(%v) len(%v) flags&proto.FlagsAppend(%v) fileSize(%v)", writer.ino, offset, len(data), flags&proto.FlagsAppend, writer.CacheFileSize())
 
-	if len(data) > MaxBufferSize || flags&proto.FlagsAppend == 0 || offset != writer.CacheFileSize() {
+	if len(data) > MaxBufferSize || flags&proto.FlagsAppend == 0 || offset != writer.CacheFileSize() || writer.overwrite {
+		if len(data) < MaxBufferSize && flags&proto.FlagsAppend != 0 || writer.overwrite {
+			return writer.tryOverWrite(ctx, offset, data, flags)
+		}
+
 		log.LogErrorf("TRACE blobStore Write error,may be len(%v)>512MB,flags(%v)!=flagAppend,offset(%v)!=fileSize(%v)", len(data), flags&proto.FlagsAppend, offset, writer.CacheFileSize())
-		err = syscall.EOPNOTSUPP
-		return
+		return 0, syscall.EOPNOTSUPP
 	}
 	// write buffer
 	log.LogDebugf("TRACE blobStore Write: ino(%v) offset(%v) len(%v) flags&proto.FlagsSyncWrite(%v)", writer.ino, offset, len(data), flags&proto.FlagsSyncWrite)
@@ -141,6 +151,71 @@ func (writer *Writer) Write(ctx context.Context, offset int, data []byte, flags 
 	// parallel io write ebs direct
 	size, err = writer.doParallelWrite(ctx, data, offset)
 	return
+}
+
+func (writer *Writer) tryOverWrite(ctx context.Context, offset int, data []byte, flags int) (size int, err error) {
+	if writer == nil {
+		return 0, fmt.Errorf("writer is not opened yet")
+	}
+	log.LogDebugf("TRACE blobStore WriteWithCheck Enter: ino(%v) offset(%v) len(%v) flags(%v)", writer.ino, offset, len(data), flags)
+
+	writer.overwrite = true
+
+	writer.RLock()
+	defer writer.RUnlock()
+
+	if offset != writer.fileOffset {
+		// flush first
+		err = writer.flushExt(writer.ino, ctx, false, true)
+		if err != nil {
+			log.LogErrorf("TRACE blobStore tryOverWrite error,flush ext fail,ino(%v) offset(%v) len(%v) flags(%v) err(%v)",
+				writer.ino, offset, len(data), flags, err)
+			return 0, err
+		}
+	}
+
+	// write to buffer, if buffer over block size, flush and overwrite
+	writer.fileOffset = offset
+	dataSize := len(data)
+	position := 0
+	log.LogDebugf("TRACE blobStore tryOverWrite: ino(%v) writer.buf.len(%v) writer.blocksize(%v)", writer.ino, len(writer.buf), writer.blockSize)
+
+	for dataSize > 0 {
+		freeSize := writer.blockSize - writer.blockPosition
+		if dataSize < freeSize {
+			freeSize = dataSize
+		}
+
+		copy(writer.buf[writer.blockPosition:], data[position:position+freeSize])
+		position += freeSize
+		writer.blockPosition += freeSize
+		dataSize -= freeSize
+		writer.fileOffset += freeSize
+		writer.dirty = true
+
+		log.LogDebugf("TRACE blobStore tryOverWrite: ino(%v) writer.fileSize(%v) writer.fileOffset(%v) writer.blockPosition(%v) position(%v) freeSize(%v)",
+			writer.ino, writer.fileSize, writer.fileOffset, writer.blockPosition, position, freeSize)
+		// if buffer over block size, flush and overwrite
+		if writer.blockPosition == writer.blockSize {
+			log.LogDebugf("TRACE blobStore tryOverWrite: ino(%v) writer.buf.len(%v) writer.blocksize(%v)", writer.ino, len(writer.buf), writer.blockSize)
+			// writer.Unlock()
+			err = writer.flushExt(writer.ino, ctx, false, true)
+			// writer.Lock()
+			if err != nil {
+				writer.buf = writer.buf[:writer.blockPosition-freeSize]
+				writer.fileOffset -= freeSize
+				writer.blockPosition -= freeSize
+				return
+			}
+		}
+	}
+
+	if offset+len(data) > int(writer.fileSize) {
+		writer.fileSize = uint64(offset + len(data))
+	}
+
+	log.LogDebugf("TRACE blobStore tryOverWrite Exit: ino(%v) writer.fileSize(%v) writer.fileOffset(%v)", writer.ino, writer.fileSize, writer.fileOffset)
+	return len(data), nil
 }
 
 func (writer *Writer) doParallelWrite(ctx context.Context, data []byte, offset int) (size int, err error) {
@@ -405,6 +480,13 @@ func (writer *Writer) Flush(ino uint64, ctx context.Context) (err error) {
 	if writer == nil {
 		return
 	}
+
+	if writer.overwrite {
+		writer.Lock()
+		defer writer.Unlock()
+		return writer.flushExt(ino, ctx, true, true)
+	}
+
 	return writer.flush(ino, ctx, true)
 }
 
@@ -528,13 +610,174 @@ func (writer *Writer) flushWithoutPool(inode uint64, ctx context.Context, flushF
 	return
 }
 
+func (writer *Writer) flushExt(inode uint64, ctx context.Context, flushFlag bool, overwrite bool) (err error) {
+	bgTime := stat.BeginStat()
+	defer func() {
+		stat.EndStat("blobstore-flushExt", err, bgTime, 1)
+	}()
+
+	log.LogDebugf("flushExt: TRACE blobStore flush: ino(%v) buf-len(%v) flushFlag(%v) overwrite(%v) fileOffset(%v) blockPosition(%v)",
+		inode, len(writer.buf), flushFlag, overwrite, writer.fileOffset, writer.blockPosition)
+
+	// writer.Lock()
+	defer func() {
+		writer.dirty = false
+		// writer.Unlock()
+	}()
+
+	if len(writer.buf) == 0 || !writer.dirty {
+		return
+	}
+
+	// get exist extents from meta
+	_, _, _, objExtents, err1 := writer.mw.GetObjExtents(inode)
+	if err1 != nil {
+		log.LogErrorf("flushExt: get obj extents fail,ino(%v) err(%v)", inode, err1)
+		return err1
+	}
+
+	sort.Slice(objExtents, func(i, j int) bool {
+		return objExtents[i].FileOffset < objExtents[j].FileOffset
+	})
+
+	bufferSize := writer.blockPosition
+	reqs := make([]reqExtent, 0)
+	start := uint64(writer.fileOffset - writer.blockPosition)
+	end := uint64(writer.fileOffset)
+
+	// find overlap extent from exist extents
+	for _, ek := range objExtents {
+		if end <= ek.FileOffset {
+			reqs = append(reqs, reqExtent{
+				Extents: proto.ObjExtentKey{
+					FileOffset: start,
+					Size:       end - start,
+				},
+				DiscardExtent: proto.ObjExtentKey{},
+			})
+			log.LogDebugf("flushExt: TRACE blobStore flushExt: ino(%v) start(%v) end(%v) ek(%v) reqs(%v)", inode, start, end, ek, reqs)
+			break
+		}
+
+		if ek.FileOffset > start {
+			reqs = append(reqs, reqExtent{
+				Extents: proto.ObjExtentKey{
+					FileOffset: start,
+					Size:       ek.FileOffset - start,
+				},
+				DiscardExtent: proto.ObjExtentKey{},
+			})
+			log.LogDebugf("flushExt: TRACE blobStore flushExt: ino(%v) start(%v) end(%v) ek(%v) reqs(%v)", inode, start, end, ek, reqs)
+			start = ek.FileOffset
+		}
+
+		reqSize := end - start
+		if end > ek.FileOffset+ek.Size {
+			reqSize = ek.FileOffset + ek.Size - start
+		}
+
+		reqs = append(reqs, reqExtent{
+			Extents: proto.ObjExtentKey{
+				FileOffset: start,
+				Size:       reqSize,
+			},
+			DiscardExtent: ek,
+		})
+		log.LogDebugf("flushExt: TRACE blobStore flushExt: ino(%v) start(%v) end(%v) ek(%v) reqSize(%v)", inode, start, end, ek, reqSize)
+		start = start + reqSize
+		if end <= ek.FileOffset+ek.Size {
+			break
+		}
+	}
+
+	if start < end {
+		log.LogDebugf("flushExt: TRACE blobStore flushExt: add last ek, ino(%v) start(%v) end(%v)", inode, start, end)
+		reqs = append(reqs, reqExtent{
+			Extents: proto.ObjExtentKey{
+				FileOffset: start,
+				Size:       end - start,
+			},
+			DiscardExtent: proto.ObjExtentKey{},
+		})
+	}
+
+	log.LogDebugf("flushExt: TRACE blobStore flushExt: ino(%v) start(%v) end(%v) reqs(%v)", inode, start, end, reqs)
+
+	bufOff := uint64(writer.fileOffset - bufferSize)
+	for _, req := range reqs {
+		ek := req.Extents
+		off := ek.FileOffset - bufOff
+
+		wSlice := &rwSlice{
+			fileOffset: ek.FileOffset,
+			size:       uint32(ek.Size),
+			Data:       writer.buf[off : off+ek.Size],
+		}
+
+		if !req.DiscardExtent.IsEmpty() {
+			// read discard extent from ebs
+			discardExtent := req.DiscardExtent
+			data := make([]byte, discardExtent.Size)
+			readN, err := writer.ebsc.Read(ctx, writer.volName, data, 0, discardExtent.Size, discardExtent)
+			if err != nil || readN != int(discardExtent.Size) {
+				msg := fmt.Sprintf("flushExt: read discard extent from ebs fail,ino(%v) fileOffset(%v) len(%v) readN(%v) err(%v)",
+					inode, discardExtent.FileOffset, discardExtent.Size, readN, err)
+				log.LogError(msg)
+				return errors.New(msg)
+			}
+
+			log.LogDebugf("flushExt: read discard extent from ebs success,ino(%v) fileOffset(%v) len(%v) readN(%v)",
+				inode, discardExtent.FileOffset, discardExtent.Size, readN)
+
+			ret := copy(data, wSlice.Data)
+			if ret != int(ek.Size) {
+				msg := fmt.Sprintf("flushExt: copy discard extent data fail,ino(%v) fileOffset(%v) len(%v) readN(%v) ret(%v)",
+					inode, discardExtent.FileOffset, discardExtent.Size, readN, ret)
+				log.LogError(msg)
+				return errors.New(msg)
+			}
+
+			wSlice.size = uint32(discardExtent.Size)
+			wSlice.Data = data
+			wSlice.fileOffset = discardExtent.FileOffset
+		}
+
+		log.LogDebugf("flushExt: TRACE blobStore flushExt: write slice, ino(%v) fileOffset(%v) len(%v) objExtentKey(%v) discardExtent(%v)",
+			inode, wSlice.fileOffset, wSlice.size, wSlice.objExtentKey, req.DiscardExtent)
+		err = writer.writeSlice(ctx, wSlice, false)
+		if err != nil {
+			if flushFlag {
+				atomic.AddUint64(&writer.fileSize, -uint64(bufferSize))
+			}
+			return
+		}
+
+		log.LogDebugf("flushExt: write slice success,ino(%v) fileOffset(%v) len(%v) objExtentKey(%v) discardExtent(%v)",
+			inode, wSlice.fileOffset, wSlice.size, wSlice.objExtentKey, req.DiscardExtent)
+
+		err = writer.mw.AppendObjExtentKeysWithCheck(writer.ino, wSlice.objExtentKey, req.DiscardExtent)
+		if err != nil {
+			log.LogErrorf("flushExt: append obj extent keys with check fail,ino(%v) fileOffset(%v) len(%v) err(%v)", inode, wSlice.fileOffset, wSlice.size, err)
+			return
+		}
+
+		log.LogDebugf("flushExt: append obj extent keys with check success,ino(%v) fileOffset(%v) len(%v) objExtentKey(%v) discardExtent(%v)",
+			inode, wSlice.fileOffset, wSlice.size, wSlice.objExtentKey, req.DiscardExtent)
+	}
+
+	writer.resetBuffer()
+	return
+}
+
 func (writer *Writer) flush(inode uint64, ctx context.Context, flushFlag bool) (err error) {
 	bgTime := stat.BeginStat()
 	defer func() {
 		stat.EndStat("blobstore-flush", err, bgTime, 1)
 	}()
 
-	log.LogDebugf("TRACE blobStore flush: ino(%v) buf-len(%v) flushFlag(%v)", inode, len(writer.buf), flushFlag)
+	log.LogDebugf("flush: TRACE blobStore flush: ino(%v) buf-len(%v) flushFlag(%v) fileOffset(%v) blockPosition(%v)",
+		inode, len(writer.buf), flushFlag, writer.fileOffset, writer.blockPosition)
+
 	writer.Lock()
 	defer func() {
 		writer.dirty = false
@@ -544,7 +787,9 @@ func (writer *Writer) flush(inode uint64, ctx context.Context, flushFlag bool) (
 	if len(writer.buf) == 0 || !writer.dirty {
 		return
 	}
+
 	bufferSize := writer.blockPosition
+
 	wSlice := &rwSlice{
 		fileOffset: uint64(writer.fileOffset - bufferSize),
 		size:       uint32(bufferSize),
@@ -562,7 +807,7 @@ func (writer *Writer) flush(inode uint64, ctx context.Context, flushFlag bool) (
 	// update meta
 	oeks = append(oeks, wSlice.objExtentKey)
 	if err = writer.mw.AppendObjExtentKeys(writer.ino, oeks); err != nil {
-		log.LogErrorf("slice write error,meta append ebsc extent keys fail,ino(%v) fileOffset(%v) len(%v) err(%v)", inode, wSlice.fileOffset, wSlice.size, err)
+		log.LogErrorf("flush: slice write error,meta append ebsc extent keys fail,ino(%v) fileOffset(%v) len(%v) err(%v)", inode, wSlice.fileOffset, wSlice.size, err)
 		return
 	}
 	writer.resetBuffer()

@@ -2080,6 +2080,54 @@ func (mw *MetaWrapper) appendExtentKeys(mp *MetaPartition, inode uint64, extents
 	return
 }
 
+func (mw *MetaWrapper) appendObjExtentKeysWithCheck(mp *MetaPartition, inode uint64, newExtent, discard proto.ObjExtentKey) (status int, err error) {
+	bgTime := stat.BeginStat()
+	defer func() {
+		stat.EndStat("appendObjExtentKeyWithCheck", err, bgTime, 1)
+	}()
+
+	req := &proto.AppendObjExtentKeysRequest{
+		VolName:       mw.volname,
+		PartitionID:   mp.PartitionID,
+		Inode:         inode,
+		Extents:       []proto.ObjExtentKey{newExtent},
+		DiscardExtent: discard,
+		IsOverwrite:   true,
+	}
+
+	packet := proto.NewPacketReqID()
+	packet.Opcode = proto.OpMetaBatchObjExtentsAdd
+	packet.PartitionID = mp.PartitionID
+	err = packet.MarshalData(req)
+	if err != nil {
+		log.LogErrorf("appendObjExtentKeyWithCheck: batch append obj extents: req(%v) err(%v)", *req, err)
+		return
+	}
+	log.LogDebugf("appendObjExtentKeyWithCheck: batch append obj extents: packet(%v) mp(%v) req(%v)", packet, mp, *req)
+
+	metric := exporter.NewTPCnt(packet.GetOpMsg())
+	defer func() {
+		metric.SetWithLabels(err, map[string]string{exporter.Vol: mw.volname})
+	}()
+
+	packet, err = mw.sendToMetaPartition(mp, packet)
+	if err != nil {
+		log.LogErrorf("appendObjExtentKeyWithCheck: batch append obj extents: packet(%v) mp(%v) req(%v) err(%v)", packet, mp, *req, err)
+		return
+	}
+
+	status = parseStatus(packet.ResultCode)
+	if status != statusOK {
+		err = errors.New(packet.GetResultMsg())
+		log.LogErrorf("appendObjExtentKeyWithCheck: batch append obj extents: packet(%v) mp(%v) req(%v) result(%v)",
+			packet, mp, *req, packet.GetResultMsg())
+		return
+	}
+
+	log.LogDebugf("appendObjExtentKeyWithCheck: batch append obj extents: packet(%v) mp(%v) req(%v) result(%v)", packet, mp, *req, packet.GetResultMsg())
+	return statusOK, nil
+}
+
 func (mw *MetaWrapper) appendObjExtentKeys(mp *MetaPartition, inode uint64, extents []proto.ObjExtentKey) (status int, err error) {
 	bgTime := stat.BeginStat()
 	defer func() {
