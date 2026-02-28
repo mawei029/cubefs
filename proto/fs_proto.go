@@ -719,13 +719,15 @@ func (ap *AppendExtentKeyWithCheckRequest) EkString() string {
 }
 
 // AppendObjExtentKeyRequest defines the request to append an obj extent key.
+// For overwrite: Extents[i] is the new extent, DiscardExtents[i] is the old extent to discard (paired by index).
+// DiscardExtent is legacy single discard; when DiscardExtents is empty, DiscardExtent is used as one pair.
 type AppendObjExtentKeysRequest struct {
-	VolName       string         `json:"vol"`
-	PartitionID   uint64         `json:"pid"`
-	Inode         uint64         `json:"ino"`
-	Extents       []ObjExtentKey `json:"ek"`
-	DiscardExtent ObjExtentKey   `json:"dek"`
-	IsOverwrite   bool           `json:"isOverwrite"`
+	VolName        string         `json:"vol"`
+	PartitionID    uint64         `json:"pid"`
+	Inode          uint64         `json:"ino"`
+	Extents        []ObjExtentKey `json:"ek"`
+	DiscardExtents []ObjExtentKey `json:"dek"`
+	IsOverwrite    bool           `json:"isOverwrite"`
 }
 
 // EkString returns a string representation of extent-related fields.
@@ -748,8 +750,12 @@ func (ap *AppendObjExtentKeysRequest) EkString() string {
 		sb.WriteString(ek.String())
 	}
 	sb.WriteString(",dek:")
-	if !ap.DiscardExtent.IsEmpty() {
-		sb.WriteString(ap.DiscardExtent.String())
+	if len(ap.DiscardExtents) > 0 {
+		for _, d := range ap.DiscardExtents {
+			if !d.IsEmpty() {
+				sb.WriteString(d.String())
+			}
+		}
 	}
 	sb.WriteString(fmt.Sprintf(",isOverwrite:%v]", ap.IsOverwrite))
 

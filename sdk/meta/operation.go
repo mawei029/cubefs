@@ -2080,19 +2080,20 @@ func (mw *MetaWrapper) appendExtentKeys(mp *MetaPartition, inode uint64, extents
 	return
 }
 
-func (mw *MetaWrapper) appendObjExtentKeysWithCheck(mp *MetaPartition, inode uint64, newExtent, discard proto.ObjExtentKey) (status int, err error) {
+// appendObjExtentKeysWithCheck sends request to metanode for atomic extent update with conflict checking (batch).
+func (mw *MetaWrapper) appendObjExtentKeysWithCheck(mp *MetaPartition, inode uint64, newExtents, discardExtents []proto.ObjExtentKey) (status int, err error) {
 	bgTime := stat.BeginStat()
 	defer func() {
 		stat.EndStat("appendObjExtentKeyWithCheck", err, bgTime, 1)
 	}()
 
 	req := &proto.AppendObjExtentKeysRequest{
-		VolName:       mw.volname,
-		PartitionID:   mp.PartitionID,
-		Inode:         inode,
-		Extents:       []proto.ObjExtentKey{newExtent},
-		DiscardExtent: discard,
-		IsOverwrite:   true,
+		VolName:        mw.volname,
+		PartitionID:    mp.PartitionID,
+		Inode:          inode,
+		Extents:        newExtents,
+		DiscardExtents: discardExtents,
+		IsOverwrite:    true,
 	}
 
 	packet := proto.NewPacketReqID()
@@ -2100,10 +2101,10 @@ func (mw *MetaWrapper) appendObjExtentKeysWithCheck(mp *MetaPartition, inode uin
 	packet.PartitionID = mp.PartitionID
 	err = packet.MarshalData(req)
 	if err != nil {
-		log.LogErrorf("appendObjExtentKeyWithCheck: batch append obj extents: req(%v) err(%v)", *req, err)
+		log.LogErrorf("appendObjExtentKeyWithCheck: batch append obj extents: ino(%v) count(%v) err(%v)", inode, len(newExtents), err)
 		return
 	}
-	log.LogDebugf("appendObjExtentKeyWithCheck: batch append obj extents: packet(%v) mp(%v) req(%v)", packet, mp, *req)
+	log.LogDebugf("appendObjExtentKeyWithCheck: batch append obj extents: packet(%v) mp(%v) ino(%v) count(%v)", packet, mp, inode, len(newExtents))
 
 	metric := exporter.NewTPCnt(packet.GetOpMsg())
 	defer func() {
@@ -2112,19 +2113,19 @@ func (mw *MetaWrapper) appendObjExtentKeysWithCheck(mp *MetaPartition, inode uin
 
 	packet, err = mw.sendToMetaPartition(mp, packet)
 	if err != nil {
-		log.LogErrorf("appendObjExtentKeyWithCheck: batch append obj extents: packet(%v) mp(%v) req(%v) err(%v)", packet, mp, *req, err)
+		log.LogErrorf("appendObjExtentKeyWithCheck: batch append obj extents: packet(%v) mp(%v) ino(%v) err(%v)", packet, mp, inode, err)
 		return
 	}
 
 	status = parseStatus(packet.ResultCode)
 	if status != statusOK {
 		err = errors.New(packet.GetResultMsg())
-		log.LogErrorf("appendObjExtentKeyWithCheck: batch append obj extents: packet(%v) mp(%v) req(%v) result(%v)",
-			packet, mp, *req, packet.GetResultMsg())
+		log.LogErrorf("appendObjExtentKeyWithCheck: batch append obj extents: packet(%v) mp(%v) ino(%v) result(%v)",
+			packet, mp, inode, packet.GetResultMsg())
 		return
 	}
 
-	log.LogDebugf("appendObjExtentKeyWithCheck: batch append obj extents: packet(%v) mp(%v) req(%v) result(%v)", packet, mp, *req, packet.GetResultMsg())
+	log.LogDebugf("appendObjExtentKeyWithCheck: batch append obj extents: packet(%v) mp(%v) ino(%v) result(%v)", packet, mp, inode, packet.GetResultMsg())
 	return statusOK, nil
 }
 

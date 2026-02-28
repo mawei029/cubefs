@@ -1649,18 +1649,23 @@ func (mw *MetaWrapper) AppendExtentKeys(inode uint64, eks []proto.ExtentKey, sto
 	return nil
 }
 
-func (mw *MetaWrapper) AppendObjExtentKeysWithCheck(inode uint64, newExtent, discard proto.ObjExtentKey) error {
+// AppendObjExtentKeysWithCheck atomically applies multiple (newExtent, discardExtent) pairs with conflict checking.
+// len(newExtents) must equal len(discardExtents); each pair is applied in order, then all discards are sent for async deletion in one batch.
+func (mw *MetaWrapper) AppendObjExtentKeysWithCheck(inode uint64, newExtents, discardExtents []proto.ObjExtentKey) error {
+	if len(newExtents) != len(discardExtents) {
+		return syscall.EINVAL
+	}
 	mp := mw.getPartitionByInode(inode)
 	if mp == nil {
 		return syscall.ENOENT
 	}
 
-	status, err := mw.appendObjExtentKeysWithCheck(mp, inode, newExtent, discard)
+	status, err := mw.appendObjExtentKeysWithCheck(mp, inode, newExtents, discardExtents)
 	if err != nil || status != statusOK {
-		log.LogErrorf("AppendObjExtentKeysWithCheck: inode(%v) newExtent(%v) discard(%v) err(%v) status(%v)", inode, newExtent, discard, err, status)
+		log.LogErrorf("AppendObjExtentKeysWithCheckBatch: inode(%v) count(%v) err(%v) status(%v)", inode, len(newExtents), err, status)
 		return statusToErrno(status)
 	}
-	log.LogDebugf("AppendObjExtentKeysWithCheck: ino(%v) newExtent(%v) discard(%v)", inode, newExtent, discard)
+	log.LogDebugf("AppendObjExtentKeysWithCheckBatch: ino(%v) count(%v)", inode, len(newExtents))
 	return nil
 }
 

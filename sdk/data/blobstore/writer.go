@@ -39,9 +39,10 @@ const (
 	MaxBufferSize = 512 * util.MB
 )
 
-type reqExtent struct {
-	Extents       proto.ObjExtentKey
-	DiscardExtent proto.ObjExtentKey
+// overwriteReq represents an overwrite request that contains both the new extent and the old extent
+type overwriteReq struct {
+	NewExtent     proto.ObjExtentKey // new extent range to write to storage (may partially overlap old data)
+	DiscardExtent proto.ObjExtentKey // old extent that needs to be discarded/replaced.（may be empty）
 }
 
 type wSliceErr struct {
@@ -71,7 +72,7 @@ type Writer struct {
 	dirty         bool
 	blockPosition int
 	limitManager  *manager.LimitManager
-	overwrite     bool
+	overwrite     bool // true: overwrite mode(flushExt); false: append mode(flush).
 }
 
 func NewWriter(config ClientConfig) (writer *Writer) {
@@ -128,88 +129,99 @@ func (writer *Writer) WriteWithoutPool(ctx context.Context, offset int, data []b
 }
 
 func (writer *Writer) Write(ctx context.Context, offset int, data []byte, flags int) (size int, err error) {
-	// atomic.StoreInt32(&writer.idle, 0)
 	if writer == nil {
 		return 0, fmt.Errorf("writer is not opened yet")
 	}
 	log.LogDebugf("TRACE blobStore Write Enter: ino(%v) offset(%v) len(%v) flags&proto.FlagsAppend(%v) fileSize(%v)", writer.ino, offset, len(data), flags&proto.FlagsAppend, writer.CacheFileSize())
 
-	if len(data) > MaxBufferSize || flags&proto.FlagsAppend == 0 || offset != writer.CacheFileSize() || writer.overwrite {
-		if len(data) < MaxBufferSize && flags&proto.FlagsAppend != 0 || writer.overwrite {
-			return writer.tryOverWrite(ctx, offset, data, flags)
-		}
-
-		log.LogErrorf("TRACE blobStore Write error,may be len(%v)>512MB,flags(%v)!=flagAppend,offset(%v)!=fileSize(%v)", len(data), flags&proto.FlagsAppend, offset, writer.CacheFileSize())
+	// Case 1: Validate write request: data too large, not append mode, or non-contiguous write (unless overwrite mode)
+	invalid := len(data) > MaxBufferSize || flags&proto.FlagsAppend == 0 || (offset != writer.CacheFileSize() && !writer.overwrite)
+	if invalid {
+		log.LogErrorf("TRACE blobStore Write error,may be len(%v)>512MB,flags(%v)!=flagAppend,offset(%v)!=fileSize(%v), overwrite(%t)",
+			len(data), flags&proto.FlagsAppend, offset, writer.CacheFileSize(), writer.overwrite)
 		return 0, syscall.EOPNOTSUPP
 	}
-	// write buffer
+
+	// Case 2: Handle overwrite: either already in overwrite mode or writing before current file offset
+	// Overwrite requires special handling to merge with existing extents and discard old data
+	if writer.overwrite || offset < writer.CacheFileSize() {
+		return writer.tryOverWrite(ctx, offset, data, flags)
+	}
+
+	// Case 3: Sequential append write: data is appended to the end of file
 	log.LogDebugf("TRACE blobStore Write: ino(%v) offset(%v) len(%v) flags&proto.FlagsSyncWrite(%v)", writer.ino, offset, len(data), flags&proto.FlagsSyncWrite)
+
+	// Case 3.1: with buffer: Use buffered write for better performance (data stays in buffer until flush)
 	if flags&proto.FlagsSyncWrite == 0 {
 		size, err = writer.doBufferWrite(ctx, data, offset)
 		return
 	}
-	// parallel io write ebs direct
+
+	// Case 3.2: Synchronous write: write directly to EBS without buffering
+	// This ensures data is immediately persisted but has lower throughput
 	size, err = writer.doParallelWrite(ctx, data, offset)
 	return
 }
 
+// tryOverWrite handles overwrite by buffering data and flushing with extent merge logic
 func (writer *Writer) tryOverWrite(ctx context.Context, offset int, data []byte, flags int) (size int, err error) {
 	if writer == nil {
 		return 0, fmt.Errorf("writer is not opened yet")
 	}
+
 	log.LogDebugf("TRACE blobStore WriteWithCheck Enter: ino(%v) offset(%v) len(%v) flags(%v)", writer.ino, offset, len(data), flags)
 
-	writer.overwrite = true
-
-	writer.RLock()
-	defer writer.RUnlock()
+	writer.Lock()
+	defer writer.Unlock()
 
 	if offset != writer.fileOffset {
-		// flush first
-		err = writer.flushExt(writer.ino, ctx, false, true)
-		if err != nil {
+		// Flush existing buffer data before starting new write at different offset
+		if err = writer.flushExt(writer.ino, ctx, false); err != nil {
 			log.LogErrorf("TRACE blobStore tryOverWrite error,flush ext fail,ino(%v) offset(%v) len(%v) flags(%v) err(%v)",
 				writer.ino, offset, len(data), flags, err)
 			return 0, err
 		}
 	}
 
-	// write to buffer, if buffer over block size, flush and overwrite
-	writer.fileOffset = offset
-	dataSize := len(data)
-	position := 0
+	remainSize, position := len(data), 0
 	log.LogDebugf("TRACE blobStore tryOverWrite: ino(%v) writer.buf.len(%v) writer.blocksize(%v)", writer.ino, len(writer.buf), writer.blockSize)
 
-	for dataSize > 0 {
+	// The loop will write data to buffer in blocks, flushing when buffer is full
+	// Process data in chunks until all data is written to buffer
+	for remainSize > 0 {
 		freeSize := writer.blockSize - writer.blockPosition
-		if dataSize < freeSize {
-			freeSize = dataSize
+		if remainSize < freeSize {
+			freeSize = remainSize
 		}
 
+		// Copy data and update position: advance in both input data and buffer
 		copy(writer.buf[writer.blockPosition:], data[position:position+freeSize])
-		position += freeSize
-		writer.blockPosition += freeSize
-		dataSize -= freeSize
-		writer.fileOffset += freeSize
-		writer.dirty = true
+		position += freeSize             // Move forward in input data
+		writer.blockPosition += freeSize // Move forward in buffer
+		remainSize -= freeSize           // Decrease remaining data to process
+		writer.fileOffset += freeSize    // Update file offset (logical position in file)
+		writer.dirty = true              // Mark buffer as modified (needs flush)
 
 		log.LogDebugf("TRACE blobStore tryOverWrite: ino(%v) writer.fileSize(%v) writer.fileOffset(%v) writer.blockPosition(%v) position(%v) freeSize(%v)",
 			writer.ino, writer.fileSize, writer.fileOffset, writer.blockPosition, position, freeSize)
-		// if buffer over block size, flush and overwrite
+
+		// Check buffer is full: when position are equal, buffer is completely filled. we flush buffer and continue
 		if writer.blockPosition == writer.blockSize {
 			log.LogDebugf("TRACE blobStore tryOverWrite: ino(%v) writer.buf.len(%v) writer.blocksize(%v)", writer.ino, len(writer.buf), writer.blockSize)
-			// writer.Unlock()
-			err = writer.flushExt(writer.ino, ctx, false, true)
-			// writer.Lock()
+			// Flush buffer with overwrite logic: this will handle extent overlap and discard old data
+			err = writer.flushExt(writer.ino, ctx, false)
 			if err != nil {
+				// Rollback the state to maintain consistency, remove the failed buffer and revert position pointers
 				writer.buf = writer.buf[:writer.blockPosition-freeSize]
 				writer.fileOffset -= freeSize
 				writer.blockPosition -= freeSize
-				return
+				return position, err
 			}
+			// After successful flush, blockPosition is reset to 0 (in flushExt -> resetBuffer). buffer is empty and ready for next chunk
 		}
 	}
 
+	// Update file size if write extends beyond current file size
 	if offset+len(data) > int(writer.fileSize) {
 		writer.fileSize = uint64(offset + len(data))
 	}
@@ -481,12 +493,15 @@ func (writer *Writer) Flush(ino uint64, ctx context.Context) (err error) {
 		return
 	}
 
+	// If in overwrite mode, use flushExt which handles extent overlap and discard logic
+	// Otherwise, use normal flush which simply appends new extent
 	if writer.overwrite {
 		writer.Lock()
 		defer writer.Unlock()
-		return writer.flushExt(ino, ctx, true, true)
+		return writer.flushExt(ino, ctx, true)
 	}
 
+	// Normal append flush: no overlap handling needed
 	return writer.flush(ino, ctx, true)
 }
 
@@ -604,109 +619,108 @@ func (writer *Writer) flushWithoutPool(inode uint64, ctx context.Context, flushF
 	oeks = append(oeks, wSlice.objExtentKey)
 	if err = writer.mw.AppendObjExtentKeys(writer.ino, oeks); err != nil {
 		log.LogErrorf("slice write error,meta append ebsc extent keys fail,ino(%v) fileOffset(%v) len(%v) err(%v)", inode, wSlice.fileOffset, wSlice.size, err)
+		// Rollback: delete orphaned data on EBS to avoid blobstore leak
+		if delErr := writer.ebsc.Delete(oeks); delErr != nil {
+			log.LogWarnf("flushWithoutPool: rollback delete ebs extent fail,ino(%v) fileOffset(%v) err(%v)", inode, wSlice.fileOffset, delErr)
+		}
 		return
 	}
 	writer.resetBufferWithoutPool()
 	return
 }
 
-func (writer *Writer) flushExt(inode uint64, ctx context.Context, flushFlag bool, overwrite bool) (err error) {
-	bgTime := stat.BeginStat()
-	defer func() {
-		stat.EndStat("blobstore-flushExt", err, bgTime, 1)
-	}()
+// computeOverwriteReqs computes overwrite request list based on the current buffer range [bufferStart, bufferEnd)
+// and existing objExtents. Each returned overwriteReq represents a range to write (NewExtent) and its corresponding
+// old range to discard (DiscardExtent, which may be empty). objExtents must be sorted by FileOffset in ascending order.
+//
+// Algorithm:
+//  1. Iterate through existing extents in sorted order
+//  2. For each extent, determine if it overlaps with buffer range [start, end)
+//  3. Generate requests for:
+//     - Non-overlapping regions (new data, no discard)
+//     - Overlapping regions (new data + old extent to discard)
+//  4. Handle partial overlaps where buffer only covers part of an extent
+//
+// Example:
+//   Buffer: [100, 200), Existing extents: [50, 150), [200, 250)
+//   Writer.fileOffset==200, Writer.fileSize==300 ; eks: {offset:50, size:100}, {offset:200, size:50}
+//   Result:
+//     - req1: NewExtent=[100, 150), DiscardExtent=[50, 150) (partial overlap)
+//     - req2: NewExtent=[150, 200), DiscardExtent=empty (new data, no overlap)
+func (writer *Writer) computeOverwriteReqs(start, end uint64, objExtents []proto.ObjExtentKey) (reqs []overwriteReq) {
+	reqs = make([]overwriteReq, 0)
 
-	log.LogDebugf("flushExt: TRACE blobStore flush: ino(%v) buf-len(%v) flushFlag(%v) overwrite(%v) fileOffset(%v) blockPosition(%v)",
-		inode, len(writer.buf), flushFlag, overwrite, writer.fileOffset, writer.blockPosition)
-
-	// writer.Lock()
-	defer func() {
-		writer.dirty = false
-		// writer.Unlock()
-	}()
-
-	if len(writer.buf) == 0 || !writer.dirty {
-		return
-	}
-
-	// get exist extents from meta
-	_, _, _, objExtents, err1 := writer.mw.GetObjExtents(inode)
-	if err1 != nil {
-		log.LogErrorf("flushExt: get obj extents fail,ino(%v) err(%v)", inode, err1)
-		return err1
-	}
-
-	sort.Slice(objExtents, func(i, j int) bool {
-		return objExtents[i].FileOffset < objExtents[j].FileOffset
-	})
-
-	bufferSize := writer.blockPosition
-	reqs := make([]reqExtent, 0)
-	start := uint64(writer.fileOffset - writer.blockPosition)
-	end := uint64(writer.fileOffset)
-
-	// find overlap extent from exist extents
+	// Iterate through existing extents to find overlaps with buffer range
 	for _, ek := range objExtents {
+		// Case 1: Buffer range ends before this extent starts - no overlap
+		// Add remaining buffer range as new data (no discard needed)
 		if end <= ek.FileOffset {
-			reqs = append(reqs, reqExtent{
-				Extents: proto.ObjExtentKey{
-					FileOffset: start,
-					Size:       end - start,
-				},
+			reqs = append(reqs, overwriteReq{
+				NewExtent:     proto.ObjExtentKey{FileOffset: start, Size: end - start},
 				DiscardExtent: proto.ObjExtentKey{},
 			})
-			log.LogDebugf("flushExt: TRACE blobStore flushExt: ino(%v) start(%v) end(%v) ek(%v) reqs(%v)", inode, start, end, ek, reqs)
 			break
 		}
 
-		if ek.FileOffset > start {
-			reqs = append(reqs, reqExtent{
-				Extents: proto.ObjExtentKey{
-					FileOffset: start,
-					Size:       ek.FileOffset - start,
-				},
+		// Case 2: Gap between buffer start and extent start - add gap as new data
+		// This handles non-contiguous extents where buffer has data before next extent
+		if start < ek.FileOffset {
+			reqs = append(reqs, overwriteReq{
+				NewExtent:     proto.ObjExtentKey{FileOffset: start, Size: ek.FileOffset - start},
 				DiscardExtent: proto.ObjExtentKey{},
 			})
-			log.LogDebugf("flushExt: TRACE blobStore flushExt: ino(%v) start(%v) end(%v) ek(%v) reqs(%v)", inode, start, end, ek, reqs)
 			start = ek.FileOffset
 		}
 
+		// Case 3: Overlap detected - calculate overlap size
+		// reqSize is the size of the overlapping region between buffer and extent
+		// If buffer extends beyond this extent, only overlap the extent's range
 		reqSize := end - start
 		if end > ek.FileOffset+ek.Size {
 			reqSize = ek.FileOffset + ek.Size - start
 		}
-
-		reqs = append(reqs, reqExtent{
-			Extents: proto.ObjExtentKey{
-				FileOffset: start,
-				Size:       reqSize,
-			},
-			DiscardExtent: ek,
+		reqs = append(reqs, overwriteReq{
+			NewExtent:     proto.ObjExtentKey{FileOffset: start, Size: reqSize},
+			DiscardExtent: ek, // Mark old extent for discard
 		})
-		log.LogDebugf("flushExt: TRACE blobStore flushExt: ino(%v) start(%v) end(%v) ek(%v) reqSize(%v)", inode, start, end, ek, reqSize)
-		start = start + reqSize
+		start += reqSize
+
+		// If buffer range is fully covered by this extent, we're done
 		if end <= ek.FileOffset+ek.Size {
 			break
 		}
 	}
 
+	// Case 4: Remaining buffer range after all extents - add as new data
+	// This handles buffer data that extends beyond all existing extents
 	if start < end {
-		log.LogDebugf("flushExt: TRACE blobStore flushExt: add last ek, ino(%v) start(%v) end(%v)", inode, start, end)
-		reqs = append(reqs, reqExtent{
-			Extents: proto.ObjExtentKey{
-				FileOffset: start,
-				Size:       end - start,
-			},
+		reqs = append(reqs, overwriteReq{
+			NewExtent:     proto.ObjExtentKey{FileOffset: start, Size: end - start},
 			DiscardExtent: proto.ObjExtentKey{},
 		})
 	}
+	return reqs
+}
 
-	log.LogDebugf("flushExt: TRACE blobStore flushExt: ino(%v) start(%v) end(%v) reqs(%v)", inode, start, end, reqs)
+// flushOverwriteReqs applies the request list: write all slices to EBS, then update metadata in one batch.
+// 1. For each req: build wSlice (read/merge old extent if partial overwrite), writeSlice to EBS, collect newExtent + discardExtent.
+// 2. One AppendObjExtentKeysWithCheck(ino, newExtents, discardExtents); on failure rollback (delete all new extents).
+// Call flow: writer.mw.AppendObjExtentKeysWithCheckBatch -> metanode BatchObjExtentAppendWithCheck -> fsmAppendObjExtentsWithCheck (multi-pair) -> objExtDelCh <- toDelete
+func (writer *Writer) flushOverwriteReqs(ctx context.Context, inode uint64, reqs []overwriteReq, bufOff uint64, bufferSize int, flushFlag bool) (err error) {
+	newExtents := make([]proto.ObjExtentKey, 0, len(reqs))
+	discardExtents := make([]proto.ObjExtentKey, 0, len(reqs))
 
-	bufOff := uint64(writer.fileOffset - bufferSize)
+	rollbackFn := func() {
+		for _, written := range newExtents {
+			if delErr := writer.ebsc.Delete([]proto.ObjExtentKey{written}); delErr != nil {
+				log.LogWarnf("flushExt: rollback delete ebs extent fail,ino(%v) fileOffset(%v) err(%v)", writer.ino, written.FileOffset, delErr)
+			}
+		}
+	}
+
 	for _, req := range reqs {
-		ek := req.Extents
-		off := ek.FileOffset - bufOff
+		ek := req.NewExtent
+		off := ek.FileOffset - bufOff // Calculate offset within buffer: convert file offset to buffer offset
 
 		wSlice := &rwSlice{
 			fileOffset: ek.FileOffset,
@@ -714,57 +728,113 @@ func (writer *Writer) flushExt(inode uint64, ctx context.Context, flushFlag bool
 			Data:       writer.buf[off : off+ek.Size],
 		}
 
+		// If old extent exists, need to merge new data with FULL old data. Can't change extent size, only modify its content
 		if !req.DiscardExtent.IsEmpty() {
-			// read discard extent from ebs
+			// Allocate buffer for FULL old extent (may be larger than new data)
 			discardExtent := req.DiscardExtent
 			data := make([]byte, discardExtent.Size)
-			readN, err := writer.ebsc.Read(ctx, writer.volName, data, 0, discardExtent.Size, discardExtent)
-			if err != nil || readN != int(discardExtent.Size) {
+
+			readN, readErr := writer.ebsc.Read(ctx, writer.volName, data, 0, discardExtent.Size, discardExtent)
+			if readErr != nil || readN != int(discardExtent.Size) {
 				msg := fmt.Sprintf("flushExt: read discard extent from ebs fail,ino(%v) fileOffset(%v) len(%v) readN(%v) err(%v)",
-					inode, discardExtent.FileOffset, discardExtent.Size, readN, err)
+					inode, discardExtent.FileOffset, discardExtent.Size, readN, readErr)
 				log.LogError(msg)
 				return errors.New(msg)
 			}
-
 			log.LogDebugf("flushExt: read discard extent from ebs success,ino(%v) fileOffset(%v) len(%v) readN(%v)",
 				inode, discardExtent.FileOffset, discardExtent.Size, readN)
 
-			ret := copy(data, wSlice.Data)
+			// Merge new data into old extent: copy new data over old data at corresponding position
+			// This preserves the extent size while updating its content. relativeOffset: new data within old extent
+			// Copy new data to the correct position in the old extent (not at the beginning)
+			relativeOffset := ek.FileOffset - discardExtent.FileOffset
+			ret := copy(data[relativeOffset:], wSlice.Data)
+
 			if ret != int(ek.Size) {
 				msg := fmt.Sprintf("flushExt: copy discard extent data fail,ino(%v) fileOffset(%v) len(%v) readN(%v) ret(%v)",
 					inode, discardExtent.FileOffset, discardExtent.Size, readN, ret)
 				log.LogError(msg)
 				return errors.New(msg)
 			}
-
+			// Update slice to use merged data (full extent size, not just new data size)
 			wSlice.size = uint32(discardExtent.Size)
 			wSlice.Data = data
 			wSlice.fileOffset = discardExtent.FileOffset
 		}
 
-		log.LogDebugf("flushExt: TRACE blobStore flushExt: write slice, ino(%v) fileOffset(%v) len(%v) objExtentKey(%v) discardExtent(%v)",
-			inode, wSlice.fileOffset, wSlice.size, wSlice.objExtentKey, req.DiscardExtent)
-		err = writer.writeSlice(ctx, wSlice, false)
-		if err != nil {
+		// Write the slice to EBS (either new data or merged data)
+		log.LogDebugf("flushExt: write slice ino(%v) fileOffset(%v) len(%v) discardExtent(%v)", inode, wSlice.fileOffset, wSlice.size, req.DiscardExtent)
+		if err = writer.writeSlice(ctx, wSlice, false); err != nil {
 			if flushFlag {
 				atomic.AddUint64(&writer.fileSize, -uint64(bufferSize))
 			}
+			// Rollback: delete already-written extents (use newExtents: real EBS location keys, not req.NewExtent)
+			rollbackFn()
 			return
 		}
 
-		log.LogDebugf("flushExt: write slice success,ino(%v) fileOffset(%v) len(%v) objExtentKey(%v) discardExtent(%v)",
-			inode, wSlice.fileOffset, wSlice.size, wSlice.objExtentKey, req.DiscardExtent)
-
-		err = writer.mw.AppendObjExtentKeysWithCheck(writer.ino, wSlice.objExtentKey, req.DiscardExtent)
-		if err != nil {
-			log.LogErrorf("flushExt: append obj extent keys with check fail,ino(%v) fileOffset(%v) len(%v) err(%v)", inode, wSlice.fileOffset, wSlice.size, err)
-			return
-		}
-
-		log.LogDebugf("flushExt: append obj extent keys with check success,ino(%v) fileOffset(%v) len(%v) objExtentKey(%v) discardExtent(%v)",
-			inode, wSlice.fileOffset, wSlice.size, wSlice.objExtentKey, req.DiscardExtent)
+		newExtents = append(newExtents, wSlice.objExtentKey)
+		discardExtents = append(discardExtents, req.DiscardExtent)
 	}
 
+	// Atomic metadata update: add batch new extent and discard old extent
+	if err = writer.mw.AppendObjExtentKeysWithCheck(writer.ino, newExtents, discardExtents); err != nil {
+		log.LogErrorf("flushExt: append obj extent keys with check batch fail,ino(%v) count(%v) err(%v)", inode, len(newExtents), err)
+		// Rollback: delete all written extents in this batch to avoid orphaned data on EBS
+		rollbackFn()
+		return
+	}
+	log.LogDebugf("flushExt: append obj extent keys with check batch success,ino(%v) count(%v)", inode, len(newExtents))
+	return nil
+}
+
+// flushExt flushes buffer data with overwrite logic. It handles partial overwrite scenarios by:
+// 1. Getting existing extents from metadata
+// 2. Computing overwrite requests (which parts to write, which old extents to discard)
+// 3. Applying requests sequentially (read old data, merge with new, write, update metadata)
+// This function is called when buffer is full during overwrite operations, or write offset not match file offset
+func (writer *Writer) flushExt(inode uint64, ctx context.Context, flushFlag bool) (err error) {
+	bgTime := stat.BeginStat()
+	defer func() {
+		stat.EndStat("blobstore-flushExt", err, bgTime, 1)
+	}()
+
+	log.LogDebugf("flushExt: ino(%v) buf-len(%v) flushFlag(%v) fileOffset(%v) blockPosition(%v)",
+		inode, len(writer.buf), flushFlag, writer.fileOffset, writer.blockPosition)
+
+	defer func() { writer.dirty = false }()
+
+	// Early return if buffer is empty or not dirty (nothing to flush)
+	if len(writer.buf) == 0 || !writer.dirty {
+		return
+	}
+
+	// Get existing extents from metadata to determine overlaps, old data already stored in EBS
+	_, _, _, objExtents, err := writer.mw.GetObjExtents(inode)
+	if err != nil {
+		log.LogErrorf("flushExt: get obj extents fail,ino(%v) err(%v)", inode, err)
+		return err
+	}
+	sort.Slice(objExtents, func(i, j int) bool {
+		return objExtents[i].FileOffset < objExtents[j].FileOffset
+	})
+
+	// Calculate buffer range in file coordinates bufferSize is the amount of data in buffer (from 0 to blockPosition)
+	bufferSize := writer.blockPosition
+	start := uint64(writer.fileOffset - bufferSize)
+	end := uint64(writer.fileOffset)
+
+	// Compute overwrite requests: determine which parts of buffer overlap with existing extents
+	// This generates a slice of requests, each specifying:
+	reqs := writer.computeOverwriteReqs(start, end, objExtents)
+	log.LogDebugf("flushExt: ino(%v) start(%v) end(%v) reqsCount(%v)", inode, start, end, len(reqs))
+
+	// Apply overwrite requests: write data and update metadata
+	if err = writer.flushOverwriteReqs(ctx, inode, reqs, start, bufferSize, flushFlag); err != nil {
+		return
+	}
+
+	// Reset buffer after successful flush: clear blockPosition for next write
 	writer.resetBuffer()
 	return
 }
@@ -808,6 +878,10 @@ func (writer *Writer) flush(inode uint64, ctx context.Context, flushFlag bool) (
 	oeks = append(oeks, wSlice.objExtentKey)
 	if err = writer.mw.AppendObjExtentKeys(writer.ino, oeks); err != nil {
 		log.LogErrorf("flush: slice write error,meta append ebsc extent keys fail,ino(%v) fileOffset(%v) len(%v) err(%v)", inode, wSlice.fileOffset, wSlice.size, err)
+		// Rollback: delete orphaned data on EBS to avoid blobstore leak
+		if delErr := writer.ebsc.Delete(oeks); delErr != nil {
+			log.LogWarnf("flush: rollback delete ebs extent fail,ino(%v) fileOffset(%v) err(%v)", inode, wSlice.fileOffset, delErr)
+		}
 		return
 	}
 	writer.resetBuffer()
