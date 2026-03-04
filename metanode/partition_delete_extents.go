@@ -38,7 +38,14 @@ import (
 const (
 	prefixDelExtent     = "EXTENT_DEL"
 	prefixDelExtentV2   = "EXTENT_DEL_V2"
+	prefixDelObjExtent  = "OBJ_EXTENT_DEL"
 	maxDeleteExtentSize = 10 * MB
+
+	// ObjExtentKey binary format field sizes (bytes)
+	// Order matches MarshalBinary: BlobsLen(4) + FileOffset(8) + Size(8) + Crc(4) + CodeMode(1) + Cid(8) + BlobSize(4) + Blobs
+	sizeOfBlob          = 24                        // Blob: MinBid(8) + Count(8) + Vid(8)
+	sizeOfBlobsLen      = 4                         // BlobsLen uint32
+	minObjExtentKeySize = 4 + 8 + 8 + 4 + 1 + 8 + 4 // 37 bytes (without Blobs)
 )
 
 var extentsFileHeader = []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08}
@@ -482,4 +489,294 @@ func (mp *metaPartition) deleteExtentsFromList(fileList *synclist.SyncList) {
 
 		log.LogDebugf("[deleteExtentsFromList] mp(%v) file(%v), cursor(%v), size(%v)", mp.config.PartitionId, fileName, cursor, len(readBuf))
 	}
+}
+
+// startToDeleteObjExtents starts two background tasks: persist to file and delete via EBS
+// 1. appendDelObjExtentsToFile: reads from objExtDelCh channel and persists to OBJ_EXTENT_DEL_* files
+// 2. deleteObjExtentsFromList: reads from files and deletes via EBS client
+func (mp *metaPartition) startToDeleteObjExtents() {
+	fileList := synclist.New()
+	go mp.appendDelObjExtentsToFile(fileList)
+	go mp.deleteObjExtentsFromList(fileList)
+}
+
+// appendDelObjExtentsToFile reads batches of obj extents from objExtDelCh channel and persists them to OBJ_EXTENT_DEL_* files
+// This ensures data persistence even if channel is full, preventing data loss during overwrite operations
+func (mp *metaPartition) appendDelObjExtentsToFile(fileList *synclist.SyncList) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.LogErrorf("[appendDelObjExtentsToFile] mp(%v) panic: %v", mp.config.PartitionId, r)
+		}
+	}()
+
+	var (
+		fileName string
+		fileSize int64
+		idx      int64
+		fp       *os.File
+	)
+
+	// Scan existing OBJ_EXTENT_DEL_* files and add to fileList
+	finfos, err := ioutil.ReadDir(mp.config.RootDir)
+	if err != nil {
+		log.LogErrorf("[appendDelObjExtentsToFile] mp(%v) read dir failed: %v", mp.config.PartitionId, err)
+		return
+	}
+
+	finfos = sortDelExtFileInfo(finfos)
+	for _, info := range finfos {
+		if strings.HasPrefix(info.Name(), prefixDelObjExtent) {
+			fileList.PushBack(info.Name())
+		}
+	}
+
+	// Open last file or create new one
+	lastItem := fileList.Back()
+	if lastItem != nil {
+		fileName = lastItem.Value.(string)
+	}
+	if lastItem == nil || !strings.HasPrefix(fileName, prefixDelObjExtent) {
+		fp, fileSize, err = mp.createObjExtentDeleteFile(idx, fileList)
+		if err != nil {
+			log.LogErrorf("[appendDelObjExtentsToFile] mp(%v) create file failed: %v", mp.config.PartitionId, err)
+			return
+		}
+	} else {
+		filePath := path.Join(mp.config.RootDir, fileName)
+		fp, err = os.OpenFile(filePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			log.LogErrorf("[appendDelObjExtentsToFile] mp(%v) open file failed: %v", mp.config.PartitionId, err)
+			return
+		}
+		info, err := fp.Stat()
+		if err != nil {
+			fp.Close()
+			log.LogErrorf("[appendDelObjExtentsToFile] mp(%v) stat file failed: %v", mp.config.PartitionId, err)
+			return
+		}
+		fileSize = info.Size()
+		idx = getDelExtFileIdx(fileName)
+	}
+
+	// Main loop: read batch from channel and write to file(persistent)
+	buf := make([]byte, 0)
+	for {
+		select {
+		case <-mp.stopC:
+			if fp != nil {
+				fp.Close()
+			}
+			return
+		case oeks := <-mp.objExtDelCh:
+			if len(oeks) == 0 {
+				continue
+			}
+			// Marshal batch of obj extents to binary
+			buf = buf[:0]
+			for _, oek := range oeks {
+				data, err := oek.MarshalBinary()
+				if err != nil {
+					log.LogWarnf("[appendDelObjExtentsToFile] mp(%v) marshal failed: %v", mp.config.PartitionId, err)
+					continue
+				}
+				buf = append(buf, data...)
+			}
+			if len(buf) == 0 {
+				continue
+			}
+
+			// Rotate file if size exceeds limit
+			if fileSize >= maxDeleteExtentSize {
+				fp.Close()
+				idx++
+				fp, fileSize, err = mp.createObjExtentDeleteFile(idx, fileList)
+				if err != nil {
+					log.LogErrorf("[appendDelObjExtentsToFile] mp(%v) create file failed: %v", mp.config.PartitionId, err)
+					return
+				}
+			}
+
+			// Write batch to file
+			if _, err = fp.Write(buf); err != nil {
+				log.LogErrorf("[appendDelObjExtentsToFile] mp(%v) write failed: %v", mp.config.PartitionId, err)
+				fp.Close()
+				return
+			}
+			fileSize += int64(len(buf))
+		}
+	}
+}
+
+// deleteObjExtentsFromList reads obj extents from OBJ_EXTENT_DEL_* files and deletes them via EBS client
+func (mp *metaPartition) deleteObjExtentsFromList(fileList *synclist.SyncList) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.LogErrorf("[deleteObjExtentsFromList] mp(%v) panic: %v", mp.config.PartitionId, r)
+		}
+	}()
+
+	cursorBuf := make([]byte, 8)
+	readBuf := make([]byte, 512*util.KB)
+	for {
+		time.Sleep(1 * time.Minute)
+		select {
+		case <-mp.stopC:
+			return
+		default:
+		}
+
+		element := fileList.Front()
+		if element == nil {
+			continue
+		}
+
+		// Check valid
+		fileName := element.Value.(string)
+		file := path.Join(mp.config.RootDir, fileName)
+		if _, err := os.Stat(file); err != nil {
+			fileList.Remove(element)
+			continue
+		}
+		if _, ok := mp.IsLeader(); !ok {
+			continue
+		}
+
+		// Open file and read cursor from header (first 8 bytes)
+		fp, err := os.OpenFile(file, os.O_RDWR, 0o644)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				log.LogErrorf("[deleteObjExtentsFromList] mp(%v) open %v error: %v", mp.config.PartitionId, file, err)
+			}
+			fileList.Remove(element)
+			continue
+		}
+
+		if _, err = fp.ReadAt(cursorBuf, 0); err != nil {
+			log.LogWarnf("[deleteObjExtentsFromList] mp(%v) read cursor failed", mp.config.PartitionId)
+			fp.Close()
+			continue
+		}
+
+		cursor := binary.BigEndian.Uint64(cursorBuf)
+		stat, err := fp.Stat()
+		if err != nil {
+			log.LogErrorf("[deleteObjExtentsFromList] mp(%v) stat failed: %v", mp.config.PartitionId, err)
+			fp.Close()
+			continue
+		}
+
+		if int64(cursor) > stat.Size() {
+			log.LogErrorf("[deleteObjExtentsFromList] mp(%v) corrupted: cursor(%v) > size(%v)",
+				mp.config.PartitionId, cursor, stat.Size())
+			fileList.Remove(element)
+			fp.Close()
+			continue
+		}
+
+		// Parse and delete extents
+		oldCursor := cursor
+		needDels, deleteCnt, cursor, err := mp.parseDelObjExtent(fp, fileList, cursor, readBuf, element)
+		if err != nil {
+			log.LogErrorf("[deleteObjExtentsFromList] mp(%v) parse failed: %v", mp.config.PartitionId, err)
+			continue
+		}
+		if deleteCnt == 0 {
+			continue
+		}
+
+		if err = mp.deleteObjExtents(needDels); err != nil {
+			log.LogErrorf("[deleteObjExtentsFromList] mp(%v) delete %d extents failed: %v",
+				mp.config.PartitionId, len(needDels), err)
+		}
+
+		// Update cursor if progress made
+		if cursor != oldCursor {
+			binary.BigEndian.PutUint64(cursorBuf, cursor)
+			updateFp, err := os.OpenFile(file, os.O_RDWR, 0o644)
+			if err == nil {
+				if _, err = updateFp.WriteAt(cursorBuf, 0); err == nil {
+					updateFp.Sync()
+				}
+				updateFp.Close()
+			}
+		}
+	}
+}
+
+// createObjExtentDeleteFile creates a new OBJ_EXTENT_DEL* file with 8-byte header for cursor
+func (mp *metaPartition) createObjExtentDeleteFile(idx int64, fileList *synclist.SyncList) (fp *os.File, fileSize int64, err error) {
+	fileName := fmt.Sprintf("%s_%d", prefixDelObjExtent, idx)
+	filePath := path.Join(mp.config.RootDir, fileName)
+	fp, err = os.OpenFile(filePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		log.LogErrorf("[createObjExtentDeleteFile] open %v failed: %v", filePath, err)
+		return
+	}
+
+	info, err := fp.Stat()
+	if err != nil {
+		fp.Close()
+		log.LogErrorf("[createObjExtentDeleteFile] stat %v failed: %v", filePath, err)
+		return
+	}
+
+	fileList.PushBack(fileName)
+
+	if info.Size() > 0 {
+		return fp, info.Size(), nil
+	}
+
+	if _, err = fp.Write(extentsFileHeader); err != nil {
+		fp.Close()
+		log.LogErrorf("[createObjExtentDeleteFile] write header failed: %v", err)
+		return
+	}
+	return fp, int64(len(extentsFileHeader)), nil
+}
+
+func (mp *metaPartition) parseDelObjExtent(fp *os.File, fileList *synclist.SyncList, cursor uint64,
+	readBuf []byte, element *list.Element,
+) (needDels []proto.ObjExtentKey, deleteCnt int, newCursor uint64, err error) {
+	defer fp.Close()
+
+	rLen, err := fp.ReadAt(readBuf, int64(cursor))
+	if err != nil && err != io.EOF {
+		log.LogErrorf("[parseDelObjExtent] mp(%v) read failed: %v", mp.config.PartitionId, err)
+		return nil, 0, cursor, err
+	}
+
+	// File fully processed: delete if not the only file
+	if err == io.EOF && rLen == 0 {
+		if fileList.Len() > 1 {
+			status := mp.raftPartition.Status()
+			if _, isLeader := mp.IsLeader(); isLeader && !status.RestoringSnapshot {
+				fileList.Remove(element)
+				os.Remove(fp.Name())
+			}
+		}
+		return nil, 0, cursor, nil
+	}
+
+	// Unmarshal obj extents from buffer
+	needDels = make([]proto.ObjExtentKey, 0)
+	buff := bytes.NewBuffer(readBuf[:rLen])
+	for buff.Len() >= sizeOfBlobsLen {
+		blobsLen := binary.BigEndian.Uint32(buff.Bytes()[:sizeOfBlobsLen])
+		estimatedSize := minObjExtentKeySize + int(blobsLen)*sizeOfBlob
+		if buff.Len() < estimatedSize {
+			break
+		}
+
+		oek := proto.ObjExtentKey{}
+		startPos := buff.Len()
+		if err = oek.UnmarshalBinary(buff); err != nil {
+			log.LogErrorf("[parseDelObjExtent] mp(%v) unmarshal failed: %v", mp.config.PartitionId, err)
+			break
+		}
+		cursor += uint64(startPos - buff.Len())
+		needDels = append(needDels, oek)
+		deleteCnt++
+	}
+
+	return needDels, deleteCnt, cursor, nil
 }

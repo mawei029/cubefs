@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"net"
 	"os"
@@ -30,7 +31,6 @@ import (
 	"time"
 
 	"github.com/cubefs/cubefs/datanode/storage"
-
 	raftProto "github.com/cubefs/cubefs/depends/tiglabs/raft/proto"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/util"
@@ -231,6 +231,20 @@ func (m *metadataManager) checkDisableAuditLogVolume(volNames []string, partitio
 		}
 	}
 	partition.SetEnableAuditLog(true)
+}
+
+// LogBatchObjExtendetsAddErr: Warn (such as over quota) or Error based on the type of error
+func logBatchObjExtentsAddErr(err error, remoteAddr, opName string) {
+	if err == nil {
+		return
+	}
+	msg := err.Error()
+	isQuota := stderrors.Is(err, ErrObjExtentOverQuota) || strings.Contains(msg, ErrObjExtentOverQuota.Error())
+	if isQuota {
+		log.LogWarnf("%s [%s] %s", remoteAddr, opName, msg)
+	} else {
+		log.LogErrorf("%s [%s] %s", remoteAddr, opName, msg)
+	}
 }
 
 // opPing handles a lightweight ping request for latency measurement
@@ -1872,15 +1886,23 @@ func (m *metadataManager) opMetaBatchExtentsAdd(conn net.Conn, p *Packet, remote
 	return
 }
 
+// opMetaBatchObjExtentsAdd handles the OpMetaBatchObjExtentsAdd packet from SDK client.
+// This is the entry point on metanode side. It parses the request, routes to the correct partition,
+// and calls either BatchObjExtentAppendWithCheck (for overwrite) or BatchObjExtentAppend (for append).
 func (m *metadataManager) opMetaBatchObjExtentsAdd(conn net.Conn, p *Packet, remoteAddr string) (err error) {
+	// Step 1: Parse request from packet data
 	req := &proto.AppendObjExtentKeysRequest{}
 	if err = m.parseRequestAndHandleError(conn, p, req, true); err != nil {
 		return
 	}
+
+	// Step 2: Get the meta partition that manages this inode
 	mp, handledByProxy, err := m.getPartitionCheckProxy(conn, p, req.PartitionID, true)
 	if err != nil || handledByProxy {
 		return
 	}
+
+	// Step 3: Check multi-version status (for snapshot/versioning support)
 	if err = m.checkMultiVersionStatus(mp, p); err != nil {
 		err = errors.NewErrorf("[%v],req[%v],err[%v]", p.GetOpMsgWithReqAndResult(), req, string(p.Data))
 		m.respondToClientWithVer(conn, p)
@@ -1900,36 +1922,25 @@ func (m *metadataManager) opMetaBatchObjExtentsAdd(conn net.Conn, p *Packet, rem
 		}()
 	}
 
-	// If IsOverwrite is true, use BatchObjExtentAppendWithCheck
-	// Otherwise, use BatchObjExtentAppend
+	// Step 4: Route to overwrite handler (with conflict check) or append handler (without check)
+	// If IsOverwrite is true, use BatchObjExtentAppendWithCheck which performs conflict detection
+	// Otherwise, use BatchObjExtentAppend which simply appends extents
 	if req.IsOverwrite {
-		if err = mp.BatchObjExtentAppendWithCheck(req, p); err != nil {
-			errMsg := err.Error()
-			if strings.Contains(errMsg, "over quota") {
-				log.LogWarnf("%s [opMetaBatchObjExtentsAdd] BatchObjExtentAppendWithCheck: %s", remoteAddr, errMsg)
-			} else {
-				log.LogErrorf("%s [opMetaBatchObjExtentsAdd] BatchObjExtentAppendWithCheck: %s", remoteAddr, errMsg)
-			}
-		}
+		err = mp.BatchObjExtentAppendWithCheck(req, p)
 	} else {
-		if err = mp.BatchObjExtentAppend(req, p); err != nil {
-			errMsg := err.Error()
-			if strings.Contains(errMsg, "over quota") {
-				log.LogWarnf("%s [opMetaBatchObjExtentsAdd] BatchObjExtentAppend: %s", remoteAddr, errMsg)
-			} else {
-				log.LogErrorf("%s [opMetaBatchObjExtentsAdd] BatchObjExtentAppend: %s", remoteAddr, errMsg)
-			}
-		}
+		err = mp.BatchObjExtentAppend(req, p)
 	}
+	if err != nil {
+		logBatchObjExtentsAddErr(err, remoteAddr, "opMetaBatchObjExtentsAdd")
+	}
+
 	m.updatePackRspSeq(mp, p)
 	if err = m.respondToClientWithVer(conn, p); err != nil {
 		log.LogErrorf("%s [opMetaBatchObjExtentsAdd] response error: %s, "+
 			"response to client: %s", remoteAddr, err.Error(), p.GetResultMsg())
 	}
-	if log.EnableDebug() {
-		log.LogDebugf("%s [opMetaBatchObjExtentsAdd] req: %d - %v, resp: %v, body: %s",
-			remoteAddr, p.GetReqID(), req, p.GetResultMsg(), p.Data)
-	}
+
+	log.LogDebugf("%s [opMetaBatchObjExtentsAdd] req: %d - %v, resp: %v, body: %s", remoteAddr, p.GetReqID(), req, p.GetResultMsg(), p.Data)
 	return
 }
 

@@ -307,7 +307,7 @@ func (mp *metaPartition) Apply(command []byte, index uint64) (resp interface{}, 
 			return
 		}
 		resp, _ = mp.fsmAppendObjExtents(dbWriteHandle, ino)
-	case opFSMObjExtAddWithCheck:
+	case opFSMObjExtsAddWithCheck:
 		ino := NewInode(0, 0)
 		if err = ino.Unmarshal(msg.V); err != nil {
 			return

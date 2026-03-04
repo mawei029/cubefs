@@ -17,19 +17,21 @@ package metanode
 import (
 	"encoding/binary"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"os"
 	"sort"
 	"time"
-
-	"github.com/cubefs/cubefs/util/timeutil"
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/util/auditlog"
 	"github.com/cubefs/cubefs/util/errors"
 	"github.com/cubefs/cubefs/util/exporter"
 	"github.com/cubefs/cubefs/util/log"
+	"github.com/cubefs/cubefs/util/timeutil"
 )
+
+var ErrObjExtentOverQuota = stderrors.New("over quota")
 
 func (mp *metaPartition) CheckQuota(inodeId uint64, p *Packet) (iParm *Inode, inode *Inode, err error) {
 	iParm = NewInode(inodeId, 0)
@@ -736,14 +738,13 @@ func (mp *metaPartition) BatchObjExtentAppend(req *proto.AppendObjExtentKeysRequ
 	return
 }
 
-// BatchObjExtentAppendWithCheck appends multiple obj extents with conflict check.
+// BatchObjExtentAppendWithCheck validates request and submits to FSM for atomic extent update
 func (mp *metaPartition) BatchObjExtentAppendWithCheck(req *proto.AppendObjExtentKeysRequest, p *Packet) (err error) {
 	status := mp.isOverQuota(req.Inode, true, false)
 	if status != 0 {
 		log.LogWarnf("BatchObjExtentAppendWithCheck fail status [%v]", status)
-		err = errors.New("BatchObjExtentAppendWithCheck is over quota")
-		reply := []byte(err.Error())
-		p.PacketErrorWithBody(status, reply)
+		err = ErrObjExtentOverQuota
+		p.PacketErrorWithBody(status, []byte(err.Error()))
 		return
 	}
 
@@ -760,47 +761,43 @@ func (mp *metaPartition) BatchObjExtentAppendWithCheck(req *proto.AppendObjExten
 		p.PacketErrorWithBody(proto.OpErr, []byte(err.Error()))
 		return
 	}
+	log.LogDebugf("BatchObjExtentAppendWithCheck: ino(%v) mp[%v] req[%v]", req.Inode, req.PartitionID, req.EkString())
 
-	if log.EnableDebug() {
-		log.LogDebugf("BatchObjExtentAppendWithCheck: ino(%v) mp[%v] req[%v]",
-			req.Inode, req.PartitionID, req.EkString())
-	}
 	// can only be called when write into ebs
 	inoParm.StorageClass = proto.StorageClass_BlobStore
 	objExtents := req.Extents
-	discardExtent := req.DiscardExtent
+	discards := req.DiscardExtents
 
-	if len(objExtents) != 1 {
-		err = errors.New("BatchObjExtentAppendWithCheck: extents is not one or more")
-		log.LogErrorf("BatchObjExtentAppendWithCheck fail, ino(%v) extents(%v) discardExtent(%v) err [%v]", req.Inode, objExtents, discardExtent, err)
+	if len(objExtents) == 0 || len(objExtents) != len(discards) {
+		err = errors.New("BatchObjExtentAppendWithCheck: extents is empty, or not match")
+		log.LogErrorf("BatchObjExtentAppendWithCheck fail, ino(%v) extents(%v) discards(%v) err [%v]", req.Inode, len(objExtents), len(discards), err)
 		p.PacketErrorWithBody(proto.OpArgMismatchErr, []byte(err.Error()))
 		return
 	}
 
-	// Merge sorted extents and discard extents into inode.extents
-	// All extents will be stored together, and FSM will distinguish them by range overlap
-	extents := make([]proto.ObjExtentKey, 0)
-	extents = append(extents, objExtents[0])
-	if !discardExtent.IsEmpty() {
-		extents = append(extents, discardExtent)
+	// Prepare FSM input: [new1, discard1, new2, discard2, ...] for batch apply
+	extents := make([]proto.ObjExtentKey, 0, len(objExtents)*2)
+	for i := range objExtents {
+		extents = append(extents, objExtents[i])
+		extents = append(extents, discards[i])
 	}
 
 	inoParm.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks(extents)
-
 	val, err := inoParm.Marshal()
 	if err != nil {
 		p.PacketErrorWithBody(proto.OpErr, []byte(err.Error()))
 		return
 	}
 
-	resp, err := mp.submit(opFSMObjExtentsAddWithCheck, val)
+	// Submit to FSM for atomic update via Raft
+	resp, err := mp.submit(opFSMObjExtsAddWithCheck, val)
 	if err != nil {
 		p.PacketErrorWithBody(proto.OpAgain, []byte(err.Error()))
 		return
 	}
 
-	log.LogDebugf("BatchObjExtentAppendWithCheck: ino(%v) mp[%v] extents[%v] discardExtent[%v] rspcode(%v)",
-		req.Inode, req.PartitionID, objExtents[0], discardExtent, resp.(uint8))
+	log.LogDebugf("BatchObjExtentAppendWithCheck: ino(%v) mp[%v] extentsCount(%v) discardsCount(%v) rspcode(%v)",
+		req.Inode, req.PartitionID, len(objExtents), len(discards), resp.(uint8))
 	p.PacketErrorWithBody(resp.(uint8), nil)
 	return
 }
