@@ -15,10 +15,12 @@
 package meta
 
 import (
+	"encoding/json"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/cubefs/cubefs/proto"
 	masterSDK "github.com/cubefs/cubefs/sdk/master"
 	"github.com/stretchr/testify/require"
 )
@@ -116,4 +118,26 @@ func TestMetaWrapper_getMetaHostsMap_errorFromMaster(t *testing.T) {
 	require.Error(t, err)
 	require.NotNil(t, hosts)
 	require.Equal(t, 0, len(hosts))
+}
+
+// TestTruncateV2Request 校验 TruncateV2 请求可正确序列化（SDK 发往 metanode 的 OpMetaTruncate 载荷）。
+func TestTruncateV2Request(t *testing.T) {
+	req := &proto.TruncateRequest{
+		VolName:       "vol",
+		PartitionID:   1,
+		Inode:         100,
+		Size:          150,
+		TruncateV2:    true,
+		NewObjExtents: []proto.ObjExtentKey{{FileOffset: 0, Size: 100}, {FileOffset: 100, Size: 50}},
+	}
+	req.FullPaths = []string{"/path"}
+	data, err := json.Marshal(req)
+	require.NoError(t, err)
+	require.NotEmpty(t, data)
+	var decoded proto.TruncateRequest
+	err = json.Unmarshal(data, &decoded)
+	require.NoError(t, err)
+	require.True(t, decoded.TruncateV2)
+	require.Equal(t, uint64(150), decoded.Size)
+	require.Len(t, decoded.NewObjExtents, 2)
 }

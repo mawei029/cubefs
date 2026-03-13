@@ -789,6 +789,10 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 	if proto.IsCold(f.super.volType) || proto.IsStorageClassBlobStore(storageClass) {
 		isCache = true
 	}
+
+	log.LogDebugf("Setattr: ino(%v) openForWrite(%v) isCache(%v) targetSize(%v) isHot(%v) storageClass(%v)",
+		ino, openForWrite, isCache, req.Valid.Size(), proto.IsHot(f.super.volType), storageClass)
+
 	if req.Valid.Size() && (proto.IsHot(f.super.volType) || proto.IsStorageClassReplica(storageClass)) {
 		// when use trunc param in open request through nfs client and mount on cfs mountPoint, cfs client may not recv open message but only setAttr,
 		// the streamer may not open and cause io error finally,so do a open no matter the stream be opened or not
@@ -820,6 +824,13 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 		}
 		f.super.ic.Delete(ino)
 		f.super.ec.RefreshExtentsCache(ino)
+		// 同步 open 状态的 writer/reader：truncate 后后续写入、读取、GetAttr 使用新 size/extents
+		if f.fWriter != nil {
+			f.fWriter.SetFileSize(req.Size)
+		}
+		if f.fReader != nil {
+			_ = f.fReader.RefreshExtents()
+		}
 	}
 
 	info, err = f.super.InodeGet(ino)
@@ -851,35 +862,86 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 	return nil
 }
 
-// doECTruncateV2 执行 EC/BlobStore 卷的 TruncateV2：EBS 读/截断/写/删后通知 meta 更新 inode.Size 与 ObjExtents。
+// doECTruncateV2 执行 EC/BlobStore 卷的 truncate：目标 < 当前则裁剪；目标 > 当前则仅设 inode 大小后退出；目标 == 当前则直接退出；当前文件不存在则视为新建空文件并设大小。
+// 调用链（仅裁剪时）：doECTruncateV2 → ec.OpenStream/Flush → Writer.TruncateV2 → writer.ebsc.TruncateV2Extents → mw.TruncateV2。
 func (f *File) doECTruncateV2(ino uint64, targetSize uint64, fullPath string) error {
-	openForWrite := true
-	if err := f.super.ec.OpenStream(ino, openForWrite, true, fullPath); err != nil {
+	// 获取当前文件大小与 extent；若不存在或无数据则 currentSize=0、objExtents=nil
+	currentSize, objExtents, err := f.getECCurrentSizeAndExtents(ino)
+	if err != nil {
+		// 文件不存在或取 meta 失败：视为新建空文件，仅将 inode 大小设为 target 后退出
+		log.LogDebugf("doECTruncateV2: ino(%v) get current err(%v), treat as new empty file size(%v)", ino, err, targetSize)
+		return f.super.mw.TruncateV2(ino, targetSize, fullPath, nil)
+	}
+
+	if targetSize == currentSize {
+		// 目标等于当前，不做任何操作直接退出
+		return nil
+	}
+
+	if targetSize > currentSize {
+		// 目标大于当前：只更新 meta 中 inode 大小为 target，不写 EBS，直接退出
+		return f.super.mw.TruncateV2(ino, targetSize, fullPath, objExtents)
+	}
+
+	// 目标小于当前：做裁剪，经 Writer 做 EBS 截断再更新 meta；复用 ensureBlobStoreWriter 保证 f.fWriter 已赋值
+	if err := f.super.ec.OpenStream(ino, true, true, fullPath); err != nil {
 		return err
 	}
 	defer f.super.ec.CloseStream(ino)
+
 	if err := f.super.ec.Flush(ino); err != nil {
 		return err
 	}
-	_, currentSize, _, objExtents, err := f.super.mw.GetObjExtents(ino)
+
+	writer, err := f.ensureBlobStoreWriter(ino)
 	if err != nil {
 		return err
+	}
+
+	newObjExtents, err := writer.TruncateV2(context.Background(), targetSize)
+	if err != nil {
+		return err
+	}
+	return f.super.mw.TruncateV2(ino, targetSize, fullPath, newObjExtents)
+}
+
+// ensureBlobStoreWriter 保证 BlobStore 卷的 f.fWriter 已赋值；若为 nil 则按 Open 相同逻辑创建并赋值，供 doECTruncateV2 等复用。
+func (f *File) ensureBlobStoreWriter(ino uint64) (*blobstore.Writer, error) {
+	if f.fWriter != nil {
+		return f.fWriter, nil
 	}
 	ebsc, err := f.super.getBlobStoreClient(f.info.PoolId)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	volName := f.super.volname
-	var newObjExtents []proto.ObjExtentKey
-	if targetSize >= currentSize {
-		newObjExtents = objExtents
-	} else {
-		newObjExtents, err = ebsc.TruncateV2Extents(context.Background(), volName, objExtents, targetSize)
-		if err != nil {
-			return err
-		}
+	fileSize, _ := f.fileSizeVersion2(ino)
+	clientConf := blobstore.ClientConfig{
+		VolName:         f.super.volname,
+		VolType:         f.super.volType,
+		BlockSize:       f.super.EbsBlockSize,
+		Ino:             ino,
+		Bc:              f.super.bc,
+		Mw:              f.super.mw,
+		Ec:              f.super.ec,
+		Ebsc:            ebsc,
+		EnableBcache:    f.super.enableBcache,
+		WConcurrency:    f.super.writeThreads,
+		ReadConcurrency: f.super.readThreads,
+		FileCache:       false,
+		FileSize:        uint64(fileSize),
+		PoolId:          f.info.PoolId,
 	}
-	return f.super.mw.TruncateV2(ino, targetSize, fullPath, newObjExtents)
+	f.fWriter = blobstore.NewWriter(clientConf)
+	return f.fWriter, nil
+}
+
+// getECCurrentSizeAndExtents 获取 EC/BlobStore 卷当前文件大小与 ObjExtents；若无数据或出错则 size=0、extents=nil、err!=nil。
+func (f *File) getECCurrentSizeAndExtents(ino uint64) (currentSize uint64, objExtents []proto.ObjExtentKey, err error) {
+	_, currentSize, _, objExtents, err = f.super.mw.GetObjExtents(ino)
+	if err != nil {
+		return 0, nil, err
+	}
+	return currentSize, objExtents, nil
 }
 
 // Readlink handles the readlink request.
@@ -1051,9 +1113,10 @@ func (f *File) fileSizeVersion2(ino uint64) (size int, gen uint64) {
 					size = cacheSize
 				}
 			}
-			gen = info.Generation
 		}
+		gen = info.Generation
 	}
+	// }
 
 	log.LogDebugf("TRACE fileSizeVersion2: ino(%v) fileSize(%v) gen(%v) valid(%v)", ino, size, gen, valid)
 	return

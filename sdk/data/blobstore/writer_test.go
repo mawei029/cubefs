@@ -96,6 +96,15 @@ func TestNotInstanceWriter_Write(t *testing.T) {
 	}
 }
 
+// TestWriter_TruncateV2_NilReturnsError 校验 nil Writer 调用 TruncateV2 返回错误（EC truncate 基本分支）。
+func TestWriter_TruncateV2_NilReturnsError(t *testing.T) {
+	w := newNilWriter()
+	ctx := context.Background()
+	_, err := w.TruncateV2(ctx, 100)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "nil")
+}
+
 func TestWriter_doBufferWrite_(t *testing.T) {
 	// write data to buffer,not write to ebs when len(buffer)<BlockSize
 	ctx := context.Background()
@@ -337,7 +346,7 @@ func MockAppendObjExtentKeysWithCheckTrue(mw *meta.MetaWrapper, inode uint64, ne
 // TestComputeOverwriteReqs tests the computeOverwriteReqs function with basic scenarios
 func TestComputeOverwriteReqs(t *testing.T) {
 	// Create a simple writer for testing
-	testWriter := &Writer{}
+	// testWriter := &Writer{}
 
 	testCases := []struct {
 		name       string
@@ -382,7 +391,7 @@ func TestComputeOverwriteReqs(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			reqs := testWriter.computeOverwriteReqs(tc.start, tc.end, tc.objExtents)
+			reqs := computeOverwriteReqs(tc.start, tc.end, tc.objExtents)
 			require.NotEqual(t, 0, len(reqs), "computeOverwriteReqs fail. got 0 reqs, expect at least 1")
 			require.Equal(t, len(tc.result), len(reqs))
 

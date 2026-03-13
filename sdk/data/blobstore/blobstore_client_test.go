@@ -216,3 +216,87 @@ func TestEbsClient_Write_Read(t *testing.T) {
 		require.Exactly(t, tc.size, read)
 	}
 }
+
+func TestComputeOverwriteReqs_NoOverlap(t *testing.T) {
+	// buffer [100, 200)，extents 均在 200 之后，则仅产生一段新数据
+	objExtents := []cproto.ObjExtentKey{
+		{FileOffset: 250, Size: 50},
+	}
+	reqs := computeOverwriteReqs(100, 200, objExtents)
+	require.Len(t, reqs, 1)
+	require.Equal(t, uint64(100), reqs[0].NewExtent.FileOffset)
+	require.Equal(t, uint64(100), reqs[0].NewExtent.Size)
+	require.True(t, reqs[0].DiscardExtent.IsEmpty())
+}
+
+func TestComputeOverwriteReqs_PartialOverlap(t *testing.T) {
+	// buffer [100, 200), extent [50, 150) -> 重叠 [100, 150)
+	objExtents := []cproto.ObjExtentKey{
+		{FileOffset: 50, Size: 100},
+	}
+	reqs := computeOverwriteReqs(100, 200, objExtents)
+	require.Len(t, reqs, 2)
+	require.Equal(t, uint64(100), reqs[0].NewExtent.FileOffset)
+	require.Equal(t, uint64(50), reqs[0].NewExtent.Size)
+	require.Equal(t, uint64(50), reqs[0].DiscardExtent.FileOffset)
+	require.Equal(t, uint64(150), reqs[1].NewExtent.FileOffset) // gap [150, 200)
+	require.Equal(t, uint64(50), reqs[1].NewExtent.Size)
+	require.True(t, reqs[1].DiscardExtent.IsEmpty())
+}
+
+// TestComputeTruncateReqs_PartialSpan 覆盖截断时部分保留、部分重叠、部分丢弃的基本场景。
+func TestComputeTruncateReqs_PartialSpan(t *testing.T) {
+	objExtents := []cproto.ObjExtentKey{
+		{FileOffset: 0, Size: 100},
+		{FileOffset: 100, Size: 100},
+		{FileOffset: 200, Size: 50},
+	}
+	req := ComputeTruncateReqs(150, objExtents)
+	require.Len(t, req.KeepExtents, 1)
+	require.Equal(t, uint64(0), req.KeepExtents[0].FileOffset)
+	require.Equal(t, uint64(100), req.KeepExtents[0].Size)
+	require.Len(t, req.OverwriteReqs, 1)
+	require.Equal(t, uint64(100), req.OverwriteReqs[0].NewExtent.FileOffset)
+	require.Equal(t, uint64(50), req.OverwriteReqs[0].NewExtent.Size)
+	require.Equal(t, uint64(100), req.OverwriteReqs[0].DiscardExtent.FileOffset)
+	require.Equal(t, uint64(100), req.OverwriteReqs[0].DiscardExtent.Size)
+	require.Len(t, req.DiscardOnly, 1)
+	require.Equal(t, uint64(200), req.DiscardOnly[0].FileOffset)
+}
+
+func TestComputeTruncateReqs_EmptyInput(t *testing.T) {
+	req := ComputeTruncateReqs(100, nil)
+	require.Empty(t, req.KeepExtents)
+	require.Empty(t, req.OverwriteReqs)
+	require.Empty(t, req.DiscardOnly)
+}
+
+func TestTruncateV2Extents_EmptyInput(t *testing.T) {
+	ebs := &BlobStoreClient{}
+	ctx := context.Background()
+	out, err := ebs.TruncateV2Extents(ctx, "vol", nil, 100)
+	require.NoError(t, err)
+	require.Nil(t, out)
+}
+
+func TestTruncateV2Extents_OnlyKeepNoEBS(t *testing.T) {
+	// 仅保留、无覆盖、无删除时，ApplyTruncateReqs 只返回 keep，不调 EBS
+	objExtents := []cproto.ObjExtentKey{
+		{FileOffset: 0, Size: 50},
+		{FileOffset: 50, Size: 50},
+	}
+	req := ComputeTruncateReqs(100, objExtents)
+	require.Len(t, req.KeepExtents, 2)
+	require.Empty(t, req.OverwriteReqs)
+	require.Empty(t, req.DiscardOnly)
+
+	ebs := &BlobStoreClient{}
+	ctx := context.Background()
+	out, err := ebs.ApplyTruncateReqs(ctx, "vol", req)
+	require.NoError(t, err)
+	require.Len(t, out, 2)
+	require.Equal(t, uint64(0), out[0].FileOffset)
+	require.Equal(t, uint64(50), out[0].Size)
+	require.Equal(t, uint64(50), out[1].FileOffset)
+	require.Equal(t, uint64(50), out[1].Size)
+}

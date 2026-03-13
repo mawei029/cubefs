@@ -373,3 +373,27 @@ func (reader *Reader) fileSize() (uint64, bool) {
 	}
 	return 0, true
 }
+
+// RefreshExtents 从 meta 重新拉取 ObjExtents 并更新缓存，供 Truncate 后调用，使后续 Read 使用新 extent 与 size。
+// 不在持锁状态下调用 GetObjExtents，避免阻塞其他 Read。
+func (reader *Reader) RefreshExtents() error {
+	_, _, eks, oeks, err := reader.mw.GetObjExtents(reader.ino)
+	if err != nil {
+		reader.Lock()
+		reader.valid = false
+		reader.Unlock()
+		log.LogErrorf("RefreshExtents: ino(%v) err(%v)", reader.ino, err)
+		return err
+	}
+	reader.Lock()
+	reader.valid = true
+	reader.extentKeys = eks
+	reader.objExtentKeys = oeks
+	if len(oeks) > 0 {
+		last := oeks[len(oeks)-1]
+		reader.fileLength = last.FileOffset + last.Size
+	}
+	reader.Unlock()
+	log.LogDebugf("RefreshExtents: ino(%v) objExtentKeysLen(%v) fileLength(%v)", reader.ino, len(oeks), reader.fileLength)
+	return nil
+}

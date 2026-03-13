@@ -878,3 +878,73 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 		require.Equal(t, uint64(150), extents[0].Size)
 	})
 }
+
+// TestFsmExtentsTruncateV2 校验 EC 卷 TruncateV2 FSM：更新 inode.Size 与 ObjExtents，不投递 objExtDelCh。
+func TestFsmExtentsTruncateV2(t *testing.T) {
+	mpC := &MetaPartitionConfig{
+		PartitionId:   10001,
+		VolName:       VolNameForTest,
+		PartitionType: proto.VolumeTypeHot,
+		StoreMode:     proto.StoreModeMem,
+	}
+	metaM := &metadataManager{
+		nodeId:          1,
+		zoneName:        "test",
+		raftStore:       nil,
+		partitions:      make(map[uint64]MetaPartition),
+		metaNode:        &MetaNode{},
+		fileStatsConfig: &fileStatsConfig{},
+	}
+	partition := NewMetaPartition(mpC, metaM)
+	mp := partition.(*metaPartition)
+	err := mp.initObjects(true)
+	require.NoError(t, err)
+	mp.uidManager = NewUidMgr(mpC.VolName, mpC.PartitionId)
+	mp.mqMgr = NewQuotaManager(mpC.VolName, mpC.PartitionId)
+	mp.uniqChecker = newUniqChecker()
+	mp.vol = NewVol()
+
+	const inoId = 9001
+	handle, err := mp.inodeTree.CreateBatchWriteHandle()
+	require.NoError(t, err)
+	fsmIno := NewInode(inoId, 0)
+	fsmIno.StorageClass = proto.StorageClass_BlobStore
+	fsmIno.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{
+		{FileOffset: 0, Size: 100},
+		{FileOffset: 100, Size: 100},
+	})
+	fsmIno.Size = 200
+	mp.inodeTree.ReplaceOrInsert(handle, fsmIno, true)
+	err = mp.inodeTree.CommitAndReleaseBatchWriteHandle(handle, false)
+	require.NoError(t, err)
+
+	// TruncateV2: 截断到 150，新 extent 列表为 [0,100) + [100,150)（后者由 client 侧 EBS 截断后得到）
+	newObjExtents := []proto.ObjExtentKey{
+		{FileOffset: 0, Size: 100},
+		{FileOffset: 100, Size: 50},
+	}
+	truncReq := &proto.TruncateRequest{
+		Inode:         inoId,
+		Size:          150,
+		NewObjExtents: newObjExtents,
+	}
+	handle2, err := mp.inodeTree.CreateBatchWriteHandle()
+	require.NoError(t, err)
+	resp, err := mp.fsmExtentsTruncateV2(handle2, truncReq)
+	require.NoError(t, err)
+	require.Equal(t, proto.OpOk, resp.Status)
+	err = mp.inodeTree.CommitAndReleaseBatchWriteHandle(handle2, false)
+	require.NoError(t, err)
+
+	updatedIno, err := mp.inodeTree.CopyGet(&Inode{Inode: inoId})
+	require.NoError(t, err)
+	require.NotNil(t, updatedIno)
+	require.Equal(t, uint64(150), updatedIno.Size)
+	sortedEks := updatedIno.HybridCloudExtents.sortedEks.(*SortedObjExtents)
+	extents := sortedEks.CopyExtents()
+	require.Len(t, extents, 2)
+	require.Equal(t, uint64(0), extents[0].FileOffset)
+	require.Equal(t, uint64(100), extents[0].Size)
+	require.Equal(t, uint64(100), extents[1].FileOffset)
+	require.Equal(t, uint64(50), extents[1].Size)
+}

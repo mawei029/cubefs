@@ -39,10 +39,22 @@ const (
 	MaxBufferSize = 512 * util.MB
 )
 
+var errPutNoKeys = errors.New("ebs put returned no extent keys")
+
 // overwriteReq represents an overwrite request that contains both the new extent and the old extent
+// overwriteReq 与 overwrite.overwriteReq 一致，Writer 与 TruncateV2 共用
+// overwriteReq 表示一次覆盖请求：新写入范围 NewExtent，以及需要废弃的旧范围 DiscardExtent（可为空）。
+// 与 writer 的 flushExt/computeOverwriteReqs 共用同一结构，TruncateV2 复用时仅产生至多一个部分重叠的 req。
 type overwriteReq struct {
-	NewExtent     proto.ObjExtentKey // new extent range to write to storage (may partially overlap old data)
-	DiscardExtent proto.ObjExtentKey // old extent that needs to be discarded/replaced.（may be empty）
+	NewExtent     proto.ObjExtentKey // 要写入的新范围（部分重叠时为截断后的范围）
+	DiscardExtent proto.ObjExtentKey // 需要废弃的旧 extent（可为空）
+}
+
+// truncateReq 为 TruncateV2 的请求结果：保留的 extents、至多一个部分重叠的 OverwriteReq、仅需删除的 extents。
+type truncateReq struct {
+	KeepExtents   []proto.ObjExtentKey
+	OverwriteReqs []overwriteReq
+	DiscardOnly   []proto.ObjExtentKey
 }
 
 type wSliceErr struct {
@@ -639,28 +651,23 @@ func (writer *Writer) flushWithoutPool(inode uint64, ctx context.Context, flushF
 //  4. Handle partial overlaps where buffer only covers part of an extent
 //
 // Example:
-//   Buffer: [100, 200), Existing extents: [50, 150), [200, 250)
-//   Writer.fileOffset==200, Writer.fileSize==300 ; eks: {offset:50, size:100}, {offset:200, size:50}
-//   Result:
-//     - req1: NewExtent=[100, 150), DiscardExtent=[50, 150) (partial overlap)
-//     - req2: NewExtent=[150, 200), DiscardExtent=empty (new data, no overlap)
-func (writer *Writer) computeOverwriteReqs(start, end uint64, objExtents []proto.ObjExtentKey) (reqs []overwriteReq) {
+//
+//	Buffer: [100, 200), Existing extents: [50, 150), [200, 250)
+//	Writer.fileOffset==200, Writer.fileSize==300 ; eks: {offset:50, size:100}, {offset:200, size:50}
+//	Result:
+//	  - req1: NewExtent=[100, 150), DiscardExtent=[50, 150) (partial overlap)
+//	  - req2: NewExtent=[150, 200), DiscardExtent=empty (new data, no overlap)
+func computeOverwriteReqs(start, end uint64, objExtents []proto.ObjExtentKey) (reqs []overwriteReq) {
 	reqs = make([]overwriteReq, 0)
-
-	// Iterate through existing extents to find overlaps with buffer range
 	for _, ek := range objExtents {
-		// Case 1: Buffer range ends before this extent starts - no overlap
-		// Add remaining buffer range as new data (no discard needed)
 		if end <= ek.FileOffset {
 			reqs = append(reqs, overwriteReq{
 				NewExtent:     proto.ObjExtentKey{FileOffset: start, Size: end - start},
 				DiscardExtent: proto.ObjExtentKey{},
 			})
+			start = end
 			break
 		}
-
-		// Case 2: Gap between buffer start and extent start - add gap as new data
-		// This handles non-contiguous extents where buffer has data before next extent
 		if start < ek.FileOffset {
 			reqs = append(reqs, overwriteReq{
 				NewExtent:     proto.ObjExtentKey{FileOffset: start, Size: ek.FileOffset - start},
@@ -668,28 +675,19 @@ func (writer *Writer) computeOverwriteReqs(start, end uint64, objExtents []proto
 			})
 			start = ek.FileOffset
 		}
-
-		// Case 3: Overlap detected - calculate overlap size
-		// reqSize is the size of the overlapping region between buffer and extent
-		// If buffer extends beyond this extent, only overlap the extent's range
 		reqSize := end - start
 		if end > ek.FileOffset+ek.Size {
 			reqSize = ek.FileOffset + ek.Size - start
 		}
 		reqs = append(reqs, overwriteReq{
 			NewExtent:     proto.ObjExtentKey{FileOffset: start, Size: reqSize},
-			DiscardExtent: ek, // Mark old extent for discard
+			DiscardExtent: ek,
 		})
 		start += reqSize
-
-		// If buffer range is fully covered by this extent, we're done
 		if end <= ek.FileOffset+ek.Size {
 			break
 		}
 	}
-
-	// Case 4: Remaining buffer range after all extents - add as new data
-	// This handles buffer data that extends beyond all existing extents
 	if start < end {
 		reqs = append(reqs, overwriteReq{
 			NewExtent:     proto.ObjExtentKey{FileOffset: start, Size: end - start},
@@ -823,7 +821,7 @@ func (writer *Writer) flushExt(inode uint64, ctx context.Context, flushFlag bool
 
 	// Compute overwrite requests: determine which parts of buffer overlap with existing extents
 	// This generates a slice of requests, each specifying:
-	reqs := writer.computeOverwriteReqs(start, end, objExtents)
+	reqs := computeOverwriteReqs(start, end, objExtents)
 	log.LogDebugf("flushExt: ino(%v) start(%v) end(%v) reqsCount(%v)", inode, start, end, len(reqs))
 
 	// Apply overwrite requests: write data and update metadata
@@ -887,6 +885,28 @@ func (writer *Writer) flush(inode uint64, ctx context.Context, flushFlag bool) (
 
 func (writer *Writer) CacheFileSize() int {
 	return int(atomic.LoadUint64(&writer.fileSize))
+}
+
+// SetFileSize 用于 Truncate 后同步 writer 内部 fileSize，使后续 Append/Write 与 CacheFileSize() 与 meta 一致。
+func (writer *Writer) SetFileSize(size uint64) {
+	atomic.StoreUint64(&writer.fileSize, size)
+}
+
+// TruncateV2 执行 EBS 侧截断：通过 writer.mw 拉取当前 ObjExtents，通过 writer.ebsc 执行读/截断/写/删，返回新 extent 列表供上层调用 meta.TruncateV2。
+// 调用链：client/file.doECTruncateV2 → Writer.TruncateV2 → writer.ebsc.TruncateV2Extents（BlobStoreClient）。
+func (writer *Writer) TruncateV2(ctx context.Context, targetSize uint64) (newObjExtents []proto.ObjExtentKey, err error) {
+	if writer == nil || writer.mw == nil || writer.ebsc == nil {
+		return nil, fmt.Errorf("Writer.TruncateV2: writer/mw/ebsc nil")
+	}
+	_, currentSize, _, objExtents, err := writer.mw.GetObjExtents(writer.ino)
+	if err != nil {
+		log.LogErrorf("TruncateV2: ino(%v) GetObjExtents err(%v)", writer.ino, err)
+		return nil, err
+	}
+	if targetSize >= currentSize {
+		return objExtents, nil
+	}
+	return writer.ebsc.TruncateV2Extents(ctx, writer.volName, objExtents, targetSize)
 }
 
 func (writer *Writer) FreeCache() {
