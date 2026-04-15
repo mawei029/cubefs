@@ -323,6 +323,7 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 		}
 
 		fileSize, _ := f.fileSizeVersion2(ino)
+		aheadEn, aheadMin, aheadTotalMem := f.super.BlobStoreAheadReadForReader()
 		clientConf := blobstore.ClientConfig{
 			VolName:         f.super.volname,
 			VolType:         f.super.volType,
@@ -344,6 +345,9 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 		}
 		var reader *blobstore.Reader
 		var writer *blobstore.Writer
+		clientConf.AheadReadEnable = aheadEn
+		clientConf.MinReadAheadSize = aheadMin
+		clientConf.PrefetchTotalMem = aheadTotalMem
 		switch req.Flags & 0x0f {
 		case syscall.O_RDONLY:
 			reader = blobstore.NewReader(clientConf)
@@ -447,7 +451,21 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 		if reader == nil {
 			return ParseError(syscall.EBADF)
 		}
-		size, err = reader.Read(ctx, resp.Data[fuse.OutHeaderSize:], int(req.Offset), req.Size)
+		// EC/BlobStore：先取 inode 代数与长度，若与 Reader 内 ObjExtents 视图不一致则刷新，再读数据
+		var info *proto.InodeInfo
+		info, err = f.super.InodeGet(f.ino)
+		if err != nil {
+			return ParseError(err)
+		}
+		f.ino = info.Inode
+		finfo, found := f.super.fileExtendInfoMap[f.ino]
+		if !found {
+			return ParseError(syscall.EBADF)
+		}
+		if err = finfo.fReader.EnsureAlignedForRead(info.Generation, info.Size); err != nil {
+			return ParseError(err)
+		}
+		size, err = finfo.fReader.Read(ctx, resp.Data[fuse.OutHeaderSize:], int(req.Offset), req.Size)
 	}
 	if err != nil && err != io.EOF {
 		msg := fmt.Sprintf("Read: ino(%v) req(%v) err(%v) size(%v)", f.ino, req, err, size)
@@ -829,7 +847,8 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 			f.fWriter.SetFileSize(req.Size)
 		}
 		if f.fReader != nil {
-			_ = f.fReader.RefreshExtents()
+			// _ = f.fReader.RefreshExtents()
+			f.syncBlobReaderAfterMetaChange(ino)
 		}
 	}
 
@@ -903,6 +922,24 @@ func (f *File) doECTruncateV2(ino uint64, targetSize uint64, fullPath string) er
 		return err
 	}
 	return f.super.mw.TruncateV2(ino, targetSize, fullPath, newObjExtents)
+}
+
+// syncBlobReaderAfterMetaChange 在 Blob 写/截断等已反映到 meta 后，刷新 Reader 内 ObjExtents，并用 InodeGet 与 SyncInodeView 对齐 inode 代数与长度。
+func (f *File) syncBlobReaderAfterMetaChange(ino uint64) {
+	if f.fReader == nil {
+		return
+	}
+	if err := f.fReader.RefreshExtents(); err != nil {
+		log.LogWarnf("syncBlobReaderAfterMetaChange: RefreshExtents ino(%v) err(%v)", ino, err)
+		return
+	}
+	info, err := f.super.InodeGet(ino)
+	if err != nil {
+		log.LogWarnf("syncBlobReaderAfterMetaChange: InodeGet ino(%v) err(%v)", ino, err)
+		return
+	}
+	f.info = info
+	f.fReader.SyncInodeView(info.Generation, info.Size)
 }
 
 // ensureBlobStoreWriter 保证 BlobStore 卷的 f.fWriter 已赋值；若为 nil 则按 Open 相同逻辑创建并赋值，供 doECTruncateV2 等复用。

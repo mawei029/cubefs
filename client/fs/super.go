@@ -122,6 +122,19 @@ type Super struct {
 
 	dirDirtyCache     map[uint64]bool
 	dirDirtyCacheLock sync.Mutex
+
+	// same mount flags as stream ahead-read; used by blobstore.Reader to prefetch EbsBlockSize bytes
+	aheadReadEnable   bool
+	minReadAheadSize  uint64
+	aheadReadTotalMem int64
+}
+
+// BlobStoreAheadReadForReader returns mount ahead-read flags for blobstore.Reader.
+// Replica path: ExtentClient uses AheadReadWindow (pooled blocks + background prefetch).
+// Blob/EC path: Reader uses a sequential buffer to merge FUSE-sized reads into one EBS read up to EbsBlockSize.
+// Same knobs: aheadReadEnable, minReadAheadSize (default 10MB; smaller files keep one EBS read per FUSE read).
+func (s *Super) BlobStoreAheadReadForReader() (enable bool, minReadAhead int, totalMem int64) {
+	return s.aheadReadEnable, int(s.minReadAheadSize), s.aheadReadTotalMem
 }
 
 // Functions that Super needs to implement
@@ -354,7 +367,8 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 		RemoteCacheName:       opt.RemoteCacheName,
 	}
 
-	log.LogInfof("ahead info enable %+v, totalMem %+v, timeout %+v, winCnt %+v", opt.AheadReadEnable, opt.AheadReadTotalMem, opt.AheadReadBlockTimeOut, opt.AheadReadWindowCnt)
+	log.LogInfof("ahead info enable %+v, totalMem %+v, timeout %+v, winCnt %+v, minReadAhead %+v, EbsblockSize %+v (stream + blob read prefetch)",
+		opt.AheadReadEnable, opt.AheadReadTotalMem, opt.AheadReadBlockTimeOut, opt.AheadReadWindowCnt, opt.MinReadAheadSize, opt.EbsBlockSize)
 
 	s.ec, err = stream.NewExtentClient(extentConfig)
 	if err != nil {

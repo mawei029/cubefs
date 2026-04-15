@@ -65,6 +65,7 @@ func (s *Super) InodeGet(ino uint64) (info *proto.InodeInfo, err error) {
 				}
 
 				fileSize, _ := f.fileSizeVersion2(f.ino)
+				aheadEn, aheadMin, aheadTotalMem := f.super.BlobStoreAheadReadForReader()
 				clientConf := blobstore.ClientConfig{
 					VolName:         f.super.volname,
 					VolType:         f.super.volType,
@@ -81,6 +82,9 @@ func (s *Super) InodeGet(ino uint64) (info *proto.InodeInfo, err error) {
 					FileSize:        uint64(fileSize),
 					PoolId:          info.PoolId,
 				}
+				clientConf.AheadReadEnable = aheadEn
+				clientConf.MinReadAheadSize = aheadMin
+				clientConf.PrefetchTotalMem = aheadTotalMem
 				ei.Lock()
 				if ei.fWriter != nil {
 					ei.fWriter.FreeCache()

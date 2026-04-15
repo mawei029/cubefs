@@ -148,11 +148,18 @@ func (writer *Writer) Write(ctx context.Context, offset int, data []byte, flags 
 		writer.ino, offset, len(data), flags&proto.FlagsAppend, writer.CacheFileSize(), writer.overwrite)
 
 	// Case 1: Validate write request: data too large, not append mode, or non-contiguous write (unless overwrite mode)
-	invalid := len(data) > MaxBufferSize || flags&proto.FlagsAppend == 0 || (offset > writer.CacheFileSize() && !writer.overwrite)
+	//invalid := len(data) > MaxBufferSize || flags&proto.FlagsAppend == 0 || (offset > writer.CacheFileSize() && !writer.overwrite)
+	invalid := len(data) > MaxBufferSize || offset > writer.CacheFileSize()
 	if invalid {
 		log.LogErrorf("TRACE blobStore Write error,may be len(%v)>512MB,flags(%v)!=flagAppend,offset(%v)!=fileSize(%v), overwrite(%t)",
-			len(data), flags&proto.FlagsAppend, offset, writer.CacheFileSize(), writer.overwrite)
+			len(data), flags, offset, writer.CacheFileSize(), writer.overwrite)
 		return 0, syscall.EOPNOTSUPP
+	}
+
+	if flags&proto.FlagsAppend != 0 && offset < writer.CacheFileSize() {
+		log.LogWarnf("offset need reset. blobStore Write: ino(%v) offset(%v) len(%v) flags&proto.FlagsAppend(%v) fileSize(%v) overwrite(%t)",
+			writer.ino, offset, len(data), flags&proto.FlagsAppend, writer.CacheFileSize(), writer.overwrite)
+		// offset = writer.CacheFileSize()
 	}
 
 	// Case 2: Handle overwrite: either already in overwrite mode or writing before current file offset
@@ -190,6 +197,7 @@ func (writer *Writer) tryOverWrite(ctx context.Context, offset int, data []byte,
 				writer.ino, offset, len(data), flags, err)
 			return 0, err
 		}
+		writer.fileOffset = offset
 	}
 
 	remainSize, position := len(data), 0
@@ -431,11 +439,15 @@ func (writer *Writer) doBufferWriteWithoutPool(ctx context.Context, data []byte,
 			err = writer.flushWithoutPool(writer.ino, ctx, false)
 			writer.Lock()
 			if err != nil {
-				writer.buf = writer.buf[:len(writer.buf)-len(data)]
-				writer.fileOffset -= len(data)
-				return
+				// Revert only this iteration's append (already-flushed prefixes must not be rolled back).
+				if freeSize > len(writer.buf) {
+					log.LogErrorf("doBufferWriteWithoutPool: rollback len err ino(%v) freeSize(%v) bufLen(%v)", writer.ino, freeSize, len(writer.buf))
+					return 0, err
+				}
+				writer.buf = writer.buf[:len(writer.buf)-freeSize]
+				writer.fileOffset -= freeSize
+				return 0, err
 			}
-
 		}
 	}
 
@@ -610,6 +622,11 @@ func (writer *Writer) flushWithoutPool(inode uint64, ctx context.Context, flushF
 		return
 	}
 	bufferSize := len(writer.buf)
+	if writer.fileOffset < bufferSize {
+		err = fmt.Errorf("flushWithoutPool: inconsistent state ino(%v) fileOffset(%v) < len(buf)(%v)", inode, writer.fileOffset, bufferSize)
+		log.LogErrorf(err.Error())
+		return err
+	}
 	wSlice := &rwSlice{
 		fileOffset: uint64(writer.fileOffset - bufferSize),
 		size:       uint32(bufferSize),
@@ -667,6 +684,11 @@ func computeOverwriteReqs(start, end uint64, objExtents []proto.ObjExtentKey) (r
 			})
 			start = end
 			break
+		}
+		// Extent ends before current start: buffer lies in a hole after this ek; skip to avoid
+		// uint64 underflow in reqSize when end > ek.FileOffset+ek.Size.
+		if start >= ek.FileOffset+ek.Size {
+			continue
 		}
 		if start < ek.FileOffset {
 			reqs = append(reqs, overwriteReq{
@@ -816,6 +838,11 @@ func (writer *Writer) flushExt(inode uint64, ctx context.Context, flushFlag bool
 
 	// Calculate buffer range in file coordinates bufferSize is the amount of data in buffer (from 0 to blockPosition)
 	bufferSize := writer.blockPosition
+	if writer.fileOffset < bufferSize {
+		err = fmt.Errorf("flushExt: inconsistent state ino(%v) fileOffset(%v) < blockPosition(%v)", inode, writer.fileOffset, bufferSize)
+		log.LogErrorf(err.Error())
+		return err
+	}
 	start := uint64(writer.fileOffset - bufferSize)
 	end := uint64(writer.fileOffset)
 
@@ -854,6 +881,11 @@ func (writer *Writer) flush(inode uint64, ctx context.Context, flushFlag bool) (
 	}
 
 	bufferSize := writer.blockPosition
+	if writer.fileOffset < bufferSize {
+		err = fmt.Errorf("flush: inconsistent state ino(%v) fileOffset(%v) < blockPosition(%v)", inode, writer.fileOffset, bufferSize)
+		log.LogErrorf(err.Error())
+		return err
+	}
 
 	wSlice := &rwSlice{
 		fileOffset: uint64(writer.fileOffset - bufferSize),
