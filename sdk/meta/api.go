@@ -1749,7 +1749,7 @@ func (mw *MetaWrapper) Truncate(inode, size uint64, fullPath string) error {
 	return nil
 }
 
-// TruncateV2 用于 EC/BlobStore 卷：调用方已完成 EBS 侧读/截断/写/删，传入新的 obj extent 列表，仅更新 meta。
+// TruncateV2 将 EC/BlobStore 卷 inode 的逻辑长度与 ObjExtents 提交到 metanode；列表须与目标长度一致（含仅扩文件、无 EBS 裁剪时传入当前对象列表）。
 func (mw *MetaWrapper) TruncateV2(inode, size uint64, fullPath string, newObjExtents []proto.ObjExtentKey) error {
 	mp := mw.getPartitionByInode(inode)
 	if mp == nil {

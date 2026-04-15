@@ -530,7 +530,7 @@ func (f *File) WriteFile(data []byte, off int64) (n int, err error) {
 			wait = true
 		}
 	}
-	if f.flags&(syscall.O_APPEND) != 0 || proto.IsCold(f.client.volType) {
+	if f.flags&(syscall.O_APPEND) != 0 {
 		flags |= proto.FlagsAppend
 		flags |= proto.FlagsSyncWrite
 	}

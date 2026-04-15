@@ -85,7 +85,7 @@ func (ebs *BlobStoreClient) Read(ctx context.Context, volName string, buf []byte
 		SliceSize: oek.BlobSize,
 		Slices:    sliceInfos,
 	}
-	// func get has retry
+	// access.Get 失败时循环重试
 	log.LogDebugf("TRACE Ebs Read,oek(%v) loc(%v)", oek, loc)
 	var body io.ReadCloser
 	defer func() {

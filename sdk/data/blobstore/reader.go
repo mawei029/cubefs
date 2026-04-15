@@ -80,7 +80,6 @@ type Reader struct {
 	ebs             *BlobStoreClient
 	readConcurrency int
 	wg              sync.WaitGroup
-	once            sync.Once
 	sync.Mutex
 	close         bool
 	extentKeys    []proto.ExtentKey
@@ -344,7 +343,7 @@ func (reader *Reader) Read(ctx context.Context, buf []byte, offset int, size int
 		return 0, syscall.EIO
 	}
 	if size > reader.bufValidLen-(offset-reader.bufBaseOff) {
-		log.LogErrorf("reader Read prefetch buffer is too small. ino(%v) offset(%v) bufBaseOff(%v) bufValidLen(%v)", reader.ino, offset, reader.bufBaseOff, reader.bufValidLen)
+		log.LogWarnf("reader Read prefetch buffer is too small. ino(%v) offset(%v) bufBaseOff(%v) bufValidLen(%v)", reader.ino, offset, reader.bufBaseOff, reader.bufValidLen)
 		reader.invalidateReadBuf()
 		return normalReadFunc()
 	}
@@ -410,6 +409,7 @@ func (reader *Reader) Close(ctx context.Context) {
 }
 
 // prepareEbsSlice 将 [offset, offset+size) 切成若干 rwSlice，每个对应一段 ObjExtentKey 内的连续区间，供并行 readSliceRange。
+// ObjExtents 须已由 ensureExtentsLoaded / RefreshExtents 加载；此处不再重复调用 GetObjExtents（已去掉历史上的二次 refresh）。
 func (reader *Reader) prepareEbsSlice(offset int, size uint32) ([]*rwSlice, error) {
 	if offset < 0 {
 		return nil, syscall.EIO
@@ -421,9 +421,6 @@ func (reader *Reader) prepareEbsSlice(offset int, size uint32) ([]*rwSlice, erro
 	endflag := false
 	selected := false
 
-	reader.once.Do(func() {
-		reader.refreshEbsExtents()
-	})
 	fileSize, valid := reader.fileSize()
 	reader.fileLength = fileSize
 	log.LogDebugf("TRACE blobStore prepareEbsSlice Enter. ino(%v)  fileSize(%v) ", reader.ino, fileSize)
@@ -472,6 +469,7 @@ func (reader *Reader) prepareEbsSlice(offset int, size uint32) ([]*rwSlice, erro
 	return chunks, nil
 }
 
+// readSliceRange 在任务池里处理单个 rwSlice：先尝试块缓存命中，否则限流后对单段 ObjExtent 调用 ebs.Read。
 func (reader *Reader) readSliceRange(ctx context.Context, rs *rwSlice) (err error) {
 	defer reader.wg.Done()
 	log.LogDebugf("TRACE blobStore readSliceRange Enter. ino(%v)  rs.fileOffset(%v),rs.rOffset(%v),rs.rSize(%v) ", reader.ino, rs.fileOffset, rs.rOffset, rs.rSize)
@@ -482,7 +480,6 @@ func (reader *Reader) readSliceRange(ctx context.Context, rs *rwSlice) (err erro
 
 	bgTime := stat.BeginStat()
 	stat.EndStat("CacheGet", nil, bgTime, 1)
-	// all request for each block.
 	metric := exporter.NewTPCnt("CacheGet")
 	defer func() {
 		metric.SetWithLabels(err, map[string]string{exporter.Vol: reader.volName})
@@ -522,7 +519,7 @@ func (reader *Reader) readSliceRange(ctx context.Context, rs *rwSlice) (err erro
 	read := copy(rs.Data, buf)
 	reader.err <- nil
 
-	// cache full block
+	// 开启块缓存且客户端存在时：异步按整 ObjExtent 读入并 Put L1；否则直接返回（本路径不再误触发 asyncCache）。
 	if !reader.needCacheL1() || reader.bc == nil {
 		log.LogDebugf("TRACE blobStore readSliceRange exit without cache. read counter=%v", read)
 		return nil
@@ -544,7 +541,7 @@ func (reader *Reader) asyncCache(ctx context.Context, cacheKey string, objExtent
 
 	log.LogDebugf("TRACE blobStore asyncCache Enter. cacheKey=%v", cacheKey)
 
-	// block is go loading.
+	// 同一 cacheKey 仅允许一处异步回填，避免并发重复读 EBS。
 	if _, ok := reader.inflightCache.Load(cacheKey); ok {
 		return
 	}

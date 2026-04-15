@@ -42,7 +42,7 @@ const (
 var errPutNoKeys = errors.New("ebs put returned no extent keys")
 
 // overwriteReq represents an overwrite request that contains both the new extent and the old extent
-// overwriteReq 与 overwrite.overwriteReq 一致，Writer 与 TruncateV2 共用
+// 与 computeOverwriteReqs / flushOverwriteReqs 使用的结构一致，TruncateV2 复用同一类型
 // overwriteReq 表示一次覆盖请求：新写入范围 NewExtent，以及需要废弃的旧范围 DiscardExtent（可为空）。
 // 与 writer 的 flushExt/computeOverwriteReqs 共用同一结构，TruncateV2 复用时仅产生至多一个部分重叠的 req。
 type overwriteReq struct {
@@ -156,10 +156,11 @@ func (writer *Writer) Write(ctx context.Context, offset int, data []byte, flags 
 		return 0, syscall.EOPNOTSUPP
 	}
 
-	if flags&proto.FlagsAppend != 0 && offset < writer.CacheFileSize() {
+	if flags&proto.FlagsAppend != 0 && offset != writer.CacheFileSize() {
 		log.LogWarnf("offset need reset. blobStore Write: ino(%v) offset(%v) len(%v) flags&proto.FlagsAppend(%v) fileSize(%v) overwrite(%t)",
 			writer.ino, offset, len(data), flags&proto.FlagsAppend, writer.CacheFileSize(), writer.overwrite)
 		// offset = writer.CacheFileSize()
+		return 0, syscall.EOPNOTSUPP
 	}
 
 	// Case 2: Handle overwrite: either already in overwrite mode or writing before current file offset
@@ -924,11 +925,17 @@ func (writer *Writer) SetFileSize(size uint64) {
 	atomic.StoreUint64(&writer.fileSize, size)
 }
 
-// TruncateV2 执行 EBS 侧截断：通过 writer.mw 拉取当前 ObjExtents，通过 writer.ebsc 执行读/截断/写/删，返回新 extent 列表供上层调用 meta.TruncateV2。
-// 调用链：client/file.doECTruncateV2 → Writer.TruncateV2 → writer.ebsc.TruncateV2Extents（BlobStoreClient）。
+// TruncateV2：先将 buf 中下刷（Flush/flushExt），再 GetObjExtents；否则 meta/ObjExtents 落后于未落盘数据，截断会基于陈旧视图。
+// targetSize < 当前逻辑长度时经 ebsc.TruncateV2Extents 做 EBS 裁剪并返回新列表；
+// targetSize >= 当前长度时直接返回现有列表（仅由上层 MetaWrapper.TruncateV2 更新 meta，不写 EBS）。
+// 调用链：File.doECTruncateV2 → Writer.TruncateV2 →（裁剪时）BlobStoreClient.TruncateV2Extents → mw.TruncateV2。
 func (writer *Writer) TruncateV2(ctx context.Context, targetSize uint64) (newObjExtents []proto.ObjExtentKey, err error) {
 	if writer == nil || writer.mw == nil || writer.ebsc == nil {
 		return nil, fmt.Errorf("Writer.TruncateV2: writer/mw/ebsc nil")
+	}
+	if err = writer.Flush(writer.ino, ctx); err != nil {
+		log.LogErrorf("TruncateV2: pre-flush ino(%v) err(%v)", writer.ino, err)
+		return nil, err
 	}
 	_, currentSize, _, objExtents, err := writer.mw.GetObjExtents(writer.ino)
 	if err != nil {

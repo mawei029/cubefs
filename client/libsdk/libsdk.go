@@ -917,7 +917,7 @@ func cfs_write(id C.int64_t, fd C.int, buf unsafe.Pointer, size C.size_t, off C.
 			wait = true
 		}
 	}
-	if f.flags&uint32(C.O_APPEND) != 0 || proto.IsCold(c.volType) || proto.IsStorageClassBlobStore(f.storageClass) {
+	if f.flags&uint32(C.O_APPEND) != 0 {
 		flags |= proto.FlagsAppend
 		flags |= proto.FlagsSyncWrite
 	}
