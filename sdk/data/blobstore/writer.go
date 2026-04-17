@@ -147,25 +147,23 @@ func (writer *Writer) Write(ctx context.Context, offset int, data []byte, flags 
 	log.LogDebugf("TRACE blobStore Write Enter: ino(%v) offset(%v) len(%v) flags&proto.FlagsAppend(%v) fileSize(%v) overwrite(%t)",
 		writer.ino, offset, len(data), flags&proto.FlagsAppend, writer.CacheFileSize(), writer.overwrite)
 
-	// Case 1: Validate write request: data too large, not append mode, or non-contiguous write (unless overwrite mode)
-	//invalid := len(data) > MaxBufferSize || flags&proto.FlagsAppend == 0 || (offset > writer.CacheFileSize() && !writer.overwrite)
-	invalid := len(data) > MaxBufferSize || offset > writer.CacheFileSize()
-	if invalid {
-		log.LogErrorf("TRACE blobStore Write error,may be len(%v)>512MB,flags(%v)!=flagAppend,offset(%v)!=fileSize(%v), overwrite(%t)",
-			len(data), flags, offset, writer.CacheFileSize(), writer.overwrite)
+	// Case 1: Validate write request: data too large
+	if len(data) > MaxBufferSize {
+		log.LogErrorf("blobStore Write error,may be len(%v)>512MB,offset(%v) fileSize(%v)",
+			len(data), offset, writer.CacheFileSize())
 		return 0, syscall.EOPNOTSUPP
 	}
 
+	// Case 1.1: O_APPEND：内核保证写到当前尾，offset 必须与 CacheFileSize 一致。
 	if flags&proto.FlagsAppend != 0 && offset != writer.CacheFileSize() {
-		log.LogWarnf("offset need reset. blobStore Write: ino(%v) offset(%v) len(%v) flags&proto.FlagsAppend(%v) fileSize(%v) overwrite(%t)",
+		log.LogErrorf("filesize need reset. blobStore Write: ino(%v) offset(%v) len(%v) flags&proto.FlagsAppend(%v) fileSize(%v) overwrite(%t)",
 			writer.ino, offset, len(data), flags&proto.FlagsAppend, writer.CacheFileSize(), writer.overwrite)
-		// offset = writer.CacheFileSize()
 		return 0, syscall.EOPNOTSUPP
 	}
 
-	// Case 2: Handle overwrite: either already in overwrite mode or writing before current file offset
-	// Overwrite requires special handling to merge with existing extents and discard old data
-	if writer.overwrite || offset < writer.CacheFileSize() {
+	// Case 2: pwrite：offset 小于当前长度（覆盖）或大于当前长度（稀疏/先洞后写）均走 tryOverWrite，与 extent 合并或写 hole 后新范围。
+	// 仅当 offset == CacheFileSize() 时为顺序追加，走缓冲/直写路径。
+	if offset != writer.CacheFileSize() {
 		return writer.tryOverWrite(ctx, offset, data, flags)
 	}
 
@@ -240,11 +238,20 @@ func (writer *Writer) tryOverWrite(ctx context.Context, offset int, data []byte,
 	}
 
 	// Update file size if write extends beyond current file size
-	if offset+len(data) > int(writer.fileSize) {
-		writer.fileSize = uint64(offset + len(data))
+	if uint64(offset+len(data)) > atomic.LoadUint64(&writer.fileSize) {
+		atomic.StoreUint64(&writer.fileSize, uint64(offset+len(data)))
 	}
 
-	log.LogDebugf("TRACE blobStore tryOverWrite Exit: ino(%v) writer.fileSize(%v) writer.fileOffset(%v)", writer.ino, writer.fileSize, writer.fileOffset)
+	// 未满整块的数据仍在 buf 中：必须 flush，否则 Read 只走 EBS/meta 会看不到本次 pwrite/稀疏写。
+	if writer.dirty && writer.blockPosition > 0 {
+		if err = writer.flushExt(writer.ino, ctx, false); err != nil {
+			log.LogErrorf("TRACE blobStore tryOverWrite error, final flush ext fail,ino(%v) offset(%v) len(%v) err(%v)",
+				writer.ino, offset, len(data), err)
+			return 0, err
+		}
+	}
+
+	log.LogDebugf("TRACE blobStore tryOverWrite Exit: ino(%v) writer.fileSize(%v) writer.fileOffset(%v)", writer.ino, atomic.LoadUint64(&writer.fileSize), writer.fileOffset)
 	return len(data), nil
 }
 

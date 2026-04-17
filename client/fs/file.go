@@ -547,6 +547,27 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 			log.LogDebugf("fallocate: ino(%v) origFilesize(%v) req(%v) err(%v)", f.ino, filesize, req, err)
 			return
 		}
+	} else if proto.IsStorageClassBlobStore(storageClass) {
+		filesize, _ := f.fileSizeVersion2(ino)
+		if req.Offset > int64(filesize) && reqlen == 1 && req.Data[0] == 0 {
+			// posix_fallocate 在不支持 fallocate 时可能退化为「在目标尾写 1 字节 0」；与 Hot/Replica 分支语义对齐。
+			fullPath := path.Join(f.getParentPath(), f.name)
+			target := uint64(req.Offset) + uint64(reqlen)
+			if err = f.doECTruncateV2(ino, target, fullPath); err != nil {
+				return ParseError(err)
+			}
+			if f.fWriter != nil {
+				f.fWriter.SetFileSize(target)
+			}
+			if f.fReader != nil {
+				f.syncBlobReaderAfterMetaChange(ino) // f.fReader.RefreshExtents()
+			} else if info, err := f.super.InodeGet(ino); err == nil {
+				f.info = info
+			}
+			resp.Size = reqlen
+			log.LogDebugf("fallocate(blob): ino(%v) origFilesize(%v) target(%v) req(%v)", f.info.Inode, filesize, target, req)
+			return nil
+		}
 	}
 
 	defer func() {
@@ -1173,10 +1194,9 @@ func (f *File) fileSizeVersion2(ino uint64) (size int, gen uint64) {
 					size = cacheSize
 				}
 			}
+			gen = info.Generation
 		}
-		gen = info.Generation
 	}
-	// }
 
 	log.LogDebugf("TRACE fileSizeVersion2: ino(%v) fileSize(%v) gen(%v) valid(%v)", ino, size, gen, valid)
 	return

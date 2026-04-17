@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -58,10 +59,12 @@ type rwSlice struct {
 	read         int
 	Data         []byte
 	objExtentKey proto.ObjExtentKey
+	// hole：对应 [start,end) 落在尚无 ObjExtent 覆盖的区间，Data 已预置为 0，readSliceRange 不调 EBS。
+	hole bool
 }
 
 func (s rwSlice) String() string {
-	return fmt.Sprintf("rwSlice{fileOffset(%v),size(%v),rOffset(%v),rSize(%v),read(%v),objExtentKey(%v)}", s.fileOffset, s.size, s.rOffset, s.rSize, s.read, s.objExtentKey)
+	return fmt.Sprintf("rwSlice{fileOffset(%v),size(%v),rOffset(%v),rSize(%v),read(%v),hole(%v),objExtentKey(%v)}", s.fileOffset, s.size, s.rOffset, s.rSize, s.read, s.hole, s.objExtentKey)
 }
 
 func (reader *Reader) String() string {
@@ -408,8 +411,8 @@ func (reader *Reader) Close(ctx context.Context) {
 	reader.Unlock()
 }
 
-// prepareEbsSlice 将 [offset, offset+size) 切成若干 rwSlice，每个对应一段 ObjExtentKey 内的连续区间，供并行 readSliceRange。
-// ObjExtents 须已由 ensureExtentsLoaded / RefreshExtents 加载；此处不再重复调用 GetObjExtents（已去掉历史上的二次 refresh）。
+// prepareEbsSlice 将 [offset, offset+size) 切成若干 rwSlice：洞区间用 hole=true、全 0；与 ObjExtent 重叠部分用
+// rOffset/rSize 表示在该 extent 对象内的读区间（须满足 rOffset+rSize<=oek.Size，否则 access.Get 会 ErrIllegalArguments）。
 func (reader *Reader) prepareEbsSlice(offset int, size uint32) ([]*rwSlice, error) {
 	if offset < 0 {
 		return nil, syscall.EIO
@@ -417,9 +420,6 @@ func (reader *Reader) prepareEbsSlice(offset int, size uint32) ([]*rwSlice, erro
 	if err := reader.ensureExtentsLoaded(); err != nil {
 		return nil, err
 	}
-	chunks := make([]*rwSlice, 0)
-	endflag := false
-	selected := false
 
 	fileSize, valid := reader.fileSize()
 	reader.fileLength = fileSize
@@ -433,45 +433,83 @@ func (reader *Reader) prepareEbsSlice(offset int, size uint32) ([]*rwSlice, erro
 		return nil, io.EOF
 	}
 
-	start := uint64(offset)
 	if uint64(offset)+uint64(size) > fileSize {
 		size = uint32(fileSize - uint64(offset))
 	}
-	end := uint64(offset + int(size))
-	for index, oek := range reader.objExtentKeys {
-		rs := &rwSlice{}
-		selected = false
-		if oek.FileOffset <= start && start < oek.FileOffset+(oek.Size) {
-			rs.index = index
-			rs.fileOffset = oek.FileOffset
-			rs.size = uint32(oek.Size)
-			rs.rOffset = start - oek.FileOffset
-			rs.rSize = uint32(oek.FileOffset + oek.Size - start)
-			selected = true
+	start := uint64(offset)
+	end := start + uint64(size)
+
+	keys := append([]proto.ObjExtentKey(nil), reader.objExtentKeys...)
+	sort.Slice(keys, func(i, j int) bool {
+		return keys[i].FileOffset < keys[j].FileOffset
+	})
+
+	chunks := make([]*rwSlice, 0)
+	cur := start
+	for i := range keys {
+		oek := keys[i]
+		ekEnd := oek.FileOffset + uint64(oek.Size)
+		if ekEnd <= cur {
+			continue
 		}
-		if end <= oek.FileOffset+oek.Size {
-			rs.rSize = uint32(end - start)
-			selected = true
-			endflag = true
+		if oek.FileOffset >= end {
+			break
 		}
-		if selected {
-			rs.objExtentKey = oek
-			rs.Data = make([]byte, rs.rSize)
-			start = oek.FileOffset + oek.Size
-			chunks = append(chunks, rs)
-			log.LogDebugf("TRACE blobStore prepareEbsSlice. ino(%v)  offset(%v) size(%v) rwSlice(%v)", reader.ino, offset, size, rs)
+		if cur < oek.FileOffset {
+			holeLen := oek.FileOffset - cur
+			chunks = append(chunks, &rwSlice{
+				hole:       true,
+				fileOffset: cur,
+				rSize:      uint32(holeLen),
+				Data:       make([]byte, holeLen),
+			})
+			cur = oek.FileOffset
 		}
-		if endflag {
+		ov := end
+		if ekEnd < ov {
+			ov = ekEnd
+		}
+		if cur >= ov {
+			continue
+		}
+		rOff := cur - oek.FileOffset
+		rSz := ov - cur
+		chunks = append(chunks, &rwSlice{
+			index:        i,
+			fileOffset:   oek.FileOffset,
+			size:         uint32(oek.Size),
+			rOffset:      rOff,
+			rSize:        uint32(rSz),
+			objExtentKey: oek,
+			Data:         make([]byte, rSz),
+		})
+		cur = ov
+		if cur >= end {
 			break
 		}
 	}
-	log.LogDebugf("TRACE blobStore prepareEbsSlice Exit. ino(%v)  offset(%v) size(%v) rwSlices(%v)", reader.ino, offset, size, chunks)
+	if cur < end {
+		holeLen := end - cur
+		chunks = append(chunks, &rwSlice{
+			hole:       true,
+			fileOffset: cur,
+			rSize:      uint32(holeLen),
+			Data:       make([]byte, holeLen),
+		})
+	}
+
+	log.LogDebugf("TRACE blobStore prepareEbsSlice Exit. ino(%v)  offset(%v) size(%v) rwSlices_len(%v)", reader.ino, offset, size, len(chunks))
 	return chunks, nil
 }
 
 // readSliceRange 在任务池里处理单个 rwSlice：先尝试块缓存命中，否则限流后对单段 ObjExtent 调用 ebs.Read。
 func (reader *Reader) readSliceRange(ctx context.Context, rs *rwSlice) (err error) {
 	defer reader.wg.Done()
+	if rs.hole {
+		log.LogDebugf("TRACE blobStore readSliceRange hole skip EBS. ino(%v) len(%v)", reader.ino, rs.rSize)
+		reader.err <- nil
+		return
+	}
 	log.LogDebugf("TRACE blobStore readSliceRange Enter. ino(%v)  rs.fileOffset(%v),rs.rOffset(%v),rs.rSize(%v) ", reader.ino, rs.fileOffset, rs.rOffset, rs.rSize)
 	cacheKey := util.GenerateKey(reader.volName, reader.ino, rs.fileOffset)
 	log.LogDebugf("TRACE blobStore readSliceRange. ino(%v)  cacheKey(%v) ", reader.ino, cacheKey)

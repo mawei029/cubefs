@@ -406,7 +406,7 @@ func TestComputeOverwriteReqs(t *testing.T) {
 	}
 }
 
-// TestTryOverWrite_Basic tests tryOverWrite with basic scenario (small data, no flush needed)
+// TestTryOverWrite_Basic tests tryOverWrite with basic scenario (small data);尾部未满块会经 flushExt 落盘并 resetBuffer。
 func TestTryOverWrite_Basic(t *testing.T) {
 	ctx := context.Background()
 
@@ -464,7 +464,7 @@ func TestTryOverWrite_Basic(t *testing.T) {
 	size, err := testWriter.tryOverWrite(ctx, 0, data, flag)
 	require.NoError(t, err, "tryOverWrite failed")
 	require.Equal(t, len(data), size, "tryOverWrite returned wrong size.")
-	require.Equal(t, len(data), testWriter.blockPosition, "tryOverWrite blockPosition incorrect.")
+	require.Equal(t, 0, testWriter.blockPosition, "after final flushExt blockPosition should be reset")
 	require.Equal(t, len(data), testWriter.fileOffset, "tryOverWrite fileOffset incorrect.")
 }
 
