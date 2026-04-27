@@ -524,28 +524,25 @@ func (ew *BlobStoreClientWrapper) getBlobStoreClient() (blobClient *blobstore.Bl
 //	| New | → Restore → | Ready |
 //	+-----+             +-------+
 type metaPartition struct {
-	config         *MetaPartitionConfig
-	size           uint64                // For partition all file size
-	applyID        uint64                // Inode/Dentry max applyID, this index will be update after restoring from the dumped data.
-	storedApplyId  uint64                // update after store snapshot to disk
-	dentryTree     DentryTree            // btree for dentries
-	inodeTree      InodeTree             // btree for inodes
-	extendTree     ExtendTree            // btree for inode extend (XAttr) management
-	multipartTree  MultipartTree         // collection for multipart management
-	txProcessor    *TransactionProcessor // transction processor
-	raftPartition  raftstore.Partition
-	stopC          chan bool
-	storeChan      chan *storeMsg
-	state          uint32
-	delInodeFp     *os.File
-	freeList       *freeList // free inode list
-	freeHybridList *freeList // to store inode delay to delete migration keys
-	extDelCh       chan []proto.ExtentKey
-	objExtDelCh    chan []proto.ObjExtentKey // legacy; obj extent discard now uses objExtentDelTree
-	extReset       chan struct{}
-	// fsmRaftApplyIndex is the raft apply index for the op currently executing in Apply (for objExtentDelTree keys).
-	fsmRaftApplyIndex         uint64
-	objExtentDelTree          ObjExtentDelTree
+	config                    *MetaPartitionConfig
+	size                      uint64                // For partition all file size
+	applyID                   uint64                // Inode/Dentry max applyID, this index will be update after restoring from the dumped data.
+	storedApplyId             uint64                // update after store snapshot to disk
+	dentryTree                DentryTree            // btree for dentries
+	inodeTree                 InodeTree             // btree for inodes
+	extendTree                ExtendTree            // btree for inode extend (XAttr) management
+	multipartTree             MultipartTree         // collection for multipart management
+	txProcessor               *TransactionProcessor // transction processor
+	raftPartition             raftstore.Partition
+	stopC                     chan bool
+	storeChan                 chan *storeMsg
+	state                     uint32
+	delInodeFp                *os.File
+	freeList                  *freeList // free inode list
+	freeHybridList            *freeList // to store inode delay to delete migration keys
+	extDelCh                  chan []proto.ExtentKey
+	objExtDelCh               chan []proto.ObjExtentKey // legacy; obj extent discard now uses objExtentDelTree
+	extReset                  chan struct{}
 	vol                       *Vol
 	manager                   *metadataManager
 	isLoadingMetaPartition    bool
@@ -573,6 +570,10 @@ type metaPartition struct {
 
 	storeMsgFlag   int32 // 0: not store msg, 1: store msg
 	leaseApplyTime int64
+
+	// fsmRaftApplyIndex is the raft apply index for the op currently executing in Apply (for objExtentDelTree keys).
+	fsmRaftApplyIndex uint64
+	objExtentDelTree  ObjExtentDelTree
 
 	rocksdbManager  RocksdbManager
 	db              *RocksdbOperator

@@ -803,6 +803,7 @@ type TruncateRequest struct {
 	Size          uint64         `json:"sz"`
 	TruncateV2    bool           `json:"truncateV2"`    // true 表示 EC 卷 TruncateV2，metanode 用 NewObjExtents 替换并跳过 objExtDelCh
 	NewObjExtents []ObjExtentKey `json:"newObjExtents"` // TruncateV2 时由 client 计算的新 obj extent 列表
+	ToDeletes     []ObjExtentKey `json:"toDeletes"`     // TruncateV2 时由 client 计算的待删 obj extent 列表
 	RequestExtend
 }
 

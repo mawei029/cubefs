@@ -1750,14 +1750,14 @@ func (mw *MetaWrapper) Truncate(inode, size uint64, fullPath string) error {
 }
 
 // TruncateV2 将 EC/BlobStore 卷 inode 的逻辑长度与 ObjExtents 提交到 metanode；列表须与目标长度一致（含仅扩文件、无 EBS 裁剪时传入当前对象列表）。
-func (mw *MetaWrapper) TruncateV2(inode, size uint64, fullPath string, newObjExtents []proto.ObjExtentKey) error {
+func (mw *MetaWrapper) TruncateV2(inode, size uint64, fullPath string, newObjExtents []proto.ObjExtentKey, toDeletes []proto.ObjExtentKey) error {
 	mp := mw.getPartitionByInode(inode)
 	if mp == nil {
 		log.LogErrorf("TruncateV2: No inode partition, ino(%v)", inode)
 		return syscall.ENOENT
 	}
 
-	status, err := mw.truncateV2(mp, inode, size, fullPath, newObjExtents)
+	status, err := mw.truncateV2(mp, inode, size, fullPath, newObjExtents, toDeletes)
 	if err != nil || status != statusOK {
 		return statusToErrno(status)
 	}

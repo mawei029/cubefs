@@ -100,7 +100,7 @@ func TestNotInstanceWriter_Write(t *testing.T) {
 func TestWriter_TruncateV2_NilReturnsError(t *testing.T) {
 	w := newNilWriter()
 	ctx := context.Background()
-	_, err := w.TruncateV2(ctx, 100)
+	_, _, err := w.TruncateV2(ctx, 100)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "nil")
 }

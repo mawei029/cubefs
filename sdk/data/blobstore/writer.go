@@ -936,21 +936,22 @@ func (writer *Writer) SetFileSize(size uint64) {
 // targetSize < 当前逻辑长度时经 ebsc.TruncateV2Extents 做 EBS 裁剪并返回新列表；
 // targetSize >= 当前长度时直接返回现有列表（仅由上层 MetaWrapper.TruncateV2 更新 meta，不写 EBS）。
 // 调用链：File.doECTruncateV2 → Writer.TruncateV2 →（裁剪时）BlobStoreClient.TruncateV2Extents → mw.TruncateV2。
-func (writer *Writer) TruncateV2(ctx context.Context, targetSize uint64) (newObjExtents []proto.ObjExtentKey, err error) {
+func (writer *Writer) TruncateV2(ctx context.Context, targetSize uint64,
+) (newObjExtents []proto.ObjExtentKey, toDelete []proto.ObjExtentKey, err error) {
 	if writer == nil || writer.mw == nil || writer.ebsc == nil {
-		return nil, fmt.Errorf("Writer.TruncateV2: writer/mw/ebsc nil")
+		return nil, nil, fmt.Errorf("Writer.TruncateV2: writer/mw/ebsc nil")
 	}
 	if err = writer.Flush(writer.ino, ctx); err != nil {
 		log.LogErrorf("TruncateV2: pre-flush ino(%v) err(%v)", writer.ino, err)
-		return nil, err
+		return nil, nil, err
 	}
 	_, currentSize, _, objExtents, err := writer.mw.GetObjExtents(writer.ino)
 	if err != nil {
 		log.LogErrorf("TruncateV2: ino(%v) GetObjExtents err(%v)", writer.ino, err)
-		return nil, err
+		return nil, nil, err
 	}
 	if targetSize >= currentSize {
-		return objExtents, nil
+		return objExtents, nil, nil
 	}
 	return writer.ebsc.TruncateV2Extents(ctx, writer.volName, objExtents, targetSize)
 }

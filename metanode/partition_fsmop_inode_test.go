@@ -879,7 +879,8 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 	})
 }
 
-// TestFsmExtentsTruncateV2 校验 EC 卷 TruncateV2 FSM：更新 inode.Size 与 ObjExtents，不投递 objExtDelCh。
+// TestFsmExtentsTruncateV2 校验 EC 卷 TruncateV2 FSM：更新 inode.Size 与 ObjExtents，
+// 并将 ToDeletes 投递到 objExtentDelTree。
 func TestFsmExtentsTruncateV2(t *testing.T) {
 	mpC := &MetaPartitionConfig{
 		PartitionId:   10001,
@@ -923,10 +924,14 @@ func TestFsmExtentsTruncateV2(t *testing.T) {
 		{FileOffset: 0, Size: 100},
 		{FileOffset: 100, Size: 50},
 	}
+	toDeletes := []proto.ObjExtentKey{
+		{FileOffset: 100, Size: 100},
+	}
 	truncReq := &proto.TruncateRequest{
 		Inode:         inoId,
 		Size:          150,
 		NewObjExtents: newObjExtents,
+		ToDeletes:     toDeletes,
 	}
 	handle2, err := mp.inodeTree.CreateBatchWriteHandle()
 	require.NoError(t, err)
@@ -947,4 +952,9 @@ func TestFsmExtentsTruncateV2(t *testing.T) {
 	require.Equal(t, uint64(100), extents[0].Size)
 	require.Equal(t, uint64(100), extents[1].FileOffset)
 	require.Equal(t, uint64(50), extents[1].Size)
+	require.NotNil(t, mp.objExtentDelTree)
+	require.Equal(t, 1, mp.objExtentDelTree.Len())
+	items := mp.objExtentDelTree.PeekFirstN(1)
+	require.Len(t, items, 1)
+	require.True(t, items[0].Oek.IsEquals(&toDeletes[0]))
 }

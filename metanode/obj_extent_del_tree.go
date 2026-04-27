@@ -186,15 +186,6 @@ func (ot *objExtentDelTree) ApplyPunishPayload(val []byte, applyIndex uint64) er
 	return nil
 }
 
-func (ot *objExtentDelTree) deleteItem(it *objExtentDelItem) {
-	if ot == nil || it == nil {
-		return
-	}
-	ot.mu.Lock()
-	defer ot.mu.Unlock()
-	ot.t.Delete(it.keyItem())
-}
-
 func normalizeObjExtentDelTsMs(ts int64, raftApplyIndex uint64) int64 {
 	if ts <= 0 {
 		return int64(raftApplyIndex)

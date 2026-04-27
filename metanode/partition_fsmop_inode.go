@@ -1049,7 +1049,8 @@ func (mp *metaPartition) fsmExtentsTruncate(dbHandle interface{}, ino *Inode) (r
 	return
 }
 
-// fsmExtentsTruncateV2 处理 EC 卷 TruncateV2：仅更新 inode.Size 与 ObjExtents，不投递 objExtDelCh（client 已删 EBS 数据）。
+// fsmExtentsTruncateV2 处理 EC 卷 TruncateV2：更新 inode.Size 与 ObjExtents，
+// 并将 req.ToDeletes 投递到 objExtentDelTree（由后台 GC 异步删 EBS）。
 func (mp *metaPartition) fsmExtentsTruncateV2(dbHandle interface{}, req *proto.TruncateRequest) (resp *InodeResponse, err error) {
 	resp = NewInodeResponse()
 	resp.Status = proto.OpOk
@@ -1086,7 +1087,13 @@ func (mp *metaPartition) fsmExtentsTruncateV2(dbHandle interface{}, req *proto.T
 		resp.Status = proto.OpErr
 		return
 	}
-	log.LogDebugf("[fsmExtentsTruncateV2] mpId(%v) ino(%v) size(%v) newExtentsLen(%v)", mp.config.PartitionId, req.Inode, req.Size, len(newEks))
+
+	if len(req.ToDeletes) > 0 && mp.objExtentDelTree != nil {
+		// TruncateRequest 无 ModifyTime 字段，按当前 Apply 时间入队。
+		mp.objExtentDelTree.EnqueueFromApply(req.Inode, time.Now().Unix(), mp.fsmRaftApplyIndex, req.ToDeletes)
+	}
+	log.LogDebugf("[fsmExtentsTruncateV2] mpId(%v) ino(%v) size(%v) newExtentsLen(%v) toDeletesLen(%v)",
+		mp.config.PartitionId, req.Inode, req.Size, len(newEks), len(req.ToDeletes))
 	return
 }
 

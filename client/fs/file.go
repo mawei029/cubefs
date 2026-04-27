@@ -932,7 +932,7 @@ func (f *File) doECTruncateV2(ino uint64, targetSize uint64, fullPath string) er
 	if err != nil {
 		// 文件不存在或取 meta 失败：视为新建空文件，仅将 inode 大小设为 target 后退出
 		log.LogDebugf("doECTruncateV2: ino(%v) get current err(%v), treat as new empty file size(%v)", ino, err, targetSize)
-		return f.super.mw.TruncateV2(ino, targetSize, fullPath, nil)
+		return f.super.mw.TruncateV2(ino, targetSize, fullPath, nil, nil)
 	}
 
 	if targetSize == currentSize {
@@ -942,7 +942,7 @@ func (f *File) doECTruncateV2(ino uint64, targetSize uint64, fullPath string) er
 
 	if targetSize > currentSize {
 		// 目标大于当前：只更新 meta 中 inode 大小为 target，不写 EBS，直接退出
-		return f.super.mw.TruncateV2(ino, targetSize, fullPath, objExtents)
+		return f.super.mw.TruncateV2(ino, targetSize, fullPath, objExtents, nil)
 	}
 
 	// 目标小于当前：做裁剪，经 Writer 做 EBS 截断再更新 meta；复用 ensureBlobStoreWriter 保证 f.fWriter 已赋值
@@ -955,16 +955,11 @@ func (f *File) doECTruncateV2(ino uint64, targetSize uint64, fullPath string) er
 		return err
 	}
 
-	writer, err := f.ensureBlobStoreWriter(ino)
+	newObjExtents, toDeletes, err := writer.TruncateV2(context.Background(), targetSize)
 	if err != nil {
 		return err
 	}
-
-	newObjExtents, err := writer.TruncateV2(context.Background(), targetSize)
-	if err != nil {
-		return err
-	}
-	return f.super.mw.TruncateV2(ino, targetSize, fullPath, newObjExtents)
+	return f.super.mw.TruncateV2(ino, targetSize, fullPath, newObjExtents, toDeletes)
 }
 
 // syncBlobReaderAfterMetaChange：GetObjExtents 刷新 Reader 内 ObjExtents，再 InodeGet + SyncInodeView 对齐 inode 代数与长度。

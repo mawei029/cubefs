@@ -274,9 +274,10 @@ func TestComputeTruncateReqs_EmptyInput(t *testing.T) {
 func TestTruncateV2Extents_EmptyInput(t *testing.T) {
 	ebs := &BlobStoreClient{}
 	ctx := context.Background()
-	out, err := ebs.TruncateV2Extents(ctx, "vol", nil, 100)
+	out, delKeys, err := ebs.TruncateV2Extents(ctx, "vol", nil, 100)
 	require.NoError(t, err)
 	require.Nil(t, out)
+	require.Empty(t, delKeys)
 }
 
 func TestTruncateV2Extents_OnlyKeepNoEBS(t *testing.T) {
@@ -292,9 +293,10 @@ func TestTruncateV2Extents_OnlyKeepNoEBS(t *testing.T) {
 
 	ebs := &BlobStoreClient{}
 	ctx := context.Background()
-	out, err := ebs.ApplyTruncateReqs(ctx, "vol", req)
+	out, delKeys, err := ebs.ApplyTruncateReqs(ctx, "vol", req)
 	require.NoError(t, err)
 	require.Len(t, out, 2)
+	require.Empty(t, delKeys)
 	require.Equal(t, uint64(0), out[0].FileOffset)
 	require.Equal(t, uint64(50), out[0].Size)
 	require.Equal(t, uint64(50), out[1].FileOffset)

@@ -1579,7 +1579,7 @@ func (mw *MetaWrapper) truncate(mp *MetaPartition, inode, size uint64, fullPath 
 }
 
 // truncateV2 用于 EC 卷：client 已完成 EBS 的读/截断/写/删，仅通知 metanode 更新 inode.Size 与 ObjExtents。
-func (mw *MetaWrapper) truncateV2(mp *MetaPartition, inode, size uint64, fullPath string, newObjExtents []proto.ObjExtentKey) (status int, err error) {
+func (mw *MetaWrapper) truncateV2(mp *MetaPartition, inode, size uint64, fullPath string, newObjExtents, toDeletes []proto.ObjExtentKey) (status int, err error) {
 	bgTime := stat.BeginStat()
 	defer func() {
 		stat.EndStat("truncateV2", err, bgTime, 1)
@@ -1592,6 +1592,7 @@ func (mw *MetaWrapper) truncateV2(mp *MetaPartition, inode, size uint64, fullPat
 		Size:          size,
 		TruncateV2:    true,
 		NewObjExtents: newObjExtents,
+		ToDeletes:     toDeletes,
 	}
 	req.FullPaths = []string{fullPath}
 

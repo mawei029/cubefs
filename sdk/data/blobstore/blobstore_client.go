@@ -401,10 +401,11 @@ func (ebs *BlobStoreClient) Get(ctx context.Context, volName string, offset uint
 // TruncateV2Extents 根据目标大小截断 ObjExtentKey 列表，复用 overwrite 的 ComputeTruncateReqs + ApplyTruncateReqs：
 // 完全在 targetSize 之前的保留，完全在之后的仅删 EBS，部分重叠的走读→截断→写新→删旧。
 // 返回截断后的新 ObjExtentKey 列表（用于 meta TruncateV2）。
-func (ebs *BlobStoreClient) TruncateV2Extents(ctx context.Context, volName string, objExtentKeys []proto.ObjExtentKey, targetSize uint64) (newObjExtents []proto.ObjExtentKey, err error) {
+func (ebs *BlobStoreClient) TruncateV2Extents(ctx context.Context, volName string, objExtentKeys []proto.ObjExtentKey, targetSize uint64,
+) (newObjExtents []proto.ObjExtentKey, toDelete []proto.ObjExtentKey, err error) {
 	log.LogDebugf("TruncateV2Extents: volName(%v) objExtentKeys(%v) targetSize(%v)", volName, objExtentKeys, targetSize)
 	if len(objExtentKeys) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	req := ComputeTruncateReqs(targetSize, objExtentKeys)
@@ -443,19 +444,25 @@ func ComputeTruncateReqs(targetSize uint64, objExtents []proto.ObjExtentKey) tru
 // ApplyTruncateReqs 执行 TruncateReq：对每个 overwriteReq 读旧 extent、截断、写新 blob、收集新 key；
 // 最后删除所有需废弃的 extent（OverwriteReq 中的 DiscardExtent + DiscardOnly）。
 // 返回保留的 extents + 新写入的 extents，供 meta TruncateV2 使用。
-func (ebs *BlobStoreClient) ApplyTruncateReqs(ctx context.Context, volName string, req truncateReq) (newObjExtents []proto.ObjExtentKey, err error) {
+func (ebs *BlobStoreClient) ApplyTruncateReqs(ctx context.Context, volName string, req truncateReq,
+) (newObjExtents []proto.ObjExtentKey, toDelete []proto.ObjExtentKey, err error) {
 	newObjExtents = make([]proto.ObjExtentKey, 0, len(req.KeepExtents)+len(req.OverwriteReqs))
 	newObjExtents = append(newObjExtents, req.KeepExtents...)
-	var toDelete []proto.ObjExtentKey
+	toDelete = make([]proto.ObjExtentKey, 0, len(req.DiscardOnly)+len(req.OverwriteReqs))
 	toDelete = append(toDelete, req.DiscardOnly...)
 
 	for _, r := range req.OverwriteReqs {
 		discard := r.DiscardExtent
+		if discard.Size == 0 {
+			continue
+		}
+		toDelete = append(toDelete, discard)
+
 		buf := make([]byte, discard.Size)
 		readN, err := ebs.Read(ctx, volName, buf, 0, discard.Size, discard)
 		if err != nil {
 			log.LogErrorf("ApplyTruncateReqs: read extent (%v) err(%v)", discard, err)
-			return nil, err
+			return nil, nil, err
 		}
 		if uint64(readN) != discard.Size {
 			log.LogWarnf("ApplyTruncateReqs: read short extent(%v) readN(%v)", discard, readN)
@@ -464,23 +471,16 @@ func (ebs *BlobStoreClient) ApplyTruncateReqs(ctx context.Context, volName strin
 		newOeks, _, err := ebs.Put(ctx, volName, bytes.NewReader(truncated), uint64(len(truncated)))
 		if err != nil {
 			log.LogErrorf("ApplyTruncateReqs: put truncated err(%v)", err)
-			return nil, err
+			return nil, nil, err
 		}
 		if len(newOeks) == 0 {
 			log.LogErrorf("ApplyTruncateReqs: put returned no keys")
-			return nil, errPutNoKeys //nolint:wrapcheck
+			return nil, nil, errPutNoKeys //nolint:wrapcheck
 		}
 		newKey := newOeks[0]
 		newKey.FileOffset = r.NewExtent.FileOffset
 		newObjExtents = append(newObjExtents, newKey)
-		toDelete = append(toDelete, discard)
 	}
 
-	if len(toDelete) > 0 {
-		if err = ebs.Delete(toDelete); err != nil {
-			log.LogErrorf("ApplyTruncateReqs: delete old extents err(%v)", err)
-			return nil, err
-		}
-	}
-	return newObjExtents, nil
+	return newObjExtents, toDelete, nil
 }
