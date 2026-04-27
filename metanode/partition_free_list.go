@@ -78,7 +78,7 @@ func (mp *metaPartition) startFreeList() (err error) {
 	go mp.deleteWorker()
 	go mp.startRecycleInodeDelFile()
 	mp.startToDeleteExtents()
-	mp.startToDeleteObjExtents()
+	mp.startObjExtentDelTreeGC()
 	return
 }
 

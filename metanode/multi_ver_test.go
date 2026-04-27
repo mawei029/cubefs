@@ -76,17 +76,19 @@ func newManager() *metadataManager {
 
 func newPartition(conf *MetaPartitionConfig, manager *metadataManager) (mp *metaPartition) {
 	mp = &metaPartition{
-		config:         conf,
-		stopC:          make(chan bool),
-		storeChan:      make(chan *storeMsg, 100),
-		freeList:       newFreeList(),
-		freeHybridList: newFreeList(),
-		extDelCh:       make(chan []proto.ExtentKey, defaultDelExtentsCnt),
-		extReset:       make(chan struct{}),
-		vol:            NewVol(),
-		manager:        manager,
-		verSeq:         conf.VerSeq,
-		rocksdbManager: manager.rocksdbManager,
+		config:           conf,
+		stopC:            make(chan bool),
+		storeChan:        make(chan *storeMsg, 100),
+		freeList:         newFreeList(),
+		freeHybridList:   newFreeList(),
+		extDelCh:         make(chan []proto.ExtentKey, defaultDelExtentsCnt),
+		objExtDelCh:      make(chan []proto.ObjExtentKey, defaultDelExtentsCnt),
+		objExtentDelTree: newObjExtentDelTree(),
+		extReset:         make(chan struct{}),
+		vol:              NewVol(),
+		manager:          manager,
+		verSeq:           conf.VerSeq,
+		rocksdbManager:   manager.rocksdbManager,
 	}
 	if conf.StoreMode == proto.StoreModeRocksDb {
 		err := mp.rocksdbManager.Register(conf.RocksDBDir)

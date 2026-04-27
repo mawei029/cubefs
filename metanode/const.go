@@ -218,6 +218,9 @@ const (
 
 	// EC/BlobStore truncate V2: client 已处理 EBS，meta 仅更新 inode.Size 与 ObjExtents
 	opFSMExtentTruncateV2 = 95
+	// Obj extent del btree: dequeue after EBS success / punish-requeue after failure
+	opFSMObjExtentGcDequeue       = 96
+	opFSMObjExtentGcPunishRequeue = 97
 )
 
 // New inode operation codes

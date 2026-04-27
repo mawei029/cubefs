@@ -127,6 +127,16 @@ type Tree interface {
 	GetApplyIdFromDisk() (uint64, error)
 }
 
+// ObjExtentDelTree stores pending object extent deletions.
+// The tree key order must be time-first for GC scanning.
+type ObjExtentDelTree interface {
+	Len() int
+	EnqueueFromApply(inode uint64, modifyTimeSec int64, raftApplyIndex uint64, oeks []proto.ObjExtentKey)
+	PeekFirstN(n int) []*objExtentDelItem
+	ApplyDequeuePayload(val []byte) error
+	ApplyPunishPayload(val []byte, applyIndex uint64) error
+}
+
 type InodeTree interface {
 	Tree
 	Get(ino *Inode) (*Inode, error)

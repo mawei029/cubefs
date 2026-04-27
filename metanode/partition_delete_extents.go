@@ -500,6 +500,77 @@ func (mp *metaPartition) startToDeleteObjExtents() {
 	go mp.deleteObjExtentsFromList(fileList)
 }
 
+const (
+	objExtentDelTreeGcBatch   = 32
+	objExtentDelGcPenaltyMs = int64(60_000)
+)
+
+// startObjExtentDelTreeGC runs periodic leader-side EBS deletes for discard ObjExtentKeys held in objExtentDelTree.
+func (mp *metaPartition) startObjExtentDelTreeGC() {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.LogErrorf("[startObjExtentDelTreeGC] mp(%v) panic: %v", mp.config.PartitionId, r)
+			}
+		}()
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-mp.stopC:
+				return
+			case <-ticker.C:
+				mp.runObjExtentDelTreeGCOnce()
+			}
+		}
+	}()
+}
+
+func (mp *metaPartition) runObjExtentDelTreeGCOnce() {
+	if mp.objExtentDelTree == nil || mp.raftPartition == nil {
+		return
+	}
+	status := mp.raftPartition.Status()
+	if status.RestoringSnapshot {
+		return
+	}
+	if _, ok := mp.IsLeader(); !ok {
+		return
+	}
+	if mp.objExtentDelTree.Len() == 0 {
+		return
+	}
+	items := mp.objExtentDelTree.PeekFirstN(objExtentDelTreeGcBatch)
+	if len(items) == 0 {
+		return
+	}
+	oeks := make([]proto.ObjExtentKey, 0, len(items))
+	for _, it := range items {
+		oeks = append(oeks, it.Oek)
+	}
+	if err := mp.deleteObjExtents(oeks); err != nil {
+		log.LogWarnf("[runObjExtentDelTreeGCOnce] mp(%v) delete ebs failed cnt(%v): %v", mp.config.PartitionId, len(oeks), err)
+		newTs := time.Now().UnixMilli() + objExtentDelGcPenaltyMs
+		payload, encErr := encodeObjExtentGcPunish(items, newTs)
+		if encErr != nil {
+			log.LogErrorf("[runObjExtentDelTreeGCOnce] mp(%v) encode punish: %v", mp.config.PartitionId, encErr)
+			return
+		}
+		if _, submitErr := mp.submit(opFSMObjExtentGcPunishRequeue, payload); submitErr != nil {
+			log.LogErrorf("[runObjExtentDelTreeGCOnce] mp(%v) submit punish: %v", mp.config.PartitionId, submitErr)
+		}
+		return
+	}
+	payload, err := encodeObjExtentGcDequeueKeys(items)
+	if err != nil {
+		log.LogErrorf("[runObjExtentDelTreeGCOnce] mp(%v) encode dequeue: %v", mp.config.PartitionId, err)
+		return
+	}
+	if _, err = mp.submit(opFSMObjExtentGcDequeue, payload); err != nil {
+		log.LogErrorf("[runObjExtentDelTreeGCOnce] mp(%v) submit dequeue: %v", mp.config.PartitionId, err)
+	}
+}
+
 // appendDelObjExtentsToFile reads batches of obj extents from objExtDelCh channel and persists them to OBJ_EXTENT_DEL_* files
 // This ensures data persistence even if channel is full, preventing data loss during overwrite operations
 func (mp *metaPartition) appendDelObjExtentsToFile(fileList *synclist.SyncList) {

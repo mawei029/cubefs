@@ -524,25 +524,28 @@ func (ew *BlobStoreClientWrapper) getBlobStoreClient() (blobClient *blobstore.Bl
 //	| New | → Restore → | Ready |
 //	+-----+             +-------+
 type metaPartition struct {
-	config                    *MetaPartitionConfig
-	size                      uint64                // For partition all file size
-	applyID                   uint64                // Inode/Dentry max applyID, this index will be update after restoring from the dumped data.
-	storedApplyId             uint64                // update after store snapshot to disk
-	dentryTree                DentryTree            // btree for dentries
-	inodeTree                 InodeTree             // btree for inodes
-	extendTree                ExtendTree            // btree for inode extend (XAttr) management
-	multipartTree             MultipartTree         // collection for multipart management
-	txProcessor               *TransactionProcessor // transction processor
-	raftPartition             raftstore.Partition
-	stopC                     chan bool
-	storeChan                 chan *storeMsg
-	state                     uint32
-	delInodeFp                *os.File
-	freeList                  *freeList // free inode list
-	freeHybridList            *freeList // to store inode delay to delete migration keys
-	extDelCh                  chan []proto.ExtentKey
-	objExtDelCh               chan []proto.ObjExtentKey
-	extReset                  chan struct{}
+	config         *MetaPartitionConfig
+	size           uint64                // For partition all file size
+	applyID        uint64                // Inode/Dentry max applyID, this index will be update after restoring from the dumped data.
+	storedApplyId  uint64                // update after store snapshot to disk
+	dentryTree     DentryTree            // btree for dentries
+	inodeTree      InodeTree             // btree for inodes
+	extendTree     ExtendTree            // btree for inode extend (XAttr) management
+	multipartTree  MultipartTree         // collection for multipart management
+	txProcessor    *TransactionProcessor // transction processor
+	raftPartition  raftstore.Partition
+	stopC          chan bool
+	storeChan      chan *storeMsg
+	state          uint32
+	delInodeFp     *os.File
+	freeList       *freeList // free inode list
+	freeHybridList *freeList // to store inode delay to delete migration keys
+	extDelCh       chan []proto.ExtentKey
+	objExtDelCh    chan []proto.ObjExtentKey // legacy; obj extent discard now uses objExtentDelTree
+	extReset       chan struct{}
+	// fsmRaftApplyIndex is the raft apply index for the op currently executing in Apply (for objExtentDelTree keys).
+	fsmRaftApplyIndex         uint64
+	objExtentDelTree          ObjExtentDelTree
 	vol                       *Vol
 	manager                   *metadataManager
 	isLoadingMetaPartition    bool
@@ -1032,19 +1035,20 @@ func (mp *metaPartition) getRaftPort() (heartbeat, replica int, err error) {
 // NewMetaPartition creates a new meta partition with the specified configuration.
 func NewMetaPartition(conf *MetaPartitionConfig, manager *metadataManager) MetaPartition {
 	mp := &metaPartition{
-		config:         conf,
-		stopC:          make(chan bool),
-		storeChan:      make(chan *storeMsg, 100),
-		freeList:       newFreeList(),
-		freeHybridList: newFreeList(),
-		extDelCh:       make(chan []proto.ExtentKey, defaultDelExtentsCnt),
-		objExtDelCh:    make(chan []proto.ObjExtentKey, defaultDelExtentsCnt),
-		syncAtimeCh:    make(chan uint64, defaultSyncInodeAtimeCnt),
-		extReset:       make(chan struct{}),
-		vol:            NewVol(),
-		manager:        manager,
-		uniqChecker:    newUniqChecker(),
-		verSeq:         conf.VerSeq,
+		config:           conf,
+		stopC:            make(chan bool),
+		storeChan:        make(chan *storeMsg, 100),
+		freeList:         newFreeList(),
+		freeHybridList:   newFreeList(),
+		extDelCh:         make(chan []proto.ExtentKey, defaultDelExtentsCnt),
+		objExtDelCh:      make(chan []proto.ObjExtentKey, defaultDelExtentsCnt),
+		objExtentDelTree: newObjExtentDelTree(),
+		syncAtimeCh:      make(chan uint64, defaultSyncInodeAtimeCnt),
+		extReset:         make(chan struct{}),
+		vol:              NewVol(),
+		manager:          manager,
+		uniqChecker:      newUniqChecker(),
+		verSeq:           conf.VerSeq,
 		multiVersionList: &proto.VolVersionInfoList{
 			TemporaryVerMap: make(map[uint64]*proto.VolVersionInfo),
 		},

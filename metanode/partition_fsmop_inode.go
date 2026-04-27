@@ -894,9 +894,9 @@ func (mp *metaPartition) fsmAppendObjExtentsWithCheck(inoParam *Inode) (status u
 	fsmIno.Generation++
 	fsmIno.ModifyTime = inoParam.ModifyTime
 
-	// Schedule all discard extents for async deletion in one batch
+	// Schedule discard extents for async EBS delete (replicated btree; same apply index for idempotent replay).
 	if len(toDelete) > 0 {
-		mp.objExtDelCh <- toDelete
+		mp.objExtentDelTree.EnqueueFromApply(inoId, inoParam.ModifyTime, mp.fsmRaftApplyIndex, toDelete)
 	}
 
 	log.LogDebugf("fsm update success, mp[%d] inode[%d] success, finalEks count[%d] gen[%d] discardCount[%d]",
