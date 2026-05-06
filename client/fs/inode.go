@@ -55,26 +55,21 @@ func (s *Super) InodeGet(ino uint64) (info *proto.InodeInfo, err error) {
 	node, isFind := s.nodeCache[ino]
 	s.fslock.Unlock()
 	if isFind {
-		dir, ok := node.(*Dir)
-		if ok {
-			dir.info = info
-		} else {
-			migrated := info.PoolId != node.(*File).info.PoolId
-			// the first time storage class change to blob store
-			if migrated && proto.IsStorageClassBlobStore(info.StorageClass) {
+		if f, ok := node.(*File); ok && proto.IsStorageClassBlobStore(info.StorageClass) {
+			ei, found := f.getExtendInfo()
+			if found && ei != nil {
 				ebsc, err := s.getBlobStoreClient(info.PoolId)
 				if err != nil {
 					log.LogErrorf("InodeGet: get blobstore client for pool(%v) err: %v", info.PoolId, err)
 					return nil, err
 				}
 
-				f := node.(*File)
-				fileSize, _ := f.fileSizeVersion2(f.info.Inode)
+				fileSize, _ := f.fileSizeVersion2(f.ino)
 				clientConf := blobstore.ClientConfig{
 					VolName:         f.super.volname,
 					VolType:         f.super.volType,
 					BlockSize:       f.super.EbsBlockSize,
-					Ino:             f.info.Inode,
+					Ino:             f.ino,
 					Bc:              f.super.bc,
 					Mw:              f.super.mw,
 					Ec:              f.super.ec,
@@ -84,31 +79,32 @@ func (s *Super) InodeGet(ino uint64) (info *proto.InodeInfo, err error) {
 					ReadConcurrency: f.super.readThreads,
 					FileCache:       false,
 					FileSize:        uint64(fileSize),
-					PoolId:          f.info.PoolId,
+					PoolId:          info.PoolId,
 				}
-				f.fWriter.FreeCache()
-				switch f.flag & 0x0f {
+				ei.Lock()
+				if ei.fWriter != nil {
+					ei.fWriter.FreeCache()
+				}
+				switch ei.flag & 0x0f {
 				case syscall.O_RDONLY:
-					log.LogDebugf("InodeGet: ino(%v) migrate(%v) info(%v) flag(%v) O_RDONLY", ino, migrated, info, f.flag)
-					f.fReader = blobstore.NewReader(clientConf)
-					f.fWriter = nil
+					log.LogDebugf("InodeGet: ino(%v) info(%v) flag(%v) O_RDONLY", ino, info, ei.flag)
+					ei.fReader = blobstore.NewReader(clientConf)
+					ei.fWriter = nil
 				case syscall.O_WRONLY:
-					log.LogDebugf("InodeGet: ino(%v) migrate(%v) info(%v) flag(%v) O_WRONLY", ino, migrated, info, f.flag)
-					f.fWriter = blobstore.NewWriter(clientConf)
-					f.fReader = nil
+					log.LogDebugf("InodeGet: ino(%v) info(%v) flag(%v) O_WRONLY", ino, info, ei.flag)
+					ei.fWriter = blobstore.NewWriter(clientConf)
+					ei.fReader = nil
 				case syscall.O_RDWR:
-					log.LogDebugf("InodeGet: ino(%v) migrate(%v) info(%v) flag(%v) O_RDWR", ino, migrated, info, f.flag)
-					f.fReader = blobstore.NewReader(clientConf)
-					f.fWriter = blobstore.NewWriter(clientConf)
+					log.LogDebugf("InodeGet: ino(%v) info(%v) flag(%v) O_RDWR", ino, info, ei.flag)
+					ei.fReader = blobstore.NewReader(clientConf)
+					ei.fWriter = blobstore.NewWriter(clientConf)
 				default:
-					log.LogDebugf("InodeGet: ino(%v) migrate(%v) info(%v) flag(%v) default", ino, migrated, info, f.flag)
-					f.fWriter = blobstore.NewWriter(clientConf)
-					f.fReader = nil
+					log.LogDebugf("InodeGet: ino(%v) info(%v) flag(%v) default", ino, info, ei.flag)
+					ei.fWriter = blobstore.NewWriter(clientConf)
+					ei.fReader = nil
 				}
+				ei.Unlock()
 			}
-			// update inode cache for File after reader and write is ready
-			node.(*File).info = info
-			log.LogDebugf("InodeGet: ino(%v) migrate(%v) info(%v)", ino, migrated, info)
 		}
 	}
 	if proto.IsStorageClassBlobStore(info.StorageClass) {

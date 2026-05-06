@@ -65,6 +65,11 @@ type Super struct {
 	nodeCache map[uint64]fs.Node
 	fslock    sync.Mutex
 
+	dirExtendInfoMap   map[uint64]*DirExtendInfo
+	fileExtendInfoMap  map[uint64]*FileExtendInfo
+	dirExtendInfoLock  sync.RWMutex
+	fileExtendInfoLock sync.RWMutex
+
 	disableDcache bool
 	fsyncOnClose  bool
 	enableXattr   bool
@@ -239,6 +244,8 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 	}
 	s.orphan = NewOrphanInodeList()
 	s.nodeCache = make(map[uint64]fs.Node)
+	s.dirExtendInfoMap = make(map[uint64]*DirExtendInfo)
+	s.fileExtendInfoMap = make(map[uint64]*FileExtendInfo)
 	s.disableDcache = opt.DisableDcache
 	s.fsyncOnClose = opt.FsyncOnClose
 	s.enableXattr = opt.EnableXattr
@@ -499,13 +506,21 @@ func (s *Super) scheduleFlush() {
 					continue
 				}
 				file := node.(*File)
-				if atomic.LoadInt32(&file.idle) >= BlobWriterIdleTimeoutPeriod {
-					if file.fWriter != nil {
-						atomic.StoreInt32(&file.idle, 0)
-						go file.fWriter.Flush(ino, ctx)
+				ei, ok := file.getExtendInfo()
+				if !ok || ei == nil {
+					continue
+				}
+				ei.RLock()
+				writer := ei.fWriter
+				idle := atomic.LoadInt32(&ei.idle)
+				ei.RUnlock()
+				if idle >= BlobWriterIdleTimeoutPeriod {
+					if writer != nil {
+						atomic.StoreInt32(&ei.idle, 0)
+						go writer.Flush(ino, ctx)
 					}
 				} else {
-					atomic.AddInt32(&file.idle, 1)
+					atomic.AddInt32(&ei.idle, 1)
 				}
 			}
 			s.fslock.Unlock()
