@@ -794,11 +794,15 @@ type GetExtentsResponse struct {
 }
 
 // TruncateRequest defines the request to truncate.
+// When TruncateV2 is true (EC/BlobStore), client has done EBS read/truncate/write/delete and sends
+// the new extent list; metanode only updates inode.Size and inode.ObjExtents, does not send to objExtDelCh.
 type TruncateRequest struct {
-	VolName     string `json:"vol"`
-	PartitionID uint64 `json:"pid"`
-	Inode       uint64 `json:"ino"`
-	Size        uint64 `json:"sz"`
+	VolName       string         `json:"vol"`
+	PartitionID   uint64         `json:"pid"`
+	Inode         uint64         `json:"ino"`
+	Size          uint64         `json:"sz"`
+	TruncateV2    bool           `json:"truncateV2"`    // true 表示 EC 卷 TruncateV2，metanode 用 NewObjExtents 替换并跳过 objExtDelCh
+	NewObjExtents []ObjExtentKey `json:"newObjExtents"` // TruncateV2 时由 client 计算的新 obj extent 列表
 	RequestExtend
 }
 

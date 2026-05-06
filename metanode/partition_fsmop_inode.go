@@ -1049,6 +1049,47 @@ func (mp *metaPartition) fsmExtentsTruncate(dbHandle interface{}, ino *Inode) (r
 	return
 }
 
+// fsmExtentsTruncateV2 处理 EC 卷 TruncateV2：仅更新 inode.Size 与 ObjExtents，不投递 objExtDelCh（client 已删 EBS 数据）。
+func (mp *metaPartition) fsmExtentsTruncateV2(dbHandle interface{}, req *proto.TruncateRequest) (resp *InodeResponse, err error) {
+	resp = NewInodeResponse()
+	resp.Status = proto.OpOk
+	ino := NewInode(req.Inode, 0)
+	i, err := mp.inodeTree.Get(ino)
+	if err != nil {
+		resp.Status = proto.OpErr
+		return
+	}
+	if i == nil || i.ShouldDelete() {
+		resp.Status = proto.OpNotExistErr
+		return
+	}
+	if !proto.IsStorageClassBlobStore(i.StorageClass) {
+		log.LogWarnf("[fsmExtentsTruncateV2] mpId(%v) ino(%v) storageClass(%v) not BlobStore", mp.config.PartitionId, i.Inode, i.StorageClass)
+		resp.Status = proto.OpArgMismatchErr
+		return
+	}
+	if proto.IsDir(i.Type) {
+		resp.Status = proto.OpArgMismatchErr
+		return
+	}
+	if i.HybridCloudExtents == nil {
+		i.HybridCloudExtents = NewSortedHybridCloudExtents()
+	}
+	newEks := req.NewObjExtents
+	if newEks == nil {
+		newEks = []proto.ObjExtentKey{}
+	}
+	i.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks(newEks)
+	i.Size = req.Size
+	if err = mp.inodeTree.Put(dbHandle, i); err != nil {
+		log.LogErrorf("[fsmExtentsTruncateV2] mpId(%v) ino(%v) Put err: %v", mp.config.PartitionId, req.Inode, err)
+		resp.Status = proto.OpErr
+		return
+	}
+	log.LogDebugf("[fsmExtentsTruncateV2] mpId(%v) ino(%v) size(%v) newExtentsLen(%v)", mp.config.PartitionId, req.Inode, req.Size, len(newEks))
+	return
+}
+
 func (mp *metaPartition) fsmEvictInode(dbHandle interface{}, ino *Inode) (resp *InodeResponse, err error) {
 	resp = NewInodeResponse()
 	log.LogDebugf("action[fsmEvictInode] inode[%v]", ino)

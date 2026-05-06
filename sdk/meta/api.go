@@ -1749,6 +1749,21 @@ func (mw *MetaWrapper) Truncate(inode, size uint64, fullPath string) error {
 	return nil
 }
 
+// TruncateV2 用于 EC/BlobStore 卷：调用方已完成 EBS 侧读/截断/写/删，传入新的 obj extent 列表，仅更新 meta。
+func (mw *MetaWrapper) TruncateV2(inode, size uint64, fullPath string, newObjExtents []proto.ObjExtentKey) error {
+	mp := mw.getPartitionByInode(inode)
+	if mp == nil {
+		log.LogErrorf("TruncateV2: No inode partition, ino(%v)", inode)
+		return syscall.ENOENT
+	}
+
+	status, err := mw.truncateV2(mp, inode, size, fullPath, newObjExtents)
+	if err != nil || status != statusOK {
+		return statusToErrno(status)
+	}
+	return nil
+}
+
 func (mw *MetaWrapper) Link(parentID uint64, name string, ino uint64, fullPath string) (*proto.InodeInfo, error) {
 	// if mw.EnableTransaction {
 	if mw.EnableTransaction&proto.TxOpMaskLink > 0 {

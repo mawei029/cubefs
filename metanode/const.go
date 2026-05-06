@@ -215,6 +215,9 @@ const (
 
 	// notify timestamp to followers
 	opFSMNotifyTimestamp = 94
+
+	// EC/BlobStore truncate V2: client 已处理 EBS，meta 仅更新 inode.Size 与 ObjExtents
+	opFSMExtentTruncateV2 = 95
 )
 
 // New inode operation codes
@@ -254,7 +257,6 @@ const (
 	cfgRaftReplicaPort   = "raftReplicaPort"
 	cfgZoneName          = "zoneName"
 	cfgRack              = "rack"
-	cfgRegion            = "region"
 
 	// Performance configuration
 	cfgDeleteBatchCount = "deleteBatchCount"

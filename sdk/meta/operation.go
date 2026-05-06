@@ -1578,6 +1578,56 @@ func (mw *MetaWrapper) truncate(mp *MetaPartition, inode, size uint64, fullPath 
 	return statusOK, nil
 }
 
+// truncateV2 用于 EC 卷：client 已完成 EBS 的读/截断/写/删，仅通知 metanode 更新 inode.Size 与 ObjExtents。
+func (mw *MetaWrapper) truncateV2(mp *MetaPartition, inode, size uint64, fullPath string, newObjExtents []proto.ObjExtentKey) (status int, err error) {
+	bgTime := stat.BeginStat()
+	defer func() {
+		stat.EndStat("truncateV2", err, bgTime, 1)
+	}()
+
+	req := &proto.TruncateRequest{
+		VolName:       mw.volname,
+		PartitionID:   mp.PartitionID,
+		Inode:         inode,
+		Size:          size,
+		TruncateV2:    true,
+		NewObjExtents: newObjExtents,
+	}
+	req.FullPaths = []string{fullPath}
+
+	packet := proto.NewPacketReqID()
+	packet.Opcode = proto.OpMetaTruncate
+	packet.PartitionID = mp.PartitionID
+	err = packet.MarshalData(req)
+	if err != nil {
+		log.LogErrorf("truncateV2: ino(%v) size(%v) err(%v)", inode, size, err)
+		return
+	}
+
+	log.LogDebugf("truncateV2 enter: packet(%v) mp(%v) ino(%v) size(%v) newExtentsLen(%v)", packet, mp, inode, size, len(newObjExtents))
+
+	metric := exporter.NewTPCnt(packet.GetOpMsg())
+	defer func() {
+		metric.SetWithLabels(err, map[string]string{exporter.Vol: mw.volname})
+	}()
+
+	packet, err = mw.sendToMetaPartition(mp, packet)
+	if err != nil {
+		log.LogErrorf("truncateV2: packet(%v) mp(%v) err(%v)", packet, mp, err)
+		return
+	}
+
+	status = parseStatus(packet.ResultCode)
+	if status != statusOK {
+		err = errors.New(packet.GetResultMsg())
+		log.LogErrorf("truncateV2: packet(%v) mp(%v) result(%v)", packet, mp, packet.GetResultMsg())
+		return
+	}
+
+	log.LogDebugf("truncateV2 exit: packet(%v) mp(%v) ino(%v)", packet, mp, inode)
+	return statusOK, nil
+}
+
 func (mw *MetaWrapper) txIlink(tx *Transaction, mp *MetaPartition, inode uint64, fullPath string) (status int, info *proto.InodeInfo, err error) {
 	bgTime := stat.BeginStat()
 	defer func() {

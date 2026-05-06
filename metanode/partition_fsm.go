@@ -151,6 +151,12 @@ func (mp *metaPartition) Apply(command []byte, index uint64) (resp interface{}, 
 			return
 		}
 		resp, _ = mp.fsmExtentsTruncate(dbWriteHandle, ino)
+	case opFSMExtentTruncateV2:
+		truncReq := &proto.TruncateRequest{}
+		if err = json.Unmarshal(msg.V, truncReq); err != nil {
+			return
+		}
+		resp, err = mp.fsmExtentsTruncateV2(dbWriteHandle, truncReq)
 	case opFSMCreateLinkInode:
 		var status uint8
 		ino := NewInode(0, 0)

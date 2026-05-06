@@ -132,10 +132,11 @@ func (writer *Writer) Write(ctx context.Context, offset int, data []byte, flags 
 	if writer == nil {
 		return 0, fmt.Errorf("writer is not opened yet")
 	}
-	log.LogDebugf("TRACE blobStore Write Enter: ino(%v) offset(%v) len(%v) flags&proto.FlagsAppend(%v) fileSize(%v)", writer.ino, offset, len(data), flags&proto.FlagsAppend, writer.CacheFileSize())
+	log.LogDebugf("TRACE blobStore Write Enter: ino(%v) offset(%v) len(%v) flags&proto.FlagsAppend(%v) fileSize(%v) overwrite(%t)",
+		writer.ino, offset, len(data), flags&proto.FlagsAppend, writer.CacheFileSize(), writer.overwrite)
 
 	// Case 1: Validate write request: data too large, not append mode, or non-contiguous write (unless overwrite mode)
-	invalid := len(data) > MaxBufferSize || flags&proto.FlagsAppend == 0 || (offset != writer.CacheFileSize() && !writer.overwrite)
+	invalid := len(data) > MaxBufferSize || flags&proto.FlagsAppend == 0 || (offset > writer.CacheFileSize() && !writer.overwrite)
 	if invalid {
 		log.LogErrorf("TRACE blobStore Write error,may be len(%v)>512MB,flags(%v)!=flagAppend,offset(%v)!=fileSize(%v), overwrite(%t)",
 			len(data), flags&proto.FlagsAppend, offset, writer.CacheFileSize(), writer.overwrite)
@@ -149,8 +150,6 @@ func (writer *Writer) Write(ctx context.Context, offset int, data []byte, flags 
 	}
 
 	// Case 3: Sequential append write: data is appended to the end of file
-	log.LogDebugf("TRACE blobStore Write: ino(%v) offset(%v) len(%v) flags&proto.FlagsSyncWrite(%v)", writer.ino, offset, len(data), flags&proto.FlagsSyncWrite)
-
 	// Case 3.1: with buffer: Use buffered write for better performance (data stays in buffer until flush)
 	if flags&proto.FlagsSyncWrite == 0 {
 		size, err = writer.doBufferWrite(ctx, data, offset)
@@ -168,8 +167,6 @@ func (writer *Writer) tryOverWrite(ctx context.Context, offset int, data []byte,
 	if writer == nil {
 		return 0, fmt.Errorf("writer is not opened yet")
 	}
-
-	log.LogDebugf("TRACE blobStore WriteWithCheck Enter: ino(%v) offset(%v) len(%v) flags(%v)", writer.ino, offset, len(data), flags)
 
 	writer.Lock()
 	defer writer.Unlock()
@@ -780,9 +777,9 @@ func (writer *Writer) flushOverwriteReqs(ctx context.Context, inode uint64, reqs
 	// Atomic metadata update: add batch new extent and discard old extent
 	if err = writer.mw.AppendObjExtentKeysWithCheck(writer.ino, newExtents, discardExtents); err != nil {
 		log.LogErrorf("flushExt: append obj extent keys with check batch fail,ino(%v) count(%v) err(%v)", inode, len(newExtents), err)
-		// Rollback: delete all written extents in this batch to avoid orphaned data on EBS
-		rollbackFn()
-		return
+		// TODO internal retry? Rollback: delete all written extents in this batch to avoid orphaned data on EBS
+		// rollbackFn()
+		// return
 	}
 	log.LogDebugf("flushExt: append obj extent keys with check batch success,ino(%v) count(%v)", inode, len(newExtents))
 	return nil

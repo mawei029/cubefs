@@ -813,6 +813,14 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 		f.super.ic.Delete(ino)
 		f.super.ec.RefreshExtentsCache(ino)
 	}
+	if req.Valid.Size() && proto.IsStorageClassBlobStore(storageClass) {
+		if err := f.doECTruncateV2(ino, req.Size, path.Join(f.getParentPath(), f.name)); err != nil {
+			log.LogErrorf("Setattr: doECTruncateV2 ino(%v) size(%v) err(%v)", ino, req.Size, err)
+			return ParseError(err)
+		}
+		f.super.ic.Delete(ino)
+		f.super.ec.RefreshExtentsCache(ino)
+	}
 
 	info, err = f.super.InodeGet(ino)
 	if err != nil {
@@ -826,7 +834,8 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 		}
 	}
 
-	if valid := setattr(info, req); valid != 0 {
+	valid := setattr(info, req)
+	if valid != 0 {
 		err = f.super.mw.Setattr(ino, valid, info.Mode, info.Uid, info.Gid, info.AccessTime.Unix(),
 			info.ModifyTime.Unix())
 		if err != nil {
@@ -838,8 +847,39 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 	fillAttr(info, &resp.Attr)
 
 	elapsed := time.Since(start)
-	log.LogDebugf("TRACE Setattr: ino(%v) req(%v) (%v)ns", ino, req, elapsed.Nanoseconds())
+	log.LogDebugf("TRACE Setattr: ino(%v) req(%v) valid(%v) cost(%v)ns", ino, req, valid, elapsed.Nanoseconds())
 	return nil
+}
+
+// doECTruncateV2 执行 EC/BlobStore 卷的 TruncateV2：EBS 读/截断/写/删后通知 meta 更新 inode.Size 与 ObjExtents。
+func (f *File) doECTruncateV2(ino uint64, targetSize uint64, fullPath string) error {
+	openForWrite := true
+	if err := f.super.ec.OpenStream(ino, openForWrite, true, fullPath); err != nil {
+		return err
+	}
+	defer f.super.ec.CloseStream(ino)
+	if err := f.super.ec.Flush(ino); err != nil {
+		return err
+	}
+	_, currentSize, _, objExtents, err := f.super.mw.GetObjExtents(ino)
+	if err != nil {
+		return err
+	}
+	ebsc, err := f.super.getBlobStoreClient(f.info.PoolId)
+	if err != nil {
+		return err
+	}
+	volName := f.super.volname
+	var newObjExtents []proto.ObjExtentKey
+	if targetSize >= currentSize {
+		newObjExtents = objExtents
+	} else {
+		newObjExtents, err = ebsc.TruncateV2Extents(context.Background(), volName, objExtents, targetSize)
+		if err != nil {
+			return err
+		}
+	}
+	return f.super.mw.TruncateV2(ino, targetSize, fullPath, newObjExtents)
 }
 
 // Readlink handles the readlink request.

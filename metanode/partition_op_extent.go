@@ -596,17 +596,23 @@ func (mp *metaPartition) ObjExtentsList(req *proto.GetExtentsRequest, p *Packet)
 
 // ExtentsTruncate truncates an extent.
 func (mp *metaPartition) ExtentsTruncate(req *ExtentsTruncateReq, p *Packet, remoteAddr string) (err error) {
-	if !proto.IsHot(mp.volType) {
-		err = fmt.Errorf("only support hot vol")
-		p.PacketErrorWithBody(proto.OpErr, []byte(err.Error()))
-		return
-	}
 	fileSize := uint64(0)
 	start := time.Now()
 	if mp.IsEnableAuditLog() {
 		defer func() {
 			auditlog.LogInodeOp(remoteAddr, mp.GetVolName(), p.GetOpMsg(), req.GetFullPath(), err, time.Since(start).Milliseconds(), req.Inode, fileSize)
 		}()
+	}
+
+	// TruncateV2: EC/BlobStore 卷，client 已做完 EBS 读/截断/写/删，仅更新 meta
+	if req.TruncateV2 {
+		return mp.extentsTruncateV2(req, p)
+	}
+
+	if !proto.IsHot(mp.volType) {
+		err = fmt.Errorf("only support hot vol")
+		p.PacketErrorWithBody(proto.OpErr, []byte(err.Error()))
+		return
 	}
 	ino := NewInode(req.Inode, proto.Mode(os.ModePerm))
 	i, err := mp.inodeTree.CopyGet(ino)
@@ -648,6 +654,48 @@ func (mp *metaPartition) ExtentsTruncate(req *ExtentsTruncateReq, p *Packet, rem
 	if err != nil {
 		log.LogErrorf("[ExtentsTruncate] mpId(%v) ino(%v) submit fsm return err: %v",
 			mp.config.PartitionId, req.Inode, err)
+		p.PacketErrorWithBody(proto.OpAgain, []byte(err.Error()))
+		return
+	}
+	msg := resp.(*InodeResponse)
+	p.PacketErrorWithBody(msg.Status, nil)
+	return
+}
+
+// extentsTruncateV2 处理 EC 卷 TruncateV2：仅更新 inode.Size 与 ObjExtents，不投递 objExtDelCh（client 已删 EBS 数据）。
+func (mp *metaPartition) extentsTruncateV2(req *ExtentsTruncateReq, p *Packet) (err error) {
+	ino := NewInode(req.Inode, proto.Mode(os.ModePerm))
+	i, err := mp.inodeTree.CopyGet(ino)
+	if err != nil {
+		p.PacketErrorWithBody(proto.OpErr, []byte(err.Error()))
+		return
+	}
+	if i == nil {
+		err = fmt.Errorf("inode[%v] is not exist", req.Inode)
+		p.PacketErrorWithBody(proto.OpErr, []byte(err.Error()))
+		return
+	}
+	if !proto.IsStorageClassBlobStore(i.StorageClass) {
+		err = fmt.Errorf("TruncateV2 only support BlobStore storageClass, inode %v has %v", req.Inode, i.StorageClass)
+		p.PacketErrorWithBody(proto.OpErr, []byte(err.Error()))
+		return
+	}
+	status := mp.isOverQuota(req.Inode, req.Size > i.Size, false)
+	if status != 0 {
+		log.LogErrorf("extentsTruncateV2 fail status [%v]", status)
+		err = errors.New("extentsTruncateV2 is over quota")
+		p.PacketErrorWithBody(status, []byte(err.Error()))
+		return
+	}
+	reqData, err := json.Marshal(req)
+	if err != nil {
+		log.LogErrorf("extentsTruncateV2: marshal req err(%v)", err)
+		p.PacketErrorWithBody(proto.OpErr, []byte(err.Error()))
+		return
+	}
+	resp, err := mp.submit(opFSMExtentTruncateV2, reqData)
+	if err != nil {
+		log.LogErrorf("[extentsTruncateV2] mpId(%v) ino(%v) submit err: %v", mp.config.PartitionId, req.Inode, err)
 		p.PacketErrorWithBody(proto.OpAgain, []byte(err.Error()))
 		return
 	}

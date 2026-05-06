@@ -689,6 +689,9 @@ func (mp *metaPartition) deleteObjExtentsFromList(fileList *synclist.SyncList) {
 				mp.config.PartitionId, len(needDels), err)
 		}
 
+		log.LogDebugf("[deleteObjExtentsFromList] mp(%d) deleteCnt(%d) cursor(%d) oldCursor(%d)",
+			mp.config.PartitionId, len(needDels), cursor, oldCursor)
+
 		// Update cursor if progress made
 		if cursor != oldCursor {
 			binary.BigEndian.PutUint64(cursorBuf, cursor)

@@ -254,6 +254,7 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 	s.bcacheBatchCnt = opt.BcacheBatchCnt
 	s.closeC = make(chan struct{}, 1)
 	s.taskPool = []common.TaskPool{common.New(DefaultTaskPoolSize, DefaultTaskPoolSize), common.New(DefaultTaskPoolSize, DefaultTaskPoolSize)}
+	s.ebsc = make(map[uint8]*blobstore.BlobStoreClient)
 	s.runningMonitor = NewRunningMonitor(opt.ClientOpTimeOut)
 	s.runningMonitor.Start()
 
