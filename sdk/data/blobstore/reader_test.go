@@ -26,6 +26,7 @@ import (
 
 	"github.com/brahma-adshonor/gohook"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/cubefs/cubefs/client/blockcache/bcache"
 	"github.com/cubefs/cubefs/proto"
@@ -388,6 +389,71 @@ func TestReadSliceRange(t *testing.T) {
 		gotError := reader.readSliceRange(ctx, rs)
 		assert.Equal(t, tc.expectError, gotError)
 	}
+}
+
+func TestCoverageReaderRead_PrefetchPath(t *testing.T) {
+	reader := &Reader{
+		volName:          "v",
+		ino:              1,
+		mw:               &meta.MetaWrapper{},
+		ebs:              &BlobStoreClient{},
+		readConcurrency:  1,
+		limitManager:     manager.NewLimitManager(nil),
+		blockSize:        64,
+		aheadReadEnable:  true,
+		minReadAheadSize: 0,
+		prefetchLimiter:  &blobReadPrefetchLimiter{maxBytes: 1 << 20},
+	}
+
+	err := gohook.HookMethod(reader.mw, "GetObjExtents", func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
+		return 1, 128, nil, []proto.ObjExtentKey{{FileOffset: 0, Size: 128}}, nil
+	}, nil)
+	require.NoError(t, err)
+	err = gohook.HookMethod(reader.ebs, "Read", func(_ *BlobStoreClient, _ context.Context, _ string, buf []byte, _ uint64, size uint64, _ proto.ObjExtentKey) (int, error) {
+		for i := range buf {
+			buf[i] = byte(i)
+		}
+		return int(size), nil
+	}, nil)
+	require.NoError(t, err)
+
+	buf := make([]byte, 16)
+	n, err := reader.Read(context.Background(), buf, 0, 16)
+	require.NoError(t, err)
+	require.Equal(t, 16, n)
+
+	n, err = reader.Read(context.Background(), buf, 8, 16)
+	require.NoError(t, err)
+	require.Equal(t, 16, n)
+}
+
+func TestCoverageReaderRead_LargeRequestFallback(t *testing.T) {
+	reader := &Reader{
+		volName:          "v",
+		ino:              2,
+		mw:               &meta.MetaWrapper{},
+		ebs:              &BlobStoreClient{},
+		readConcurrency:  1,
+		limitManager:     manager.NewLimitManager(nil),
+		blockSize:        32,
+		aheadReadEnable:  true,
+		minReadAheadSize: 0,
+		prefetchLimiter:  &blobReadPrefetchLimiter{maxBytes: 1 << 20},
+	}
+
+	err := gohook.HookMethod(reader.mw, "GetObjExtents", func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
+		return 1, 128, nil, []proto.ObjExtentKey{{FileOffset: 0, Size: 128}}, nil
+	}, nil)
+	require.NoError(t, err)
+	err = gohook.HookMethod(reader.ebs, "Read", func(_ *BlobStoreClient, _ context.Context, _ string, _ []byte, _ uint64, size uint64, _ proto.ObjExtentKey) (int, error) {
+		return int(size), nil
+	}, nil)
+	require.NoError(t, err)
+
+	buf := make([]byte, 40) // >= blockSize, fallback path
+	n, err := reader.Read(context.Background(), buf, 0, len(buf))
+	require.NoError(t, err)
+	require.Equal(t, len(buf), n)
 }
 
 func MockGetObjExtentsTrue(m *meta.MetaWrapper, inode uint64) (gen uint64, size uint64,

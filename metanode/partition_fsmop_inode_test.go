@@ -485,7 +485,7 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 		inoParam.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{
 			{FileOffset: 0, Size: 100},
 		})
-		status := mp.fsmAppendObjExtentsWithCheck(inoParam)
+		status, _ := mp.fsmAppendObjExtentsWithCheck(nil, inoParam)
 		require.Equal(t, proto.OpNotExistErr, status)
 	})
 
@@ -505,7 +505,7 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 		inoParam1 := NewInode(inoId, 0)
 		inoParam1.StorageClass = proto.StorageClass_BlobStore
 		inoParam1.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{})
-		status1 := mp.fsmAppendObjExtentsWithCheck(inoParam1)
+		status1, _ := mp.fsmAppendObjExtentsWithCheck(handle, inoParam1)
 		require.Equal(t, proto.OpArgMismatchErr, status1)
 
 		// Too many extents
@@ -516,7 +516,7 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 			{FileOffset: 100, Size: 100},
 			{FileOffset: 200, Size: 100},
 		})
-		status2 := mp.fsmAppendObjExtentsWithCheck(inoParam2)
+		status2, _ := mp.fsmAppendObjExtentsWithCheck(handle, inoParam2)
 		require.Equal(t, proto.OpArgMismatchErr, status2)
 	})
 
@@ -542,7 +542,7 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 			{},
 		})
 
-		status := mp.fsmAppendObjExtentsWithCheck(inoParam)
+		status, _ := mp.fsmAppendObjExtentsWithCheck(handle, inoParam)
 		require.Equal(t, proto.OpOk, status)
 
 		updatedIno, err := mp.inodeTree.CopyGet(fsmIno)
@@ -576,7 +576,7 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 		inoParam1.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{
 			{FileOffset: 0, Size: 100}, {},
 		})
-		status1 := mp.fsmAppendObjExtentsWithCheck(inoParam1)
+		status1, _ := mp.fsmAppendObjExtentsWithCheck(handle, inoParam1)
 		require.Equal(t, proto.OpOk, status1)
 
 		// Insert after
@@ -585,7 +585,7 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 		inoParam2.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{
 			{FileOffset: 500, Size: 100}, {},
 		})
-		status2 := mp.fsmAppendObjExtentsWithCheck(inoParam2)
+		status2, _ := mp.fsmAppendObjExtentsWithCheck(handle, inoParam2)
 		require.Equal(t, proto.OpOk, status2)
 
 		// Insert middle
@@ -594,7 +594,7 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 		inoParam3.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{
 			{FileOffset: 350, Size: 100}, {},
 		})
-		status3 := mp.fsmAppendObjExtentsWithCheck(inoParam3)
+		status3, _ := mp.fsmAppendObjExtentsWithCheck(handle, inoParam3)
 		require.Equal(t, proto.OpOk, status3)
 
 		// Verify all extents
@@ -633,7 +633,7 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 			existingExtent, // discard
 		})
 
-		status := mp.fsmAppendObjExtentsWithCheck(inoParam)
+		status, _ := mp.fsmAppendObjExtentsWithCheck(handle, inoParam)
 		require.Equal(t, proto.OpOk, status)
 
 		updatedIno, err := mp.inodeTree.CopyGet(fsmIno)
@@ -667,7 +667,7 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 			existingExtent, // discard
 		})
 
-		status := mp.fsmAppendObjExtentsWithCheck(inoParam)
+		status, _ := mp.fsmAppendObjExtentsWithCheck(handle, inoParam)
 		require.Equal(t, proto.OpOk, status)
 
 		updatedIno, err := mp.inodeTree.CopyGet(fsmIno)
@@ -703,7 +703,7 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 			{FileOffset: 0, Size: 100},   // discard provided
 		})
 
-		status := mp.fsmAppendObjExtentsWithCheck(inoParam)
+		status, _ := mp.fsmAppendObjExtentsWithCheck(handle, inoParam)
 		require.Equal(t, proto.OpConflictExtentsErr, status)
 	})
 
@@ -729,7 +729,7 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 			{FileOffset: 0, Size: 100, Cid: 2, CodeMode: 2},
 			{FileOffset: 0, Size: 100, Cid: 3, CodeMode: 3}, // discard mismatch
 		})
-		status1 := mp.fsmAppendObjExtentsWithCheck(inoParam1)
+		status1, _ := mp.fsmAppendObjExtentsWithCheck(handle, inoParam1)
 		require.Equal(t, proto.OpConflictExtentsErr, status1)
 
 		// Extend last but discard mismatch
@@ -739,7 +739,7 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 			{FileOffset: 0, Size: 150, Cid: 2, CodeMode: 2},
 			{FileOffset: 0, Size: 100, Cid: 3, CodeMode: 3}, // discard mismatch
 		})
-		status2 := mp.fsmAppendObjExtentsWithCheck(inoParam2)
+		status2, _ := mp.fsmAppendObjExtentsWithCheck(handle, inoParam2)
 		require.Equal(t, proto.OpConflictExtentsErr, status2)
 	})
 
@@ -767,7 +767,7 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 			{FileOffset: 0, Size: 150}, // extend non-last
 			{FileOffset: 0, Size: 100},
 		})
-		status1 := mp.fsmAppendObjExtentsWithCheck(inoParam1)
+		status1, _ := mp.fsmAppendObjExtentsWithCheck(handle, inoParam1)
 		require.Equal(t, proto.OpConflictExtentsErr, status1)
 
 		// Partial overlap
@@ -777,7 +777,7 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 			{FileOffset: 50, Size: 100}, // partial overlap
 			{FileOffset: 0, Size: 100},
 		})
-		status2 := mp.fsmAppendObjExtentsWithCheck(inoParam2)
+		status2, _ := mp.fsmAppendObjExtentsWithCheck(handle, inoParam2)
 		require.Equal(t, proto.OpConflictExtentsErr, status2)
 	})
 
@@ -801,14 +801,14 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 		inoParam1 := NewInode(inoId, 0)
 		inoParam1.StorageClass = proto.StorageClass_BlobStore
 		inoParam1.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{newExtent, {}})
-		status1 := mp.fsmAppendObjExtentsWithCheck(inoParam1)
+		status1, _ := mp.fsmAppendObjExtentsWithCheck(handle, inoParam1)
 		require.Equal(t, proto.OpOk, status1)
 
 		// Second execution
 		inoParam2 := NewInode(inoId, 0)
 		inoParam2.StorageClass = proto.StorageClass_BlobStore
 		inoParam2.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{newExtent, {}})
-		status2 := mp.fsmAppendObjExtentsWithCheck(inoParam2)
+		status2, _ := mp.fsmAppendObjExtentsWithCheck(handle, inoParam2)
 		require.Equal(t, proto.OpOk, status2)
 
 		// Verify extent count remains 1
@@ -845,7 +845,7 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 			newExtent1,
 			existingExtent,
 		})
-		status1 := mp.fsmAppendObjExtentsWithCheck(inoParam1)
+		status1, _ := mp.fsmAppendObjExtentsWithCheck(handle, inoParam1)
 		require.Equal(t, proto.OpOk, status1)
 
 		// Second: repeat replace (should succeed)
@@ -855,7 +855,7 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 			newExtent1,
 			newExtent1,
 		})
-		status2 := mp.fsmAppendObjExtentsWithCheck(inoParam2)
+		status2, _ := mp.fsmAppendObjExtentsWithCheck(handle, inoParam2)
 		require.Equal(t, proto.OpOk, status2)
 
 		// Third: extend further
@@ -865,7 +865,7 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 			newExtent2,
 			newExtent1,
 		})
-		status3 := mp.fsmAppendObjExtentsWithCheck(inoParam3)
+		status3, _ := mp.fsmAppendObjExtentsWithCheck(handle, inoParam3)
 		require.Equal(t, proto.OpOk, status3)
 
 		// Verify final state
@@ -960,4 +960,62 @@ func TestFsmExtentsTruncateV2(t *testing.T) {
 	require.Equal(t, int64(mp.fsmRaftApplyIndex), items[0].TsMs)
 	require.Equal(t, mp.fsmRaftApplyIndex<<20, items[0].Uniq)
 	require.True(t, items[0].Oek.IsEquals(&toDeletes[0]))
+}
+
+func TestFsmExtentsTruncateV2_Errors(t *testing.T) {
+	mpC := &MetaPartitionConfig{
+		PartitionId:   10002,
+		VolName:       VolNameForTest,
+		PartitionType: proto.VolumeTypeHot,
+		StoreMode:     proto.StoreModeMem,
+	}
+	metaM := &metadataManager{
+		nodeId:          1,
+		zoneName:        "test",
+		raftStore:       nil,
+		partitions:      make(map[uint64]MetaPartition),
+		metaNode:        &MetaNode{},
+		fileStatsConfig: &fileStatsConfig{},
+	}
+	partition := NewMetaPartition(mpC, metaM)
+	mp := partition.(*metaPartition)
+	err := mp.initObjects(true)
+	require.NoError(t, err)
+	mp.uidManager = NewUidMgr(mpC.VolName, mpC.PartitionId)
+	mp.mqMgr = NewQuotaManager(mpC.VolName, mpC.PartitionId)
+	mp.uniqChecker = newUniqChecker()
+	mp.vol = NewVol()
+
+	t.Run("inode not exist", func(t *testing.T) {
+		handle, err := mp.inodeTree.CreateBatchWriteHandle()
+		require.NoError(t, err)
+		resp, err := mp.fsmExtentsTruncateV2(handle, &proto.TruncateRequest{
+			Inode:         7777,
+			Size:          10,
+			NewObjExtents: []proto.ObjExtentKey{{FileOffset: 0, Size: 10}},
+		})
+		require.NoError(t, err)
+		require.Equal(t, proto.OpNotExistErr, resp.Status)
+		require.NoError(t, mp.inodeTree.CommitAndReleaseBatchWriteHandle(handle, false))
+	})
+
+	t.Run("inode storage class is not blobstore", func(t *testing.T) {
+		handle, err := mp.inodeTree.CreateBatchWriteHandle()
+		require.NoError(t, err)
+		ino := NewInode(8888, 0)
+		ino.StorageClass = proto.StorageClass_Replica_SSD
+		mp.inodeTree.ReplaceOrInsert(handle, ino, true)
+		require.NoError(t, mp.inodeTree.CommitAndReleaseBatchWriteHandle(handle, false))
+
+		handle2, err := mp.inodeTree.CreateBatchWriteHandle()
+		require.NoError(t, err)
+		resp, err := mp.fsmExtentsTruncateV2(handle2, &proto.TruncateRequest{
+			Inode:         8888,
+			Size:          10,
+			NewObjExtents: []proto.ObjExtentKey{{FileOffset: 0, Size: 10}},
+		})
+		require.NoError(t, err)
+		require.Equal(t, proto.OpArgMismatchErr, resp.Status)
+		require.NoError(t, mp.inodeTree.CommitAndReleaseBatchWriteHandle(handle2, false))
+	})
 }

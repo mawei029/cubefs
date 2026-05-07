@@ -22,9 +22,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"testing"
 
+	"github.com/agiledragon/gomonkey/v2"
 	"github.com/cubefs/cubefs/blobstore/api/access"
 	"github.com/cubefs/cubefs/blobstore/common/crc32block"
 	"github.com/cubefs/cubefs/blobstore/common/proto"
@@ -218,7 +220,7 @@ func TestEbsClient_Write_Read(t *testing.T) {
 }
 
 func TestComputeOverwriteReqs_NoOverlap(t *testing.T) {
-	// buffer [100, 200), when all extents start after 200, only one new segment is generated.
+	// buffer [100, 200)，extents 均在 200 之后，则仅产生一段新数据
 	objExtents := []cproto.ObjExtentKey{
 		{FileOffset: 250, Size: 50},
 	}
@@ -230,7 +232,7 @@ func TestComputeOverwriteReqs_NoOverlap(t *testing.T) {
 }
 
 func TestComputeOverwriteReqs_PartialOverlap(t *testing.T) {
-	// buffer [100, 200), extent [50, 150) -> overlap [100, 150).
+	// buffer [100, 200), extent [50, 150) -> 重叠 [100, 150)
 	objExtents := []cproto.ObjExtentKey{
 		{FileOffset: 50, Size: 100},
 	}
@@ -244,7 +246,7 @@ func TestComputeOverwriteReqs_PartialOverlap(t *testing.T) {
 	require.True(t, reqs[1].DiscardExtent.IsEmpty())
 }
 
-// TestComputeTruncateReqs_PartialSpan covers the basic truncate case with partial keep, partial overlap, and partial discard.
+// TestComputeTruncateReqs_PartialSpan 覆盖截断时部分保留、部分重叠、部分丢弃的基本场景。
 func TestComputeTruncateReqs_PartialSpan(t *testing.T) {
 	objExtents := []cproto.ObjExtentKey{
 		{FileOffset: 0, Size: 100},
@@ -274,14 +276,13 @@ func TestComputeTruncateReqs_EmptyInput(t *testing.T) {
 func TestTruncateV2Extents_EmptyInput(t *testing.T) {
 	ebs := &BlobStoreClient{}
 	ctx := context.Background()
-	out, delKeys, err := ebs.TruncateV2Extents(ctx, "vol", nil, 100)
+	out, _, err := ebs.TruncateV2Extents(ctx, "vol", nil, 100)
 	require.NoError(t, err)
 	require.Nil(t, out)
-	require.Empty(t, delKeys)
 }
 
 func TestTruncateV2Extents_OnlyKeepNoEBS(t *testing.T) {
-	// When there is only keep/no overwrite/no delete, ApplyTruncateReqs should return keep directly without EBS calls.
+	// 仅保留、无覆盖、无删除时，ApplyTruncateReqs 只返回 keep，不调 EBS
 	objExtents := []cproto.ObjExtentKey{
 		{FileOffset: 0, Size: 50},
 		{FileOffset: 50, Size: 50},
@@ -293,12 +294,75 @@ func TestTruncateV2Extents_OnlyKeepNoEBS(t *testing.T) {
 
 	ebs := &BlobStoreClient{}
 	ctx := context.Background()
-	out, delKeys, err := ebs.ApplyTruncateReqs(ctx, "vol", req)
+	out, toDel, err := ebs.ApplyTruncateReqs(ctx, "vol", req)
 	require.NoError(t, err)
 	require.Len(t, out, 2)
-	require.Empty(t, delKeys)
+	require.Len(t, toDel, 0)
 	require.Equal(t, uint64(0), out[0].FileOffset)
 	require.Equal(t, uint64(50), out[0].Size)
 	require.Equal(t, uint64(50), out[1].FileOffset)
 	require.Equal(t, uint64(50), out[1].Size)
+}
+
+func TestApplyTruncateReqs_ReadError(t *testing.T) {
+	ebs := &BlobStoreClient{}
+	req := truncateReq{
+		OverwriteReqs: []overwriteReq{
+			{
+				NewExtent:     cproto.ObjExtentKey{FileOffset: 0, Size: 10},
+				DiscardExtent: cproto.ObjExtentKey{FileOffset: 0, Size: 20},
+			},
+		},
+	}
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(ebs), "Read",
+		func(_ *BlobStoreClient, _ context.Context, _ string, _ []byte, _ uint64, _ uint64, _ cproto.ObjExtentKey) (int, error) {
+			return 0, io.ErrUnexpectedEOF
+		})
+	out, toDel, err := ebs.ApplyTruncateReqs(context.Background(), "vol", req)
+	require.Error(t, err)
+	require.Nil(t, out)
+	require.Len(t, toDel, 0)
+}
+
+func TestApplyTruncateReqs_PutNoKeys(t *testing.T) {
+	ebs := &BlobStoreClient{}
+	req := truncateReq{
+		OverwriteReqs: []overwriteReq{
+			{
+				NewExtent:     cproto.ObjExtentKey{FileOffset: 0, Size: 10},
+				DiscardExtent: cproto.ObjExtentKey{FileOffset: 0, Size: 20},
+			},
+		},
+	}
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(ebs), "Read",
+		func(_ *BlobStoreClient, _ context.Context, _ string, _ []byte, _ uint64, size uint64, _ cproto.ObjExtentKey) (int, error) {
+			return int(size), nil
+		})
+	patches.ApplyMethod(reflect.TypeOf(ebs), "Put",
+		func(_ *BlobStoreClient, _ context.Context, _ string, _ io.Reader, _ uint64) ([]cproto.ObjExtentKey, [][]byte, error) {
+			return nil, nil, nil
+		})
+	out, toDel, err := ebs.ApplyTruncateReqs(context.Background(), "vol", req)
+	require.ErrorIs(t, err, errPutNoKeys)
+	require.Nil(t, out)
+	require.Len(t, toDel, 0)
+}
+
+func TestApplyTruncateReqs_DeleteError(t *testing.T) {
+	ebs := &BlobStoreClient{}
+	req := truncateReq{
+		DiscardOnly: []cproto.ObjExtentKey{{FileOffset: 0, Size: 20}},
+	}
+
+	out, toDel, err := ebs.ApplyTruncateReqs(context.Background(), "vol", req)
+	require.NoError(t, err)
+	require.NotNil(t, out)
+	require.Len(t, out, 0)
+	require.Len(t, toDel, 1)
 }

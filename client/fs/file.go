@@ -456,20 +456,10 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 			return ParseError(syscall.EBADF)
 		}
 		// EC/BlobStore: fetch inode generation/size first; refresh Reader ObjExtents view when it is stale before reading.
-		var info *proto.InodeInfo
-		info, err = f.super.InodeGet(f.ino)
-		if err != nil {
+		if err = reader.EnsureAlignedForRead(info.Generation, info.Size); err != nil {
 			return ParseError(err)
 		}
-		f.ino = info.Inode
-		finfo, found := f.super.fileExtendInfoMap[f.ino]
-		if !found {
-			return ParseError(syscall.EBADF)
-		}
-		if err = finfo.fReader.EnsureAlignedForRead(info.Generation, info.Size); err != nil {
-			return ParseError(err)
-		}
-		size, err = finfo.fReader.Read(ctx, resp.Data[fuse.OutHeaderSize:], int(req.Offset), req.Size)
+		size, err = reader.Read(ctx, resp.Data[fuse.OutHeaderSize:], int(req.Offset), req.Size)
 	}
 	if err != nil && err != io.EOF {
 		msg := fmt.Sprintf("Read: ino(%v) req(%v) err(%v) size(%v)", f.ino, req, err, size)
@@ -556,16 +546,14 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 			if err = f.doECTruncateV2(ino, target, fullPath); err != nil {
 				return ParseError(err)
 			}
-			if f.fWriter != nil {
-				f.fWriter.SetFileSize(target)
+			if writer := f.getWriter(); writer != nil {
+				writer.SetFileSize(target)
 			}
-			if f.fReader != nil {
+			if f.getReader() != nil {
 				f.syncBlobReaderAfterMetaChange(ino) // f.fReader.RefreshExtents()
-			} else if info, err := f.super.InodeGet(ino); err == nil {
-				f.info = info
 			}
 			resp.Size = reqlen
-			log.LogDebugf("fallocate(blob): ino(%v) origFilesize(%v) target(%v) req(%v)", f.info.Inode, filesize, target, req)
+			log.LogDebugf("fallocate(blob): ino(%v) origFilesize(%v) target(%v) req(%v)", f.ino, filesize, target, req)
 			return nil
 		}
 	}
@@ -729,8 +717,6 @@ func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) (err error) {
 		return ParseError(err)
 	}
 
-	// Same as above: syncBlobReaderAfterMetaChange is not forced after Flush.
-
 	if DisableMetaCache {
 		openForWrite := false
 		if req.Flags&0x0f != syscall.O_RDONLY {
@@ -874,10 +860,10 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 			f.super.ic.Delete(ino)
 			f.super.ec.RefreshExtentsCache(ino)
 			// After truncate, update Writer logical file size on opened fds and sync Reader ObjExtents + inode view via syncBlobReaderAfterMetaChange.
-			if f.fWriter != nil {
-				f.fWriter.SetFileSize(req.Size)
+			if writer := f.getWriter(); writer != nil {
+				writer.SetFileSize(req.Size)
 			}
-			if f.fReader != nil {
+			if f.getReader() != nil {
 				f.syncBlobReaderAfterMetaChange(ino)
 			}
 		default:
@@ -922,8 +908,8 @@ func (f *File) doECTruncateV2(ino uint64, targetSize uint64, fullPath string) er
 	if err != nil {
 		return err
 	}
-	if err := writer.Flush(f.info.Inode, context.Background()); err != nil {
-		log.LogErrorf("flushBlobWriterBeforeECTruncate: ino(%v) err(%v)", f.info.Inode, err)
+	if err := writer.Flush(f.ino, context.Background()); err != nil {
+		log.LogErrorf("flushBlobWriterBeforeECTruncate: ino(%v) err(%v)", f.ino, err)
 		return err
 	}
 
@@ -969,10 +955,11 @@ func (f *File) doECTruncateV2(ino uint64, targetSize uint64, fullPath string) er
 // syncBlobReaderAfterMetaChange refreshes Reader ObjExtents via GetObjExtents, then aligns inode generation/size through InodeGet + SyncInodeView.
 // Currently used only in Setattr truncate-for-Blob path; not called from Write/Flush/Fsync (see comments above).
 func (f *File) syncBlobReaderAfterMetaChange(ino uint64) {
-	if f.fReader == nil {
+	reader := f.getReader()
+	if reader == nil {
 		return
 	}
-	if err := f.fReader.RefreshExtents(); err != nil {
+	if err := reader.RefreshExtents(); err != nil {
 		log.LogWarnf("syncBlobReaderAfterMetaChange: RefreshExtents ino(%v) err(%v)", ino, err)
 		return
 	}
@@ -981,16 +968,19 @@ func (f *File) syncBlobReaderAfterMetaChange(ino uint64) {
 		log.LogWarnf("syncBlobReaderAfterMetaChange: InodeGet ino(%v) err(%v)", ino, err)
 		return
 	}
-	f.info = info
-	f.fReader.SyncInodeView(info.Generation, info.Size)
+	reader.SyncInodeView(info.Generation, info.Size)
 }
 
 // ensureBlobStoreWriter guarantees f.fWriter is initialized for BlobStore volumes; when nil, create it with the same logic as Open for reuse by doECTruncateV2, etc.
 func (f *File) ensureBlobStoreWriter(ino uint64) (*blobstore.Writer, error) {
-	if f.fWriter != nil {
-		return f.fWriter, nil
+	if writer := f.getWriter(); writer != nil {
+		return writer, nil
 	}
-	ebsc, err := f.super.getBlobStoreClient(f.info.PoolId)
+	info, err := f.getInfo()
+	if err != nil {
+		return nil, err
+	}
+	ebsc, err := f.super.getBlobStoreClient(info.PoolId)
 	if err != nil {
 		return nil, err
 	}
@@ -1009,10 +999,11 @@ func (f *File) ensureBlobStoreWriter(ino uint64) (*blobstore.Writer, error) {
 		ReadConcurrency: f.super.readThreads,
 		FileCache:       false,
 		FileSize:        uint64(fileSize),
-		PoolId:          f.info.PoolId,
+		PoolId:          info.PoolId,
 	}
-	f.fWriter = blobstore.NewWriter(clientConf)
-	return f.fWriter, nil
+	writer := blobstore.NewWriter(clientConf)
+	f.setReaderWriter(f.getReader(), writer)
+	return writer, nil
 }
 
 // getECCurrentSizeAndExtents returns current file size and ObjExtents for EC/BlobStore volumes; on missing data or errors, returns size=0, extents=nil, err!=nil.

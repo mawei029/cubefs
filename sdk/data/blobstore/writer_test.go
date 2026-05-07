@@ -96,7 +96,7 @@ func TestNotInstanceWriter_Write(t *testing.T) {
 	}
 }
 
-// TestWriter_TruncateV2_NilReturnsError verifies nil Writer returns error on TruncateV2 (basic EC truncate branch).
+// TestWriter_TruncateV2_NilReturnsError 校验 nil Writer 调用 TruncateV2 返回错误（EC truncate 基本分支）。
 func TestWriter_TruncateV2_NilReturnsError(t *testing.T) {
 	w := newNilWriter()
 	ctx := context.Background()
@@ -406,7 +406,7 @@ func TestComputeOverwriteReqs(t *testing.T) {
 	}
 }
 
-// TestTryOverWrite_Basic tests tryOverWrite with a basic scenario (small data); trailing partial block is persisted via flushExt and resetBuffer.
+// TestTryOverWrite_Basic tests tryOverWrite with basic scenario (small data, no flush needed)
 func TestTryOverWrite_Basic(t *testing.T) {
 	ctx := context.Background()
 
@@ -464,7 +464,7 @@ func TestTryOverWrite_Basic(t *testing.T) {
 	size, err := testWriter.tryOverWrite(ctx, 0, data, flag)
 	require.NoError(t, err, "tryOverWrite failed")
 	require.Equal(t, len(data), size, "tryOverWrite returned wrong size.")
-	require.Equal(t, 0, testWriter.blockPosition, "after final flushExt blockPosition should be reset")
+	require.Equal(t, 0, testWriter.blockPosition, "tryOverWrite should flush trailing partial block and reset blockPosition.")
 	require.Equal(t, len(data), testWriter.fileOffset, "tryOverWrite fileOffset incorrect.")
 }
 

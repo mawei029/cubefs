@@ -15,33 +15,32 @@ import (
 )
 
 func newBlobFileForTruncateTest() *File {
-	return &File{
+	f := &File{
 		super: &Super{
 			mw: &meta.MetaWrapper{},
 			ec: &stream.ExtentClient{},
 		},
-		info: &cfsproto.InodeInfo{
-			Inode:  100,
-			PoolId: 1,
-		},
+		ino: 100,
 	}
+	f.setReaderWriter(nil, &blobstore.Writer{})
+	return f
 }
 
 func TestFileDoECTruncateV2_ENOENTTreatAsNewFile(t *testing.T) {
 	f := newBlobFileForTruncateTest()
-	w := &blobstore.Writer{}
+	w := f.getWriter()
 
 	var gotObjExtents []cfsproto.ObjExtentKey
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
-	patches.ApplyMethod(reflect.TypeOf(f), "ensureBlobStoreWriter",
-		func(_ *File, _ uint64) (*blobstore.Writer, error) { return w, nil })
 	patches.ApplyMethod(reflect.TypeOf(w), "Flush",
 		func(_ *blobstore.Writer, _ uint64, _ context.Context) error { return nil })
-	patches.ApplyMethod(reflect.TypeOf(f), "getECCurrentSizeAndExtents",
-		func(_ *File, _ uint64) (uint64, []cfsproto.ObjExtentKey, error) { return 0, nil, syscall.ENOENT })
+	patches.ApplyMethod(reflect.TypeOf(f.super.mw), "GetObjExtents",
+		func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []cfsproto.ExtentKey, []cfsproto.ObjExtentKey, error) {
+			return 0, 0, nil, nil, syscall.ENOENT
+		})
 	patches.ApplyMethod(reflect.TypeOf(f.super.mw), "TruncateV2",
-		func(_ *meta.MetaWrapper, _ uint64, _ uint64, _ string, objExtents []cfsproto.ObjExtentKey) error {
+		func(_ *meta.MetaWrapper, _ uint64, _ uint64, _ string, objExtents []cfsproto.ObjExtentKey, _ []cfsproto.ObjExtentKey) error {
 			gotObjExtents = objExtents
 			return nil
 		})
@@ -53,20 +52,20 @@ func TestFileDoECTruncateV2_ENOENTTreatAsNewFile(t *testing.T) {
 
 func TestFileDoECTruncateV2_ExpandOnlyMeta(t *testing.T) {
 	f := newBlobFileForTruncateTest()
-	w := &blobstore.Writer{}
+	w := f.getWriter()
 	current := []cfsproto.ObjExtentKey{{FileOffset: 0, Size: 64}}
 
 	var gotObjExtents []cfsproto.ObjExtentKey
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
-	patches.ApplyMethod(reflect.TypeOf(f), "ensureBlobStoreWriter",
-		func(_ *File, _ uint64) (*blobstore.Writer, error) { return w, nil })
 	patches.ApplyMethod(reflect.TypeOf(w), "Flush",
 		func(_ *blobstore.Writer, _ uint64, _ context.Context) error { return nil })
-	patches.ApplyMethod(reflect.TypeOf(f), "getECCurrentSizeAndExtents",
-		func(_ *File, _ uint64) (uint64, []cfsproto.ObjExtentKey, error) { return 64, current, nil })
+	patches.ApplyMethod(reflect.TypeOf(f.super.mw), "GetObjExtents",
+		func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []cfsproto.ExtentKey, []cfsproto.ObjExtentKey, error) {
+			return 0, 64, nil, current, nil
+		})
 	patches.ApplyMethod(reflect.TypeOf(f.super.mw), "TruncateV2",
-		func(_ *meta.MetaWrapper, _ uint64, _ uint64, _ string, objExtents []cfsproto.ObjExtentKey) error {
+		func(_ *meta.MetaWrapper, _ uint64, _ uint64, _ string, objExtents []cfsproto.ObjExtentKey, _ []cfsproto.ObjExtentKey) error {
 			gotObjExtents = objExtents
 			return nil
 		})
@@ -78,19 +77,19 @@ func TestFileDoECTruncateV2_ExpandOnlyMeta(t *testing.T) {
 
 func TestFileDoECTruncateV2_EqualSizeNoop(t *testing.T) {
 	f := newBlobFileForTruncateTest()
-	w := &blobstore.Writer{}
+	w := f.getWriter()
 	var truncateCalled bool
 
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
-	patches.ApplyMethod(reflect.TypeOf(f), "ensureBlobStoreWriter",
-		func(_ *File, _ uint64) (*blobstore.Writer, error) { return w, nil })
 	patches.ApplyMethod(reflect.TypeOf(w), "Flush",
 		func(_ *blobstore.Writer, _ uint64, _ context.Context) error { return nil })
-	patches.ApplyMethod(reflect.TypeOf(f), "getECCurrentSizeAndExtents",
-		func(_ *File, _ uint64) (uint64, []cfsproto.ObjExtentKey, error) { return 64, nil, nil })
+	patches.ApplyMethod(reflect.TypeOf(f.super.mw), "GetObjExtents",
+		func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []cfsproto.ExtentKey, []cfsproto.ObjExtentKey, error) {
+			return 0, 64, nil, nil, nil
+		})
 	patches.ApplyMethod(reflect.TypeOf(f.super.mw), "TruncateV2",
-		func(_ *meta.MetaWrapper, _ uint64, _ uint64, _ string, _ []cfsproto.ObjExtentKey) error {
+		func(_ *meta.MetaWrapper, _ uint64, _ uint64, _ string, _ []cfsproto.ObjExtentKey, _ []cfsproto.ObjExtentKey) error {
 			truncateCalled = true
 			return nil
 		})
@@ -102,32 +101,30 @@ func TestFileDoECTruncateV2_EqualSizeNoop(t *testing.T) {
 
 func TestFileDoECTruncateV2_ShrinkPath(t *testing.T) {
 	f := newBlobFileForTruncateTest()
-	w := &blobstore.Writer{}
+	w := f.getWriter()
 	newObjExtents := []cfsproto.ObjExtentKey{{FileOffset: 0, Size: 32}}
 
 	var gotObjExtents []cfsproto.ObjExtentKey
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
-	patches.ApplyMethod(reflect.TypeOf(f), "ensureBlobStoreWriter",
-		func(_ *File, _ uint64) (*blobstore.Writer, error) { return w, nil })
 	patches.ApplyMethod(reflect.TypeOf(w), "Flush",
 		func(_ *blobstore.Writer, _ uint64, _ context.Context) error { return nil })
-	patches.ApplyMethod(reflect.TypeOf(f), "getECCurrentSizeAndExtents",
-		func(_ *File, _ uint64) (uint64, []cfsproto.ObjExtentKey, error) {
-			return 128, []cfsproto.ObjExtentKey{{FileOffset: 0, Size: 128}}, nil
+	patches.ApplyMethod(reflect.TypeOf(f.super.mw), "GetObjExtents",
+		func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []cfsproto.ExtentKey, []cfsproto.ObjExtentKey, error) {
+			return 0, 128, nil, []cfsproto.ObjExtentKey{{FileOffset: 0, Size: 128}}, nil
 		})
 	patches.ApplyMethod(reflect.TypeOf(f.super.ec), "OpenStream",
 		func(_ *stream.ExtentClient, _ uint64, _ bool, _ bool, _ string) error { return nil })
 	patches.ApplyMethod(reflect.TypeOf(f.super.ec), "CloseStream",
-		func(_ *stream.ExtentClient, _ uint64) {})
+		func(_ *stream.ExtentClient, _ uint64) error { return nil })
 	patches.ApplyMethod(reflect.TypeOf(f.super.ec), "Flush",
 		func(_ *stream.ExtentClient, _ uint64) error { return nil })
 	patches.ApplyMethod(reflect.TypeOf(w), "TruncateV2",
-		func(_ *blobstore.Writer, _ context.Context, _ uint64) ([]cfsproto.ObjExtentKey, error) {
-			return newObjExtents, nil
+		func(_ *blobstore.Writer, _ context.Context, _ uint64) ([]cfsproto.ObjExtentKey, []cfsproto.ObjExtentKey, error) {
+			return newObjExtents, nil, nil
 		})
 	patches.ApplyMethod(reflect.TypeOf(f.super.mw), "TruncateV2",
-		func(_ *meta.MetaWrapper, _ uint64, _ uint64, _ string, objExtents []cfsproto.ObjExtentKey) error {
+		func(_ *meta.MetaWrapper, _ uint64, _ uint64, _ string, objExtents []cfsproto.ObjExtentKey, _ []cfsproto.ObjExtentKey) error {
 			gotObjExtents = objExtents
 			return nil
 		})

@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
-	stderrors "errors"
 	"fmt"
 	"net"
 	"os"
@@ -231,20 +230,6 @@ func (m *metadataManager) checkDisableAuditLogVolume(volNames []string, partitio
 		}
 	}
 	partition.SetEnableAuditLog(true)
-}
-
-// LogBatchObjExtendetsAddErr: Warn (such as over quota) or Error based on the type of error
-func logBatchObjExtentsAddErr(err error, remoteAddr, opName string) {
-	if err == nil {
-		return
-	}
-	msg := err.Error()
-	isQuota := stderrors.Is(err, ErrObjExtentOverQuota) || strings.Contains(msg, ErrObjExtentOverQuota.Error())
-	if isQuota {
-		log.LogWarnf("%s [%s] %s", remoteAddr, opName, msg)
-	} else {
-		log.LogErrorf("%s [%s] %s", remoteAddr, opName, msg)
-	}
 }
 
 // opPing handles a lightweight ping request for latency measurement
@@ -1931,7 +1916,13 @@ func (m *metadataManager) opMetaBatchObjExtentsAdd(conn net.Conn, p *Packet, rem
 		err = mp.BatchObjExtentAppend(req, p)
 	}
 	if err != nil {
-		logBatchObjExtentsAddErr(err, remoteAddr, "opMetaBatchObjExtentsAdd")
+		msg := err.Error()
+		isQuota := strings.Contains(msg, "over quota")
+		if isQuota {
+			log.LogWarnf("%s [%s] %s", remoteAddr, "opMetaBatchObjExtentsAdd", msg)
+		} else {
+			log.LogErrorf("%s [%s] %s", remoteAddr, "opMetaBatchObjExtentsAdd", msg)
+		}
 	}
 
 	m.updatePackRspSeq(mp, p)

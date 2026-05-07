@@ -31,8 +31,6 @@ import (
 	"github.com/cubefs/cubefs/util/timeutil"
 )
 
-var ErrObjExtentOverQuota = stderrors.New("over quota")
-
 func (mp *metaPartition) CheckQuota(inodeId uint64, p *Packet) (iParm *Inode, inode *Inode, err error) {
 	iParm = NewInode(inodeId, 0)
 	status := mp.isOverQuota(inodeId, true, false)
@@ -791,7 +789,7 @@ func (mp *metaPartition) BatchObjExtentAppendWithCheck(req *proto.AppendObjExten
 	status := mp.isOverQuota(req.Inode, true, false)
 	if status != 0 {
 		log.LogWarnf("BatchObjExtentAppendWithCheck fail status [%v]", status)
-		err = ErrObjExtentOverQuota
+		err = stderrors.New("over quota")
 		p.PacketErrorWithBody(status, []byte(err.Error()))
 		return
 	}

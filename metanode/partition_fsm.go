@@ -319,7 +319,7 @@ func (mp *metaPartition) Apply(command []byte, index uint64) (resp interface{}, 
 		if err = ino.Unmarshal(msg.V); err != nil {
 			return
 		}
-		resp = mp.fsmAppendObjExtentsWithCheck(ino)
+		resp, _ = mp.fsmAppendObjExtentsWithCheck(dbWriteHandle, ino)
 	case opFSMSentToChan:
 		resp = mp.fsmSendToChan(msg.V, false)
 	case opFSMSentToChanWithVer:

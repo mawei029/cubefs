@@ -45,7 +45,6 @@ func newTestMetaPartition(rootDir string, ctrl *gomock.Controller) *metaPartitio
 	}
 	mp := newPartition(config, newManager())
 	mp.stopC = make(chan bool)
-	mp.objExtDelCh = make(chan []proto.ObjExtentKey, 100)
 
 	// Mock raft: leader + Submit applies through FSM (obj extent GC dequeue/punish).
 	if ctrl != nil {

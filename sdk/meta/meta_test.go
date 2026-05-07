@@ -17,11 +17,13 @@ package meta
 import (
 	"encoding/json"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/cubefs/cubefs/proto"
 	masterSDK "github.com/cubefs/cubefs/sdk/master"
+	"github.com/cubefs/cubefs/util/btree"
 	"github.com/stretchr/testify/require"
 )
 
@@ -120,7 +122,7 @@ func TestMetaWrapper_getMetaHostsMap_errorFromMaster(t *testing.T) {
 	require.Equal(t, 0, len(hosts))
 }
 
-// TestTruncateV2Request verifies TruncateV2 request serialization (OpMetaTruncate payload sent from SDK to metanode).
+// TestTruncateV2Request 校验 TruncateV2 请求可正确序列化（SDK 发往 metanode 的 OpMetaTruncate 载荷）。
 func TestTruncateV2Request(t *testing.T) {
 	req := &proto.TruncateRequest{
 		VolName:       "vol",
@@ -140,4 +142,13 @@ func TestTruncateV2Request(t *testing.T) {
 	require.True(t, decoded.TruncateV2)
 	require.Equal(t, uint64(150), decoded.Size)
 	require.Len(t, decoded.NewObjExtents, 2)
+}
+
+func TestCoverageMetaWrapperTruncateV2_NoPartition(t *testing.T) {
+	mw := &MetaWrapper{
+		partitions: make(map[uint64]*MetaPartition),
+		ranges:     btree.New(8),
+	}
+	err := mw.TruncateV2(100, 64, "/x", nil, nil)
+	require.ErrorIs(t, err, syscall.ENOENT)
 }

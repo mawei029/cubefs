@@ -820,7 +820,7 @@ func (mp *metaPartition) fsmAppendObjExtents(dbHandle interface{}, inoParam *Ino
 }
 
 // fsmAppendObjExtentsWithCheck performs conflict checking and atomically updates inode extents via FSM
-func (mp *metaPartition) fsmAppendObjExtentsWithCheck(inoParam *Inode) (status uint8) {
+func (mp *metaPartition) fsmAppendObjExtentsWithCheck(dbHandle interface{}, inoParam *Inode) (status uint8, err error) {
 	mpId := mp.config.PartitionId
 	inoId := inoParam.Inode
 
@@ -832,18 +832,18 @@ func (mp *metaPartition) fsmAppendObjExtentsWithCheck(inoParam *Inode) (status u
 	}
 	if fsmIno == nil {
 		log.LogInfof("action[fsmAppendObjExtentsWithCheck] mp[%v] inode[%v] not exist", mpId, inoId)
-		return proto.OpNotExistErr
+		return proto.OpNotExistErr, nil
 	}
 	if fsmIno.ShouldDelete() {
 		log.LogInfof("action[fsmAppendObjExtentsWithCheck] mp[%v] inode[%v] already deleted", mpId, inoId)
-		return proto.OpNotExistErr
+		return proto.OpNotExistErr, nil
 	}
 	log.LogDebugf("action[fsmAppendObjExtentsWithCheck] mp[%v] inode[%v] ino[%v], req[%v]", mpId, inoId, fsmIno.String(), inoParam.String())
 
 	// Update storage class
 	if err := fsmIno.updateStorageClass(inoParam.StorageClass, fsmIno.PoolId, false); err != nil {
 		log.LogErrorf("action[fsmAppendObjExtentsWithCheck] mp[%v] inode[%v] updateStorageClass failed: %v", mpId, inoId, err)
-		return proto.OpMismatchStorageClass
+		return proto.OpMismatchStorageClass, nil
 	}
 
 	// Extract pairs new extent and discard extent from input
@@ -856,7 +856,7 @@ func (mp *metaPartition) fsmAppendObjExtentsWithCheck(inoParam *Inode) (status u
 	}
 	if len(requestEks) < 2 || len(requestEks)%2 != 0 {
 		log.LogErrorf("action[fsmAppendObjExtentsWithCheck] mp[%v] inode[%v] OpArgMismatchErr: extents must be pairs (new,discard), len(requestEks)=%v", mpId, inoId, len(requestEks))
-		return proto.OpArgMismatchErr
+		return proto.OpArgMismatchErr, nil
 	}
 
 	// Check if the new extent is already exist
@@ -876,7 +876,7 @@ func (mp *metaPartition) fsmAppendObjExtentsWithCheck(inoParam *Inode) (status u
 		// Check conflicts and append/update extent
 		status, finalEks := mp.appendObjExtentsCheck(mpId, inoId, eksInInode, newExtent, discardExtent)
 		if status != proto.OpOk {
-			return status
+			return status, nil
 		}
 		eksInInode = finalEks
 		if !discardExtent.IsEmpty() {
@@ -899,9 +899,14 @@ func (mp *metaPartition) fsmAppendObjExtentsWithCheck(inoParam *Inode) (status u
 		mp.objExtentDelTree.EnqueueFromApply(inoId, inoParam.ModifyTime, mp.fsmRaftApplyIndex, toDelete)
 	}
 
+	if err = mp.inodeTree.Update(dbHandle, fsmIno); err != nil {
+		log.LogErrorf("fsmAppendObjExtentsWithCheck mp(%v) inode(%v) Put error: %v", mpId, inoId, err)
+		return proto.OpErr, err
+	}
+
 	log.LogDebugf("fsm update success, mp[%d] inode[%d] success, finalEks count[%d] gen[%d] discardCount[%d]",
 		mpId, inoId, len(eksInInode), fsmIno.Generation, len(toDelete))
-	return proto.OpOk
+	return proto.OpOk, nil
 }
 
 // appendObjExtentsCheck checks conflicts between existing extents and new extent, then appends or updates.
