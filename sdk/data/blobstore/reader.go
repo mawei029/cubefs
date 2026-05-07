@@ -59,7 +59,7 @@ type rwSlice struct {
 	read         int
 	Data         []byte
 	objExtentKey proto.ObjExtentKey
-	// hole：对应 [start,end) 落在尚无 ObjExtent 覆盖的区间，Data 已预置为 0，readSliceRange 不调 EBS。
+	// hole marks [start,end) ranges that are not covered by any ObjExtent; Data is pre-filled with zeros and readSliceRange skips EBS.
 	hole bool
 }
 
@@ -94,17 +94,17 @@ type Reader struct {
 	inflightCache sync.Map
 	limitManager  *manager.LimitManager
 
-	// extentsGeneration / metaReportedSize：来自 MetaWrapper.GetObjExtents（与 proto.GetObjExtentsResponse 的 Generation、Size 一致），
-	// 在 extent 列表变化时递增，可作「数据视图版本」指纹；成功 refresh 后有效。
+	// extentsGeneration / metaReportedSize come from MetaWrapper.GetObjExtents (same meaning as Generation/Size in proto.GetObjExtentsResponse),
+	// they increase when extent list changes and can be used as a data-view version fingerprint; valid after successful refresh.
 	extentsGeneration uint64
 	metaReportedSize  uint64
-	// inodeViewGen / inodeViewSize：与 file 层 InodeGet 对齐的 inode 代数与长度；用于 EnsureAlignedForRead 判断 Reader 缓存是否落后于 meta。
+	// inodeViewGen / inodeViewSize are inode generation/size aligned with file-layer InodeGet; used by EnsureAlignedForRead to detect stale Reader cache.
 	inodeViewGen  uint64
 	inodeViewSize uint64
 
-	// blockSize + readBuf：EC/BlobStore 读路径在「开启 aheadRead 且文件大于 minReadAheadSize」时，
-	// 将多次 FUSE 小读（如 max_read=128KiB）合并为至多 blockSize（EbsBlockSize）一次的 EBS 拉取，结果缓存在 readBuf。
-	// 与副本流 AheadReadWindow 的开关语义类似，实现是 Reader 内缓冲而非 stream 模块。
+	// blockSize + readBuf: when aheadRead is enabled and file size is larger than minReadAheadSize in EC/BlobStore reads,
+	// merge multiple small FUSE reads (for example max_read=128KiB) into at most one EBS fetch of blockSize (EbsBlockSize), and cache result in readBuf.
+	// Semantics are similar to replica-stream AheadReadWindow, but implementation is Reader-side buffering instead of stream module logic.
 	blockSize        int
 	aheadReadEnable  bool
 	minReadAheadSize uint64
@@ -214,7 +214,7 @@ func NewReader(config ClientConfig) (reader *Reader) {
 	return
 }
 
-// ensurePrefetchBuf 保证 readBuf 至少为 blockSize，并向全局 prefetch 预算记账；预算不足时返回 false，Read 将退化为按次 readEbsRange。
+// ensurePrefetchBuf ensures readBuf capacity is at least blockSize and reserves global prefetch budget; on budget shortage it returns false and Read falls back to per-call readEbsRange.
 func (reader *Reader) ensurePrefetchBuf() bool {
 	if reader.blockSize <= 0 {
 		return false
@@ -285,28 +285,28 @@ func (reader *Reader) Read(ctx context.Context, buf []byte, offset int, size int
 		return n, nil
 	}
 
-	// 预读门控：必须配置 blockSize、挂载打开 aheadRead，且文件长度大于 minReadAheadSize（与 stream 侧一致，避免小文件多占缓冲）。
+	// Prefetch gate: requires blockSize configured, mount-level aheadRead enabled, and file length > minReadAheadSize (same as stream-side policy to avoid over-buffering small files).
 	usePrefetch := reader.blockSize > 0 && reader.aheadReadEnable && fileSize > reader.minReadAheadSize
-	// case 1: 未开预读或文件过小 → 每调一次 readEbsRange;
+	// case 1: prefetch disabled or file too small -> each call does one readEbsRange;
 	if !usePrefetch {
 		return normalReadFunc()
 	}
 
-	// case 2: 预读预算失败, 全局 prefetch 内存池用尽：本趟仍保证读对，但不建 readBuf → 同上兜底；
+	// case 2: prefetch budget reservation failed and global prefetch pool is exhausted: still read correctly but without readBuf, fallback as above;
 	if !reader.ensurePrefetchBuf() {
 		return normalReadFunc()
 	}
 
-	// case3: 单次请求不小于 blockSize：无法放入预读窗口，直接走 EBS 范围读并丢弃缓冲，避免半块逻辑
+	// case 3: single request >= blockSize: cannot fit prefetch window, read EBS range directly and invalidate buffer to avoid half-block logic.
 	if size >= reader.blockSize {
 		reader.invalidateReadBuf()
 		return normalReadFunc()
 	}
 
-	// case4: 聚合小读 预读窗口：一次 readEbsRange 最多拉 [offset, offset+fetch)，fetch≤blockSize；同一窗口内多次 FUSE Read 只拷 readBuf 不重复访问 EBS。
+	// case 4: aggregate small reads with prefetch window: one readEbsRange fetches at most [offset, offset+fetch), fetch<=blockSize; repeated FUSE reads in same window copy from readBuf without extra EBS calls.
 	ebsFetchSize := 0
 	if reader.bufValidLen == 0 || offset < reader.bufBaseOff || offset >= reader.bufBaseOff+reader.bufValidLen {
-		// 缓冲空、或请求落在当前缓冲窗口外 → 作废旧窗口，按新 offset 重新拉一块
+		// Buffer is empty or request falls outside current window -> invalidate old window and fetch a new block from the new offset.
 		reader.invalidateReadBuf()
 		fetch := reader.blockSize
 		rem := int(fileSize - uint64(offset))
@@ -351,7 +351,7 @@ func (reader *Reader) Read(ctx context.Context, buf []byte, offset int, size int
 		return normalReadFunc()
 	}
 
-	// case4.1 从 readBuf 拷出数据到目的地buf
+	// case 4.1: copy data from readBuf to destination buffer.
 	winStart := offset - reader.bufBaseOff
 	copy(buf, reader.readBuf[winStart:winStart+size])
 
@@ -360,8 +360,8 @@ func (reader *Reader) Read(ctx context.Context, buf []byte, offset int, size int
 	return size, nil
 }
 
-// readEbsRange 按 ObjExtent 切分并行 readSliceRange，每个切片最终调用 BlobStoreClient.Read（access.Get + ReadFull）。
-// 调用方须已持 reader.Mutex。
+// readEbsRange splits ranges by ObjExtent and runs readSliceRange in parallel; each slice eventually calls BlobStoreClient.Read (access.Get + ReadFull).
+// Caller must already hold reader.Mutex.
 func (reader *Reader) readEbsRange(ctx context.Context, offset int, size uint32) ([]byte, error) {
 	rSlices, err := reader.prepareEbsSlice(offset, size)
 	log.LogDebugf("TRACE reader readEbsRange. ino(%v)  rSlices-length(%v) ", reader.ino, len(rSlices))
@@ -395,7 +395,7 @@ func (reader *Reader) readEbsRange(ctx context.Context, offset int, size uint32)
 	return out, nil
 }
 
-// invalidateReadBuf 清空预读窗口（不释放底层切片），下次 Read 会重新 readEbsRange。
+// invalidateReadBuf clears prefetch window (without freeing underlying slice); next Read will run readEbsRange again.
 func (reader *Reader) invalidateReadBuf() {
 	reader.bufValidLen = 0
 	reader.bufBaseOff = 0
@@ -411,8 +411,8 @@ func (reader *Reader) Close(ctx context.Context) {
 	reader.Unlock()
 }
 
-// prepareEbsSlice 将 [offset, offset+size) 切成若干 rwSlice：洞区间用 hole=true、全 0；与 ObjExtent 重叠部分用
-// rOffset/rSize 表示在该 extent 对象内的读区间（须满足 rOffset+rSize<=oek.Size，否则 access.Get 会 ErrIllegalArguments）。
+// prepareEbsSlice splits [offset, offset+size) into rwSlices: hole ranges are marked hole=true and zero-filled; overlapping ObjExtent ranges use
+// rOffset/rSize to describe read region inside that extent object (must satisfy rOffset+rSize<=oek.Size, otherwise access.Get returns ErrIllegalArguments).
 func (reader *Reader) prepareEbsSlice(offset int, size uint32) ([]*rwSlice, error) {
 	if offset < 0 {
 		return nil, syscall.EIO
@@ -502,7 +502,7 @@ func (reader *Reader) prepareEbsSlice(offset int, size uint32) ([]*rwSlice, erro
 	return chunks, nil
 }
 
-// readSliceRange 在任务池里处理单个 rwSlice：先尝试块缓存命中，否则限流后对单段 ObjExtent 调用 ebs.Read。
+// readSliceRange handles one rwSlice in worker pool: try block-cache hit first, otherwise throttle and call ebs.Read for the single ObjExtent slice.
 func (reader *Reader) readSliceRange(ctx context.Context, rs *rwSlice) (err error) {
 	defer reader.wg.Done()
 	if rs.hole {
@@ -557,7 +557,7 @@ func (reader *Reader) readSliceRange(ctx context.Context, rs *rwSlice) (err erro
 	read := copy(rs.Data, buf)
 	reader.err <- nil
 
-	// 开启块缓存且客户端存在时：异步按整 ObjExtent 读入并 Put L1；否则直接返回（本路径不再误触发 asyncCache）。
+	// When block cache is enabled and client exists: asynchronously read full ObjExtent and Put into L1; otherwise return directly (this path no longer triggers asyncCache by mistake).
 	if !reader.needCacheL1() || reader.bc == nil {
 		log.LogDebugf("TRACE blobStore readSliceRange exit without cache. read counter=%v", read)
 		return nil
@@ -579,7 +579,7 @@ func (reader *Reader) asyncCache(ctx context.Context, cacheKey string, objExtent
 
 	log.LogDebugf("TRACE blobStore asyncCache Enter. cacheKey=%v", cacheKey)
 
-	// 同一 cacheKey 仅允许一处异步回填，避免并发重复读 EBS。
+	// Only one async refill is allowed per cacheKey to avoid duplicated concurrent EBS reads.
 	if _, ok := reader.inflightCache.Load(cacheKey); ok {
 		return
 	}
@@ -606,8 +606,8 @@ func (reader *Reader) needCacheL1() bool {
 	return reader.enableBcache
 }
 
-// ensureExtentsLoaded 在尚未成功拉取 ObjExtents 时向 meta 拉取一次（valid=false 时重试）。
-// 与历史行为一致：拉取失败时对上层返回 syscall.EIO，便于 FUSE 路径处理。
+// ensureExtentsLoaded fetches ObjExtents from meta when they were not loaded successfully yet (retry when valid=false).
+// Keep historical behavior: return syscall.EIO to upper layers on fetch failure for easier FUSE-path handling.
 func (reader *Reader) ensureExtentsLoaded() error {
 	if reader.valid {
 		return nil
@@ -618,8 +618,8 @@ func (reader *Reader) ensureExtentsLoaded() error {
 	return nil
 }
 
-// EnsureAlignedForRead 用 file 层 InodeGet 得到的 Generation/Size 与 Reader 内缓存对比；不一致则 RefreshExtents，
-// 用于写入或截断后 inode 与 ObjExtents 已前进但 Reader 仍持有旧 extent 列表的情况。
+// EnsureAlignedForRead compares file-layer InodeGet Generation/Size against Reader cache; refresh extents on mismatch,
+// used when inode/ObjExtents have advanced after write/truncate while Reader still holds stale extent list.
 func (reader *Reader) EnsureAlignedForRead(inodeGen, inodeSize uint64) error {
 	var stale bool
 	reader.Lock()
@@ -638,7 +638,7 @@ func (reader *Reader) EnsureAlignedForRead(inodeGen, inodeSize uint64) error {
 	return nil
 }
 
-// SyncInodeView 在已通过 RefreshExtents 等路径与 meta 对齐后，更新 inode 视图锚点，避免下一次 Read 误判为落后。
+// SyncInodeView updates inode-view anchor after alignment with meta (for example via RefreshExtents), preventing next Read from false stale detection.
 func (reader *Reader) SyncInodeView(inodeGen, inodeSize uint64) {
 	reader.Lock()
 	defer reader.Unlock()
@@ -675,8 +675,8 @@ func (reader *Reader) fileSize() (uint64, bool) {
 	return 0, true
 }
 
-// RefreshExtents 从 meta 重新拉取 ObjExtents 并更新缓存，供 Truncate 后调用，使后续 Read 使用新 extent 与 size。
-// 不在持锁状态下调用 GetObjExtents，避免阻塞其他 Read。
+// RefreshExtents re-fetches ObjExtents from meta and updates cache; used after truncate so later Reads use updated extents and size.
+// Do not call GetObjExtents while holding lock to avoid blocking other Reads.
 func (reader *Reader) RefreshExtents() error {
 	gen, sz, eks, oeks, err := reader.mw.GetObjExtents(reader.ino)
 	if err != nil {

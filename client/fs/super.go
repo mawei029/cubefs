@@ -132,7 +132,7 @@ type Super struct {
 // BlobStoreAheadReadForReader returns mount ahead-read flags for blobstore.Reader.
 // Replica path: ExtentClient uses AheadReadWindow (pooled blocks + background prefetch).
 // Blob/EC path: Reader uses a sequential buffer to merge FUSE-sized reads into one EBS read up to EbsBlockSize.
-// Same knobs: aheadReadEnable, minReadAheadSize（默认见 proto.InitMountOptions 中 MinReadAheadSize，通常为 1MiB；小于该长度的文件不启用 Reader 内预读窗口）。
+// Same knobs: aheadReadEnable and minReadAheadSize (default comes from proto.InitMountOptions.MinReadAheadSize, usually 1 MiB; files smaller than this do not use the Reader prefetch window).
 func (s *Super) BlobStoreAheadReadForReader() (enable bool, minReadAhead int, totalMem int64) {
 	return s.aheadReadEnable, int(s.minReadAheadSize), s.aheadReadTotalMem
 }

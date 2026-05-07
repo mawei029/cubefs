@@ -801,9 +801,10 @@ type TruncateRequest struct {
 	PartitionID   uint64         `json:"pid"`
 	Inode         uint64         `json:"ino"`
 	Size          uint64         `json:"sz"`
-	TruncateV2    bool           `json:"truncateV2"`    // true 表示 EC 卷 TruncateV2，metanode 用 NewObjExtents 替换并跳过 objExtDelCh
-	NewObjExtents []ObjExtentKey `json:"newObjExtents"` // TruncateV2 时由 client 计算的新 obj extent 列表
-	ToDeletes     []ObjExtentKey `json:"toDeletes"`     // TruncateV2 时由 client 计算的待删 obj extent 列表
+	Timestamp     int64          `json:"timestamp"`
+	TruncateV2    bool           `json:"truncateV2"`    // true means EC TruncateV2; metanode replaces with NewObjExtents and skips objExtDelCh
+	NewObjExtents []ObjExtentKey `json:"newObjExtents"` // new obj extent list computed by client for TruncateV2
+	ToDeletes     []ObjExtentKey `json:"toDeletes"`     // obj extent list to delete, computed by client for TruncateV2
 	RequestExtend
 }
 

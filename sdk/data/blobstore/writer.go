@@ -42,15 +42,15 @@ const (
 var errPutNoKeys = errors.New("ebs put returned no extent keys")
 
 // overwriteReq represents an overwrite request that contains both the new extent and the old extent
-// 与 computeOverwriteReqs / flushOverwriteReqs 使用的结构一致，TruncateV2 复用同一类型
-// overwriteReq 表示一次覆盖请求：新写入范围 NewExtent，以及需要废弃的旧范围 DiscardExtent（可为空）。
-// 与 writer 的 flushExt/computeOverwriteReqs 共用同一结构，TruncateV2 复用时仅产生至多一个部分重叠的 req。
+// Same structure used by computeOverwriteReqs/flushOverwriteReqs; TruncateV2 reuses this type.
+// overwriteReq describes one overwrite request: new written range NewExtent and old range to discard DiscardExtent (optional).
+// Shared by writer flushExt/computeOverwriteReqs; in TruncateV2 reuse there is at most one partially-overlapped request.
 type overwriteReq struct {
-	NewExtent     proto.ObjExtentKey // 要写入的新范围（部分重叠时为截断后的范围）
-	DiscardExtent proto.ObjExtentKey // 需要废弃的旧 extent（可为空）
+	NewExtent     proto.ObjExtentKey // Newly written range (trimmed range when partial overlap happens).
+	DiscardExtent proto.ObjExtentKey // Old extent to discard (optional).
 }
 
-// truncateReq 为 TruncateV2 的请求结果：保留的 extents、至多一个部分重叠的 OverwriteReq、仅需删除的 extents。
+// truncateReq is TruncateV2 planning result: kept extents, at most one partially-overlapped OverwriteReq, and delete-only extents.
 type truncateReq struct {
 	KeepExtents   []proto.ObjExtentKey
 	OverwriteReqs []overwriteReq
@@ -154,15 +154,15 @@ func (writer *Writer) Write(ctx context.Context, offset int, data []byte, flags 
 		return 0, syscall.EOPNOTSUPP
 	}
 
-	// Case 1.1: O_APPEND：内核保证写到当前尾，offset 必须与 CacheFileSize 一致。
+	// Case 1.1: O_APPEND - kernel guarantees append-to-end, so offset must equal CacheFileSize.
 	if flags&proto.FlagsAppend != 0 && offset != writer.CacheFileSize() {
 		log.LogErrorf("filesize need reset. blobStore Write: ino(%v) offset(%v) len(%v) flags&proto.FlagsAppend(%v) fileSize(%v) overwrite(%t)",
 			writer.ino, offset, len(data), flags&proto.FlagsAppend, writer.CacheFileSize(), writer.overwrite)
 		return 0, syscall.EOPNOTSUPP
 	}
 
-	// Case 2: pwrite：offset 小于当前长度（覆盖）或大于当前长度（稀疏/先洞后写）均走 tryOverWrite，与 extent 合并或写 hole 后新范围。
-	// 仅当 offset == CacheFileSize() 时为顺序追加，走缓冲/直写路径。
+	// Case 2: pwrite - offset < current size (overwrite) or > current size (sparse / hole-then-write) both go through tryOverWrite to merge with extents or create new range after hole.
+	// Only offset == CacheFileSize() is sequential append, which goes through buffered/direct-write path.
 	if offset != writer.CacheFileSize() {
 		return writer.tryOverWrite(ctx, offset, data, flags)
 	}
@@ -242,7 +242,7 @@ func (writer *Writer) tryOverWrite(ctx context.Context, offset int, data []byte,
 		atomic.StoreUint64(&writer.fileSize, uint64(offset+len(data)))
 	}
 
-	// 未满整块的数据仍在 buf 中：必须 flush，否则 Read 只走 EBS/meta 会看不到本次 pwrite/稀疏写。
+	// Partial block data still in buf must be flushed, otherwise Read (which uses EBS/meta) will not observe this pwrite/sparse write.
 	if writer.dirty && writer.blockPosition > 0 {
 		if err = writer.flushExt(writer.ino, ctx, false); err != nil {
 			log.LogErrorf("TRACE blobStore tryOverWrite error, final flush ext fail,ino(%v) offset(%v) len(%v) err(%v)",
@@ -927,24 +927,22 @@ func (writer *Writer) CacheFileSize() int {
 	return int(atomic.LoadUint64(&writer.fileSize))
 }
 
-// SetFileSize 用于 Truncate 后同步 writer 内部 fileSize，使后续 Append/Write 与 CacheFileSize() 与 meta 一致。
+// SetFileSize syncs writer internal fileSize after truncate so later Append/Write and CacheFileSize() stay consistent with meta.
 func (writer *Writer) SetFileSize(size uint64) {
 	atomic.StoreUint64(&writer.fileSize, size)
 }
 
-// TruncateV2：先将 buf 中下刷（Flush/flushExt），再 GetObjExtents；否则 meta/ObjExtents 落后于未落盘数据，截断会基于陈旧视图。
-// targetSize < 当前逻辑长度时经 ebsc.TruncateV2Extents 做 EBS 裁剪并返回新列表；
-// targetSize >= 当前长度时直接返回现有列表（仅由上层 MetaWrapper.TruncateV2 更新 meta，不写 EBS）。
-// 调用链：File.doECTruncateV2 → Writer.TruncateV2 →（裁剪时）BlobStoreClient.TruncateV2Extents → mw.TruncateV2。
+// TruncateV2 first flushes buffered data (Flush/flushExt), then calls GetObjExtents; otherwise truncate may operate on stale meta/ObjExtents view.
+// When targetSize < current logical size, call ebsc.TruncateV2Extents to shrink EBS and return new extent list;
+// when targetSize >= current size, return existing list directly (upper-layer MetaWrapper.TruncateV2 updates meta only, no EBS write).
+// Call chain: File.doECTruncateV2 -> Writer.TruncateV2 -> (shrink path) BlobStoreClient.TruncateV2Extents -> mw.TruncateV2.
 func (writer *Writer) TruncateV2(ctx context.Context, targetSize uint64,
 ) (newObjExtents []proto.ObjExtentKey, toDelete []proto.ObjExtentKey, err error) {
 	if writer == nil || writer.mw == nil || writer.ebsc == nil {
 		return nil, nil, fmt.Errorf("Writer.TruncateV2: writer/mw/ebsc nil")
 	}
-	if err = writer.Flush(writer.ino, ctx); err != nil {
-		log.LogErrorf("TruncateV2: pre-flush ino(%v) err(%v)", writer.ino, err)
-		return nil, nil, err
-	}
+	// don't need to flush here, because the truncate is already done in the file.truncateV2 function
+
 	_, currentSize, _, objExtents, err := writer.mw.GetObjExtents(writer.ino)
 	if err != nil {
 		log.LogErrorf("TruncateV2: ino(%v) GetObjExtents err(%v)", writer.ino, err)

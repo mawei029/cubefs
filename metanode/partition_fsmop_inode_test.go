@@ -478,7 +478,7 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 	mp.uniqChecker = newUniqChecker()
 	mp.vol = NewVol()
 
-	// ==================== 基础错误场景 ====================
+	// ==================== Basic error scenarios ====================
 	t.Run("error - inode not exist", func(t *testing.T) {
 		inoParam := NewInode(9999, 0)
 		inoParam.StorageClass = proto.StorageClass_BlobStore
@@ -520,7 +520,7 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 		require.Equal(t, proto.OpArgMismatchErr, status2)
 	})
 
-	// ==================== 成功场景 - 插入新数据 ====================
+	// ==================== Success scenario - insert new data ====================
 	t.Run("success - insert to empty extents", func(t *testing.T) {
 		handle, err := mp.inodeTree.CreateBatchWriteHandle()
 		require.NoError(t, err)
@@ -609,7 +609,7 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 		require.Equal(t, uint64(500), extents[3].FileOffset)
 	})
 
-	// ==================== 成功场景 - 冲突检测（替换和扩展）====================
+	// ==================== Success scenario - conflict checks (replace and extend) ====================
 	t.Run("success - exact match replace", func(t *testing.T) {
 		handle, err := mp.inodeTree.CreateBatchWriteHandle()
 		require.NoError(t, err)
@@ -679,7 +679,7 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 		require.Equal(t, uint64(150), extents[0].Size)
 	})
 
-	// ==================== 错误场景 - 冲突检测 ====================
+	// ==================== Error scenario - conflict checks ====================
 	t.Run("error - no overlap but discard provided", func(t *testing.T) {
 		handle, err := mp.inodeTree.CreateBatchWriteHandle()
 		require.NoError(t, err)
@@ -781,7 +781,7 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 		require.Equal(t, proto.OpConflictExtentsErr, status2)
 	})
 
-	// ==================== 重复执行场景 - 幂等性测试 ====================
+	// ==================== Repeated execution scenario - idempotency test ====================
 	t.Run("success - repeat insert same extent", func(t *testing.T) {
 		handle, err := mp.inodeTree.CreateBatchWriteHandle()
 		require.NoError(t, err)
@@ -879,8 +879,8 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 	})
 }
 
-// TestFsmExtentsTruncateV2 校验 EC 卷 TruncateV2 FSM：更新 inode.Size 与 ObjExtents，
-// 并将 ToDeletes 投递到 objExtentDelTree。
+// TestFsmExtentsTruncateV2 verifies EC TruncateV2 FSM: update inode.Size and ObjExtents,
+// and enqueue ToDeletes into objExtentDelTree.
 func TestFsmExtentsTruncateV2(t *testing.T) {
 	mpC := &MetaPartitionConfig{
 		PartitionId:   10001,
@@ -904,6 +904,7 @@ func TestFsmExtentsTruncateV2(t *testing.T) {
 	mp.mqMgr = NewQuotaManager(mpC.VolName, mpC.PartitionId)
 	mp.uniqChecker = newUniqChecker()
 	mp.vol = NewVol()
+	mp.fsmRaftApplyIndex = 12345
 
 	const inoId = 9001
 	handle, err := mp.inodeTree.CreateBatchWriteHandle()
@@ -919,7 +920,7 @@ func TestFsmExtentsTruncateV2(t *testing.T) {
 	err = mp.inodeTree.CommitAndReleaseBatchWriteHandle(handle, false)
 	require.NoError(t, err)
 
-	// TruncateV2: 截断到 150，新 extent 列表为 [0,100) + [100,150)（后者由 client 侧 EBS 截断后得到）
+	// TruncateV2: truncate to 150, new extents become [0,100) + [100,150) (the latter comes from client-side EBS truncation).
 	newObjExtents := []proto.ObjExtentKey{
 		{FileOffset: 0, Size: 100},
 		{FileOffset: 100, Size: 50},
@@ -956,5 +957,7 @@ func TestFsmExtentsTruncateV2(t *testing.T) {
 	require.Equal(t, 1, mp.objExtentDelTree.Len())
 	items := mp.objExtentDelTree.PeekFirstN(1)
 	require.Len(t, items, 1)
+	require.Equal(t, int64(mp.fsmRaftApplyIndex), items[0].TsMs)
+	require.Equal(t, mp.fsmRaftApplyIndex<<20, items[0].Uniq)
 	require.True(t, items[0].Oek.IsEquals(&toDeletes[0]))
 }

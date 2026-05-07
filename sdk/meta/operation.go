@@ -1578,7 +1578,7 @@ func (mw *MetaWrapper) truncate(mp *MetaPartition, inode, size uint64, fullPath 
 	return statusOK, nil
 }
 
-// truncateV2 用于 EC 卷：client 已完成 EBS 的读/截断/写/删，仅通知 metanode 更新 inode.Size 与 ObjExtents。
+// truncateV2 is for EC volumes: client already completed EBS read/truncate/write/delete, so only notify metanode to update inode.Size and ObjExtents.
 func (mw *MetaWrapper) truncateV2(mp *MetaPartition, inode, size uint64, fullPath string, newObjExtents, toDeletes []proto.ObjExtentKey) (status int, err error) {
 	bgTime := stat.BeginStat()
 	defer func() {
@@ -1590,6 +1590,7 @@ func (mw *MetaWrapper) truncateV2(mp *MetaPartition, inode, size uint64, fullPat
 		PartitionID:   mp.PartitionID,
 		Inode:         inode,
 		Size:          size,
+		Timestamp:     time.Now().Unix(),
 		TruncateV2:    true,
 		NewObjExtents: newObjExtents,
 		ToDeletes:     toDeletes,

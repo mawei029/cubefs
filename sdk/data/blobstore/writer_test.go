@@ -96,7 +96,7 @@ func TestNotInstanceWriter_Write(t *testing.T) {
 	}
 }
 
-// TestWriter_TruncateV2_NilReturnsError 校验 nil Writer 调用 TruncateV2 返回错误（EC truncate 基本分支）。
+// TestWriter_TruncateV2_NilReturnsError verifies nil Writer returns error on TruncateV2 (basic EC truncate branch).
 func TestWriter_TruncateV2_NilReturnsError(t *testing.T) {
 	w := newNilWriter()
 	ctx := context.Background()
@@ -406,7 +406,7 @@ func TestComputeOverwriteReqs(t *testing.T) {
 	}
 }
 
-// TestTryOverWrite_Basic tests tryOverWrite with basic scenario (small data);尾部未满块会经 flushExt 落盘并 resetBuffer。
+// TestTryOverWrite_Basic tests tryOverWrite with a basic scenario (small data); trailing partial block is persisted via flushExt and resetBuffer.
 func TestTryOverWrite_Basic(t *testing.T) {
 	ctx := context.Background()
 

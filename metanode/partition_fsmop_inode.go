@@ -910,6 +910,7 @@ func (mp *metaPartition) fsmAppendObjExtentsWithCheck(inoParam *Inode) (status u
 //   - Extend: new has same start as the last extent but larger end → same requirement, replace with newExtent.
 //   - Conflict: any other overlap (e.g. new inside existing, or overlapping multiple) → OpConflictExtentsErr.
 //   - Append: no overlap with any existing → require discard empty, then append newExtent (sorted).
+//
 // Returns (status, finalEks). existingExtents must be sorted by FileOffset.
 func (mp *metaPartition) appendObjExtentsCheck(mpId uint64, inoId uint64, existingExtents []proto.ObjExtentKey, newExtent, discardExtent proto.ObjExtentKey) (status uint8, finalEks []proto.ObjExtentKey) {
 	newStart := newExtent.FileOffset
@@ -1049,8 +1050,8 @@ func (mp *metaPartition) fsmExtentsTruncate(dbHandle interface{}, ino *Inode) (r
 	return
 }
 
-// fsmExtentsTruncateV2 处理 EC 卷 TruncateV2：更新 inode.Size 与 ObjExtents，
-// 并将 req.ToDeletes 投递到 objExtentDelTree（由后台 GC 异步删 EBS）。
+// fsmExtentsTruncateV2 handles EC TruncateV2: updates inode.Size and ObjExtents,
+// and enqueues req.ToDeletes into objExtentDelTree (background GC deletes EBS asynchronously).
 func (mp *metaPartition) fsmExtentsTruncateV2(dbHandle interface{}, req *proto.TruncateRequest) (resp *InodeResponse, err error) {
 	resp = NewInodeResponse()
 	resp.Status = proto.OpOk
@@ -1089,8 +1090,8 @@ func (mp *metaPartition) fsmExtentsTruncateV2(dbHandle interface{}, req *proto.T
 	}
 
 	if len(req.ToDeletes) > 0 && mp.objExtentDelTree != nil {
-		// TruncateRequest 无 ModifyTime 字段，按当前 Apply 时间入队。
-		mp.objExtentDelTree.EnqueueFromApply(req.Inode, time.Now().Unix(), mp.fsmRaftApplyIndex, req.ToDeletes)
+		// TruncateRequest has ModifyTime field,or Use ts=0 so all replicas derive TsMs from the same apply index.
+		mp.objExtentDelTree.EnqueueFromApply(req.Inode, req.Timestamp, mp.fsmRaftApplyIndex, req.ToDeletes)
 	}
 	log.LogDebugf("[fsmExtentsTruncateV2] mpId(%v) ino(%v) size(%v) newExtentsLen(%v) toDeletesLen(%v)",
 		mp.config.PartitionId, req.Inode, req.Size, len(newEks), len(req.ToDeletes))

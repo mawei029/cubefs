@@ -216,7 +216,7 @@ const (
 	// notify timestamp to followers
 	opFSMNotifyTimestamp = 94
 
-	// EC/BlobStore truncate V2: client 已处理 EBS，meta 仅更新 inode.Size 与 ObjExtents
+	// EC/BlobStore truncate V2: client already handled EBS; meta only updates inode.Size and ObjExtents.
 	opFSMExtentTruncateV2 = 95
 	// Obj extent del btree: dequeue after EBS success / punish-requeue after failure
 	opFSMObjExtentGcDequeue       = 96

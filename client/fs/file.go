@@ -455,7 +455,7 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 		if reader == nil {
 			return ParseError(syscall.EBADF)
 		}
-		// EC/BlobStore：先取 inode 代数与长度，若与 Reader 内 ObjExtents 视图不一致则刷新，再读数据
+		// EC/BlobStore: fetch inode generation/size first; refresh Reader ObjExtents view when it is stale before reading.
 		var info *proto.InodeInfo
 		info, err = f.super.InodeGet(f.ino)
 		if err != nil {
@@ -550,7 +550,7 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 	} else if proto.IsStorageClassBlobStore(storageClass) {
 		filesize, _ := f.fileSizeVersion2(ino)
 		if req.Offset > int64(filesize) && reqlen == 1 && req.Data[0] == 0 {
-			// posix_fallocate 在不支持 fallocate 时可能退化为「在目标尾写 1 字节 0」；与 Hot/Replica 分支语义对齐。
+			// posix_fallocate may degrade to writing one trailing zero byte when fallocate is unsupported; keep behavior aligned with Hot/Replica branch.
 			fullPath := path.Join(f.getParentPath(), f.name)
 			target := uint64(req.Offset) + uint64(reqlen)
 			if err = f.doECTruncateV2(ino, target, fullPath); err != nil {
@@ -668,8 +668,8 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 			return ParseError(err)
 		}
 	}
-	// RDWR 下可在写成功后调用 syncBlobReaderAfterMetaChange 立即对齐 Reader；当前分支未启用，
-	// 读侧依赖每次 Read 的 InodeGet + blobstore.Reader.EnsureAlignedForRead 刷新 ObjExtents。
+	// Under RDWR we can call syncBlobReaderAfterMetaChange right after successful writes to align Reader immediately; this branch keeps it disabled,
+	// and read path relies on InodeGet + blobstore.Reader.EnsureAlignedForRead on each Read to refresh ObjExtents.
 	elapsed := time.Since(start)
 	log.LogDebugf("TRACE Write: ino(%v) offset(%v) len(%v) flags(%v) fileflags(%v) req(%v) (%v) ",
 		ino, req.Offset, reqlen, req.Flags, req.FileFlags, req, elapsed.String())
@@ -729,7 +729,7 @@ func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) (err error) {
 		return ParseError(err)
 	}
 
-	// 同上：未在 Flush 后强制 syncBlobReaderAfterMetaChange。
+	// Same as above: syncBlobReaderAfterMetaChange is not forced after Flush.
 
 	if DisableMetaCache {
 		openForWrite := false
@@ -840,14 +840,14 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 	log.LogDebugf("Setattr: ino(%v) openForWrite(%v) isCache(%v) targetSize(%v) isHot(%v) storageClass(%v)",
 		ino, openForWrite, isCache, req.Valid.Size(), proto.IsHot(f.super.volType), storageClass)
 
-	// 按存储类互斥处理截断，避免 Hot 卷 + BlobStore 池同时走 ec.Truncate 与 doECTruncateV2。
+	// Handle truncate by storage-class-exclusive branches to avoid running ec.Truncate and doECTruncateV2 at the same time.
 	if req.Valid.Size() {
 		fullPath := path.Join(f.getParentPath(), f.name)
 		switch {
 		case proto.IsHot(f.super.volType) || proto.IsStorageClassReplica(storageClass):
 			// when use trunc param in open request through nfs client and mount on cfs mountPoint, cfs client may not recv open message but only setAttr,
 			// the streamer may not open and cause io error finally,so do a open no matter the stream be opened or not
-			// 副本 extent：NFS 等可能只来 Setattr 不来 Open，需先 OpenStream 再 Truncate。
+			// Replica extents: NFS may only send Setattr without Open, so open stream first then truncate.
 			if err := f.super.ec.OpenStream(ino, openForWrite, isCache, path.Join(f.getParentPath(), f.name)); err != nil {
 				log.LogErrorf("Setattr: OpenStream ino(%v) size(%v) err(%v)", ino, req.Size, err)
 				return ParseError(err)
@@ -866,14 +866,14 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 			f.super.ic.Delete(ino)
 			f.super.ec.RefreshExtentsCache(ino)
 		case proto.IsStorageClassBlobStore(storageClass):
-			// EC/Blob：TruncateV2 / mw.TruncateV2；doECTruncateV2 内会先 flush BlobStore Writer 再截断。
+			// EC/Blob path: TruncateV2 / mw.TruncateV2; doECTruncateV2 flushes BlobStore Writer before truncate.
 			if err = f.doECTruncateV2(ino, req.Size, fullPath); err != nil {
 				log.LogErrorf("Setattr: doECTruncateV2 ino(%v) size(%v) err(%v)", ino, req.Size, err)
 				return ParseError(err)
 			}
 			f.super.ic.Delete(ino)
 			f.super.ec.RefreshExtentsCache(ino)
-			// 截断后更新已打开 fd 上的 Writer 逻辑长度，并通过 syncBlobReaderAfterMetaChange 拉 ObjExtents + SyncInodeView。
+			// After truncate, update Writer logical file size on opened fds and sync Reader ObjExtents + inode view via syncBlobReaderAfterMetaChange.
 			if f.fWriter != nil {
 				f.fWriter.SetFileSize(req.Size)
 			}
@@ -881,7 +881,7 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 				f.syncBlobReaderAfterMetaChange(ino)
 			}
 		default:
-			// 其它 storageClass 的 size 变更未在此实现，由后续 setattr(meta) 等路径处理（若有）。
+			// Size changes for other storage classes are not handled here; they are left to later setattr(meta) paths if any.
 		}
 	}
 
@@ -915,8 +915,8 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 	return nil
 }
 
-// doECTruncateV2 执行 EC/BlobStore 卷的 truncate：目标 < 当前则裁剪；目标 > 当前则仅设 inode 大小后退出；目标 == 当前则直接退出；当前文件不存在则视为新建空文件并设大小。
-// 调用链（仅裁剪时）：doECTruncateV2 →（可选）ec.OpenStream/Flush → Writer.TruncateV2（内含 Writer.Flush）→ ebsc.TruncateV2Extents → mw.TruncateV2。
+// doECTruncateV2 handles truncate for EC/BlobStore volumes: shrink when target < current; update inode size only when target > current; no-op when equal; treat missing files as new empty files and set size.
+// Call chain (shrink only): doECTruncateV2 -> (optional) ec.OpenStream/Flush -> Writer.TruncateV2 (includes Writer.Flush) -> ebsc.TruncateV2Extents -> mw.TruncateV2.
 func (f *File) doECTruncateV2(ino uint64, targetSize uint64, fullPath string) error {
 	writer, err := f.ensureBlobStoreWriter(ino)
 	if err != nil {
@@ -927,25 +927,29 @@ func (f *File) doECTruncateV2(ino uint64, targetSize uint64, fullPath string) er
 		return err
 	}
 
-	// 获取当前文件大小与 extent；若不存在或无数据则 currentSize=0、objExtents=nil
+	// Fetch current file size and extents.
 	currentSize, objExtents, err := f.getECCurrentSizeAndExtents(ino)
 	if err != nil {
-		// 文件不存在或取 meta 失败：视为新建空文件，仅将 inode 大小设为 target 后退出
-		log.LogDebugf("doECTruncateV2: ino(%v) get current err(%v), treat as new empty file size(%v)", ino, err, targetSize)
-		return f.super.mw.TruncateV2(ino, targetSize, fullPath, nil, nil)
+		if err == syscall.ENOENT || strings.Contains(err.Error(), syscall.ENOENT.Error()) {
+			// File not found: treat as new empty file, set inode size to target, then exit.
+			log.LogDebugf("doECTruncateV2: ino(%v) not found, treat as new empty file size(%v)", ino, targetSize)
+			return f.super.mw.TruncateV2(ino, targetSize, fullPath, nil, nil)
+		}
+		log.LogErrorf("doECTruncateV2: ino(%v) get current extents err(%v)", ino, err)
+		return err
 	}
 
 	if targetSize == currentSize {
-		// 目标等于当前，不做任何操作直接退出
+		// Target equals current size: no-op and return immediately.
 		return nil
 	}
 
 	if targetSize > currentSize {
-		// 目标大于当前：只更新 meta 中 inode 大小为 target，不写 EBS，直接退出
+		// Target is larger than current: only update inode size in meta to target, do not write EBS, then return.
 		return f.super.mw.TruncateV2(ino, targetSize, fullPath, objExtents, nil)
 	}
 
-	// 目标小于当前：做裁剪，经 Writer 做 EBS 截断再更新 meta；复用 ensureBlobStoreWriter 保证 f.fWriter 已赋值
+	// Target is smaller than current: shrink via Writer/EBS first, then update meta; reuse ensureBlobStoreWriter to guarantee f.fWriter is initialized.
 	if err := f.super.ec.OpenStream(ino, true, true, fullPath); err != nil {
 		return err
 	}
@@ -962,8 +966,8 @@ func (f *File) doECTruncateV2(ino uint64, targetSize uint64, fullPath string) er
 	return f.super.mw.TruncateV2(ino, targetSize, fullPath, newObjExtents, toDeletes)
 }
 
-// syncBlobReaderAfterMetaChange：GetObjExtents 刷新 Reader 内 ObjExtents，再 InodeGet + SyncInodeView 对齐 inode 代数与长度。
-// 当前仅在 Setattr 截断 Blob 路径调用；Write/Flush/Fsync 未调用（见上文注释）。
+// syncBlobReaderAfterMetaChange refreshes Reader ObjExtents via GetObjExtents, then aligns inode generation/size through InodeGet + SyncInodeView.
+// Currently used only in Setattr truncate-for-Blob path; not called from Write/Flush/Fsync (see comments above).
 func (f *File) syncBlobReaderAfterMetaChange(ino uint64) {
 	if f.fReader == nil {
 		return
@@ -981,7 +985,7 @@ func (f *File) syncBlobReaderAfterMetaChange(ino uint64) {
 	f.fReader.SyncInodeView(info.Generation, info.Size)
 }
 
-// ensureBlobStoreWriter 保证 BlobStore 卷的 f.fWriter 已赋值；若为 nil 则按 Open 相同逻辑创建并赋值，供 doECTruncateV2 等复用。
+// ensureBlobStoreWriter guarantees f.fWriter is initialized for BlobStore volumes; when nil, create it with the same logic as Open for reuse by doECTruncateV2, etc.
 func (f *File) ensureBlobStoreWriter(ino uint64) (*blobstore.Writer, error) {
 	if f.fWriter != nil {
 		return f.fWriter, nil
@@ -1011,7 +1015,7 @@ func (f *File) ensureBlobStoreWriter(ino uint64) (*blobstore.Writer, error) {
 	return f.fWriter, nil
 }
 
-// getECCurrentSizeAndExtents 获取 EC/BlobStore 卷当前文件大小与 ObjExtents；若无数据或出错则 size=0、extents=nil、err!=nil。
+// getECCurrentSizeAndExtents returns current file size and ObjExtents for EC/BlobStore volumes; on missing data or errors, returns size=0, extents=nil, err!=nil.
 func (f *File) getECCurrentSizeAndExtents(ino uint64) (currentSize uint64, objExtents []proto.ObjExtentKey, err error) {
 	_, currentSize, _, objExtents, err = f.super.mw.GetObjExtents(ino)
 	if err != nil {

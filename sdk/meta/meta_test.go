@@ -120,7 +120,7 @@ func TestMetaWrapper_getMetaHostsMap_errorFromMaster(t *testing.T) {
 	require.Equal(t, 0, len(hosts))
 }
 
-// TestTruncateV2Request 校验 TruncateV2 请求可正确序列化（SDK 发往 metanode 的 OpMetaTruncate 载荷）。
+// TestTruncateV2Request verifies TruncateV2 request serialization (OpMetaTruncate payload sent from SDK to metanode).
 func TestTruncateV2Request(t *testing.T) {
 	req := &proto.TruncateRequest{
 		VolName:       "vol",

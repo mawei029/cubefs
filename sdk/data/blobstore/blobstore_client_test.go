@@ -218,7 +218,7 @@ func TestEbsClient_Write_Read(t *testing.T) {
 }
 
 func TestComputeOverwriteReqs_NoOverlap(t *testing.T) {
-	// buffer [100, 200)，extents 均在 200 之后，则仅产生一段新数据
+	// buffer [100, 200), when all extents start after 200, only one new segment is generated.
 	objExtents := []cproto.ObjExtentKey{
 		{FileOffset: 250, Size: 50},
 	}
@@ -230,7 +230,7 @@ func TestComputeOverwriteReqs_NoOverlap(t *testing.T) {
 }
 
 func TestComputeOverwriteReqs_PartialOverlap(t *testing.T) {
-	// buffer [100, 200), extent [50, 150) -> 重叠 [100, 150)
+	// buffer [100, 200), extent [50, 150) -> overlap [100, 150).
 	objExtents := []cproto.ObjExtentKey{
 		{FileOffset: 50, Size: 100},
 	}
@@ -244,7 +244,7 @@ func TestComputeOverwriteReqs_PartialOverlap(t *testing.T) {
 	require.True(t, reqs[1].DiscardExtent.IsEmpty())
 }
 
-// TestComputeTruncateReqs_PartialSpan 覆盖截断时部分保留、部分重叠、部分丢弃的基本场景。
+// TestComputeTruncateReqs_PartialSpan covers the basic truncate case with partial keep, partial overlap, and partial discard.
 func TestComputeTruncateReqs_PartialSpan(t *testing.T) {
 	objExtents := []cproto.ObjExtentKey{
 		{FileOffset: 0, Size: 100},
@@ -281,7 +281,7 @@ func TestTruncateV2Extents_EmptyInput(t *testing.T) {
 }
 
 func TestTruncateV2Extents_OnlyKeepNoEBS(t *testing.T) {
-	// 仅保留、无覆盖、无删除时，ApplyTruncateReqs 只返回 keep，不调 EBS
+	// When there is only keep/no overwrite/no delete, ApplyTruncateReqs should return keep directly without EBS calls.
 	objExtents := []cproto.ObjExtentKey{
 		{FileOffset: 0, Size: 50},
 		{FileOffset: 50, Size: 50},

@@ -604,7 +604,7 @@ func (mp *metaPartition) ExtentsTruncate(req *ExtentsTruncateReq, p *Packet, rem
 		}()
 	}
 
-	// TruncateV2: EC/BlobStore 卷，client 已做完 EBS 读/截断/写/删，仅更新 meta
+	// TruncateV2: for EC/BlobStore volumes, client already completed EBS read/truncate/write/delete; only meta is updated here.
 	if req.TruncateV2 {
 		return mp.extentsTruncateV2(req, p)
 	}
@@ -662,7 +662,7 @@ func (mp *metaPartition) ExtentsTruncate(req *ExtentsTruncateReq, p *Packet, rem
 	return
 }
 
-// extentsTruncateV2 处理 EC 卷 TruncateV2：仅更新 inode.Size 与 ObjExtents，不投递 objExtDelCh（client 已删 EBS 数据）。
+// extentsTruncateV2 handles EC TruncateV2: only update inode.Size and ObjExtents, and do not push to objExtDelCh (client already removed EBS data).
 func (mp *metaPartition) extentsTruncateV2(req *ExtentsTruncateReq, p *Packet) (err error) {
 	ino := NewInode(req.Inode, proto.Mode(os.ModePerm))
 	i, err := mp.inodeTree.CopyGet(ino)

@@ -38,7 +38,7 @@ import (
 )
 
 const (
-	// MaxRetryTimes 各 EBS 调用在首次失败后最多再重试的次数（共 1+MaxRetryTimes 次请求）；重试间隔从 RetrySleepInterval 起每次翻倍。
+	// MaxRetryTimes is the max retry count after the first failure for each EBS call (total requests = 1 + MaxRetryTimes); retry interval starts from RetrySleepInterval and doubles each attempt.
 	MaxRetryTimes      = 4
 	RetrySleepInterval = 100 * time.Millisecond
 	SendTimeLimit      = 20 * 1000 // ms
@@ -88,7 +88,7 @@ func (ebs *BlobStoreClient) Read(ctx context.Context, volName string, buf []byte
 		SliceSize: oek.BlobSize,
 		Slices:    sliceInfos,
 	}
-	// access.Get 失败时循环重试
+	// Retry in loop when access.Get fails.
 	log.LogDebugf("TRACE Ebs Read,oek(%v) loc(%v)", oek, loc)
 	var body io.ReadCloser
 	defer func() {
@@ -103,7 +103,7 @@ func (ebs *BlobStoreClient) Read(ctx context.Context, volName string, buf []byte
 		}
 		code := rpc.DetectStatusCode(err)
 		if code == blobberr.CodeBidNotFound || code == blobberr.CodeShardMarkDeleted {
-			// 旧 Location 已被删或 Bid 不存在：同 Location 重试无意义，交给上层 RefreshExtents 换新 key。
+			// Old location was deleted or bid does not exist: retrying on same location is meaningless; let upper layer RefreshExtents fetch a new key.
 			break
 		}
 		log.LogWarnf("TRACE Ebs Read,oek(%v), err(%v), requestId(%v), retry(%v)/%v", oek, err, requestId, attempt, MaxRetryTimes)
@@ -398,9 +398,9 @@ func (ebs *BlobStoreClient) Get(ctx context.Context, volName string, offset uint
 	return
 }
 
-// TruncateV2Extents 根据目标大小截断 ObjExtentKey 列表，复用 overwrite 的 ComputeTruncateReqs + ApplyTruncateReqs：
-// 完全在 targetSize 之前的保留，完全在之后的仅删 EBS，部分重叠的走读→截断→写新→删旧。
-// 返回截断后的新 ObjExtentKey 列表（用于 meta TruncateV2）。
+// TruncateV2Extents truncates ObjExtentKey list by target size, reusing overwrite flow ComputeTruncateReqs + ApplyTruncateReqs:
+// keep extents fully before targetSize, delete-only extents fully after it, and for partial overlap do read -> trim -> write new -> delete old.
+// Return the truncated ObjExtentKey list for meta TruncateV2.
 func (ebs *BlobStoreClient) TruncateV2Extents(ctx context.Context, volName string, objExtentKeys []proto.ObjExtentKey, targetSize uint64,
 ) (newObjExtents []proto.ObjExtentKey, toDelete []proto.ObjExtentKey, err error) {
 	log.LogDebugf("TruncateV2Extents: volName(%v) objExtentKeys(%v) targetSize(%v)", volName, objExtentKeys, targetSize)
@@ -412,8 +412,8 @@ func (ebs *BlobStoreClient) TruncateV2Extents(ctx context.Context, volName strin
 	return ebs.ApplyTruncateReqs(ctx, volName, req)
 }
 
-// ComputeTruncateReqs 根据目标大小 targetSize 与现有 objExtents 计算截断请求。
-// 复用 overwriteReq 结构：部分重叠的 extent 对应一个 OverwriteReq（读旧→截断→写新→删旧）。
+// ComputeTruncateReqs computes truncate operations from targetSize and existing objExtents.
+// Reuse overwriteReq structure: each partially overlapped extent maps to one OverwriteReq (read old -> trim -> write new -> delete old).
 func ComputeTruncateReqs(targetSize uint64, objExtents []proto.ObjExtentKey) truncateReq {
 	eks := make([]proto.ObjExtentKey, len(objExtents))
 	copy(eks, objExtents)
@@ -441,9 +441,9 @@ func ComputeTruncateReqs(targetSize uint64, objExtents []proto.ObjExtentKey) tru
 	return truncateReq{KeepExtents: keep, OverwriteReqs: overwriteReqs, DiscardOnly: discardOnly}
 }
 
-// ApplyTruncateReqs 执行 TruncateReq：对每个 overwriteReq 读旧 extent、截断、写新 blob、收集新 key；
-// 最后删除所有需废弃的 extent（OverwriteReq 中的 DiscardExtent + DiscardOnly）。
-// 返回保留的 extents + 新写入的 extents，供 meta TruncateV2 使用。
+// ApplyTruncateReqs executes TruncateReq: for each overwriteReq, read old extent, trim, write new blob, and collect new keys;
+// then delete all discarded extents (DiscardExtent in OverwriteReq plus DiscardOnly).
+// Return kept extents plus newly written extents for meta TruncateV2.
 func (ebs *BlobStoreClient) ApplyTruncateReqs(ctx context.Context, volName string, req truncateReq,
 ) (newObjExtents []proto.ObjExtentKey, toDelete []proto.ObjExtentKey, err error) {
 	newObjExtents = make([]proto.ObjExtentKey, 0, len(req.KeepExtents)+len(req.OverwriteReqs))
