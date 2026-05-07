@@ -28,6 +28,7 @@ import (
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/util"
+	cflog "github.com/cubefs/cubefs/util/log"
 	"github.com/cubefs/cubefs/util/tmpfs"
 	"github.com/stretchr/testify/require"
 )
@@ -93,7 +94,7 @@ func testWriteSingleFile(t *testing.T) {
 	defer func() { require.NoError(t, cacheBlock.Delete("test")) }()
 	bytes := randTestData(1024)
 	require.NoError(t, cacheBlock.WriteAt(bytes, int64(0), 1024))
-	t.Logf("testWriteSingleFile, test:%s cacheBlock.datasize:%d", t.Name(), cacheBlock.usedSize)
+	t.Logf("testWriteSingleFile, test:%s cacheBlock.datasize:%d", t.Name(), cacheBlock.getUsedSize())
 }
 
 func testWriteSingleFileError(t *testing.T) {
@@ -117,7 +118,7 @@ func testWriteSingleFileError(t *testing.T) {
 	bytes := randTestData(1024)
 	require.NoError(t, cacheBlock.WriteAt(bytes, int64(0), 1024))
 	require.Error(t, cacheBlock.WriteAt(bytes, proto.CACHE_BLOCK_SIZE, 1024))
-	t.Logf("testWriteSingleFileError, test:%s cacheBlock.datasize:%d", t.Name(), cacheBlock.usedSize)
+	t.Logf("testWriteSingleFileError, test:%s cacheBlock.datasize:%d", t.Name(), cacheBlock.getUsedSize())
 }
 
 func testWriteCacheBlockFull(t *testing.T) {
@@ -147,7 +148,7 @@ func testWriteCacheBlockFull(t *testing.T) {
 		}
 		offset += 1024
 		if offset/1024%1024 == 0 {
-			t.Logf("testWriteCacheBlockFull, offset:%d cacheBlock.datasize:%d", offset, cacheBlock.usedSize)
+			t.Logf("testWriteCacheBlockFull, offset:%d cacheBlock.datasize:%d", offset, cacheBlock.getUsedSize())
 		}
 	}
 	require.GreaterOrEqual(t, offset+1024, int64(proto.CACHE_BLOCK_SIZE))
@@ -215,7 +216,7 @@ func testWriteMultiCacheBlock(t *testing.T, newMultiCacheFunc func(volume string
 				}
 				offset += 1024
 				if j%50 == 0 {
-					t.Logf("testWriteMultiCacheBlock, volume:%v, write count:%v, cacheBlock.datasize:%d", volume, j, cacheBlock.usedSize)
+					t.Logf("testWriteMultiCacheBlock, volume:%v, write count:%v, cacheBlock.datasize:%d", volume, j, cacheBlock.getUsedSize())
 				}
 			}
 			require.GreaterOrEqual(t, offset+1024, int64(1024*count))
@@ -305,7 +306,7 @@ func testParallelOperation(t *testing.T) {
 				return
 			case <-ticker.C:
 				bytesRead := make([]byte, 1024)
-				offset := rand.Intn(int(cacheBlock.allocSize))
+				offset := rand.Intn(int(cacheBlock.getAllocSize()))
 				cacheBlock.Read(context.Background(), bytesRead, int64(offset), 1024, true, false)
 			}
 		}
@@ -409,7 +410,7 @@ func testWriteSingleFileV2(t *testing.T) {
 		Crc:      crcBuf[:4],
 		DataSize: 1024,
 	}))
-	t.Logf("testWriteSingleFileV2, test:%s cacheBlock.datasize:%d", t.Name(), cacheBlock.usedSize)
+	t.Logf("testWriteSingleFileV2, test:%s cacheBlock.datasize:%d", t.Name(), cacheBlock.getUsedSize())
 	_ = cacheBlock.MaybeWriteCompleted(proto.CACHE_BLOCK_PACKET_SIZE + 1024)
 	file, _ := cacheBlock.GetOrOpenFileHandler()
 	_, _ = file.ReadAt(crcBuf[:4], proto.CACHE_BLOCK_PACKET_SIZE*2+HeaderSize)
@@ -457,7 +458,7 @@ func testWriteSingleFileErrorV2(t *testing.T) {
 		Crc:      make([]byte, proto.CACHE_BLOCK_CRC_SIZE),
 		DataSize: 1024,
 	}))
-	t.Logf("testWriteSingleFileErrorV2, test:%s cacheBlock.datasize:%d", t.Name(), cacheBlock.usedSize)
+	t.Logf("testWriteSingleFileErrorV2, test:%s cacheBlock.datasize:%d", t.Name(), cacheBlock.getUsedSize())
 }
 
 func testWriteCacheBlockFullV2(t *testing.T) {
@@ -494,7 +495,7 @@ func testWriteCacheBlockFullV2(t *testing.T) {
 		}
 		offset += proto.CACHE_BLOCK_PACKET_SIZE
 		if offset/proto.CACHE_BLOCK_PACKET_SIZE%128 == 0 {
-			t.Logf("testWriteCacheBlockFullV2, offset:%d cacheBlock.datasize:%d", offset, cacheBlock.usedSize)
+			t.Logf("testWriteCacheBlockFullV2, offset:%d cacheBlock.datasize:%d", offset, cacheBlock.getUsedSize())
 		}
 	}
 	require.Equal(t, offset, int64(proto.CACHE_OBJECT_BLOCK_SIZE))
@@ -541,11 +542,64 @@ func testWriteMultiCacheBlockV2(t *testing.T) {
 				}
 				offset += proto.CACHE_BLOCK_PACKET_SIZE
 				if j%proto.CACHE_BLOCK_PACKET_SIZE == 0 {
-					t.Logf("testWriteMultiCacheBlock, pdir:%v, write count:%v, cacheBlock.datasize:%d", pDir, j, cacheBlock.usedSize)
+					t.Logf("testWriteMultiCacheBlock, pdir:%v, write count:%v, cacheBlock.datasize:%d", pDir, j, cacheBlock.getUsedSize())
 				}
 			}
 			require.Equal(t, offset, int64(proto.CACHE_BLOCK_PACKET_SIZE*25))
 		}(i)
 	}
 	wg.Wait()
+}
+
+func TestCacheBlockV2ReadReloadAndComplete(t *testing.T) {
+	_, err := cflog.InitLog(t.TempDir(), "cachengine", cflog.DebugLevel, nil, cflog.DefaultLogLeftSpaceLimitRatio)
+	require.NoError(t, err)
+	defer cflog.SetLogLevelV2(cflog.WarnLevel)
+
+	root := t.TempDir()
+	disk := &Disk{Path: root, TotalSpace: 200 * util.MB, Capacity: 1024, Status: proto.ReadWrite}
+	engine, err := NewCacheEngine("", 0, DefaultCacheMaxUsedRatio, []*Disk{disk}, 1024, 1024, 0, 1, 1, nil, DefaultExpireTime, nil, false, "", 1024, 100, 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, engine.Stop()) }()
+
+	uniKey := t.Name()
+	volume := MapKeyToDirectory(uniKey)
+	block, err, _, _ := engine.CreateBlockV2(volume, uniKey, uint64(DefaultExpireTime/time.Second), proto.CACHE_BLOCK_PACKET_SIZE, "127.0.0.1")
+	require.NoError(t, err)
+	defer func() { require.NoError(t, block.Delete("test")) }()
+
+	data := randTestData(proto.CACHE_BLOCK_PACKET_SIZE)
+	crcBuf := make([]byte, proto.CACHE_BLOCK_CRC_SIZE)
+	expectedCRC := crc32.ChecksumIEEE(data)
+	binary.BigEndian.PutUint32(crcBuf, expectedCRC)
+	require.NoError(t, block.WriteAtV2(&proto.FlashWriteParam{
+		Offset:   0,
+		Size:     proto.CACHE_BLOCK_PACKET_SIZE,
+		Data:     data,
+		Crc:      crcBuf,
+		DataSize: proto.CACHE_BLOCK_PACKET_SIZE,
+	}))
+	require.Equal(t, int64(proto.CACHE_BLOCK_PACKET_SIZE), block.LoadDataSize())
+	require.NoError(t, block.MaybeWriteCompleted(proto.CACHE_BLOCK_PACKET_SIZE))
+
+	readBuf := make([]byte, proto.CACHE_BLOCK_PACKET_SIZE)
+	gotCRC, err := block.Read(context.Background(), readBuf, 0, proto.CACHE_BLOCK_PACKET_SIZE, true, true)
+	require.NoError(t, err)
+	require.Equal(t, expectedCRC, gotCRC)
+	require.Equal(t, data, readBuf)
+
+	reloaded := NewCacheBlockV2(disk.Path+"/"+DefaultCacheDirName, volume, uniKey, proto.CACHE_BLOCK_PACKET_SIZE, "", disk, 1024, 100)
+	reloaded.cacheEngine = engine
+	require.NoError(t, reloaded.initFilePath(true))
+	defer func() { require.NoError(t, reloaded.Close()) }()
+	require.Equal(t, int64(proto.CACHE_BLOCK_PACKET_SIZE), reloaded.getAllocSize())
+	require.Equal(t, int64(proto.CACHE_BLOCK_PACKET_SIZE), reloaded.LoadDataSize())
+}
+
+func TestCacheBlockV2RateLimit(t *testing.T) {
+	disk := &Disk{Path: t.TempDir(), Status: proto.ReadWrite}
+	block := NewCacheBlockV2(disk.Path, "volume", "limited-key", 2*1024, "127.0.0.1", disk, 1024, 100)
+
+	require.Equal(t, util.LimitedFlowError, block.CheckRateLimit(60, 1024))
+	require.NoError(t, block.CheckRateLimit(1, 4*1024))
 }

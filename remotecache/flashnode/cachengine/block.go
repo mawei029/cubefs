@@ -60,7 +60,6 @@ type CacheBlock struct {
 
 	usedSize  int64
 	allocSize int64
-	sizeLock  sync.RWMutex
 
 	initOnce     sync.Once
 	sourceReader ReadExtentData
@@ -254,10 +253,12 @@ func (cb *CacheBlock) Read(ctx context.Context, data []byte, offset, size int64,
 		stat.EndStat("HitCacheRead:ReadFromDisk", err, bgTime, 1)
 	}()
 
-	if offset >= cb.getAllocSize() || offset > cb.getUsedSize() || cb.getUsedSize() == 0 {
-		return 0, fmt.Errorf("invalid read, offset:%d, allocSize:%d, usedSize:%d", offset, cb.getAllocSize(), cb.getUsedSize())
+	allocSize := cb.getAllocSize()
+	usedSize := cb.getUsedSize()
+	if offset >= allocSize || offset > usedSize || usedSize == 0 {
+		return 0, fmt.Errorf("invalid read, offset:%d, allocSize:%d, usedSize:%d", offset, allocSize, usedSize)
 	}
-	realSize := cb.getUsedSize() - offset
+	realSize := usedSize - offset
 	if realSize >= size {
 		realSize = size
 	}
@@ -267,7 +268,7 @@ func (cb *CacheBlock) Read(ctx context.Context, data []byte, offset, size int64,
 	}
 
 	if log.EnableDebug() {
-		log.LogDebugf("action[Read] read cache block:%v, offset:%d, allocSize:%d, usedSize:%d", cb.blockKey, offset, cb.allocSize, cb.usedSize)
+		log.LogDebugf("action[Read] read cache block:%v, offset:%d, allocSize:%d, usedSize:%d", cb.blockKey, offset, allocSize, usedSize)
 	}
 	var file *os.File
 	if file, err = cb.GetOrOpenFileHandler(); err != nil {
@@ -279,7 +280,7 @@ func (cb *CacheBlock) Read(ctx context.Context, data []byte, offset, size int64,
 	}
 	if readCrc {
 		sliceIndex := offset / proto.CACHE_BLOCK_PACKET_SIZE
-		crcOffset := cb.allocSize + HeaderSize + sliceIndex*proto.CACHE_BLOCK_CRC_SIZE
+		crcOffset := allocSize + HeaderSize + sliceIndex*proto.CACHE_BLOCK_CRC_SIZE
 		crcBuf := bytespool.Alloc(proto.CACHE_BLOCK_CRC_SIZE)
 		defer bytespool.Free(crcBuf)
 		if _, err = cb.readWithRetry(crcBuf, crcOffset, file); err != nil {
@@ -467,8 +468,8 @@ func (cb *CacheBlock) initFilePath(isLoad bool) (err error) {
 			file.Close()
 			return fmt.Errorf("initFilePath check file header failed: %s", err.Error())
 		}
-		cb.allocSize = allocSize
-		cb.usedSize = usedSize
+		cb.updateAllocSize(allocSize)
+		cb.updateUsedSize(usedSize)
 		cb.ttl = int64(time.Until(expiredTime).Seconds())
 		file.Close()
 		cb.notifyReady()
@@ -644,38 +645,38 @@ func (cb *CacheBlock) InitOnce(engine *CacheEngine, sources []*proto.DataSource)
 }
 
 func (cb *CacheBlock) getUsedSize() int64 {
-	cb.sizeLock.RLock()
-	defer cb.sizeLock.RUnlock()
-	return cb.usedSize
+	return atomic.LoadInt64(&cb.usedSize)
 }
 
 func (cb *CacheBlock) maybeUpdateUsedSize(size int64) {
-	cb.sizeLock.Lock()
-	defer cb.sizeLock.Unlock()
-	if cb.usedSize < size {
-		if log.EnableDebug() {
-			log.LogDebugf("maybeUpdateUsedSize, cache block:%v, old:%v, new:%v", cb.blockKey, cb.usedSize, size)
+	for {
+		usedSize := cb.getUsedSize()
+		if usedSize >= size {
+			return
 		}
-		cb.usedSize = size
+		if log.EnableDebug() {
+			log.LogDebugf("maybeUpdateUsedSize, cache block:%v, old:%v, new:%v", cb.blockKey, usedSize, size)
+		}
+		if atomic.CompareAndSwapInt64(&cb.usedSize, usedSize, size) {
+			return
+		}
 	}
 }
 
 func (cb *CacheBlock) getAllocSize() int64 {
-	cb.sizeLock.RLock()
-	defer cb.sizeLock.RUnlock()
-	return cb.allocSize
+	return atomic.LoadInt64(&cb.allocSize)
 }
 
 func (cb *CacheBlock) updateAllocSize(size int64) {
-	cb.sizeLock.Lock()
-	defer cb.sizeLock.Unlock()
-	cb.allocSize = size
+	atomic.StoreInt64(&cb.allocSize, size)
+}
+
+func (cb *CacheBlock) updateUsedSize(size int64) {
+	atomic.StoreInt64(&cb.usedSize, size)
 }
 
 func (cb *CacheBlock) LoadDataSize() (size int64) {
-	cb.sizeLock.Lock()
-	defer cb.sizeLock.Unlock()
-	return cb.usedSize
+	return cb.getUsedSize()
 }
 
 func (cb *CacheBlock) GetRootPath() string {
@@ -769,11 +770,11 @@ func (cb *CacheBlock) InitForCacheRead(sources []*proto.DataSource, readDataNode
 }
 
 func (cb *CacheBlock) info() string {
-	return fmt.Sprintf("path(%v)_from(%v)_size(%v)", cb.filePath, cb.clientIP, cb.allocSize)
+	return fmt.Sprintf("path(%v)_from(%v)_size(%v)", cb.filePath, cb.clientIP, cb.getAllocSize())
 }
 
 func (cb *CacheBlock) CheckRateLimit(size int, threshold uint64) error {
-	if cb.keyLimiter != nil && uint64(cb.allocSize) >= threshold {
+	if cb.keyLimiter != nil && uint64(cb.getAllocSize()) >= threshold {
 		if !cb.keyLimiter.AllowN(time.Now(), size) {
 			return util.LimitedFlowError
 		}
@@ -782,7 +783,7 @@ func (cb *CacheBlock) CheckRateLimit(size int, threshold uint64) error {
 }
 
 func (cb *CacheBlock) initKeyLimiter(keyRateLimitThreshold int32, keyLimiterFlow int64) {
-	if cb.allocSize >= int64(keyRateLimitThreshold) && keyLimiterFlow > 0 {
+	if cb.getAllocSize() >= int64(keyRateLimitThreshold) && keyLimiterFlow > 0 {
 		flow := float64(keyLimiterFlow)
 		cb.keyLimiter = rate.NewLimiter(rate.Limit(flow), int(flow/2))
 	}
@@ -970,7 +971,7 @@ func (cb *CacheBlock) WriteAtV2(writeParam *proto.FlashWriteParam) (err error) {
 		log.LogWarnf("[WriteAtV2] WriteAt (%v) data offset %v err %v", cb.filePath, writeParam.Offset+HeaderSize, err)
 		return
 	}
-	n := writeParam.Offset/proto.CACHE_BLOCK_PACKET_SIZE*proto.CACHE_BLOCK_CRC_SIZE + cb.allocSize + HeaderSize
+	n := writeParam.Offset/proto.CACHE_BLOCK_PACKET_SIZE*proto.CACHE_BLOCK_CRC_SIZE + cb.getAllocSize() + HeaderSize
 	if log.EnableDebug() {
 		log.LogDebugf("[WriteAtV2] file offset %v crc index %v and datasize %v", writeParam.Offset, n, writeParam.DataSize)
 	}
@@ -983,7 +984,8 @@ func (cb *CacheBlock) WriteAtV2(writeParam *proto.FlashWriteParam) (err error) {
 }
 
 func (cb *CacheBlock) MaybeWriteCompleted(reqLen int64) (err error) {
-	if cb.usedSize != reqLen {
+	usedSize := cb.getUsedSize()
+	if usedSize != reqLen {
 		return
 	}
 	var file *os.File
@@ -1000,7 +1002,7 @@ func (cb *CacheBlock) MaybeWriteCompleted(reqLen int64) (err error) {
 	}
 	cb.notifyReady()
 	if log.EnableDebug() {
-		log.LogDebugf("action[MaybeWriteCompleted], block:%s, size %v write file sucess", cb.blockKey, cb.usedSize)
+		log.LogDebugf("action[MaybeWriteCompleted], block:%s, size %v write file sucess", cb.blockKey, usedSize)
 	}
 	return nil
 }

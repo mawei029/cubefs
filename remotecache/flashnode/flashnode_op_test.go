@@ -15,9 +15,11 @@
 package flashnode
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"hash/crc32"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -28,6 +30,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/cubefs/cubefs/proto"
+	"github.com/cubefs/cubefs/remotecache/flashnode/cachengine"
+	"github.com/cubefs/cubefs/util"
 	"github.com/stretchr/testify/require"
 )
 
@@ -336,4 +340,74 @@ func testTCPObjectCacheRead(t *testing.T) {
 	require.NoError(t, p.WriteToConn(conn))
 	require.NoError(t, r.ReadFromConn(conn, 3))
 	require.Equal(t, proto.OpErr, r.ResultCode)
+}
+
+func TestDoObjectReadRequestRepliesCachedData(t *testing.T) {
+	root := t.TempDir()
+	disk := &cachengine.Disk{Path: root, TotalSpace: 200 * util.MB, Capacity: 1024, Status: proto.ReadWrite}
+	engine, err := cachengine.NewCacheEngine("", 0, cachengine.DefaultCacheMaxUsedRatio, []*cachengine.Disk{disk},
+		1024, 1024, 0, 1, 1, nil, cachengine.DefaultExpireTime, nil, false, "", 1024, 100, 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, engine.Stop()) }()
+
+	uniKey := t.Name()
+	volume := cachengine.MapKeyToDirectory(uniKey)
+	block, err, _, _ := engine.CreateBlockV2(volume, uniKey, uint64(cachengine.DefaultExpireTime/time.Second),
+		proto.CACHE_BLOCK_PACKET_SIZE, "127.0.0.1")
+	require.NoError(t, err)
+	defer func() { require.NoError(t, block.Delete("test")) }()
+
+	data := make([]byte, proto.CACHE_BLOCK_PACKET_SIZE)
+	for i := range data {
+		data[i] = byte(i % 251)
+	}
+	crcBuf := make([]byte, proto.CACHE_BLOCK_CRC_SIZE)
+	binary.BigEndian.PutUint32(crcBuf, crc32.ChecksumIEEE(data))
+	require.NoError(t, block.WriteAtV2(&proto.FlashWriteParam{
+		Offset:   0,
+		Size:     proto.CACHE_BLOCK_PACKET_SIZE,
+		Data:     data,
+		Crc:      crcBuf,
+		DataSize: proto.CACHE_BLOCK_PACKET_SIZE,
+	}))
+	require.NoError(t, block.MaybeWriteCompleted(proto.CACHE_BLOCK_PACKET_SIZE))
+
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	f := &FlashNode{
+		cacheEngine: engine,
+		metrics:     &FlashNodeMetrics{},
+		limitRead:   util.NewIOLimiterEx(0, 1, 0, 0),
+	}
+	req := &proto.CacheReadRequestBase{Key: uniKey, Offset: 0, Size_: uint64(len(data))}
+	p := proto.NewPacketReqID()
+	p.Opcode = proto.OpFlashNodeCacheReadObject
+	done := make(chan error, 1)
+	go func() {
+		done <- f.doObjectReadRequest(context.Background(), serverConn, req, p, block, "unit-test")
+	}()
+
+	firstReply := proto.NewPacket()
+	header := make([]byte, util.PacketHeaderSize)
+	require.NoError(t, clientConn.SetReadDeadline(time.Now().Add(3*time.Second)))
+	_, err = io.ReadFull(clientConn, header)
+	require.NoError(t, err)
+	require.NoError(t, firstReply.UnmarshalHeader(header))
+	require.Equal(t, proto.OpOk, firstReply.ResultCode)
+	require.Equal(t, uint32(len(data)), firstReply.Size)
+
+	dataReply := proto.NewPacket()
+	require.NoError(t, dataReply.ReadFromConn(clientConn, 3))
+	require.Equal(t, proto.OpOk, dataReply.ResultCode)
+	require.Equal(t, uint32(len(data)), dataReply.Size)
+	require.Equal(t, data, dataReply.Data)
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("doObjectReadRequest did not finish")
+	}
 }
