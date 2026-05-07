@@ -1130,15 +1130,18 @@ func (f *FlashNode) doObjectReadRequest(ctx context.Context, conn net.Conn, req 
 	var errInner error
 	buf := bytespool.Alloc(proto.CACHE_BLOCK_PACKET_SIZE)
 	defer bytespool.Free(buf)
+	reply := proto.NewPacket()
+	reply.ReqID = p.ReqID
+	reply.StartT = p.StartT
+	reply.Opcode = p.Opcode
+	reply.ResultCode = proto.OpOk
+	reply.Data = buf
 	var alignedOffset int64
 	var readDiskSize uint32
 	readAndReply := func() {
-		reply := proto.NewPacket()
-		reply.ReqID = p.ReqID
-		reply.StartT = p.StartT
-		reply.Data = buf
 		reply.KernelOffset = uint64(offset)
 		reply.ExtentOffset = offset - alignedOffset
+		reply.Data = buf
 		p.Size = proto.CACHE_BLOCK_PACKET_SIZE
 		p.ExtentOffset = offset
 		reply.CRC, errInner = block.Read(ctx, reply.Data[:readDiskSize], alignedOffset, int64(readDiskSize), f.waitForCacheBlock, true)
