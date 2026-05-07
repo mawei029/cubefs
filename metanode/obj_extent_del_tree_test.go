@@ -1,6 +1,8 @@
 package metanode
 
 import (
+	"bytes"
+	"encoding/binary"
 	"testing"
 
 	"github.com/cubefs/cubefs/proto"
@@ -52,4 +54,68 @@ func TestNormalizeObjExtentDelTsMs(t *testing.T) {
 	require.Equal(t, int64(9), normalizeObjExtentDelTsMs(0, 9))
 	require.Equal(t, int64(1700000000*1000), normalizeObjExtentDelTsMs(1700000000, 1))
 	require.Equal(t, int64(1700000000000), normalizeObjExtentDelTsMs(1700000000000, 1))
+}
+
+func TestObjExtentDelTreeEdgeBranches(t *testing.T) {
+	var nilTree *objExtentDelTree
+	require.Nil(t, nilTree.PeekFirstN(1))
+	nilTree.EnqueueFromApply(1, 0, 1, nil)
+	require.NoError(t, nilTree.ApplyDequeuePayload(nil))
+	require.NoError(t, nilTree.ApplyPunishPayload(nil, 1))
+
+	ot := newObjExtentDelTree()
+	ot.EnqueueFromApply(1, 0, 2, []proto.ObjExtentKey{{}})
+	require.Equal(t, 0, ot.Len())
+	require.Nil(t, ot.PeekFirstN(0))
+}
+
+func TestObjExtentDelTreeEncodeDecodeAndErrors(t *testing.T) {
+	oek := createTestObjExtentKey(0, 64, 3)
+	it := &objExtentDelItem{
+		TsMs:  10,
+		Inode: 11,
+		Uniq:  12,
+		Oek:   oek,
+	}
+	// copy should deep-copy blobs
+	cp := it.Copy().(*objExtentDelItem)
+	require.True(t, cp.Oek.IsEquals(&oek))
+	if len(cp.Oek.Blobs) > 0 {
+		cp.Oek.Blobs[0].MinBid = 999
+		require.NotEqual(t, cp.Oek.Blobs[0].MinBid, it.Oek.Blobs[0].MinBid)
+	}
+
+	val, err := encodeObjExtentGcDequeueKeys([]*objExtentDelItem{it})
+	require.NoError(t, err)
+	keys, err := decodeObjExtentGcDequeueKeys(val)
+	require.NoError(t, err)
+	require.Len(t, keys, 1)
+	require.Equal(t, it.TsMs, keys[0].TsMs)
+	require.Equal(t, it.Inode, keys[0].Inode)
+	require.Equal(t, it.Uniq, keys[0].Uniq)
+
+	_, err = decodeObjExtentGcDequeueKeys([]byte{1, 2, 3})
+	require.Error(t, err)
+
+	var tooManyBuf bytes.Buffer
+	require.NoError(t, binary.Write(&tooManyBuf, binary.BigEndian, uint32(maxObjExtentDelBatch+1)))
+	_, err = decodeObjExtentGcDequeueKeys(tooManyBuf.Bytes())
+	require.Error(t, err)
+}
+
+func TestObjExtentDelTreeApplyPunishPayloadErrors(t *testing.T) {
+	ot := newObjExtentDelTree()
+
+	// short payload: missing count
+	require.Error(t, ot.ApplyPunishPayload([]byte{1}, 1))
+
+	var tooManyBuf bytes.Buffer
+	require.NoError(t, binary.Write(&tooManyBuf, binary.BigEndian, uint32(maxObjExtentDelBatch+1)))
+	require.Error(t, ot.ApplyPunishPayload(tooManyBuf.Bytes(), 1))
+
+	// count=1 but payload truncated
+	var truncated bytes.Buffer
+	require.NoError(t, binary.Write(&truncated, binary.BigEndian, uint32(1)))
+	require.NoError(t, binary.Write(&truncated, binary.BigEndian, int64(1))) // oldTs only
+	require.Error(t, ot.ApplyPunishPayload(truncated.Bytes(), 1))
 }

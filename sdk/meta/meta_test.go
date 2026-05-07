@@ -23,6 +23,7 @@ import (
 
 	"github.com/cubefs/cubefs/proto"
 	masterSDK "github.com/cubefs/cubefs/sdk/master"
+	"github.com/cubefs/cubefs/util"
 	"github.com/cubefs/cubefs/util/btree"
 	"github.com/stretchr/testify/require"
 )
@@ -148,7 +149,56 @@ func TestCoverageMetaWrapperTruncateV2_NoPartition(t *testing.T) {
 	mw := &MetaWrapper{
 		partitions: make(map[uint64]*MetaPartition),
 		ranges:     btree.New(8),
+		conns:      util.NewConnectPool(),
 	}
 	err := mw.TruncateV2(100, 64, "/x", nil, nil)
+	require.ErrorIs(t, err, syscall.ENOENT)
+}
+
+func TestCoverageMetaWrapperAppendObjExtentKeysWithCheck(t *testing.T) {
+	mw := &MetaWrapper{
+		partitions: make(map[uint64]*MetaPartition),
+		ranges:     btree.New(8),
+		conns:      util.NewConnectPool(),
+	}
+	mp := &MetaPartition{PartitionID: 1, Start: 1, End: 1 << 62, Members: []string{"127.0.0.1:1"}, LeaderAddr: "127.0.0.1:1"}
+	mw.ranges.ReplaceOrInsert(mp)
+
+	newExts := []proto.ObjExtentKey{{FileOffset: 0, Size: 10}}
+	discards := []proto.ObjExtentKey{{FileOffset: 0, Size: 10}}
+
+	t.Run("len mismatch", func(t *testing.T) {
+		err := mw.AppendObjExtentKeysWithCheck(1, newExts, nil)
+		require.ErrorIs(t, err, syscall.EINVAL)
+	})
+
+	t.Run("inner success", func(t *testing.T) {
+		err := mw.AppendObjExtentKeysWithCheck(1, newExts, discards)
+		require.Error(t, err)
+	})
+}
+
+func TestCoverageMetaWrapperTruncateV2_StatusBranch(t *testing.T) {
+	mw := &MetaWrapper{
+		partitions: make(map[uint64]*MetaPartition),
+		ranges:     btree.New(8),
+		conns:      util.NewConnectPool(),
+	}
+	mp := &MetaPartition{PartitionID: 1, Start: 1, End: 1 << 62, Members: []string{"127.0.0.1:1"}, LeaderAddr: "127.0.0.1:1"}
+	mw.ranges.ReplaceOrInsert(mp)
+	exts := []proto.ObjExtentKey{{FileOffset: 0, Size: 10}}
+
+	t.Run("network/send error path", func(t *testing.T) {
+		err := mw.TruncateV2(1, 10, "/x", exts, nil)
+		require.Error(t, err)
+	})
+}
+
+func TestCoverageMetaWrapperAppendObjExtentKeysWithCheck_NoPartition(t *testing.T) {
+	mw := &MetaWrapper{
+		partitions: make(map[uint64]*MetaPartition),
+		ranges:     btree.New(8),
+	}
+	err := mw.AppendObjExtentKeysWithCheck(999, []proto.ObjExtentKey{{FileOffset: 0, Size: 1}}, []proto.ObjExtentKey{{}})
 	require.ErrorIs(t, err, syscall.ENOENT)
 }

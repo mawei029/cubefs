@@ -16,8 +16,11 @@ package blobstore
 
 import (
 	"context"
+	"crypto/md5"
 	"fmt"
+	"io"
 	"reflect"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -527,4 +530,186 @@ func TestFlushExt_Basic(t *testing.T) {
 	// Verify buffer is reset
 	require.Equal(t, 0, testWriter.blockPosition, "blockPosition should be reset to 0 after flush.")
 	require.False(t, testWriter.dirty, "dirty should be false after flush")
+}
+
+func TestWriterWrite_NewGuardBranches(t *testing.T) {
+	t.Run("too large returns EOPNOTSUPP", func(t *testing.T) {
+		w := &Writer{}
+		n, err := w.Write(context.Background(), 0, make([]byte, MaxBufferSize+1), 0)
+		require.Equal(t, 0, n)
+		require.ErrorIs(t, err, syscall.EOPNOTSUPP)
+	})
+
+	t.Run("append offset mismatch returns EOPNOTSUPP", func(t *testing.T) {
+		w := &Writer{fileSize: 10}
+		n, err := w.Write(context.Background(), 0, []byte("x"), proto.FlagsAppend)
+		require.Equal(t, 0, n)
+		require.ErrorIs(t, err, syscall.EOPNOTSUPP)
+	})
+}
+
+func TestWriterSetFileSizeAndTruncateV2GrowNoShrink(t *testing.T) {
+	w := &Writer{}
+	w.SetFileSize(123)
+	require.Equal(t, 123, w.CacheFileSize())
+
+	mw := &meta.MetaWrapper{}
+	err := gohook.HookMethod(mw, "GetObjExtents", func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
+		return 1, 20, nil, []proto.ObjExtentKey{{FileOffset: 0, Size: 20}}, nil
+	}, nil)
+	require.NoError(t, err)
+	defer gohook.UnHookMethod(mw, "GetObjExtents")
+
+	w.mw = mw
+	w.ebsc = &BlobStoreClient{}
+	w.ino = 1
+	w.volName = "vol"
+
+	newExts, toDel, err := w.TruncateV2(context.Background(), 25)
+	require.NoError(t, err)
+	require.Len(t, newExts, 1)
+	require.Len(t, toDel, 0)
+}
+
+func TestWriterCoverageAdditionalBranches(t *testing.T) {
+	t.Run("flush overwrite selector", func(t *testing.T) {
+		w := &Writer{overwrite: true}
+		require.NoError(t, w.Flush(1, context.Background()))
+	})
+
+	t.Run("flushWithoutPool inconsistent state", func(t *testing.T) {
+		w := &Writer{
+			ino:        1,
+			fileOffset: 1,
+			buf:        []byte{1, 2, 3},
+			dirty:      true,
+		}
+		err := w.flushWithoutPool(1, context.Background(), false)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "inconsistent state")
+	})
+
+	t.Run("computeOverwriteReqs covers continue and hole", func(t *testing.T) {
+		reqs := computeOverwriteReqs(50, 120, []proto.ObjExtentKey{
+			{FileOffset: 0, Size: 20},
+			{FileOffset: 80, Size: 20},
+		})
+		require.NotEmpty(t, reqs)
+		var hasHole bool
+		for _, r := range reqs {
+			if r.DiscardExtent.Size == 0 {
+				hasHole = true
+			}
+		}
+		require.True(t, hasHole)
+	})
+
+	t.Run("truncateV2 getObjExtents error", func(t *testing.T) {
+		mw := &meta.MetaWrapper{}
+		err := gohook.HookMethod(mw, "GetObjExtents", func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
+			return 0, 0, nil, nil, io.ErrUnexpectedEOF
+		}, nil)
+		require.NoError(t, err)
+		defer gohook.UnHookMethod(mw, "GetObjExtents")
+
+		w := &Writer{mw: mw, ebsc: &BlobStoreClient{}, ino: 1, volName: "v"}
+		_, _, err = w.TruncateV2(context.Background(), 1)
+		require.Error(t, err)
+	})
+}
+
+func TestWriterCoverageMoreLowFunctions(t *testing.T) {
+	t.Run("writeWithoutPool guards and success", func(t *testing.T) {
+		var nilWriter *Writer
+		_, err := nilWriter.WriteWithoutPool(context.Background(), 0, []byte("a"))
+		require.Error(t, err)
+
+		w := &Writer{
+			blockSize:    8,
+			buf:          make([]byte, 0, 8),
+			ino:          1,
+			volName:      "v",
+			limitManager: manager.NewLimitManager(nil),
+			ebsc:         &BlobStoreClient{},
+			mw:           &meta.MetaWrapper{},
+		}
+		_, err = w.WriteWithoutPool(context.Background(), 1, []byte("a"))
+		require.ErrorIs(t, err, syscall.EOPNOTSUPP)
+
+		// success path
+		err = gohook.HookMethod(w.ebsc, "Write", MockEbscWriteTrue, nil)
+		require.NoError(t, err)
+		defer gohook.UnHookMethod(w.ebsc, "Write")
+		err = gohook.HookMethod(w.mw, "AppendObjExtentKeys", MockAppendObjExtentKeysTrue, nil)
+		require.NoError(t, err)
+		defer gohook.UnHookMethod(w.mw, "AppendObjExtentKeys")
+
+		n, err := w.WriteWithoutPool(context.Background(), 0, []byte("abc"))
+		require.NoError(t, err)
+		require.Equal(t, 3, n)
+	})
+
+	t.Run("writeFromReader and flushWithoutPool and freecache", func(t *testing.T) {
+		buf.InitCachePool(8)
+		ec := &stream.ExtentClient{}
+		ec.LimitManager = manager.NewLimitManager(nil)
+		w := NewWriter(ClientConfig{
+			VolName:      "v",
+			BlockSize:    8,
+			Ino:          2,
+			Ec:           ec,
+			Ebsc:         &BlobStoreClient{},
+			Mw:           &meta.MetaWrapper{},
+			WConcurrency: 1,
+		})
+		w.buf = make([]byte, 0, 8)
+
+		err := gohook.HookMethod(w.ebsc, "Write", MockEbscWriteTrue, nil)
+		require.NoError(t, err)
+		defer gohook.UnHookMethod(w.ebsc, "Write")
+		err = gohook.HookMethod(w.mw, "AppendObjExtentKeys", MockAppendObjExtentKeysTrue, nil)
+		require.NoError(t, err)
+		defer gohook.UnHookMethod(w.mw, "AppendObjExtentKeys")
+
+		h := md5.New()
+		size, err := w.WriteFromReader(context.Background(), strings.NewReader("abcdefghi"), h)
+		require.NoError(t, err)
+		require.Equal(t, uint64(9), size)
+
+		// FlushWithoutPool wrapper branch
+		w.dirty = true
+		w.fileOffset = len(w.buf)
+		require.NoError(t, w.FlushWithoutPool(w.ino, context.Background()))
+
+		// FreeCache/allocateCache branches
+		w.allocateCache()
+		require.NotNil(t, w.buf)
+		w.FreeCache()
+		w.FreeCache()
+	})
+
+	t.Run("flush function direct path", func(t *testing.T) {
+		w := &Writer{
+			ino:           3,
+			volName:       "v",
+			blockSize:     4,
+			blockPosition: 4,
+			fileOffset:    4,
+			dirty:         true,
+			buf:           make([]byte, 4),
+			limitManager:  manager.NewLimitManager(nil),
+			ebsc:          &BlobStoreClient{},
+			mw:            &meta.MetaWrapper{},
+		}
+		copy(w.buf, []byte("data"))
+		err := gohook.HookMethod(w.ebsc, "Write", MockEbscWriteTrue, nil)
+		require.NoError(t, err)
+		defer gohook.UnHookMethod(w.ebsc, "Write")
+		err = gohook.HookMethod(w.mw, "AppendObjExtentKeys", MockAppendObjExtentKeysTrue, nil)
+		require.NoError(t, err)
+		defer gohook.UnHookMethod(w.mw, "AppendObjExtentKeys")
+
+		require.NoError(t, w.flush(w.ino, context.Background(), true))
+		require.Equal(t, 0, w.blockPosition)
+	})
 }

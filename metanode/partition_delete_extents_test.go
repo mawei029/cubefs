@@ -15,6 +15,7 @@
 package metanode
 
 import (
+	"errors"
 	"os"
 	"reflect"
 	"sync/atomic"
@@ -139,4 +140,171 @@ func TestRunObjExtentDelTreeGCOnce_PunishRequeue(t *testing.T) {
 	peek := mp.objExtentDelTree.PeekFirstN(1)
 	require.Len(t, peek, 1)
 	require.GreaterOrEqual(t, peek[0].TsMs, int64(1_700_000_000_000)+objExtentDelGcPenaltyMs-1)
+}
+
+func TestStartObjExtentDelTreeGC_StopImmediately(t *testing.T) {
+	rootDir, err := os.MkdirTemp("", "obj_extent_del_tree_start")
+	require.NoError(t, err)
+	defer os.RemoveAll(rootDir)
+
+	mp := newTestMetaPartition(rootDir, nil)
+	mp.startObjExtentDelTreeGC()
+	close(mp.stopC)
+	time.Sleep(20 * time.Millisecond)
+}
+
+func TestRunObjExtentDelTreeGCOnce_EarlyReturnBranches(t *testing.T) {
+	rootDir, err := os.MkdirTemp("", "obj_extent_del_tree_early")
+	require.NoError(t, err)
+	defer os.RemoveAll(rootDir)
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	t.Run("nil tree", func(t *testing.T) {
+		mp := newTestMetaPartition(rootDir, ctrl)
+		mp.objExtentDelTree = nil
+		mp.runObjExtentDelTreeGCOnce()
+	})
+
+	t.Run("restoring snapshot", func(t *testing.T) {
+		mp := newTestMetaPartition(rootDir, ctrl)
+		raft := raftstoremock.NewMockPartition(ctrl)
+		raft.EXPECT().Status().Return(&raftstore.PartitionStatus{RestoringSnapshot: true}).AnyTimes()
+		raft.EXPECT().LeaderTerm().Return(uint64(1), uint64(1)).AnyTimes()
+		mp.raftPartition = raft
+		mp.runObjExtentDelTreeGCOnce()
+	})
+
+	t.Run("not leader", func(t *testing.T) {
+		mp := newTestMetaPartition(rootDir, ctrl)
+		raft := raftstoremock.NewMockPartition(ctrl)
+		raft.EXPECT().Status().Return(&raftstore.PartitionStatus{RestoringSnapshot: false}).AnyTimes()
+		raft.EXPECT().LeaderTerm().Return(uint64(2), uint64(1)).AnyTimes()
+		mp.raftPartition = raft
+		mp.runObjExtentDelTreeGCOnce()
+	})
+
+	t.Run("empty tree", func(t *testing.T) {
+		mp := newTestMetaPartition(rootDir, ctrl)
+		raft := raftstoremock.NewMockPartition(ctrl)
+		raft.EXPECT().Status().Return(&raftstore.PartitionStatus{RestoringSnapshot: false}).AnyTimes()
+		raft.EXPECT().LeaderTerm().Return(uint64(1), uint64(1)).AnyTimes()
+		mp.raftPartition = raft
+		mp.runObjExtentDelTreeGCOnce()
+	})
+}
+
+func TestRunObjExtentDelTreeGCOnce_EncodeErrorBranches(t *testing.T) {
+	rootDir, err := os.MkdirTemp("", "obj_extent_del_tree_encode_err")
+	require.NoError(t, err)
+	defer os.RemoveAll(rootDir)
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mp := newTestMetaPartition(rootDir, ctrl)
+	mp.blobClientWrapper = &BlobStoreClientWrapper{blobClient: &blobstore.BlobStoreClient{}}
+	mp.objExtentDelTree.EnqueueFromApply(1, 1700000000, 1, []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 1)})
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(&blobstore.BlobStoreClient{}), "Delete",
+		func(_ *blobstore.BlobStoreClient, _ []proto.ObjExtentKey) error { return errors.New("delete failed") })
+	patches.ApplyFunc(encodeObjExtentGcPunish,
+		func(_ []*objExtentDelItem, _ int64) ([]byte, error) { return nil, errors.New("encode punish failed") })
+	mp.runObjExtentDelTreeGCOnce()
+
+	patches.Reset()
+	mp.objExtentDelTree.EnqueueFromApply(1, 1700000001, 2, []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 2)})
+	patches.ApplyMethod(reflect.TypeOf(&blobstore.BlobStoreClient{}), "Delete",
+		func(_ *blobstore.BlobStoreClient, _ []proto.ObjExtentKey) error { return nil })
+	patches.ApplyFunc(encodeObjExtentGcDequeueKeys,
+		func(_ []*objExtentDelItem) ([]byte, error) { return nil, errors.New("encode dequeue failed") })
+	mp.runObjExtentDelTreeGCOnce()
+}
+
+func TestStartObjExtentDelTreeGC_TickerAndPanicRecover(t *testing.T) {
+	rootDir, err := os.MkdirTemp("", "obj_extent_del_tree_ticker")
+	require.NoError(t, err)
+	defer os.RemoveAll(rootDir)
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mp := newTestMetaPartition(rootDir, ctrl)
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	realNewTicker := time.NewTicker
+	patches.ApplyFunc(time.NewTicker, func(_ time.Duration) *time.Ticker {
+		return realNewTicker(5 * time.Millisecond)
+	})
+
+	mp.blobClientWrapper = &BlobStoreClientWrapper{blobClient: &blobstore.BlobStoreClient{}}
+	mp.objExtentDelTree.EnqueueFromApply(1, 1700000000, 1, []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 1)})
+	patches.ApplyMethod(reflect.TypeOf(&blobstore.BlobStoreClient{}), "Delete",
+		func(_ *blobstore.BlobStoreClient, _ []proto.ObjExtentKey) error { return nil })
+
+	mp.startObjExtentDelTreeGC()
+	time.Sleep(40 * time.Millisecond)
+	require.GreaterOrEqual(t, mp.objExtentDelTree.Len(), 0)
+	close(mp.stopC)
+
+	mp2 := newTestMetaPartition(rootDir, ctrl)
+	patches.Reset()
+	realNewTicker = time.NewTicker
+	patches.ApplyFunc(time.NewTicker, func(_ time.Duration) *time.Ticker {
+		return realNewTicker(5 * time.Millisecond)
+	})
+	raft := raftstoremock.NewMockPartition(ctrl)
+	raft.EXPECT().Status().Return(nil).AnyTimes() // trigger panic at status.RestoringSnapshot
+	raft.EXPECT().LeaderTerm().Return(uint64(1), uint64(1)).AnyTimes()
+	mp2.raftPartition = raft
+	mp2.startObjExtentDelTreeGC()
+	time.Sleep(30 * time.Millisecond) // panic should be recovered by defer in goroutine
+	close(mp2.stopC)
+}
+
+func TestRunObjExtentDelTreeGCOnce_ItemsEmptyAndSubmitErrors(t *testing.T) {
+	rootDir, err := os.MkdirTemp("", "obj_extent_del_tree_submit")
+	require.NoError(t, err)
+	defer os.RemoveAll(rootDir)
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mp := newTestMetaPartition(rootDir, ctrl)
+	mp.blobClientWrapper = &BlobStoreClientWrapper{blobClient: &blobstore.BlobStoreClient{}}
+	oek := createTestObjExtentKey(0, 1024, 1)
+	mp.objExtentDelTree.EnqueueFromApply(42, 1700000000, 7, []proto.ObjExtentKey{oek})
+
+	t.Run("peek returns empty", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyMethod(reflect.TypeOf(mp.objExtentDelTree), "PeekFirstN",
+			func(_ *objExtentDelTree, _ int) []*objExtentDelItem { return nil })
+		mp.runObjExtentDelTreeGCOnce()
+	})
+
+	t.Run("punish submit error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyMethod(reflect.TypeOf(&blobstore.BlobStoreClient{}), "Delete",
+			func(_ *blobstore.BlobStoreClient, _ []proto.ObjExtentKey) error { return errors.New("delete failed") })
+		patches.ApplyMethod(reflect.TypeOf(mp.raftPartition), "Submit",
+			func(_ *raftstoremock.MockPartition, _ []byte) (interface{}, error) {
+				return nil, errors.New("submit failed")
+			})
+		mp.runObjExtentDelTreeGCOnce()
+	})
+
+	t.Run("dequeue submit error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyMethod(reflect.TypeOf(&blobstore.BlobStoreClient{}), "Delete",
+			func(_ *blobstore.BlobStoreClient, _ []proto.ObjExtentKey) error { return nil })
+		patches.ApplyMethod(reflect.TypeOf(mp.raftPartition), "Submit",
+			func(_ *raftstoremock.MockPartition, _ []byte) (interface{}, error) {
+				return nil, errors.New("submit failed")
+			})
+		mp.runObjExtentDelTreeGCOnce()
+	})
 }

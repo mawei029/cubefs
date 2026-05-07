@@ -22,6 +22,7 @@ import (
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNew(t *testing.T) {
@@ -65,4 +66,36 @@ func TestNew(t *testing.T) {
 	}
 	wg.Wait()
 	pool.Close()
+}
+
+func TestTaskPoolInstanceExecuteAndClose(t *testing.T) {
+	pool := New(1, 2)
+	defer pool.Close()
+
+	done := make(chan int, 1)
+	pool.Execute(&rwSlice{index: 7}, func(op *rwSlice) {
+		done <- op.index
+	})
+
+	select {
+	case v := <-done:
+		require.Equal(t, 7, v)
+	case <-time.After(2 * time.Second):
+		t.Fatal("task pool execute timeout")
+	}
+}
+
+func TestExecutorRun(t *testing.T) {
+	exec := NewExecutor(1)
+	done := make(chan struct{}, 1)
+
+	exec.Run(func() {
+		done <- struct{}{}
+	})
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("executor run timeout")
+	}
 }

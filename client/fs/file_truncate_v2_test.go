@@ -133,3 +133,69 @@ func TestFileDoECTruncateV2_ShrinkPath(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, newObjExtents, gotObjExtents)
 }
+
+func TestFileDoECTruncateV2_ErrorBranches(t *testing.T) {
+	t.Run("writer flush error", func(t *testing.T) {
+		f := newBlobFileForTruncateTest()
+		w := f.getWriter()
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyMethod(reflect.TypeOf(w), "Flush",
+			func(_ *blobstore.Writer, _ uint64, _ context.Context) error { return syscall.EIO })
+		err := f.doECTruncateV2(100, 8, "/a")
+		require.Error(t, err)
+	})
+
+	t.Run("GetObjExtents generic error", func(t *testing.T) {
+		f := newBlobFileForTruncateTest()
+		w := f.getWriter()
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyMethod(reflect.TypeOf(w), "Flush",
+			func(_ *blobstore.Writer, _ uint64, _ context.Context) error { return nil })
+		patches.ApplyMethod(reflect.TypeOf(f.super.mw), "GetObjExtents",
+			func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []cfsproto.ExtentKey, []cfsproto.ObjExtentKey, error) {
+				return 0, 0, nil, nil, syscall.EIO
+			})
+		err := f.doECTruncateV2(100, 8, "/a")
+		require.Error(t, err)
+	})
+
+	t.Run("OpenStream error in shrink", func(t *testing.T) {
+		f := newBlobFileForTruncateTest()
+		w := f.getWriter()
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyMethod(reflect.TypeOf(w), "Flush",
+			func(_ *blobstore.Writer, _ uint64, _ context.Context) error { return nil })
+		patches.ApplyMethod(reflect.TypeOf(f.super.mw), "GetObjExtents",
+			func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []cfsproto.ExtentKey, []cfsproto.ObjExtentKey, error) {
+				return 0, 128, nil, []cfsproto.ObjExtentKey{{FileOffset: 0, Size: 128}}, nil
+			})
+		patches.ApplyMethod(reflect.TypeOf(f.super.ec), "OpenStream",
+			func(_ *stream.ExtentClient, _ uint64, _ bool, _ bool, _ string) error { return syscall.EIO })
+		err := f.doECTruncateV2(100, 64, "/a")
+		require.Error(t, err)
+	})
+
+	t.Run("ec flush error in shrink", func(t *testing.T) {
+		f := newBlobFileForTruncateTest()
+		w := f.getWriter()
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyMethod(reflect.TypeOf(w), "Flush",
+			func(_ *blobstore.Writer, _ uint64, _ context.Context) error { return nil })
+		patches.ApplyMethod(reflect.TypeOf(f.super.mw), "GetObjExtents",
+			func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []cfsproto.ExtentKey, []cfsproto.ObjExtentKey, error) {
+				return 0, 128, nil, []cfsproto.ObjExtentKey{{FileOffset: 0, Size: 128}}, nil
+			})
+		patches.ApplyMethod(reflect.TypeOf(f.super.ec), "OpenStream",
+			func(_ *stream.ExtentClient, _ uint64, _ bool, _ bool, _ string) error { return nil })
+		patches.ApplyMethod(reflect.TypeOf(f.super.ec), "CloseStream",
+			func(_ *stream.ExtentClient, _ uint64) error { return nil })
+		patches.ApplyMethod(reflect.TypeOf(f.super.ec), "Flush",
+			func(_ *stream.ExtentClient, _ uint64) error { return syscall.EIO })
+		err := f.doECTruncateV2(100, 64, "/a")
+		require.Error(t, err)
+	})
+}

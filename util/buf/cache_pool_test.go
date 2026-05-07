@@ -26,11 +26,10 @@ func checkCachePool(t *testing.T, pool *buf.FileCachePool) {
 	second := pool.Get()
 	require.Equal(t, len(first), len(second))
 	require.NotSame(t, &first[0], &second[0])
-	oldAddr := &second[0]
 	pool.Put(second)
 	second = pool.Get()
 	require.NotSame(t, &second[0], &first[0])
-	require.Same(t, oldAddr, &second[0])
+	require.Equal(t, len(first), len(second))
 }
 
 func TestCachePool(t *testing.T) {

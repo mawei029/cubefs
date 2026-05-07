@@ -20,6 +20,7 @@ import (
 	"path"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/util"
@@ -77,4 +78,15 @@ func TestPersistInodesFreeList(t *testing.T) {
 		return
 	}
 	require.Greater(t, cnt, 1)
+}
+
+func TestStartFreeList_StartObjExtentDelTreeGCInvoked(t *testing.T) {
+	rootDir, err := os.MkdirTemp("", "start_free_list")
+	require.NoError(t, err)
+	defer os.RemoveAll(rootDir)
+	mp := newTestMetaPartition(rootDir, nil)
+	err = mp.startFreeList()
+	require.NoError(t, err)
+	close(mp.stopC)
+	time.Sleep(20 * time.Millisecond)
 }

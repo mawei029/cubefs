@@ -28,6 +28,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/cubefs/cubefs/blobstore/api/access"
+	ebsproto "github.com/cubefs/cubefs/blobstore/common/proto"
 	"github.com/cubefs/cubefs/client/blockcache/bcache"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/manager"
@@ -35,6 +37,22 @@ import (
 	"github.com/cubefs/cubefs/sdk/meta"
 	"github.com/cubefs/cubefs/util/errors"
 )
+
+func newSafeBlobStoreClientForTest() *BlobStoreClient {
+	return &BlobStoreClient{
+		client: &fakeAccessAPI{
+			getFn: func(_ context.Context, args *access.GetArgs) (io.ReadCloser, error) {
+				return io.NopCloser(strings.NewReader(strings.Repeat("x", int(args.ReadSize)))), nil
+			},
+			putFn: func(_ context.Context, _ *access.PutArgs) (ebsproto.Location, access.HashSumMap, error) {
+				return ebsproto.Location{}, nil, nil
+			},
+			deleteFn: func(_ context.Context, _ *access.DeleteArgs) ([]ebsproto.Location, error) {
+				return nil, nil
+			},
+		},
+	}
+}
 
 func TestNewReader(t *testing.T) {
 	mockConfig := ClientConfig{
@@ -202,7 +220,7 @@ func TestRead(t *testing.T) {
 		reader.readConcurrency = tc.readConcurrency
 
 		mw := &meta.MetaWrapper{}
-		ebsc := &BlobStoreClient{}
+		ebsc := newSafeBlobStoreClientForTest()
 		bc := &bcache.BcacheClient{}
 		ec := &stream.ExtentClient{}
 		err := gohook.HookMethod(mw, "GetObjExtents", tc.getObjFunc, nil)
@@ -233,7 +251,7 @@ func TestRead(t *testing.T) {
 }
 
 func TestAsyncCache(t *testing.T) {
-	ebsc := &BlobStoreClient{}
+	ebsc := newSafeBlobStoreClientForTest()
 	ec := &stream.ExtentClient{}
 	bc := &bcache.BcacheClient{}
 	err := gohook.HookMethod(ec, "Write", MockWriteTrue, nil)
@@ -308,6 +326,62 @@ func TestNeedCacheL1(t *testing.T) {
 	}
 }
 
+func TestBlobPrefetchLimiterAndEnsurePrefetchBuf(t *testing.T) {
+	l := &blobReadPrefetchLimiter{maxBytes: 8}
+	assert.True(t, l.tryAcquire(4))
+	assert.False(t, l.tryAcquire(5))
+	l.release(2)
+	assert.True(t, l.tryAcquire(4))
+
+	r := &Reader{blockSize: 0}
+	assert.False(t, r.ensurePrefetchBuf())
+
+	r.blockSize = 8
+	r.prefetchLimiter = &blobReadPrefetchLimiter{maxBytes: 4}
+	assert.False(t, r.ensurePrefetchBuf())
+
+	r.prefetchLimiter = &blobReadPrefetchLimiter{maxBytes: 16}
+	assert.True(t, r.ensurePrefetchBuf())
+	assert.True(t, len(r.readBuf) >= 8)
+}
+
+func TestReaderRead_PrefetchAndFallbackPaths(t *testing.T) {
+	reader := &Reader{
+		ino:              1,
+		volName:          "vol",
+		valid:            true,
+		objExtentKeys:    []proto.ObjExtentKey{{FileOffset: 0, Size: 64}},
+		readConcurrency:  2,
+		blockSize:        16,
+		aheadReadEnable:  true,
+		minReadAheadSize: 1,
+		limitManager:     manager.NewLimitManager(nil),
+	}
+	ebsc := newSafeBlobStoreClientForTest()
+	reader.ebs = ebsc
+
+	err := gohook.HookMethod(ebsc, "Read", MockEbscReadTrue, nil)
+	require.NoError(t, err)
+	defer gohook.UnHookMethod(ebsc, "Read")
+
+	buf1 := make([]byte, 4)
+	n, err := reader.Read(context.Background(), buf1, 0, 4)
+	require.NoError(t, err)
+	require.Equal(t, 4, n)
+
+	buf2 := make([]byte, 4)
+	n, err = reader.Read(context.Background(), buf2, 2, 4)
+	require.NoError(t, err)
+	require.Equal(t, 4, n)
+	// request >= blockSize falls back to direct read path
+	buf3 := make([]byte, 16)
+	n, err = reader.Read(context.Background(), buf3, 16, 16)
+	require.NoError(t, err)
+	require.Equal(t, 16, n)
+
+	reader.Close(context.Background())
+}
+
 func TestReadSliceRange(t *testing.T) {
 	testCase := []struct {
 		enableBcache     bool
@@ -353,7 +427,7 @@ func TestReadSliceRange(t *testing.T) {
 	for _, tc := range testCase {
 		reader := &Reader{}
 		reader.limitManager = manager.NewLimitManager(nil)
-		ebsc := &BlobStoreClient{}
+		ebsc := newSafeBlobStoreClientForTest()
 		bc := &bcache.BcacheClient{}
 		ec := &stream.ExtentClient{}
 		reader.volName = "cfs"
@@ -389,71 +463,6 @@ func TestReadSliceRange(t *testing.T) {
 		gotError := reader.readSliceRange(ctx, rs)
 		assert.Equal(t, tc.expectError, gotError)
 	}
-}
-
-func TestCoverageReaderRead_PrefetchPath(t *testing.T) {
-	reader := &Reader{
-		volName:          "v",
-		ino:              1,
-		mw:               &meta.MetaWrapper{},
-		ebs:              &BlobStoreClient{},
-		readConcurrency:  1,
-		limitManager:     manager.NewLimitManager(nil),
-		blockSize:        64,
-		aheadReadEnable:  true,
-		minReadAheadSize: 0,
-		prefetchLimiter:  &blobReadPrefetchLimiter{maxBytes: 1 << 20},
-	}
-
-	err := gohook.HookMethod(reader.mw, "GetObjExtents", func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
-		return 1, 128, nil, []proto.ObjExtentKey{{FileOffset: 0, Size: 128}}, nil
-	}, nil)
-	require.NoError(t, err)
-	err = gohook.HookMethod(reader.ebs, "Read", func(_ *BlobStoreClient, _ context.Context, _ string, buf []byte, _ uint64, size uint64, _ proto.ObjExtentKey) (int, error) {
-		for i := range buf {
-			buf[i] = byte(i)
-		}
-		return int(size), nil
-	}, nil)
-	require.NoError(t, err)
-
-	buf := make([]byte, 16)
-	n, err := reader.Read(context.Background(), buf, 0, 16)
-	require.NoError(t, err)
-	require.Equal(t, 16, n)
-
-	n, err = reader.Read(context.Background(), buf, 8, 16)
-	require.NoError(t, err)
-	require.Equal(t, 16, n)
-}
-
-func TestCoverageReaderRead_LargeRequestFallback(t *testing.T) {
-	reader := &Reader{
-		volName:          "v",
-		ino:              2,
-		mw:               &meta.MetaWrapper{},
-		ebs:              &BlobStoreClient{},
-		readConcurrency:  1,
-		limitManager:     manager.NewLimitManager(nil),
-		blockSize:        32,
-		aheadReadEnable:  true,
-		minReadAheadSize: 0,
-		prefetchLimiter:  &blobReadPrefetchLimiter{maxBytes: 1 << 20},
-	}
-
-	err := gohook.HookMethod(reader.mw, "GetObjExtents", func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
-		return 1, 128, nil, []proto.ObjExtentKey{{FileOffset: 0, Size: 128}}, nil
-	}, nil)
-	require.NoError(t, err)
-	err = gohook.HookMethod(reader.ebs, "Read", func(_ *BlobStoreClient, _ context.Context, _ string, _ []byte, _ uint64, size uint64, _ proto.ObjExtentKey) (int, error) {
-		return int(size), nil
-	}, nil)
-	require.NoError(t, err)
-
-	buf := make([]byte, 40) // >= blockSize, fallback path
-	n, err := reader.Read(context.Background(), buf, 0, len(buf))
-	require.NoError(t, err)
-	require.Equal(t, len(buf), n)
 }
 
 func MockGetObjExtentsTrue(m *meta.MetaWrapper, inode uint64) (gen uint64, size uint64,
@@ -538,4 +547,150 @@ func MockGetTrue(bc *bcache.BcacheClient, vol, key string, buf []byte, offset ui
 
 func MockGetFalse(bc *bcache.BcacheClient, vol, key string, buf []byte, offset uint64, size uint32) (int, error) {
 	return 0, errors.New("Bcache get failed")
+}
+
+func TestReaderCoveragePrefetchAndAlignment(t *testing.T) {
+	t.Run("limiter singleton and ensurePrefetchBuf branches", func(t *testing.T) {
+		blobReadPrefetchLimiterGV = nil
+		l1 := getBlobReadPrefetchLimiter(16)
+		require.NotNil(t, l1)
+		l2 := getBlobReadPrefetchLimiter(32)
+		require.Equal(t, l1, l2)
+		require.Equal(t, int64(16), l2.maxBytes)
+
+		r := &Reader{blockSize: 4, prefetchLimiter: &blobReadPrefetchLimiter{maxBytes: 1}}
+		require.False(t, r.ensurePrefetchBuf())
+		r.prefetchLimiter.maxBytes = 8
+		require.True(t, r.ensurePrefetchBuf())
+		require.True(t, r.ensurePrefetchBuf())
+		r.Close(context.Background())
+		require.Equal(t, int64(0), r.prefetchReserved)
+	})
+
+	t.Run("read paths and prefetch fallback", func(t *testing.T) {
+		r := &Reader{
+			valid:            true,
+			objExtentKeys:    []proto.ObjExtentKey{{FileOffset: 0, Size: 8}},
+			readConcurrency:  1,
+			blockSize:        4,
+			aheadReadEnable:  true,
+			minReadAheadSize: 0,
+			prefetchLimiter:  &blobReadPrefetchLimiter{maxBytes: 8},
+			limitManager:     manager.NewLimitManager(nil),
+			ebs:              newSafeBlobStoreClientForTest(),
+		}
+		err := gohook.HookMethod(r.ebs, "Read",
+			func(_ *BlobStoreClient, _ context.Context, _ string, buf []byte, _ uint64, _ uint64, _ proto.ObjExtentKey) (int, error) {
+				for i := range buf {
+					buf[i] = byte(i + 1)
+				}
+				return len(buf), nil
+			}, nil)
+		require.NoError(t, err)
+		defer gohook.UnHookMethod(r.ebs, "Read")
+
+		n, err := r.Read(context.Background(), make([]byte, 0), 0, 0)
+		require.NoError(t, err)
+		require.Equal(t, 0, n)
+
+		_, err = r.Read(context.Background(), make([]byte, 2), 10, 2)
+		require.ErrorIs(t, err, io.EOF)
+
+		r.prefetchLimiter.maxBytes = 0
+		n, err = r.Read(context.Background(), make([]byte, 2), 0, 2)
+		require.NoError(t, err)
+		require.Equal(t, 2, n)
+
+		r.prefetchLimiter.maxBytes = 8
+		n, err = r.Read(context.Background(), make([]byte, 4), 0, 4)
+		require.NoError(t, err)
+		require.Equal(t, 4, n)
+		require.Equal(t, 0, r.bufValidLen)
+
+		r.prefetchLimiter.maxBytes = 8
+		r.bufValidLen = 1
+		r.bufBaseOff = 0
+		r.readBuf = make([]byte, 1)
+		n, err = r.Read(context.Background(), make([]byte, 2), 0, 2)
+		require.NoError(t, err)
+		require.Equal(t, 2, n)
+	})
+
+	t.Run("refresh and align branches", func(t *testing.T) {
+		r := &Reader{
+			valid:            true,
+			metaReportedSize: 10,
+			inodeViewGen:     1,
+			inodeViewSize:    10,
+		}
+		require.NoError(t, r.EnsureAlignedForRead(1, 10))
+
+		mw := &meta.MetaWrapper{}
+		err := gohook.HookMethod(mw, "GetObjExtents", func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
+			return 2, 8, nil, []proto.ObjExtentKey{{FileOffset: 0, Size: 8}}, nil
+		}, nil)
+		require.NoError(t, err)
+		defer gohook.UnHookMethod(mw, "GetObjExtents")
+
+		r.mw = mw
+		r.ino = 100
+		r.valid = false
+		require.NoError(t, r.EnsureAlignedForRead(2, 8))
+		require.Equal(t, uint64(2), r.inodeViewGen)
+		require.Equal(t, uint64(8), r.inodeViewSize)
+		require.NoError(t, r.RefreshExtents())
+	})
+}
+
+func TestReaderCoverageHelperBranches(t *testing.T) {
+	t.Run("string and newreader minreadahead clamp", func(t *testing.T) {
+		ec := &stream.ExtentClient{}
+		ec.LimitManager = manager.NewLimitManager(nil)
+		r := NewReader(ClientConfig{
+			VolName:          "v",
+			Ino:              1,
+			Ec:               ec,
+			BlockSize:        4,
+			AheadReadEnable:  true,
+			MinReadAheadSize: -1,
+			PrefetchTotalMem: 4,
+		})
+		require.NotContains(t, (rwSlice{fileOffset: 1}).String(), "hole(true)")
+		require.Contains(t, r.String(), "Reader{")
+		require.Equal(t, uint64(0), r.minReadAheadSize)
+	})
+
+	t.Run("ensureExtentsLoaded and readEbsRange error paths", func(t *testing.T) {
+		mw := &meta.MetaWrapper{}
+		err := gohook.HookMethod(mw, "GetObjExtents", func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
+			return 0, 0, nil, nil, errors.New("boom")
+		}, nil)
+		require.NoError(t, err)
+		defer gohook.UnHookMethod(mw, "GetObjExtents")
+
+		r := &Reader{mw: mw, ino: 1, readConcurrency: 1, limitManager: manager.NewLimitManager(nil)}
+		require.Error(t, r.ensureExtentsLoaded())
+		_, err = r.readEbsRange(context.Background(), -1, 1)
+		require.Error(t, err)
+	})
+
+	t.Run("prepareEbsSlice holes and readSliceRange hole", func(t *testing.T) {
+		r := &Reader{
+			valid: true,
+			objExtentKeys: []proto.ObjExtentKey{
+				{FileOffset: 10, Size: 5},
+				{FileOffset: 20, Size: 5},
+			},
+			limitManager: manager.NewLimitManager(nil),
+		}
+		slices, err := r.prepareEbsSlice(0, 30)
+		require.NoError(t, err)
+		require.NotEmpty(t, slices)
+
+		r.err = make(chan error, 1)
+		r.wg.Add(1)
+		require.NoError(t, r.readSliceRange(context.Background(), &rwSlice{hole: true, rSize: 3}))
+		r.wg.Wait()
+		require.NoError(t, <-r.err)
+	})
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,27 +19,30 @@ import (
 )
 
 const (
-	PROF_PORT                = 8220
 	METAPARTITION_ID         = 1
 	INVALID_METAPARTITION_ID = 1000
 )
 
-var server = createMetaNodeServerForTest()
+var (
+	server     = createMetaNodeServerForTest()
+	apiBaseURL string
+)
 
 func createMetaNodeServerForTest() (m *MetaNode) {
 	var err error
 	m = &MetaNode{}
 
-	go func() {
-		err = http.ListenAndServe(fmt.Sprintf(":%v", PROF_PORT), nil)
-		if err != nil {
-			panic(err)
-		}
-	}()
-
 	if err = m.registerAPIHandler(); err != nil {
 		return
 	}
+	ln, lerr := net.Listen("tcp", "127.0.0.1:0")
+	if lerr != nil {
+		return
+	}
+	apiBaseURL = fmt.Sprintf("http://%s", ln.Addr().String())
+	go func() {
+		_ = http.Serve(ln, nil)
+	}()
 
 	return
 }
@@ -145,15 +149,13 @@ func getSnapshot(t *testing.T, snapshotFile string, url string) {
 }
 
 func TestGetInodeSnapshot(t *testing.T) {
-	url := fmt.Sprintf("http://127.0.0.1:%v%v?pid=%v",
-		PROF_PORT, "/getInodeSnapshot", METAPARTITION_ID)
+	url := fmt.Sprintf("%s%v?pid=%v", apiBaseURL, "/getInodeSnapshot", METAPARTITION_ID)
 	fmt.Println(url)
 	getSnapshot(t, inodeFile, url)
 }
 
 func TestGetDentrySnapshot(t *testing.T) {
-	url := fmt.Sprintf("http://127.0.0.1:%v%v?pid=%v",
-		PROF_PORT, "/getDentrySnapshot", METAPARTITION_ID)
+	url := fmt.Sprintf("%s%v?pid=%v", apiBaseURL, "/getDentrySnapshot", METAPARTITION_ID)
 	fmt.Println(url)
 	getSnapshot(t, dentryFile, url)
 }
@@ -166,8 +168,7 @@ func TestWithWrongMetaPartitionID(t *testing.T) {
 	mp := createMetaPartition(testPath, t)
 	require.NotNil(t, mp)
 
-	url := fmt.Sprintf("http://127.0.0.1:%v%v?pid=%v",
-		PROF_PORT, "/getInodeSnapshot", 2)
+	url := fmt.Sprintf("%s%v?pid=%v", apiBaseURL, "/getInodeSnapshot", 2)
 
 	data := httpReqHandle(url, t)
 	require.Contains(t, string(data), "unknown meta partition")
@@ -181,7 +182,7 @@ func ensureOpLimiterForTest(t *testing.T) {
 	}
 }
 
-func apiURL(p string) string { return fmt.Sprintf("http://127.0.0.1:%d%s", PROF_PORT, p) }
+func apiURL(p string) string { return fmt.Sprintf("%s%s", apiBaseURL, p) }
 
 type apiResp struct {
 	Code int             `json:"code"`
