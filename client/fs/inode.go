@@ -15,6 +15,7 @@
 package fs
 
 import (
+	"context"
 	"syscall"
 	"time"
 
@@ -86,7 +87,14 @@ func (s *Super) InodeGet(ino uint64) (info *proto.InodeInfo, err error) {
 				clientConf.MinReadAheadSize = aheadMin
 				clientConf.PrefetchTotalMem = aheadTotalMem
 				ei.Lock()
+				// inode cache miss triggers this refresh: must persist buffered blob data before
+				// FreeCache/NewWriter or unflushed bytes are dropped (e.g. Write defers ic.Delete then Flush -> InodeGet).
 				if ei.fWriter != nil {
+					if flushErr := ei.fWriter.Flush(ino, context.Background()); flushErr != nil {
+						ei.Unlock()
+						log.LogErrorf("InodeGet: flush blob writer before refresh on cache miss ino(%v) err(%v)", ino, flushErr)
+						return nil, ParseError(flushErr)
+					}
 					ei.fWriter.FreeCache()
 				}
 				switch ei.flag & 0x0f {

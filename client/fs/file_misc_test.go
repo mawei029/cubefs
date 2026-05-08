@@ -314,3 +314,122 @@ func TestFile_Write_BlobAppendFlagPath(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 3, resp.Size)
 }
+
+func TestFile_Open_BlobFlushExistingWriterError(t *testing.T) {
+	s := newTestSuperForFile()
+	s.volType = proto.VolumeTypeCold
+	s.volname = "vol"
+	s.EbsBlockSize = 4096
+	s.writeThreads = 1
+	s.readThreads = 1
+	s.ebsc = map[uint8]*blobstore.BlobStoreClient{1: {}}
+	f := &File{super: s, ino: 30, parentIno: 1, name: "openflush"}
+	w := &blobstore.Writer{}
+	f.setReaderWriter(nil, w)
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet", func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
+		return &proto.InodeInfo{Inode: 30, PoolId: 1, StorageClass: proto.StorageClass_BlobStore, Size: 0}, nil
+	})
+	patches.ApplyMethod(reflect.TypeOf(s.ec), "OpenStream", func(_ *stream.ExtentClient, _ uint64, _ bool, _ bool, _ string) error {
+		return nil
+	})
+	patches.ApplyMethod(reflect.TypeOf(s.ec), "RefreshExtentsCache", func(_ *stream.ExtentClient, _ uint64) error { return nil })
+	patches.ApplyMethod(reflect.TypeOf(s.ec), "FileSize", func(_ *stream.ExtentClient, _ uint64) (int, uint64, bool) {
+		return 0, 1, false
+	})
+	patches.ApplyMethod(reflect.TypeOf(w), "Flush", func(_ *blobstore.Writer, _ uint64, _ context.Context) error {
+		return errors.New("flush failed")
+	})
+
+	req := &fuse.OpenRequest{Flags: syscall.O_RDONLY}
+	resp := &fuse.OpenResponse{}
+	h, err := f.Open(context.Background(), req, resp)
+	require.Error(t, err)
+	require.Nil(t, h)
+}
+
+func TestFile_Flush_BlobNilWriterReadOnlyOk(t *testing.T) {
+	s := newTestSuperForFile()
+	s.fsyncOnClose = true
+	s.volType = proto.VolumeTypeCold
+	s.poolCache = map[uint8]*proto.StoragePoolInfo{
+		1: {Id: 1, StorageClass: uint8(proto.StorageClass_BlobStore)},
+	}
+	f := &File{super: s, ino: 31, parentIno: 1, name: "fl"}
+	f.setFlag(syscall.O_RDONLY)
+	f.setReaderWriter(&blobstore.Reader{}, nil)
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet", func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
+		return &proto.InodeInfo{Inode: 31, PoolId: 1, StorageClass: proto.StorageClass_BlobStore}, nil
+	})
+
+	err := f.Flush(context.Background(), &fuse.FlushRequest{})
+	require.NoError(t, err)
+}
+
+func TestFile_Flush_BlobNilWriterWriteModeBadFd(t *testing.T) {
+	s := newTestSuperForFile()
+	s.fsyncOnClose = true
+	s.volType = proto.VolumeTypeCold
+	s.poolCache = map[uint8]*proto.StoragePoolInfo{
+		1: {Id: 1, StorageClass: uint8(proto.StorageClass_BlobStore)},
+	}
+	f := &File{super: s, ino: 32, parentIno: 1, name: "fl2"}
+	f.setFlag(syscall.O_WRONLY)
+	f.setReaderWriter(nil, nil)
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet", func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
+		return &proto.InodeInfo{Inode: 32, PoolId: 1, StorageClass: proto.StorageClass_BlobStore}, nil
+	})
+
+	err := f.Flush(context.Background(), &fuse.FlushRequest{})
+	require.Error(t, err)
+	require.Equal(t, fuse.Errno(syscall.EBADF), err)
+}
+
+func TestFile_Fsync_BlobNilWriterReadOnlyOk(t *testing.T) {
+	s := newTestSuperForFile()
+	s.volType = proto.VolumeTypeCold
+	s.poolCache = map[uint8]*proto.StoragePoolInfo{
+		1: {Id: 1, StorageClass: uint8(proto.StorageClass_BlobStore)},
+	}
+	f := &File{super: s, ino: 33, parentIno: 1, name: "fs"}
+	f.setFlag(syscall.O_RDONLY)
+	f.setReaderWriter(&blobstore.Reader{}, nil)
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet", func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
+		return &proto.InodeInfo{Inode: 33, PoolId: 1, StorageClass: proto.StorageClass_BlobStore}, nil
+	})
+
+	err := f.Fsync(context.Background(), &fuse.FsyncRequest{})
+	require.NoError(t, err)
+}
+
+func TestFile_Fsync_BlobNilWriterWriteModeBadFd(t *testing.T) {
+	s := newTestSuperForFile()
+	s.volType = proto.VolumeTypeCold
+	s.poolCache = map[uint8]*proto.StoragePoolInfo{
+		1: {Id: 1, StorageClass: uint8(proto.StorageClass_BlobStore)},
+	}
+	f := &File{super: s, ino: 34, parentIno: 1, name: "fs2"}
+	f.setFlag(syscall.O_RDWR)
+	f.setReaderWriter(&blobstore.Reader{}, nil)
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet", func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
+		return &proto.InodeInfo{Inode: 34, PoolId: 1, StorageClass: proto.StorageClass_BlobStore}, nil
+	})
+
+	err := f.Fsync(context.Background(), &fuse.FsyncRequest{})
+	require.Error(t, err)
+	require.Equal(t, fuse.Errno(syscall.EBADF), err)
+}

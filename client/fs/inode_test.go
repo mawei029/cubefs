@@ -1,6 +1,7 @@
 package fs
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"syscall"
@@ -73,6 +74,44 @@ func TestInodeGet_BlobStoreFileRefreshReaderWriter(t *testing.T) {
 	require.True(t, proto.IsStorageClassBlobStore(got.StorageClass))
 	require.NotNil(t, f.getReader())
 	require.NotNil(t, f.getWriter())
+}
+
+func TestInodeGet_BlobFlushBeforeRefreshFails(t *testing.T) {
+	s := newTestSuperForInode()
+	ino := uint64(101)
+	poolID := uint8(1)
+
+	f := &File{super: s, ino: ino}
+	f.setFlag(syscall.O_RDONLY)
+	w := &blobstore.Writer{}
+	f.setReaderWriter(nil, w)
+	s.nodeCache[ino] = f
+	s.ebsc[poolID] = &blobstore.BlobStoreClient{}
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "InodeGet_ll",
+		func(_ *meta.MetaWrapper, gotIno uint64, _ bool) (*proto.InodeInfo, error) {
+			require.Equal(t, ino, gotIno)
+			return &proto.InodeInfo{
+				Inode:        ino,
+				StorageClass: proto.StorageClass_BlobStore,
+				PoolId:       poolID,
+				Size:         0,
+				Generation:   1,
+			}, nil
+		})
+	patches.ApplyMethod(reflect.TypeOf(s.ec), "FileSize",
+		func(_ *stream.ExtentClient, _ uint64) (int, uint64, bool) {
+			return 0, 1, false
+		})
+	patches.ApplyMethod(reflect.TypeOf(w), "Flush",
+		func(_ *blobstore.Writer, _ uint64, _ context.Context) error {
+			return errors.New("flush failed")
+		})
+
+	_, err := s.InodeGet(ino)
+	require.Error(t, err)
 }
 
 func TestInodeGet_NoExtentsRefreshCache(t *testing.T) {

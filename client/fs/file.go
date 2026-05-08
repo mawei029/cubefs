@@ -345,6 +345,10 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 			PoolId:          info.PoolId,
 		}
 		if writer := f.getWriter(); writer != nil {
+			if flushErr := writer.Flush(ino, context.Background()); flushErr != nil {
+				log.LogErrorf("Open: flush blob writer before replace ino(%v) err(%v)", ino, flushErr)
+				return nil, ParseError(flushErr)
+			}
 			writer.FreeCache()
 		}
 		var reader *blobstore.Reader
@@ -696,6 +700,11 @@ func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) (err error) {
 	} else {
 		err = f.withWriter(func(writer *blobstore.Writer) error {
 			if writer == nil {
+				// BlobStore read-only handles have no Writer; Flush may still arrive on close (e.g. fsyncOnClose).
+				// Use open mode from Open(), not req.Flags (FlushRequest.Flags is FUSE flush flags, not O_*).
+				if f.getFlag()&0x0f == syscall.O_RDONLY {
+					return nil
+				}
 				return syscall.EBADF
 			}
 			return writer.Flush(f.ino, context.Background())
@@ -760,6 +769,10 @@ func (f *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) (err error) {
 	} else {
 		err = f.withWriter(func(writer *blobstore.Writer) error {
 			if writer == nil {
+				// Same as Flush; FsyncRequest.Flags is datasync-related, not O_RDONLY.
+				if f.getFlag()&0x0f == syscall.O_RDONLY {
+					return nil
+				}
 				return syscall.EBADF
 			}
 			return writer.Flush(f.ino, context.Background())
