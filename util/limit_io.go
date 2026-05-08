@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -56,6 +57,19 @@ var (
 	LimitedFlowError   = errors.New("flow limited")
 	LimitedRunError    = errors.New("run limited")
 )
+
+func IsFlowLimitDeadlineError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	// x/time/rate.WaitN returns a non-wrapped error like
+	// "rate: Wait(n=...) would exceed context deadline" when it can predict
+	// the requested wait cannot complete before ctx deadline.
+	return strings.Contains(err.Error(), "would exceed context deadline")
+}
 
 // flow rate limiter's burst is double limit.
 // max queue size of io is 8-times io concurrency.
@@ -134,7 +148,11 @@ func (l *IoLimiter) TryRunAsync(ctx context.Context, size int, waitForFlow bool,
 	if size > 0 && l.limit > 0 {
 		if waitForFlow {
 			if err := l.flow.WaitN(ctx, size); err != nil {
-				return LimitedFlowError
+				if IsFlowLimitDeadlineError(err) {
+					return LimitedFlowError
+				}
+				log.LogWarnf("action[limitio] tryrun async wait flow with %d %s", size, err.Error())
+				return err
 			}
 		} else {
 			if !l.flow.AllowN(time.Now(), size) {
@@ -148,9 +166,15 @@ func (l *IoLimiter) TryRunAsync(ctx context.Context, size int, waitForFlow bool,
 	return nil
 }
 
-func (l *IoLimiter) AcquireDiskFlow(size int) error {
+func (l *IoLimiter) AcquireDiskFlow(ctx context.Context, size int) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if size > 0 && l.limit > 0 {
-		if err := l.flow.WaitN(context.Background(), size); err != nil {
+		if err := l.flow.WaitN(ctx, size); err != nil {
+			if IsFlowLimitDeadlineError(err) {
+				return LimitedFlowError
+			}
 			log.LogWarnf("action[limitio] get disk flow token wait flow with %d %s", size, err.Error())
 			return err
 		}

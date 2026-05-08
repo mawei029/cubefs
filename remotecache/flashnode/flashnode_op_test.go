@@ -21,11 +21,13 @@ import (
 	"hash/crc32"
 	"io"
 	"net"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/google/uuid"
 
@@ -410,4 +412,141 @@ func TestDoObjectReadRequestRepliesCachedData(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("doObjectReadRequest did not finish")
 	}
+}
+
+func TestCacheReadContextUsesRequestDeadline(t *testing.T) {
+	deadline := time.Now().Add(time.Minute).Truncate(time.Nanosecond)
+	ctx, cancel := newCacheReadContext(uint64(deadline.UnixNano()), time.Hour)
+	defer cancel()
+
+	got, ok := ctx.Deadline()
+	require.True(t, ok)
+	require.Equal(t, deadline.UnixNano(), got.UnixNano())
+}
+
+func TestCacheReadContextUsesFallbackWhenDeadlineMissing(t *testing.T) {
+	before := time.Now()
+	ctx, cancel := newCacheReadContext(0, time.Minute)
+	defer cancel()
+
+	got, ok := ctx.Deadline()
+	require.True(t, ok)
+	require.GreaterOrEqual(t, got.Sub(before), time.Minute-time.Second)
+	require.LessOrEqual(t, got.Sub(before), time.Minute+time.Second)
+}
+
+func TestLargeObjectReadDeadlineStopsFlowWait(t *testing.T) {
+	limiter := util.NewIOLimiter(100, 0)
+	defer limiter.Close()
+	require.NoError(t, limiter.TryRunAsync(context.Background(), 50, true, func() {}))
+
+	f := &FlashNode{limitRead: limiter}
+	block := &cachengine.CacheBlock{}
+	setCacheBlockUsedSizeForTest(t, block, 50)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	deadline, ok := ctx.Deadline()
+	require.True(t, ok)
+	req := &proto.CacheReadRequestBase{
+		Offset:   0,
+		Size_:    50,
+		Deadline: uint64(deadline.UnixNano()),
+	}
+	p := proto.NewPacketReqID()
+	p.Opcode = proto.OpFlashNodeCacheReadObject
+
+	err := f.doObjectReadRequest(ctx, discardTestConn{}, req, p, block, t.Name())
+	require.ErrorIs(t, err, util.LimitedFlowError)
+}
+
+type discardTestConn struct{}
+
+func (discardTestConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (discardTestConn) Write(p []byte) (int, error)      { return len(p), nil }
+func (discardTestConn) Close() error                     { return nil }
+func (discardTestConn) LocalAddr() net.Addr              { return testAddr("local") }
+func (discardTestConn) RemoteAddr() net.Addr             { return testAddr("remote") }
+func (discardTestConn) SetDeadline(time.Time) error      { return nil }
+func (discardTestConn) SetReadDeadline(time.Time) error  { return nil }
+func (discardTestConn) SetWriteDeadline(time.Time) error { return nil }
+
+type testAddr string
+
+func (a testAddr) Network() string { return string(a) }
+func (a testAddr) String() string  { return string(a) }
+
+func TestObjectReadFlowSizeAlignsToPackets(t *testing.T) {
+	packetSize := uint64(proto.CACHE_BLOCK_PACKET_SIZE)
+	dataSize := 4 * packetSize
+
+	tests := []struct {
+		name     string
+		offset   uint64
+		size     uint64
+		dataSize uint64
+		want     int
+	}{
+		{
+			name:     "single_byte_reads_one_packet",
+			offset:   0,
+			size:     1,
+			dataSize: dataSize,
+			want:     int(packetSize),
+		},
+		{
+			name:     "size_crosses_packet_boundary",
+			offset:   0,
+			size:     packetSize + 1,
+			dataSize: dataSize,
+			want:     int(2 * packetSize),
+		},
+		{
+			name:     "unaligned_offset_reads_containing_packet",
+			offset:   100,
+			size:     1,
+			dataSize: dataSize,
+			want:     int(packetSize),
+		},
+		{
+			name:     "unaligned_range_crosses_boundary",
+			offset:   packetSize - 1,
+			size:     2,
+			dataSize: dataSize,
+			want:     int(2 * packetSize),
+		},
+		{
+			name:     "range_is_capped_by_loaded_data",
+			offset:   0,
+			size:     packetSize + 1,
+			dataSize: packetSize + 1,
+			want:     int(packetSize + 1),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, objectReadFlowSize(tt.offset, tt.size, tt.dataSize))
+		})
+	}
+}
+
+func TestSmallObjectReadDeadlineStopsDiskFlowWait(t *testing.T) {
+	limiter := util.NewIOLimiter(2, 0)
+	defer limiter.Close()
+	require.NoError(t, limiter.TryRunAsync(context.Background(), 1, true, func() {}))
+
+	ctx, cancel := newCacheReadContext(uint64(time.Now().Add(-time.Second).UnixNano()), time.Hour)
+	defer cancel()
+
+	err := limiter.AcquireDiskFlow(ctx, 1)
+	require.ErrorIs(t, err, util.LimitedFlowError)
+}
+
+func setCacheBlockUsedSizeForTest(t *testing.T, block *cachengine.CacheBlock, size int64) {
+	t.Helper()
+
+	field := reflect.ValueOf(block).Elem().FieldByName("usedSize")
+	require.True(t, field.IsValid())
+	*(*int64)(unsafe.Pointer(field.UnsafeAddr())) = size
 }

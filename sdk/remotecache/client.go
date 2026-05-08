@@ -1580,7 +1580,7 @@ func (reader *RemoteCacheReader) Read(p []byte) (n int, err error) {
 		return 0, fmt.Errorf(proto.ErrorReadFromCloseReaderTpl, reader.reqID)
 	}
 	if !reader.directRead && !reader.loadAll && reader.ctx.Err() != nil {
-		err = reader.ctx.Err()
+		err = fmt.Errorf("RemoteCacheReader: check read err %w", reader.ctx.Err())
 		log.LogErrorf("RemoteCacheReader:reqID(%v) err(%v)", reader.reqID, err)
 		return 0, err
 	}

@@ -78,7 +78,7 @@ func newCmdFlashTopoUpdate(client *master.MasterClient) *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "update",
-		Short: "update flash topology heartbeat config",
+		Short: "update flash topology config",
 		RunE: func(cmd *cobra.Command, args []string) (err error) {
 			var topo *proto.FlashTopologyAdminView
 			if name == "" {

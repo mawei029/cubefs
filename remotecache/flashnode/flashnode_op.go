@@ -42,8 +42,20 @@ import (
 	"golang.org/x/time/rate"
 )
 
+func newCacheReadContext(deadline uint64, fallback time.Duration) (context.Context, context.CancelFunc) {
+	if deadline > 0 {
+		return context.WithDeadline(context.Background(), time.Unix(0, int64(deadline)))
+	}
+	return context.WithTimeout(context.Background(), fallback)
+}
+
 func (f *FlashNode) preHandle(conn net.Conn, p *proto.Packet) error {
-	if (p.Opcode == proto.OpFlashNodeCacheRead || p.Opcode == proto.OpFlashNodeCachePrepare || p.Opcode == 0xDC || p.Opcode == 0xDB) && !f.readLimiter.Allow() {
+	if (p.Opcode == proto.OpFlashNodeCacheRead ||
+		p.Opcode == proto.OpFlashNodeCachePrepare ||
+		p.Opcode == 0xDC ||
+		p.Opcode == 0xDB ||
+		p.Opcode == proto.OpFlashNodeBatchReadObject ||
+		p.Opcode == proto.OpFlashNodeCacheReadObject) && !f.readLimiter.Allow() {
 		metric := exporter.NewTPCnt("NodeReqLimit")
 		metric.Set(nil)
 		err := errors.NewErrorf("%s", "remotecache read request was been limited")
@@ -687,7 +699,7 @@ func (f *FlashNode) smallObjectGet(req *proto.BatchReadItem, connAddr string, de
 		}
 		return
 	}
-	ctx, ctxCancel := context.WithTimeout(context.Background(), time.Duration(f.handleReadTimeout)*time.Millisecond)
+	ctx, ctxCancel := newCacheReadContext(deadLine, time.Duration(f.handleReadTimeout)*time.Millisecond)
 	defer ctxCancel()
 	dataSize := block.LoadDataSize()
 	readDiskSize := util.Min(proto.CACHE_BLOCK_PACKET_SIZE, int(uint64(dataSize)-req.Offset))
@@ -699,7 +711,9 @@ func (f *FlashNode) smallObjectGet(req *proto.BatchReadItem, connAddr string, de
 	} else {
 		diskDataBuf = bytespool.Alloc(proto.CACHE_BLOCK_PACKET_SIZE)
 	}
-	if err = f.limitRead.AcquireDiskFlow(readDiskSize); err == nil {
+	// The read limiter accounts for payload bytes sent to the SDK. The disk read
+	// may fetch a full packet for CRC validation, but only req.Size_ is returned.
+	if err = f.limitRead.AcquireDiskFlow(ctx, int(req.Size_)); err == nil {
 		readCRC, readDiskErr = block.Read(ctx, diskDataBuf[:readDiskSize], int64(req.Offset), int64(readDiskSize), f.waitForCacheBlock, true)
 	}
 	if readDiskErr != nil {
@@ -787,15 +801,16 @@ func (f *FlashNode) opCacheObjectGet(conn net.Conn, p *proto.Packet) (err error)
 		}
 		return
 	}
+	ctx, ctxCancel := newCacheReadContext(req.Deadline, time.Duration(f.handleReadTimeout)*time.Millisecond)
+	defer ctxCancel()
 
 	bgTime2 := stat.BeginStat()
-	err = block.CheckRateLimit(int(req.Size_), uint64(f.keyRateLimitThreshold))
+	err = block.CheckRateLimit(ctx, int(req.Size_), uint64(f.keyRateLimitThreshold))
 	if err != nil {
 		stat.EndStat("HitCacheRead:KeyLimit", err, bgTime2, 1)
 		return
 	}
-	ctx, ctxCancel := context.WithTimeout(context.Background(), time.Duration(f.handleReadTimeout)*time.Millisecond)
-	defer ctxCancel()
+	stat.EndStat("CheckRateLimit", err, bgTime2, 1)
 	// reply to client as quick as possible if hit cache
 	err = f.doObjectReadRequest(ctx, conn, req, p, block, reqID)
 	if err != nil {
@@ -1111,7 +1126,6 @@ func (f *FlashNode) doObjectReadRequest(ctx context.Context, conn net.Conn, req 
 			}
 		}
 	}()
-
 	// first reply to client
 	dataSize := block.LoadDataSize()
 	firstReply := proto.NewPacket()
@@ -1168,29 +1182,62 @@ func (f *FlashNode) doObjectReadRequest(ctx context.Context, conn net.Conn, req 
 				reply.LogMessage(reply.GetOpMsg(), conn.RemoteAddr().String(), reply.StartT, errInner), block.GetBlockKey())
 		}
 	}
-	var keepAlive bool
-	for {
-		alignedOffset = offset / proto.CACHE_BLOCK_PACKET_SIZE * proto.CACHE_BLOCK_PACKET_SIZE
-		readDiskSize = uint32(util.Min(proto.CACHE_BLOCK_PACKET_SIZE, int(dataSize-alignedOffset)))
-		if !keepAlive {
-			err = f.limitRead.RunNoWait(int(readDiskSize), false, readAndReply)
-			keepAlive = true
-		} else {
-			err = f.limitRead.Run(int(readDiskSize), true, readAndReply)
+	streamDone := make(chan struct{})
+	// Reserve flow tokens for the packet-aligned payload bytes that will actually
+	// be sent to the SDK.
+	// This keeps the large-object read path from failing halfway through a
+	// multi-packet response when later chunks hit the limiter.
+	streamReadSize := objectReadFlowSize(req.Offset, req.Size_, uint64(dataSize))
+	err = f.limitRead.TryRunAsync(ctx, streamReadSize, true, func() {
+		defer close(streamDone)
+		for {
+			alignedOffset = offset / proto.CACHE_BLOCK_PACKET_SIZE * proto.CACHE_BLOCK_PACKET_SIZE
+			readDiskSize = uint32(util.Min(proto.CACHE_BLOCK_PACKET_SIZE, int(dataSize-alignedOffset)))
+			readAndReply()
+			if errInner != nil {
+				return
+			}
+			if uint64(offset) >= req.Offset+req.Size_ {
+				break
+			}
 		}
-		if err != nil {
-			return
-		}
-		if errInner != nil {
-			err = errInner
-			return
-		}
-		if uint64(offset) >= req.Offset+req.Size_ {
-			break
-		}
+	})
+	if err != nil {
+		// The first reply has already been sent. Do not write another packet here;
+		// return the limiter error to opCacheObjectGet and let its defer send
+		// PacketErrorWithBody as the next object reply.
+		return
+	}
+	<-streamDone
+	if errInner != nil {
+		err = errInner
+		return
 	}
 	p.PacketOkReply()
 	return
+}
+
+func objectReadFlowSize(offset, size, dataSize uint64) int {
+	if size == 0 || offset >= dataSize {
+		return 0
+	}
+	packetSize := uint64(proto.CACHE_BLOCK_PACKET_SIZE)
+	startAligned := offset / packetSize * packetSize
+	end := offset + size
+	if end < offset || end > dataSize {
+		end = dataSize
+	}
+	endAligned := end / packetSize * packetSize
+	if end%packetSize != 0 {
+		endAligned += packetSize
+	}
+	if endAligned > dataSize {
+		endAligned = dataSize
+	}
+	if endAligned <= startAligned {
+		return 0
+	}
+	return int(endAligned - startAligned)
 }
 
 func (f *FlashNode) opCachePrepare(conn net.Conn, p *proto.Packet) (err error) {

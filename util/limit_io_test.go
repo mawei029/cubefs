@@ -15,6 +15,9 @@
 package util
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -148,4 +151,74 @@ func TestLimitIOConcurrency(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	close(done)
 	l.Close()
+}
+
+func TestIoLimiterAcquireDiskFlowWithContextDeadline(t *testing.T) {
+	l := NewIOLimiter(2, 0)
+	defer l.Close()
+
+	require.True(t, l.flow.AllowN(time.Now(), l.flow.Burst()))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	err := l.AcquireDiskFlow(ctx, 1)
+	require.ErrorIs(t, err, LimitedFlowError)
+}
+
+func TestIsFlowLimitDeadlineError(t *testing.T) {
+	require.False(t, IsFlowLimitDeadlineError(nil))
+	require.True(t, IsFlowLimitDeadlineError(context.DeadlineExceeded))
+	require.True(t, IsFlowLimitDeadlineError(fmt.Errorf("wrapped deadline: %w", context.DeadlineExceeded)))
+	require.False(t, IsFlowLimitDeadlineError(errors.New("other error")))
+}
+
+func TestIsFlowLimitDeadlineErrorForRateWaitDeadline(t *testing.T) {
+	l := NewIOLimiter(2, 0)
+	defer l.Close()
+
+	require.True(t, l.flow.AllowN(time.Now(), l.flow.Burst()))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	err := l.flow.WaitN(ctx, 1)
+	require.Error(t, err)
+	require.True(t, IsFlowLimitDeadlineError(err))
+}
+
+func TestIoLimiterAcquireDiskFlowReturnsNonContextWaitError(t *testing.T) {
+	l := NewIOLimiter(2, 0)
+	defer l.Close()
+
+	err := l.AcquireDiskFlow(context.Background(), l.flow.Burst()+1)
+	require.Error(t, err)
+	require.False(t, errors.Is(err, LimitedFlowError))
+}
+
+func TestIoLimiterTryRunAsyncWithContextDeadline(t *testing.T) {
+	l := NewIOLimiter(2, 0)
+	defer l.Close()
+
+	require.True(t, l.flow.AllowN(time.Now(), l.flow.Burst()))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	ran := false
+	err := l.TryRunAsync(ctx, 1, true, func() {
+		ran = true
+	})
+	require.ErrorIs(t, err, LimitedFlowError)
+	require.False(t, ran)
+}
+
+func TestIoLimiterTryRunAsyncReturnsNonContextWaitError(t *testing.T) {
+	l := NewIOLimiter(2, 0)
+	defer l.Close()
+
+	ran := false
+	err := l.TryRunAsync(context.Background(), l.flow.Burst()+1, true, func() {
+		ran = true
+	})
+	require.Error(t, err)
+	require.False(t, errors.Is(err, LimitedFlowError))
+	require.False(t, ran)
 }

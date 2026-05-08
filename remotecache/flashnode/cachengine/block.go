@@ -64,13 +64,16 @@ type CacheBlock struct {
 	initOnce     sync.Once
 	sourceReader ReadExtentData
 
-	readyOnce  sync.Once
-	readyCh    chan struct{}
-	closeOnce  sync.Once
-	closeCh    chan struct{}
-	clientIP   string
-	disk       *Disk
-	keyLimiter *rate.Limiter
+	readyOnce sync.Once
+	readyCh   chan struct{}
+	closeOnce sync.Once
+	closeCh   chan struct{}
+	clientIP  string
+	disk      *Disk
+
+	keyLimiterMu   sync.Mutex
+	keyLimiter     *rate.Limiter
+	keyLimiterFlow int64
 }
 
 // NewCacheBlock create and returns a new extent instance.
@@ -773,16 +776,68 @@ func (cb *CacheBlock) info() string {
 	return fmt.Sprintf("path(%v)_from(%v)_size(%v)", cb.filePath, cb.clientIP, cb.getAllocSize())
 }
 
-func (cb *CacheBlock) CheckRateLimit(size int, threshold uint64) error {
-	if cb.keyLimiter != nil && uint64(cb.getAllocSize()) >= threshold {
-		if !cb.keyLimiter.AllowN(time.Now(), size) {
-			return util.LimitedFlowError
+func (cb *CacheBlock) CheckRateLimit(ctx context.Context, size int, threshold uint64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if uint64(cb.getAllocSize()) >= threshold {
+		if keyLimiter := cb.getOrUpdateKeyLimiter(); keyLimiter != nil {
+			if err := keyLimiter.WaitN(ctx, size); err != nil {
+				if util.IsFlowLimitDeadlineError(err) {
+					return util.LimitedFlowError
+				}
+				log.LogWarnf("action[CheckRateLimit] key(%v) wait flow with %d err %v", cb.blockKey, size, err)
+				return err
+			}
 		}
 	}
 	return nil
 }
 
+func (cb *CacheBlock) getOrUpdateKeyLimiter() *rate.Limiter {
+	// Cache blocks created through CacheEngine always have cacheEngine set.
+	// Keep this guard for tests or partially initialized blocks so rate-limit
+	// checks do not panic before the block is fully attached to an engine.
+	if cb.cacheEngine == nil {
+		return cb.keyLimiter
+	}
+	flow := cb.cacheEngine.GetKeyLimiterFlow()
+	if atomic.LoadInt64(&cb.keyLimiterFlow) != flow {
+		cb.keyLimiterMu.Lock()
+		if atomic.LoadInt64(&cb.keyLimiterFlow) != flow {
+			cb.resetKeyLimiterLocked(flow)
+		}
+		keyLimiter := cb.keyLimiter
+		cb.keyLimiterMu.Unlock()
+		return keyLimiter
+	}
+
+	// Intentionally avoid locking on the hot read path. keyLimiterFlow changes
+	// are rare control-plane updates; during the short update window, a request
+	// may use the previous limiter or skip key limiting once. That temporary
+	// flow jitter is acceptable here and cheaper than adding a lock to every
+	// high-concurrency read.
+	return cb.keyLimiter
+}
+
+func (cb *CacheBlock) resetKeyLimiterLocked(keyLimiterFlow int64) {
+	if keyLimiterFlow <= 0 {
+		cb.keyLimiter = nil
+		atomic.StoreInt64(&cb.keyLimiterFlow, keyLimiterFlow)
+		return
+	}
+	flow := float64(keyLimiterFlow)
+	if cb.keyLimiter == nil {
+		cb.keyLimiter = rate.NewLimiter(rate.Limit(flow), int(flow/2))
+	} else {
+		cb.keyLimiter.SetLimit(rate.Limit(flow))
+		cb.keyLimiter.SetBurst(int(flow / 2))
+	}
+	atomic.StoreInt64(&cb.keyLimiterFlow, keyLimiterFlow)
+}
+
 func (cb *CacheBlock) initKeyLimiter(keyRateLimitThreshold int32, keyLimiterFlow int64) {
+	atomic.StoreInt64(&cb.keyLimiterFlow, keyLimiterFlow)
 	if cb.getAllocSize() >= int64(keyRateLimitThreshold) && keyLimiterFlow > 0 {
 		flow := float64(keyLimiterFlow)
 		cb.keyLimiter = rate.NewLimiter(rate.Limit(flow), int(flow/2))
@@ -869,7 +924,7 @@ func (c *CacheEngine) createCacheBlockV2(pDir string, uniKey string, ttl int64, 
 		}
 	}
 	if cacheItem, err = c.selectAvailableLruCache(); err == nil {
-		block = NewCacheBlockV2(cacheItem.config.Path, pDir, uniKey, allocSize, clientIP, cacheItem.disk, c.keyRateLimitThreshold, c.keyLimiterFlow)
+		block = NewCacheBlockV2(cacheItem.config.Path, pDir, uniKey, allocSize, clientIP, cacheItem.disk, c.keyRateLimitThreshold, c.GetKeyLimiterFlow())
 		if ttl <= 0 {
 			ttl = proto.DefaultCacheTTLSec
 		}
@@ -917,7 +972,7 @@ func (c *CacheEngine) createCacheBlockFromExistV2(dataPath string, volume string
 	if atomic.LoadInt32(&cacheItem.disk.Status) == proto.Unavailable {
 		return nil, nil, errors.NewErrorf("lru cache item related to dataPath(%v) is unavailable", dataPath)
 	}
-	block = NewCacheBlockV2(cacheItem.config.Path, volume, uniKey, allocSize, clientIP, cacheItem.disk, c.keyRateLimitThreshold, c.keyLimiterFlow)
+	block = NewCacheBlockV2(cacheItem.config.Path, volume, uniKey, allocSize, clientIP, cacheItem.disk, c.keyRateLimitThreshold, c.GetKeyLimiterFlow())
 	block.cacheEngine = c
 	defer func() {
 		if err != nil {
@@ -938,7 +993,7 @@ func (c *CacheEngine) createCacheBlockFromExistV2(dataPath string, volume string
 	if err = block.initFilePath(true); err != nil {
 		return
 	}
-	block.initKeyLimiter(c.keyRateLimitThreshold, c.keyLimiterFlow)
+	block.initKeyLimiter(c.keyRateLimitThreshold, c.GetKeyLimiterFlow())
 	return
 }
 

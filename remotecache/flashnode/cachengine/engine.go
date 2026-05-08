@@ -189,7 +189,7 @@ func NewCacheEngine(memDataDir string, totalMemSize int64, maxUseRatio float64, 
 	s.cacheEvictWorkerNum = cacheEvictWorkerNum
 	s.localAddr = localAddr
 	s.keyRateLimitThreshold = keyRateLimitThreshold
-	s.keyLimiterFlow = keyLimiterFlow
+	atomic.StoreInt64(&s.keyLimiterFlow, keyLimiterFlow)
 	s.reservedSpace = reservedSpace
 	s.keyToDiskMap = make(map[string]*lruCacheItem)
 	s.statCh = make(chan StatUpdate, StatChanSize)
@@ -378,6 +378,10 @@ func (c *CacheEngine) IsVolumeDisableTTL(volume string) bool {
 func (c *CacheEngine) SetKeyLimiterFlow(keyLimiterFlow int64) {
 	atomic.StoreInt64(&c.keyLimiterFlow, keyLimiterFlow)
 	log.LogInfof("CacheEngine: set keyLimiterFlow to %d", keyLimiterFlow)
+}
+
+func (c *CacheEngine) GetKeyLimiterFlow() int64 {
+	return atomic.LoadInt64(&c.keyLimiterFlow)
 }
 
 func (c *CacheEngine) getCacheItem(key string) (*lruCacheItem, bool) {
