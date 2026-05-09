@@ -57,6 +57,9 @@ func (s *Super) InodeGet(ino uint64) (info *proto.InodeInfo, err error) {
 	s.fslock.Unlock()
 	if isFind {
 		if f, ok := node.(*File); ok && proto.IsStorageClassBlobStore(info.StorageClass) {
+			if s.oec.Reader(ino) != nil || s.oec.Writer(ino) != nil {
+				return info, nil
+			}
 			ei, found := f.getExtendInfo()
 			if found && ei != nil {
 				ebsc, err := s.getBlobStoreClient(info.PoolId)
@@ -66,19 +69,19 @@ func (s *Super) InodeGet(ino uint64) (info *proto.InodeInfo, err error) {
 				}
 
 				fileSize, _ := f.fileSizeVersion2(f.ino)
-				aheadEn, aheadMin, aheadTotalMem := f.super.BlobStoreAheadReadForReader()
+				aheadEn, aheadMin, aheadTotalMem := s.BlobStoreAheadReadForReader()
 				clientConf := blobstore.ClientConfig{
-					VolName:         f.super.volname,
-					VolType:         f.super.volType,
-					BlockSize:       f.super.EbsBlockSize,
+					VolName:         s.volname,
+					VolType:         s.volType,
+					BlockSize:       s.EbsBlockSize,
 					Ino:             f.ino,
-					Bc:              f.super.bc,
-					Mw:              f.super.mw,
-					Ec:              f.super.ec,
+					Bc:              s.bc,
+					Mw:              s.mw,
+					LimitManager:    s.blobClientLimitManager(),
 					Ebsc:            ebsc,
-					EnableBcache:    f.super.enableBcache,
-					WConcurrency:    f.super.writeThreads,
-					ReadConcurrency: f.super.readThreads,
+					EnableBcache:    s.enableBcache,
+					WConcurrency:    s.writeThreads,
+					ReadConcurrency: s.readThreads,
 					FileCache:       false,
 					FileSize:        uint64(fileSize),
 					PoolId:          info.PoolId,
@@ -89,31 +92,31 @@ func (s *Super) InodeGet(ino uint64) (info *proto.InodeInfo, err error) {
 				ei.Lock()
 				// inode cache miss triggers this refresh: must persist buffered blob data before
 				// FreeCache/NewWriter or unflushed bytes are dropped (e.g. Write defers ic.Delete then Flush -> InodeGet).
-				if ei.fWriter != nil {
-					if flushErr := ei.fWriter.Flush(ino, context.Background()); flushErr != nil {
+				if ei.coldBlobWriter != nil {
+					if flushErr := ei.coldBlobWriter.Flush(ino, context.Background()); flushErr != nil {
 						ei.Unlock()
 						log.LogErrorf("InodeGet: flush blob writer before refresh on cache miss ino(%v) err(%v)", ino, flushErr)
 						return nil, ParseError(flushErr)
 					}
-					ei.fWriter.FreeCache()
+					ei.coldBlobWriter.FreeCache()
 				}
 				switch ei.flag & 0x0f {
 				case syscall.O_RDONLY:
 					log.LogDebugf("InodeGet: ino(%v) info(%v) flag(%v) O_RDONLY", ino, info, ei.flag)
-					ei.fReader = blobstore.NewReader(clientConf)
-					ei.fWriter = nil
+					ei.coldBlobReader = blobstore.NewReader(clientConf)
+					ei.coldBlobWriter = nil
 				case syscall.O_WRONLY:
 					log.LogDebugf("InodeGet: ino(%v) info(%v) flag(%v) O_WRONLY", ino, info, ei.flag)
-					ei.fWriter = blobstore.NewWriter(clientConf)
-					ei.fReader = nil
+					ei.coldBlobWriter = blobstore.NewWriter(clientConf)
+					ei.coldBlobReader = nil
 				case syscall.O_RDWR:
 					log.LogDebugf("InodeGet: ino(%v) info(%v) flag(%v) O_RDWR", ino, info, ei.flag)
-					ei.fReader = blobstore.NewReader(clientConf)
-					ei.fWriter = blobstore.NewWriter(clientConf)
+					ei.coldBlobReader = blobstore.NewReader(clientConf)
+					ei.coldBlobWriter = blobstore.NewWriter(clientConf)
 				default:
 					log.LogDebugf("InodeGet: ino(%v) info(%v) flag(%v) default", ino, info, ei.flag)
-					ei.fWriter = blobstore.NewWriter(clientConf)
-					ei.fReader = nil
+					ei.coldBlobWriter = blobstore.NewWriter(clientConf)
+					ei.coldBlobReader = nil
 				}
 				ei.Unlock()
 			}

@@ -28,6 +28,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/cubefs/cubefs/blobstore/api/access"
 	"github.com/cubefs/cubefs/client/blockcache/bcache"
 	"github.com/cubefs/cubefs/client/common"
@@ -35,6 +37,7 @@ import (
 	"github.com/cubefs/cubefs/depends/bazil.org/fuse/fs"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/blobstore"
+	"github.com/cubefs/cubefs/sdk/data/manager"
 	"github.com/cubefs/cubefs/sdk/data/stream"
 	"github.com/cubefs/cubefs/sdk/meta"
 	"github.com/cubefs/cubefs/util"
@@ -43,21 +46,22 @@ import (
 	"github.com/cubefs/cubefs/util/log"
 	"github.com/cubefs/cubefs/util/stat"
 	"github.com/cubefs/cubefs/util/ump"
-	"github.com/google/uuid"
 )
 
 // Super defines the struct of a super block.
 type Super struct {
-	cluster     string
-	volname     string
-	masters     string
-	mountPoint  string
-	subDir      string
-	owner       string
-	ic          *InodeCache
-	dc          *Dcache
-	mw          *meta.MetaWrapper
-	ec          *stream.ExtentClient
+	cluster    string
+	volname    string
+	masters    string
+	mountPoint string
+	subDir     string
+	owner      string
+	ic         *InodeCache
+	dc         *Dcache
+	mw         *meta.MetaWrapper
+	ec         *stream.ExtentClient
+	// oec 在 NewSuper 中于 NewExtentClient 成功后必定构造，与 ec 共享 LimitManager；业务路径勿判 nil。
+	oec         *blobstore.ECExtentClient
 	orphan      *OrphanInodeList
 	enSyncWrite bool
 	keepCache   bool
@@ -80,16 +84,17 @@ type Super struct {
 	suspendCh chan interface{}
 
 	// data lake
-	volType             int
-	ebsEndpoint         string
-	EbsBlockSize        int
-	enableBcache        bool
-	bcacheDir           string
-	bcacheFilterFiles   string
-	bcacheCheckInterval int64
-	bcacheBatchCnt      int64
-	runningMonitor      *RunningMonitor
-	syncMetaCache       int32
+	volType                int
+	volAllowedStorageClass []uint32 // 与 mount opt 一致；用于判断冷/Blob 数据路径（Forget evict 顺序等）
+	ebsEndpoint            string
+	EbsBlockSize           int
+	enableBcache           bool
+	bcacheDir              string
+	bcacheFilterFiles      string
+	bcacheCheckInterval    int64
+	bcacheBatchCnt         int64
+	runningMonitor         *RunningMonitor
+	syncMetaCache          int32
 
 	logpath string
 
@@ -135,6 +140,12 @@ type Super struct {
 // Same knobs: aheadReadEnable and minReadAheadSize (default comes from proto.InitMountOptions.MinReadAheadSize, usually 1 MiB; files smaller than this do not use the Reader prefetch window).
 func (s *Super) BlobStoreAheadReadForReader() (enable bool, minReadAhead int, totalMem int64) {
 	return s.aheadReadEnable, int(s.minReadAheadSize), s.aheadReadTotalMem
+}
+
+// usesBlobStoreDataPath 与 NewSuper 中启动 scheduleFlush 的条件一致：冷卷或允许 Blob 存储类时可能走 oec/EBS。
+// Forget 时优先 Evict oec，避免副本 ec Streamer 请求队列竞态阻塞 EC 卷孤儿 inode 清理。
+func (s *Super) usesBlobStoreDataPath() bool {
+	return proto.IsCold(s.volType) || proto.IsVolSupportStorageClass(s.volAllowedStorageClass, proto.StorageClass_BlobStore)
 }
 
 // Functions that Super needs to implement
@@ -301,6 +312,7 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 	}
 
 	s.volType = opt.VolType
+	s.volAllowedStorageClass = opt.VolAllowedStorageClass
 	s.ebsEndpoint = opt.EbsEndpoint
 	s.EbsBlockSize = opt.EbsBlockSize
 	s.enableBcache = opt.EnableBcache
@@ -374,6 +386,19 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 	if err != nil {
 		return nil, errors.Trace(err, "NewExtentClient failed!")
 	}
+	s.oec = blobstore.NewObjExtentClient(&blobstore.ObjExtentConfig{
+		LimitManager: s.ec.LimitManager,
+	})
+	s.oec.BeforeEBSShrinkHook = func(ino uint64, fullPath string) (func(), error) {
+		if err := s.ec.OpenStream(ino, true, true, fullPath); err != nil {
+			return nil, err
+		}
+		if err := s.ec.Flush(ino); err != nil {
+			_ = s.ec.CloseStream(ino)
+			return nil, err
+		}
+		return func() { _ = s.ec.CloseStream(ino) }, nil
+	}
 	s.mw.VerReadSeq = s.ec.GetReadVer()
 
 	s.mw.Client = s.ec
@@ -414,6 +439,11 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 	go s.loopUpdatePoolCache()
 
 	return s, nil
+}
+
+// blobClientLimitManager 供 blobstore.ClientConfig；与 ec.LimitManager 同源（见 NewObjExtentClient）。
+func (s *Super) blobClientLimitManager() *manager.LimitManager {
+	return s.oec.LimitManager
 }
 
 func (s *Super) AddDirtyDir(ino uint64) {
@@ -526,9 +556,12 @@ func (s *Super) scheduleFlush() {
 					continue
 				}
 				ei.RLock()
-				writer := ei.fWriter
+				writer := ei.coldBlobWriter
 				idle := atomic.LoadInt32(&ei.idle)
 				ei.RUnlock()
+				if writer == nil && proto.IsStorageClassBlobStore(file.storageClass()) {
+					writer = s.oec.Writer(ino)
+				}
 				if idle >= BlobWriterIdleTimeoutPeriod {
 					if writer != nil {
 						atomic.StoreInt32(&ei.idle, 0)

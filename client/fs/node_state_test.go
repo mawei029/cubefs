@@ -70,18 +70,12 @@ func TestCoverageFileExtendInfoAndStorageClass(t *testing.T) {
 
 	reader := &blobstore.Reader{}
 	writer := &blobstore.Writer{}
-	f.setReaderWriter(reader, writer)
-	gotReader, gotWriter := f.getReaderWriter()
-	require.Equal(t, reader, gotReader)
-	require.Equal(t, writer, gotWriter)
-	require.Equal(t, reader, f.getReader())
-	require.Equal(t, writer, f.getWriter())
-
-	err := f.withWriter(func(w *blobstore.Writer) error {
-		require.Equal(t, writer, w)
-		return nil
-	})
-	require.NoError(t, err)
+	f.setColdBlobReaderWriter(reader, writer)
+	require.Equal(t, reader, f.coldBlobReader())
+	require.Equal(t, writer, f.coldBlobWriter())
+	r2, w2 := f.coldBlobReaderWriter()
+	require.Equal(t, reader, r2)
+	require.Equal(t, writer, w2)
 
 	f.storeIdle(1)
 	f.removeParentDcacheEntry()

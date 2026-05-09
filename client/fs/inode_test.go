@@ -23,6 +23,7 @@ func newTestSuperForInode() *Super {
 		ic:                NewInodeCache(time.Hour, 64, true),
 		mw:                &meta.MetaWrapper{},
 		ec:                &stream.ExtentClient{},
+		oec:               blobstore.NewObjExtentClient(nil),
 		nodeCache:         make(map[uint64]bazilfs.Node),
 		dirExtendInfoMap:  make(map[uint64]*DirExtendInfo),
 		fileExtendInfoMap: make(map[uint64]*FileExtendInfo),
@@ -47,7 +48,7 @@ func TestInodeGet_BlobStoreFileRefreshReaderWriter(t *testing.T) {
 
 	f := &File{super: s, ino: ino}
 	f.setFlag(syscall.O_RDWR)
-	f.setReaderWriter(nil, &blobstore.Writer{})
+	f.setColdBlobReaderWriter(nil, &blobstore.Writer{})
 	s.nodeCache[ino] = f
 	s.ebsc[poolID] = &blobstore.BlobStoreClient{}
 
@@ -72,8 +73,8 @@ func TestInodeGet_BlobStoreFileRefreshReaderWriter(t *testing.T) {
 	got, err := s.InodeGet(ino)
 	require.NoError(t, err)
 	require.True(t, proto.IsStorageClassBlobStore(got.StorageClass))
-	require.NotNil(t, f.getReader())
-	require.NotNil(t, f.getWriter())
+	require.NotNil(t, f.coldBlobReader())
+	require.NotNil(t, f.coldBlobWriter())
 }
 
 func TestInodeGet_BlobFlushBeforeRefreshFails(t *testing.T) {
@@ -84,7 +85,7 @@ func TestInodeGet_BlobFlushBeforeRefreshFails(t *testing.T) {
 	f := &File{super: s, ino: ino}
 	f.setFlag(syscall.O_RDONLY)
 	w := &blobstore.Writer{}
-	f.setReaderWriter(nil, w)
+	f.setColdBlobReaderWriter(nil, w)
 	s.nodeCache[ino] = f
 	s.ebsc[poolID] = &blobstore.BlobStoreClient{}
 
