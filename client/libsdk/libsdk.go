@@ -1641,7 +1641,7 @@ func (c *client) allocFD(ino uint64, flags, mode uint32, fileCache bool, fileSiz
 			Ino:             ino,
 			Bc:              c.bc,
 			Mw:              c.mw,
-			Ec:              c.ec,
+			LimitManager:    c.ec.LimitManager,
 			Ebsc:            c.ebsc,
 			EnableBcache:    c.enableBcache,
 			WConcurrency:    c.writeBlockThread,

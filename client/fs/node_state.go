@@ -21,10 +21,11 @@ type DirExtendInfo struct {
 
 type FileExtendInfo struct {
 	sync.RWMutex
-	idle    int32
-	fReader *blobstore.Reader
-	fWriter *blobstore.Writer
-	flag    uint32
+	idle int32
+	// coldBlobReader/coldBlobWriter：仅用于冷卷且非 EC（未走 ObjExtentClient）时挂接的独立 Blob 客户端；EC/BlobStore 一律用 Super.oec。
+	coldBlobReader *blobstore.Reader
+	coldBlobWriter *blobstore.Writer
+	flag           uint32
 }
 
 func (d *Dir) getInfo() (*proto.InodeInfo, error) {
@@ -335,45 +336,35 @@ func (f *File) setFlag(flag uint32) {
 	ei.flag = flag
 }
 
-func (f *File) getReaderWriter() (*blobstore.Reader, *blobstore.Writer) {
+func (f *File) coldBlobReaderWriter() (*blobstore.Reader, *blobstore.Writer) {
 	ei, ok := f.getExtendInfo()
 	if !ok || ei == nil {
 		return nil, nil
 	}
 	ei.RLock()
 	defer ei.RUnlock()
-	return ei.fReader, ei.fWriter
+	return ei.coldBlobReader, ei.coldBlobWriter
 }
 
-func (f *File) getReader() *blobstore.Reader {
-	reader, _ := f.getReaderWriter()
-	return reader
+func (f *File) coldBlobReader() *blobstore.Reader {
+	r, _ := f.coldBlobReaderWriter()
+	return r
 }
 
-func (f *File) getWriter() *blobstore.Writer {
-	_, writer := f.getReaderWriter()
-	return writer
+func (f *File) coldBlobWriter() *blobstore.Writer {
+	_, w := f.coldBlobReaderWriter()
+	return w
 }
 
-func (f *File) setReaderWriter(reader *blobstore.Reader, writer *blobstore.Writer) {
+func (f *File) setColdBlobReaderWriter(reader *blobstore.Reader, writer *blobstore.Writer) {
 	ei := f.getOrCreateExtendInfo()
 	if ei == nil {
 		return
 	}
 	ei.Lock()
-	ei.fReader = reader
-	ei.fWriter = writer
+	ei.coldBlobReader = reader
+	ei.coldBlobWriter = writer
 	ei.Unlock()
-}
-
-func (f *File) withWriter(fn func(*blobstore.Writer) error) error {
-	ei := f.getOrCreateExtendInfo()
-	if ei == nil {
-		return nil
-	}
-	ei.Lock()
-	defer ei.Unlock()
-	return fn(ei.fWriter)
 }
 
 func (f *File) storeIdle(v int32) {

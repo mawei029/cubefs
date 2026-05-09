@@ -266,6 +266,19 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 		isCache = true
 	}
 	d.super.ec.OpenStream(info.Inode, openForWrite, isCache, path.Join(child.(*File).getParentPath(), child.(*File).name))
+	defer func() {
+		if err != nil {
+			_ = d.super.ec.CloseStream(info.Inode)
+		}
+	}()
+	if proto.IsStorageClassBlobStore(info.StorageClass) {
+		childFile := child.(*File)
+		if errOec := childFile.openOECStream(info, uint32(req.Flags&0x0f), info.Size); errOec != nil {
+			err = errOec
+			log.LogErrorf("Create: openOECStream ino(%v) err(%v)", info.Inode, errOec)
+			return nil, nil, ParseError(errOec)
+		}
+	}
 	d.super.fslock.Lock()
 	d.super.nodeCache[info.Inode] = child
 	d.super.fslock.Unlock()

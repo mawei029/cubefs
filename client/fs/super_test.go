@@ -105,6 +105,7 @@ func TestNewSuper_CoversInitBranches(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.NotNil(t, s.ebsc)
+	require.NotNil(t, s.oec)
 	require.NotNil(t, s.runningMonitor)
 	close(s.closeC)
 	s.runningMonitor.Stop()
