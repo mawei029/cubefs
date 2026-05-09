@@ -32,12 +32,15 @@ import (
 	proto2 "github.com/cubefs/cubefs/blobstore/common/proto"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/manager"
-	"github.com/cubefs/cubefs/sdk/data/stream"
 	"github.com/cubefs/cubefs/sdk/meta"
 	"github.com/cubefs/cubefs/util/buf"
 )
 
 var writer *Writer
+
+func newTestLimitManager() *manager.LimitManager {
+	return manager.NewLimitManager(nil)
+}
 
 func init() {
 	// start ebs mock service
@@ -60,7 +63,7 @@ func init() {
 		Ino:             1000,
 		Bc:              nil,
 		Mw:              nil,
-		Ec:              nil,
+		LimitManager:    newTestLimitManager(),
 		Ebsc:            blobStoreClient,
 		EnableBcache:    false,
 		WConcurrency:    10,
@@ -68,17 +71,8 @@ func init() {
 		FileCache:       false,
 		FileSize:        0,
 	}
-	ec := &stream.ExtentClient{}
-	fmt.Println(reflect.ValueOf(MockWriteTrue).Type().Name())
-	fmt.Println(reflect.ValueOf(ec.Write).Type().Name())
-	err := gohook.HookMethod(ec, "Write", MockWriteTrue, nil)
-	if err != nil {
-		panic(fmt.Sprintf("Hook advance instance method failed:%s", err.Error()))
-	}
-	config.Ec = ec
 
 	buf.InitCachePool(8388608)
-	config.Ec.LimitManager = manager.NewLimitManager(nil)
 	writer = NewWriter(config)
 }
 
@@ -104,6 +98,15 @@ func TestWriter_TruncateV2_NilReturnsError(t *testing.T) {
 	w := newNilWriter()
 	ctx := context.Background()
 	_, _, err := w.TruncateV2(ctx, 100)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "nil")
+}
+
+// TestWriter_TruncateV2FromExtents_NilReturnsError 校验 nil Writer 调用 TruncateV2FromExtents 返回错误。
+func TestWriter_TruncateV2FromExtents_NilReturnsError(t *testing.T) {
+	w := newNilWriter()
+	ctx := context.Background()
+	_, _, err := w.TruncateV2FromExtents(ctx, 100, 200, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "nil")
 }
@@ -209,6 +212,12 @@ func TestParallelWrite(t *testing.T) {
 	data := []byte("Hello world")
 	offset := 0
 
+	// 全局 writer 可能被同包其它用例留下 dirty；doParallelWrite 会先 flushExt，需干净状态或完整 mock Mw。
+	writer.Lock()
+	writer.dirty = false
+	writer.blockPosition = 0
+	writer.Unlock()
+
 	mw := &meta.MetaWrapper{}
 	err := gohook.HookMethod(mw, "AppendObjExtentKeys", MockAppendObjExtentKeysTrue, nil)
 	if err != nil {
@@ -227,7 +236,7 @@ func TestNewWriter(t *testing.T) {
 		Ino:             1000,
 		Bc:              nil,
 		Mw:              nil,
-		Ec:              nil,
+		LimitManager:    newTestLimitManager(),
 		Ebsc:            nil,
 		EnableBcache:    false,
 		WConcurrency:    10,
@@ -235,12 +244,6 @@ func TestNewWriter(t *testing.T) {
 		FileCache:       false,
 		FileSize:        0,
 	}
-	config.Ec = &stream.ExtentClient{}
-	err := gohook.HookMethod(config.Ec, "Write", MockWriteTrue, nil)
-	if err != nil {
-		panic(fmt.Sprintf("Hook advance instance method failed:%s", err.Error()))
-	}
-	config.Ec.LimitManager = manager.NewLimitManager(nil)
 	w := NewWriter(config)
 	_ = w.String()
 }
@@ -421,7 +424,7 @@ func TestTryOverWrite_Basic(t *testing.T) {
 		Ino:             1000,
 		Bc:              nil,
 		Mw:              nil,
-		Ec:              nil,
+		LimitManager:    newTestLimitManager(),
 		Ebsc:            nil,
 		EnableBcache:    false,
 		WConcurrency:    10,
@@ -429,11 +432,6 @@ func TestTryOverWrite_Basic(t *testing.T) {
 		FileCache:       false,
 		FileSize:        0,
 	}
-	ec := &stream.ExtentClient{}
-	err := gohook.HookMethod(ec, "Write", MockWriteTrue, nil)
-	require.NoError(t, err, "Hook Write failed")
-	config.Ec = ec
-	config.Ec.LimitManager = manager.NewLimitManager(nil)
 
 	testWriter := NewWriter(config)
 	testWriter.buf = make([]byte, 1024)
@@ -442,7 +440,7 @@ func TestTryOverWrite_Basic(t *testing.T) {
 
 	// Mock MetaWrapper for flushExt
 	mw := &meta.MetaWrapper{}
-	err = gohook.HookMethod(mw, "GetObjExtents", MockGetObjExtentsEmpty, nil)
+	err := gohook.HookMethod(mw, "GetObjExtents", MockGetObjExtentsEmpty, nil)
 	require.NoError(t, err, "Hook GetObjExtents failed")
 
 	err = gohook.HookMethod(mw, "AppendObjExtentKeysWithCheck", MockAppendObjExtentKeysWithCheckTrue, nil)
@@ -483,7 +481,7 @@ func TestFlushExt_Basic(t *testing.T) {
 		Ino:             1000,
 		Bc:              nil,
 		Mw:              nil,
-		Ec:              nil,
+		LimitManager:    newTestLimitManager(),
 		Ebsc:            nil,
 		EnableBcache:    false,
 		WConcurrency:    10,
@@ -491,11 +489,6 @@ func TestFlushExt_Basic(t *testing.T) {
 		FileCache:       false,
 		FileSize:        0,
 	}
-	ec := &stream.ExtentClient{}
-	err := gohook.HookMethod(ec, "Write", MockWriteTrue, nil)
-	require.NoError(t, err, "Hook Write failed")
-	config.Ec = ec
-	config.Ec.LimitManager = manager.NewLimitManager(nil)
 
 	testWriter := NewWriter(config)
 	testWriter.buf = make([]byte, 1024)
@@ -510,7 +503,7 @@ func TestFlushExt_Basic(t *testing.T) {
 
 	// Mock MetaWrapper - return empty extents (no overlap)
 	mw := &meta.MetaWrapper{}
-	err = gohook.HookMethod(mw, "GetObjExtents", MockGetObjExtentsEmpty, nil)
+	err := gohook.HookMethod(mw, "GetObjExtents", MockGetObjExtentsEmpty, nil)
 	require.NoError(t, err, "Hook GetObjExtents failed")
 
 	err = gohook.HookMethod(mw, "AppendObjExtentKeysWithCheck", MockAppendObjExtentKeysWithCheckTrue, nil)
@@ -651,13 +644,11 @@ func TestWriterCoverageMoreLowFunctions(t *testing.T) {
 
 	t.Run("writeFromReader and flushWithoutPool and freecache", func(t *testing.T) {
 		buf.InitCachePool(8)
-		ec := &stream.ExtentClient{}
-		ec.LimitManager = manager.NewLimitManager(nil)
 		w := NewWriter(ClientConfig{
 			VolName:      "v",
 			BlockSize:    8,
 			Ino:          2,
-			Ec:           ec,
+			LimitManager: newTestLimitManager(),
 			Ebsc:         &BlobStoreClient{},
 			Mw:           &meta.MetaWrapper{},
 			WConcurrency: 1,
@@ -711,5 +702,48 @@ func TestWriterCoverageMoreLowFunctions(t *testing.T) {
 
 		require.NoError(t, w.flush(w.ino, context.Background(), true))
 		require.Equal(t, 0, w.blockPosition)
+	})
+
+	t.Run("flushWithoutPool then tryOverWrite no panic", func(t *testing.T) {
+		blockSize := 8
+		w := &Writer{
+			ino:           5,
+			volName:       "v",
+			blockSize:     blockSize,
+			blockPosition: 59287 % blockSize, // stale index after hypothetical copy-path use
+			fileOffset:    100,
+			dirty:         true,
+			buf:           make([]byte, blockSize),
+			overwrite:     true,
+			limitManager:  newTestLimitManager(),
+			ebsc:          &BlobStoreClient{},
+			mw:            &meta.MetaWrapper{},
+		}
+		err := gohook.HookMethod(w.ebsc, "Write", MockEbscWriteTrue, nil)
+		require.NoError(t, err)
+		defer gohook.UnHookMethod(w.ebsc, "Write")
+		err = gohook.HookMethod(w.mw, "AppendObjExtentKeys", MockAppendObjExtentKeysTrue, nil)
+		require.NoError(t, err)
+		defer gohook.UnHookMethod(w.mw, "AppendObjExtentKeys")
+
+		require.NoError(t, w.flushWithoutPool(w.ino, context.Background(), false))
+		require.Equal(t, 0, len(w.buf))
+		require.Equal(t, 0, w.blockPosition)
+
+		err = gohook.HookMethod(w.mw, "GetObjExtents", func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
+			return 1, 100, nil, nil, nil
+		}, nil)
+		require.NoError(t, err)
+		defer gohook.UnHookMethod(w.mw, "GetObjExtents")
+		err = gohook.HookMethod(w.mw, "AppendObjExtentKeysWithCheck", func(_ *meta.MetaWrapper, _ uint64, _, _ []proto.ObjExtentKey) error {
+			return nil
+		}, nil)
+		require.NoError(t, err)
+		defer gohook.UnHookMethod(w.mw, "AppendObjExtentKeysWithCheck")
+
+		n, err := w.tryOverWrite(context.Background(), 0, []byte("ab"), 0)
+		require.NoError(t, err)
+		require.Equal(t, 2, n)
+		require.Equal(t, blockSize, len(w.buf))
 	})
 }

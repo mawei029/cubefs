@@ -21,6 +21,7 @@ import (
 	"math/rand"
 	"os"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 
@@ -33,7 +34,6 @@ import (
 	"github.com/cubefs/cubefs/client/blockcache/bcache"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/manager"
-	"github.com/cubefs/cubefs/sdk/data/stream"
 	"github.com/cubefs/cubefs/sdk/meta"
 	"github.com/cubefs/cubefs/util/errors"
 )
@@ -62,7 +62,7 @@ func TestNewReader(t *testing.T) {
 		Ino:             2,
 		Bc:              nil,
 		Mw:              nil,
-		Ec:              nil,
+		LimitManager:    newTestLimitManager(),
 		Ebsc:            nil,
 		EnableBcache:    false,
 		WConcurrency:    0,
@@ -70,12 +70,6 @@ func TestNewReader(t *testing.T) {
 		FileCache:       false,
 		FileSize:        0,
 	}
-	ec := &stream.ExtentClient{}
-	err := gohook.HookMethod(ec, "Write", MockWriteTrue, nil)
-	if err != nil {
-		panic(fmt.Sprintf("Hook advance instance method failed:%s", err.Error()))
-	}
-	mockConfig.Ec = ec
 
 	reader := NewReader(mockConfig)
 	assert.NotEmpty(t, reader, nil)
@@ -83,25 +77,38 @@ func TestNewReader(t *testing.T) {
 
 func TestFileSize(t *testing.T) {
 	testCase := []struct {
-		valid      bool
-		objEks     []proto.ObjExtentKey
-		expectSize uint64
-		expectOk   bool
+		valid            bool
+		metaReportedSize uint64
+		objEks           []proto.ObjExtentKey
+		expectSize       uint64
+		expectOk         bool
 	}{
-		{false, nil, 0, false},
-		{true, nil, 0, true},
-		{true, []proto.ObjExtentKey{{Size: uint64(100), FileOffset: uint64(100)}}, 200, true},
+		{false, 0, nil, 0, false},
+		{true, 0, nil, 0, true},
+		{true, 0, []proto.ObjExtentKey{{Size: uint64(100), FileOffset: uint64(100)}}, 200, true},
+		// 稀疏：inode/ meta 长度 100，仅 [20,40) 有对象 extent，可读范围应为 100（尾部洞补零）
+		{true, 100, []proto.ObjExtentKey{{FileOffset: 20, Size: 20}}, 100, true},
+		// 无 extent 但 meta 声明长度（全文件为洞）
+		{true, 100, nil, 100, true},
 	}
 
 	for _, tc := range testCase {
 		reader := Reader{}
 		reader.limitManager = manager.NewLimitManager(nil)
 		reader.valid = tc.valid
+		reader.metaReportedSize = tc.metaReportedSize
 		reader.objExtentKeys = tc.objEks
 		gotSize, gotOk := reader.fileSize()
 		assert.Equal(t, tc.expectSize, gotSize)
 		assert.Equal(t, tc.expectOk, gotOk)
+		lb, lbOk := reader.LogicalReadBound()
+		assert.Equal(t, gotSize, lb, "LogicalReadBound 应与 fileSize 一致")
+		assert.Equal(t, gotOk, lbOk)
 	}
+	var nilReader *Reader
+	nz, nok := nilReader.LogicalReadBound()
+	assert.Equal(t, uint64(0), nz)
+	assert.False(t, nok)
 
 	//// mock objExtentKey
 	//objEks := make([]proto.ObjExtentKey, 0)
@@ -196,21 +203,47 @@ func TestPrepareEbsSlice(t *testing.T) {
 	}
 }
 
+func TestPrepareEbsSlice_sparseHeadMiddleTailHoles(t *testing.T) {
+	r := Reader{
+		valid:            true,
+		metaReportedSize: 100,
+		objExtentKeys:    []proto.ObjExtentKey{{FileOffset: 20, Size: 20}},
+		limitManager:     manager.NewLimitManager(nil),
+	}
+	slices, err := r.prepareEbsSlice(0, 100)
+	require.NoError(t, err)
+	require.Len(t, slices, 3)
+	require.True(t, slices[0].hole)
+	require.Equal(t, uint64(0), slices[0].fileOffset)
+	require.Equal(t, uint32(20), slices[0].rSize)
+	require.False(t, slices[1].hole)
+	require.Equal(t, uint32(20), slices[1].rSize)
+	require.True(t, slices[2].hole)
+	require.Equal(t, uint64(40), slices[2].fileOffset)
+	require.Equal(t, uint32(60), slices[2].rSize)
+	for _, s := range slices {
+		if s.hole {
+			require.Equal(t, int(s.rSize), len(s.Data))
+			for _, b := range s.Data {
+				require.Equal(t, byte(0), b)
+			}
+		}
+	}
+}
+
 func TestRead(t *testing.T) {
 	testCase := []struct {
-		close            bool
-		readConcurrency  int
-		getObjFunc       func(*meta.MetaWrapper, uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error)
-		bcacheGetFunc    func(*bcache.BcacheClient, string, string, []byte, uint64, uint32) (int, error)
-		checkDpExistFunc func(*stream.ExtentClient, uint64) error
-		// readExtentFunc   func(*stream.ExtentClient, uint64, *proto.ExtentKey, []byte, int, int, uint32) (int, error, bool)
-		ebsReadFunc func(*BlobStoreClient, context.Context, string, []byte, uint64, uint64, proto.ObjExtentKey) (int, error)
-		expectError error
+		close           bool
+		readConcurrency int
+		getObjFunc      func(*meta.MetaWrapper, uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error)
+		bcacheGetFunc   func(*bcache.BcacheClient, string, string, []byte, uint64, uint32) (int, error)
+		ebsReadFunc     func(*BlobStoreClient, context.Context, string, []byte, uint64, uint64, proto.ObjExtentKey) (int, error)
+		expectError     error
 	}{
-		{true, 2, MockGetObjExtentsTrue, MockGetTrue, MockCheckDataPartitionExistTrue, MockEbscReadTrue, os.ErrInvalid},
-		{false, 2, MockGetObjExtentsFalse, MockGetTrue, MockCheckDataPartitionExistTrue, MockEbscReadTrue, syscall.EIO},
-		{false, 2, MockGetObjExtentsTrue, MockGetTrue, MockCheckDataPartitionExistTrue, MockEbscReadFalse, syscall.EIO},
-		{false, 2, MockGetObjExtentsTrue, MockGetTrue, MockCheckDataPartitionExistTrue, MockEbscReadTrue, nil},
+		{true, 2, MockGetObjExtentsTrue, MockGetTrue, MockEbscReadTrue, os.ErrInvalid},
+		{false, 2, MockGetObjExtentsFalse, MockGetTrue, MockEbscReadTrue, syscall.EIO},
+		{false, 2, MockGetObjExtentsTrue, MockGetTrue, MockEbscReadFalse, syscall.EIO},
+		{false, 2, MockGetObjExtentsTrue, MockGetTrue, MockEbscReadTrue, nil},
 	}
 
 	for _, tc := range testCase {
@@ -222,12 +255,7 @@ func TestRead(t *testing.T) {
 		mw := &meta.MetaWrapper{}
 		ebsc := newSafeBlobStoreClientForTest()
 		bc := &bcache.BcacheClient{}
-		ec := &stream.ExtentClient{}
 		err := gohook.HookMethod(mw, "GetObjExtents", tc.getObjFunc, nil)
-		if err != nil {
-			panic(fmt.Sprintf("Hook advance instance method failed:%s", err.Error()))
-		}
-		err = gohook.HookMethod(ec, "CheckDataPartitionExsit", tc.checkDpExistFunc, nil)
 		if err != nil {
 			panic(fmt.Sprintf("Hook advance instance method failed:%s", err.Error()))
 		}
@@ -252,13 +280,8 @@ func TestRead(t *testing.T) {
 
 func TestAsyncCache(t *testing.T) {
 	ebsc := newSafeBlobStoreClientForTest()
-	ec := &stream.ExtentClient{}
 	bc := &bcache.BcacheClient{}
-	err := gohook.HookMethod(ec, "Write", MockWriteTrue, nil)
-	if err != nil {
-		panic(fmt.Sprintf("Hook advance instance method failed:%s", err.Error()))
-	}
-	err = gohook.HookMethod(bc, "Put", MockPutTrue, nil)
+	err := gohook.HookMethod(bc, "Put", MockPutTrue, nil)
 	if err != nil {
 		panic(fmt.Sprintf("Hook advance instance method failed:%s", err.Error()))
 	}
@@ -303,7 +326,7 @@ func TestAsyncCache(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Hook advance instance method failed:%s", err.Error())
 		}
-		reader.fileLength = tc.fileSize
+		_ = tc.fileSize
 		reader.asyncCache(ctx, "cacheKey", objEk)
 	}
 }
@@ -384,42 +407,40 @@ func TestReaderRead_PrefetchAndFallbackPaths(t *testing.T) {
 
 func TestReadSliceRange(t *testing.T) {
 	testCase := []struct {
-		enableBcache     bool
-		extentKey        proto.ExtentKey
-		bcacheGetFunc    func(*bcache.BcacheClient, string, string, []byte, uint64, uint32) (int, error)
-		checkDpExistFunc func(*stream.ExtentClient, uint64) error
-		// readExtentFunc   func(*stream.ExtentClient, uint64, *proto.ExtentKey, []byte, int, int, uint32) (int, error, bool)
-		ebsReadFunc func(*BlobStoreClient, context.Context, string, []byte, uint64, uint64, proto.ObjExtentKey) (int, error)
-		expectError error
+		enableBcache  bool
+		extentKey     proto.ExtentKey
+		bcacheGetFunc func(*bcache.BcacheClient, string, string, []byte, uint64, uint32) (int, error)
+		ebsReadFunc   func(*BlobStoreClient, context.Context, string, []byte, uint64, uint64, proto.ObjExtentKey) (int, error)
+		expectError   error
 	}{
 		{
 			false,
 			proto.ExtentKey{},
-			MockGetTrue, MockCheckDataPartitionExistTrue,
+			MockGetTrue,
 			MockEbscReadTrue, nil,
 		},
 		{
 			false,
 			proto.ExtentKey{},
-			MockGetTrue, MockCheckDataPartitionExistTrue,
+			MockGetTrue,
 			MockEbscReadFalse, syscall.EIO,
 		},
 		{
 			true,
 			proto.ExtentKey{},
-			MockGetTrue, MockCheckDataPartitionExistTrue,
+			MockGetTrue,
 			MockEbscReadFalse, nil,
 		},
 		{
 			true,
 			proto.ExtentKey{},
-			MockGetFalse, MockCheckDataPartitionExistTrue,
+			MockGetFalse,
 			MockEbscReadFalse, syscall.EIO,
 		},
 		{
 			true,
 			proto.ExtentKey{},
-			MockGetFalse, MockCheckDataPartitionExistTrue,
+			MockGetFalse,
 			MockEbscReadTrue, nil,
 		},
 	}
@@ -429,12 +450,9 @@ func TestReadSliceRange(t *testing.T) {
 		reader.limitManager = manager.NewLimitManager(nil)
 		ebsc := newSafeBlobStoreClientForTest()
 		bc := &bcache.BcacheClient{}
-		ec := &stream.ExtentClient{}
 		reader.volName = "cfs"
 		reader.ino = 12407
-		reader.fileLength = 10
-		reader.ec = ec
-		reader.err = make(chan error)
+		errCh := make(chan error, 1)
 		rs := &rwSlice{}
 		rs.rSize = uint32(len("Hello world"))
 		rs.Data = make([]byte, len("Hello world"))
@@ -448,20 +466,13 @@ func TestReadSliceRange(t *testing.T) {
 		if err != nil {
 			panic(fmt.Sprintf("Hook advance instance method failed:%s", err.Error()))
 		}
-		err = gohook.HookMethod(ec, "CheckDataPartitionExsit", tc.checkDpExistFunc, nil)
-		if err != nil {
-			panic(fmt.Sprintf("Hook advance instance method failed:%s", err.Error()))
-		}
 		reader.ebs = ebsc
 		reader.bc = bc
 
 		ctx := context.Background()
-		reader.wg.Add(1)
-		go func() {
-			<-reader.err
-		}()
-		gotError := reader.readSliceRange(ctx, rs)
+		gotError := reader.readSliceRange(ctx, rs, errCh)
 		assert.Equal(t, tc.expectError, gotError)
+		<-errCh
 	}
 }
 
@@ -499,38 +510,6 @@ func MockEbscReadFalse(ebsc *BlobStoreClient, ctx context.Context, volName strin
 	oek proto.ObjExtentKey,
 ) (readN int, err error) {
 	return 0, syscall.EIO
-}
-
-func MockReadExtentTrue(client *stream.ExtentClient, inode uint64, ek *proto.ExtentKey,
-	data []byte, offset int, size int, poolId uint8, storageClass uint32,
-) (read int, err error, b bool) {
-	return len("Hello world"), nil, true
-}
-
-func MockReadExtentFalse(client *stream.ExtentClient, inode uint64, ek *proto.ExtentKey,
-	data []byte, offset int, size int, poolId uint8, storageClass uint32,
-) (read int, err error) {
-	return 0, errors.New("Read extent failed")
-}
-
-func MockCheckDataPartitionExistTrue(client *stream.ExtentClient, partitionID uint64) error {
-	return nil
-}
-
-func MockCheckDataPartitionExistFalse(client *stream.ExtentClient, partitionID uint64) error {
-	return errors.New("CheckDataPartitionExist failed")
-}
-
-func MockWriteTrue(client *stream.ExtentClient, inode uint64, offset int, data []byte,
-	flags int, checkFunc func() error, poolId uint8, storageClass uint32, isMigration, waitForFlush bool,
-) (write int, err error) {
-	return len(data), nil
-}
-
-func MockWriteFalse(client *stream.ExtentClient, inode uint64, offset int, data []byte,
-	flags int,
-) (write int, err error) {
-	return 0, errors.New("Write failed")
 }
 
 func MockPutTrue(bc *bcache.BcacheClient, vol, key string, buf []byte) error {
@@ -617,12 +596,14 @@ func TestReaderCoveragePrefetchAndAlignment(t *testing.T) {
 	})
 
 	t.Run("refresh and align branches", func(t *testing.T) {
+		es := &ECStreamer{}
 		r := &Reader{
 			valid:            true,
 			metaReportedSize: 10,
-			inodeViewGen:     1,
-			inodeViewSize:    10,
+			ecStreamer:       es,
 		}
+		atomic.StoreUint64(&es.fileSize, 10)
+		atomic.StoreUint64(&es.inoVersion, 1)
 		require.NoError(t, r.EnsureAlignedForRead(1, 10))
 
 		mw := &meta.MetaWrapper{}
@@ -636,20 +617,22 @@ func TestReaderCoveragePrefetchAndAlignment(t *testing.T) {
 		r.ino = 100
 		r.valid = false
 		require.NoError(t, r.EnsureAlignedForRead(2, 8))
-		require.Equal(t, uint64(2), r.inodeViewGen)
-		require.Equal(t, uint64(8), r.inodeViewSize)
-		require.NoError(t, r.RefreshExtents())
+		require.Equal(t, uint64(2), atomic.LoadUint64(&es.inoVersion))
+		require.Equal(t, uint64(10), atomic.LoadUint64(&es.fileSize))
+
+		atomic.StoreUint32(&es.dirty, 1)
+		require.NoError(t, r.EnsureAlignedForRead(2, 8))
+		_, err = r.RefreshExtents()
+		require.NoError(t, err)
 	})
 }
 
 func TestReaderCoverageHelperBranches(t *testing.T) {
 	t.Run("string and newreader minreadahead clamp", func(t *testing.T) {
-		ec := &stream.ExtentClient{}
-		ec.LimitManager = manager.NewLimitManager(nil)
 		r := NewReader(ClientConfig{
 			VolName:          "v",
 			Ino:              1,
-			Ec:               ec,
+			LimitManager:     newTestLimitManager(),
 			BlockSize:        4,
 			AheadReadEnable:  true,
 			MinReadAheadSize: -1,
@@ -670,7 +653,9 @@ func TestReaderCoverageHelperBranches(t *testing.T) {
 
 		r := &Reader{mw: mw, ino: 1, readConcurrency: 1, limitManager: manager.NewLimitManager(nil)}
 		require.Error(t, r.ensureExtentsLoaded())
+		r.Lock()
 		_, err = r.readEbsRange(context.Background(), -1, 1)
+		r.Unlock()
 		require.Error(t, err)
 	})
 
@@ -687,10 +672,8 @@ func TestReaderCoverageHelperBranches(t *testing.T) {
 		require.NoError(t, err)
 		require.NotEmpty(t, slices)
 
-		r.err = make(chan error, 1)
-		r.wg.Add(1)
-		require.NoError(t, r.readSliceRange(context.Background(), &rwSlice{hole: true, rSize: 3}))
-		r.wg.Wait()
-		require.NoError(t, <-r.err)
+		errCh := make(chan error, 1)
+		require.NoError(t, r.readSliceRange(context.Background(), &rwSlice{hole: true, rSize: 3}, errCh))
+		require.NoError(t, <-errCh)
 	})
 }
