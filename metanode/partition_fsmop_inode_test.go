@@ -451,6 +451,18 @@ func TestCleanRocksdbInodeTestDir(t *testing.T) {
 	os.RemoveAll(RocksdbInodeTestDir)
 }
 
+func TestFsmUpdateExtentKeyAfterMigrationRejectsGenerationMismatch(t *testing.T) {
+	mp := newMpForFsmInodeTest(t, proto.StoreModeMem)
+	const ino = 8801
+	prepareInodeForFsmInodeTest(t, mp, ino)
+
+	param := NewInode(ino, 0)
+	param.LeaseExpireTime = 0
+	param.Generation = 2
+	resp := mp.fsmUpdateExtentKeyAfterMigration(param)
+	require.EqualValues(t, proto.OpLeaseOccupiedByOthers, resp.Status)
+}
+
 func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 	// Setup test partition
 	mpC := &MetaPartitionConfig{
