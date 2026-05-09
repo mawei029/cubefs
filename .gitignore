@@ -26,6 +26,7 @@ java/src/main/resources/*.so
 !.cursor/commands/
 .cursor/commands/*
 !.cursor/commands/incremental-coverage-autofix.md
+!.cursor/commands/icover.md
 !.cursor/skills/
 .cursor/skills/*
 !.cursor/skills/incremental-go-coverage/

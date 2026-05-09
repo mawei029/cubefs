@@ -6,8 +6,15 @@ alwaysApply: true
 # Incremental Go Coverage Workflow
 
 - 当用户要求“提高增量覆盖率”“自动补齐测试用例”“只看改动代码覆盖率”时，优先使用项目级 skill `incremental-go-coverage`。
+- 命令入口同时支持 `/incremental-coverage-autofix` 与等价短别名 `/icover`，两者参数解析与行为完全一致。
 - 当用户传入 `base commit` 时，必须先执行 `git rev-parse --verify <commit>` 校验基线是否存在。
 - 支持可选阈值参数 `target_coverage`（默认 80），用于指定目标增量覆盖率。
+- `target_coverage` 是**整体目标**（最终验收阈值），不是每一轮必须命中的目标。
+- 自动补测必须启用“分轮自适应目标”：
+  - 先计算 `base_coverage`（初始增量覆盖率）与复杂度等级（基于 changed lines、changed files、核心复杂路径占比）。
+  - 依据复杂度生成每轮里程碑目标 `round_target[i]`（递增且不超过 `target_coverage`）。
+  - 每轮只要求达到当轮 `round_target[i]`，最后才用 `target_coverage` 做总验收。
+- 如果需要内部冗余目标，只允许用于最终轮兜底，不得将固定 `target+20` 作为每轮硬门槛。
 - 如果 `base commit` 不存在：必须立即报错并停止，不允许继续跑测试或覆盖率。
 - 如果 `target_coverage` 非法（非数字或超出 0-100）：必须立即报错并停止。
 - `base commit` 校验失败时，回复中必须附带正确用法示例：
@@ -16,8 +23,60 @@ alwaysApply: true
 - 优先走**最小变更包范围**的 `go test -coverprofile`，不要默认整仓 `bash build/build.sh testcover`。
 - 用 `.cursor/skills/incremental-go-coverage/scripts/check_incremental_go_coverage.py` 做 changed-line 覆盖率计算。
 - 低于阈值时，优先补已有 `_test.go` 中的 focused tests，再重新执行覆盖率校验。
+- 自动补测分两阶段：
+  - 阶段1（默认自动）：仅允许测试侧改动（`_test.go`、测试夹具、mock/fake），不改生产流程语义。
+  - 阶段2（注入/侵入）：仅在阶段1收敛低增益后可选；必须先提示用户并得到明确同意后才能执行。
+- 自动补测采用有界重试，最多 5 轮（不含初始基线检测）；达到整体目标提前结束。
+- 每轮都要做“收益评估”，命中以下任一条件时提前停止（即使未到第 5 轮）：
+  - 连续 2 轮覆盖率增益低于 1.5 个百分点；
+  - 连续 2 轮未覆盖 changed lines 集合高度重合（重合率 > 90%）；
+  - 明确识别为环境阻塞或范围不匹配且当轮修复失败。
+- 到第 5 轮仍未达标时必须停止重试，并明确输出失败原因分类（环境阻塞/覆盖范围不匹配/测试缺口/收敛无收益）和剩余未覆盖 changed lines。
+- 每轮必须执行“策略自动决策层”：先判定 `ENV_BLOCKED/SCOPE_MISMATCH/TEST_GAP_FOCUSED/TEST_GAP_BROAD/CONVERGED_NO_GAIN`，再执行对应动作。
+- 对复杂逻辑（并发/状态机/时序/错误路径）补测时，必须启用“四层能力”：
+  - 复杂度标签化：按 `concurrency/state-machine/error-injection/timing-order` 分类缺口
+  - 夹具优先：优先复用可注入 fixture（fake clock/fault injector/channel 控制），避免堆砌超大场景用例
+  - 行为覆盖：每轮至少新增 1 条关键行为断言（状态迁移/不变量/重试回滚幂等）
+  - 风险优先：按 `risk = complexity * change_size * impact_surface` 选择本轮优先补齐目标
+- 当用户要求“只改测试，不改生产流程”时，必须按**测试热点分包策略**执行（不是手动探索）：
+  - 每轮只选一个热点文件（优先 `TOPN_RISK_UNCOVERED` 第一项）
+  - 分包顺序固定：`PACK_A`(异步编排) -> `PACK_B`(consumer 生命周期) -> `PACK_C`(写入错误恢复) -> `PACK_D`(flush/cleanup 收敛)
+  - 每个分包先跑定向 `go test`，再跑增量覆盖率校验，记录分包增益
+  - 分包增益 `>= 3.0pp` 可继续同热点；`< 1.5pp` 必须切下一个分包；连续两个分包 `< 1.0pp` 进入 `CONVERGED_NO_GAIN`
+- **默认在用户当前分支直接推进**，禁止主动拆 PR、`git checkout -b`、`git worktree add`、`gh pr create`：
+  - 仅当用户显式要求“拆 PR / 切分支 / 分批合并”时才执行
+  - 阶段 2 收益就地 commit；是否提 PR/合并由用户在当前分支决定，skill 不主动建议
+- 每轮必须输出 `TOPN_RISK_UNCOVERED`（默认 Top 5 高风险未覆盖函数清单），且下一轮必须至少覆盖其中 1 个函数。
+- 阶段2执行前必须输出并等待用户确认：
+  - `PHASE2_CONSENT_REQUIRED: true`
+  - `PHASE2_PLAN: <计划注入点与目的>`
+  - `PHASE2_SAFETY_NOTE: <为何安全可用，如何保证默认语义不变>`
+- 阶段2获批后必须输出：
+  - `PHASE: 2`
+  - `PHASE2_SAFE_GUARD: <mock-like seam/默认关闭/回滚方式>`
+- 攻破执行采用自动推进，不要求每步都询问用户：
+  - 单热点最多 10 步微迭代（补测/验证/覆盖率复算）
+  - 当前步有收益则继续进攻；无收益自动切换下一可攻破点
+  - 到 10 步或收敛后停止并汇报
+- 对复杂逻辑如果当前轮增益不足，必须先切换策略（如进入 `COMPLEX_CORE_FOCUSED`）再决定是否收敛停止。
+- 当需要继续下一轮（`NEXT_ROUND_REQUIRED: true`）时，回复必须包含：
+  - `NEXT_ROUND_REQUIRED: true`
+  - `ROUND_INDEX: <当前轮次>`
+  - `ROUND_TARGET: <当前轮次目标>`
+  - `FINAL_TARGET: <target_coverage>`
+  - `TOPN_RISK_UNCOVERED: <Top 5 高风险未覆盖函数>`
+  - `ROUND_HOTSPOT_FILE: <本轮热点文件>`
+  - `PACK_INDEX: <A|B|C|D>`
+  - `PACK_GAIN_PP: <分包增益>`
+  - `NEXT_ROUND_FOCUS_TARGET: <下一轮至少覆盖的 TopN 目标>`
+  - `NEXT_ROUND_STRATEGY: <STATE>`
+  - `NEXT_ROUND_COMMANDS: <下一轮命令>`
+- 当达到停止条件（达到整体目标、提前收敛、到第 5 轮、或硬阻塞）时，回复必须包含：
+  - `NEXT_ROUND_REQUIRED: false`
+  - `STOP_REASON: <REACHED_TARGET|CONVERGED_NO_GAIN|MAX_ROUNDS_REACHED|ENV_BLOCKED|SCOPE_MISMATCH>`
 - 汇报结果时明确说明：
   - 当前增量覆盖率
+  - 用户阈值 `target_coverage`、初始覆盖率 `base_coverage`、已执行轮次与每轮目标
   - 使用的基线 commit 或“当前未提交代码”
   - 运行过的定向测试命令
   - 仍未覆盖的关键文件或关键路径
