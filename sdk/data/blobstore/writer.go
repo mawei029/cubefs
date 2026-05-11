@@ -115,10 +115,15 @@ func NewWriter(config ClientConfig) (writer *Writer) {
 }
 
 func (writer *Writer) notifyECStreamerAfterWrite() {
-	if writer == nil || writer.ecStreamer == nil {
-		return
-	}
 	writer.ecStreamer.noteWriteFinished(uint64(writer.CacheFileSize()))
+}
+
+func (writer *Writer) notifyECStreamerAfterFlushCommitted() {
+	writer.ecStreamer.noteWriterFlushCommitted(uint64(writer.CacheFileSize()))
+}
+
+func (writer *Writer) markECStreamerReadViewStale() {
+	writer.ecStreamer.markDirty()
 }
 
 func (writer *Writer) String() string {
@@ -177,7 +182,7 @@ func (writer *Writer) Write(ctx context.Context, offset int, data []byte, flags 
 	if offset != writer.CacheFileSize() {
 		size, err = writer.tryOverWrite(ctx, offset, data, flags)
 		if err == nil {
-			writer.notifyECStreamerAfterWrite()
+			writer.notifyECStreamerAfterFlushCommitted()
 		}
 		return
 	}
@@ -196,7 +201,7 @@ func (writer *Writer) Write(ctx context.Context, offset int, data []byte, flags 
 	// This ensures data is immediately persisted but has lower throughput
 	size, err = writer.doParallelWrite(ctx, data, offset)
 	if err == nil {
-		writer.notifyECStreamerAfterWrite()
+		writer.notifyECStreamerAfterFlushCommitted()
 	}
 	return
 }
@@ -239,6 +244,7 @@ func (writer *Writer) tryOverWrite(ctx context.Context, offset int, data []byte,
 		remainSize -= freeSize           // Decrease remaining data to process
 		writer.fileOffset += freeSize    // Update file offset (logical position in file)
 		writer.dirty = true              // Mark buffer as modified (needs flush)
+		writer.markECStreamerReadViewStale()
 
 		log.LogDebugf("TRACE blobStore tryOverWrite: ino(%v) writer.fileSize(%v) writer.fileOffset(%v) writer.blockPosition(%v) position(%v) freeSize(%v)",
 			writer.ino, writer.fileSize, writer.fileOffset, writer.blockPosition, position, freeSize)
@@ -414,6 +420,7 @@ LOOP:
 			leftToWrite -= writeSize
 			writer.fileOffset += writeSize
 			writer.dirty = true
+			writer.markECStreamerReadViewStale()
 
 			writeBuff()
 
@@ -451,7 +458,7 @@ LOOP:
 	size = uint64(writer.fileOffset)
 	atomic.AddUint64(&writer.fileSize, size)
 	if err == nil {
-		writer.notifyECStreamerAfterWrite()
+		writer.notifyECStreamerAfterFlushCommitted()
 	}
 	return
 }
@@ -477,6 +484,7 @@ func (writer *Writer) doBufferWriteWithoutPool(ctx context.Context, data []byte,
 		dataSize -= freeSize
 		writer.fileOffset += freeSize
 		writer.dirty = true
+		writer.markECStreamerReadViewStale()
 
 		if len(writer.buf) == writer.blockSize {
 			log.LogDebugf("TRACE blobStore doBufferWriteWithoutPool: ino(%v) writer.buf.len(%v) writer.blocksize(%v)", writer.ino, len(writer.buf), writer.blockSize)
@@ -526,6 +534,7 @@ func (writer *Writer) doBufferWrite(ctx context.Context, data []byte, offset int
 		dataSize -= freeSize
 		writer.fileOffset += freeSize
 		writer.dirty = true
+		writer.markECStreamerReadViewStale()
 
 		if writer.blockPosition == writer.blockSize {
 			log.LogDebugf("TRACE blobStore doBufferWrite: ino(%v) writer.buf.len(%v) writer.blocksize(%v)", writer.ino, len(writer.buf), writer.blockSize)
@@ -730,7 +739,7 @@ func (writer *Writer) flushWithoutPool(inode uint64, ctx context.Context, flushF
 	}
 	writer.resetBufferWithoutPool()
 	writer.dirty = false
-	writer.notifyECStreamerAfterWrite()
+	writer.notifyECStreamerAfterFlushCommitted()
 	return nil
 }
 
@@ -939,7 +948,7 @@ func (writer *Writer) flushExt(inode uint64, ctx context.Context, flushFlag bool
 	// Reset buffer after successful flush: clear blockPosition for next write
 	writer.resetBuffer()
 	writer.dirty = false
-	writer.notifyECStreamerAfterWrite()
+	writer.notifyECStreamerAfterFlushCommitted()
 	return nil
 }
 
@@ -992,7 +1001,7 @@ func (writer *Writer) flush(inode uint64, ctx context.Context, flushFlag bool) (
 	}
 	writer.resetBuffer()
 	writer.dirty = false
-	writer.notifyECStreamerAfterWrite()
+	writer.notifyECStreamerAfterFlushCommitted()
 	return nil
 }
 
@@ -1003,9 +1012,7 @@ func (writer *Writer) CacheFileSize() int {
 // SetFileSize syncs writer internal fileSize after truncate so later Append/Write and CacheFileSize() stay consistent with meta.
 func (writer *Writer) SetFileSize(size uint64) {
 	atomic.StoreUint64(&writer.fileSize, size)
-	if writer != nil && writer.ecStreamer != nil {
-		writer.ecStreamer.syncEffectiveSize(size)
-	}
+	writer.ecStreamer.syncEffectiveSize(size)
 }
 
 // TruncateV2 first flushes buffered data (Flush/flushExt), then calls GetObjExtents; otherwise truncate may operate on stale meta/ObjExtents view.

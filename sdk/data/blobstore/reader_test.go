@@ -69,6 +69,7 @@ func TestNewReader(t *testing.T) {
 		ReadConcurrency: 0,
 		FileCache:       false,
 		FileSize:        0,
+		ECStreamer:      NewECStreamer(2, nil, nil),
 	}
 
 	reader := NewReader(mockConfig)
@@ -93,11 +94,13 @@ func TestFileSize(t *testing.T) {
 	}
 
 	for _, tc := range testCase {
-		reader := Reader{}
-		reader.limitManager = manager.NewLimitManager(nil)
-		reader.valid = tc.valid
-		reader.metaReportedSize = tc.metaReportedSize
-		reader.objExtentKeys = tc.objEks
+		reader := Reader{
+			limitManager:     manager.NewLimitManager(nil),
+			ecStreamer:       NewECStreamer(1, nil, nil),
+			valid:            tc.valid,
+			metaReportedSize: tc.metaReportedSize,
+			objExtentKeys:    tc.objEks,
+		}
 		gotSize, gotOk := reader.fileSize()
 		assert.Equal(t, tc.expectSize, gotSize)
 		assert.Equal(t, tc.expectOk, gotOk)
@@ -160,8 +163,10 @@ func TestRefreshEbsExtents(t *testing.T) {
 	}
 
 	for _, tc := range testCase {
-		reader := Reader{}
-		reader.limitManager = manager.NewLimitManager(nil)
+		reader := Reader{
+			limitManager: manager.NewLimitManager(nil),
+			ecStreamer:   NewECStreamer(0, nil, nil),
+		}
 		mw := &meta.MetaWrapper{}
 		err := gohook.HookMethod(mw, "GetObjExtents", tc.getObjFunc, nil)
 		if err != nil {
@@ -195,9 +200,11 @@ func TestPrepareEbsSlice(t *testing.T) {
 		if err != nil {
 			panic(fmt.Sprintf("Hook advance instance method failed:%s", err.Error()))
 		}
-		reader := Reader{}
-		reader.limitManager = manager.NewLimitManager(nil)
-		reader.mw = mw
+		reader := Reader{
+			limitManager: manager.NewLimitManager(nil),
+			ecStreamer:   NewECStreamer(0, nil, nil),
+			mw:           mw,
+		}
 		_, got := reader.prepareEbsSlice(tc.offset, tc.size)
 		assert.Equal(t, tc.expectError, got)
 	}
@@ -209,6 +216,7 @@ func TestPrepareEbsSlice_sparseHeadMiddleTailHoles(t *testing.T) {
 		metaReportedSize: 100,
 		objExtentKeys:    []proto.ObjExtentKey{{FileOffset: 20, Size: 20}},
 		limitManager:     manager.NewLimitManager(nil),
+		ecStreamer:       NewECStreamer(0, nil, nil),
 	}
 	slices, err := r.prepareEbsSlice(0, 100)
 	require.NoError(t, err)
@@ -247,10 +255,12 @@ func TestRead(t *testing.T) {
 	}
 
 	for _, tc := range testCase {
-		reader := &Reader{}
-		reader.limitManager = manager.NewLimitManager(nil)
-		reader.close = tc.close
-		reader.readConcurrency = tc.readConcurrency
+		reader := &Reader{
+			limitManager:    manager.NewLimitManager(nil),
+			ecStreamer:      NewECStreamer(0, nil, nil),
+			close:           tc.close,
+			readConcurrency: tc.readConcurrency,
+		}
 
 		mw := &meta.MetaWrapper{}
 		ebsc := newSafeBlobStoreClientForTest()
@@ -379,6 +389,7 @@ func TestReaderRead_PrefetchAndFallbackPaths(t *testing.T) {
 		aheadReadEnable:  true,
 		minReadAheadSize: 1,
 		limitManager:     manager.NewLimitManager(nil),
+		ecStreamer:       NewECStreamer(1, nil, nil),
 	}
 	ebsc := newSafeBlobStoreClientForTest()
 	reader.ebs = ebsc
@@ -557,6 +568,7 @@ func TestReaderCoveragePrefetchAndAlignment(t *testing.T) {
 			prefetchLimiter:  &blobReadPrefetchLimiter{maxBytes: 8},
 			limitManager:     manager.NewLimitManager(nil),
 			ebs:              newSafeBlobStoreClientForTest(),
+			ecStreamer:       NewECStreamer(1, nil, nil),
 		}
 		err := gohook.HookMethod(r.ebs, "Read",
 			func(_ *BlobStoreClient, _ context.Context, _ string, buf []byte, _ uint64, _ uint64, _ proto.ObjExtentKey) (int, error) {
@@ -637,6 +649,7 @@ func TestReaderCoverageHelperBranches(t *testing.T) {
 			AheadReadEnable:  true,
 			MinReadAheadSize: -1,
 			PrefetchTotalMem: 4,
+			ECStreamer:       NewECStreamer(1, nil, nil),
 		})
 		require.NotContains(t, (rwSlice{fileOffset: 1}).String(), "hole(true)")
 		require.Contains(t, r.String(), "Reader{")
@@ -651,7 +664,13 @@ func TestReaderCoverageHelperBranches(t *testing.T) {
 		require.NoError(t, err)
 		defer gohook.UnHookMethod(mw, "GetObjExtents")
 
-		r := &Reader{mw: mw, ino: 1, readConcurrency: 1, limitManager: manager.NewLimitManager(nil)}
+		r := &Reader{
+			mw:              mw,
+			ino:             1,
+			readConcurrency: 1,
+			limitManager:    manager.NewLimitManager(nil),
+			ecStreamer:      NewECStreamer(1, nil, nil),
+		}
 		require.Error(t, r.ensureExtentsLoaded())
 		r.Lock()
 		_, err = r.readEbsRange(context.Background(), -1, 1)
@@ -667,6 +686,7 @@ func TestReaderCoverageHelperBranches(t *testing.T) {
 				{FileOffset: 20, Size: 5},
 			},
 			limitManager: manager.NewLimitManager(nil),
+			ecStreamer:   NewECStreamer(1, nil, nil),
 		}
 		slices, err := r.prepareEbsSlice(0, 30)
 		require.NoError(t, err)

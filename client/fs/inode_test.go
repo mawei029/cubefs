@@ -23,7 +23,7 @@ func newTestSuperForInode() *Super {
 		ic:                NewInodeCache(time.Hour, 64, true),
 		mw:                &meta.MetaWrapper{},
 		ec:                &stream.ExtentClient{},
-		oec:               blobstore.NewObjExtentClient(nil),
+		oec:               blobstore.NewObjExtentClient(blobstore.ObjExtentConfig{}),
 		nodeCache:         make(map[uint64]bazilfs.Node),
 		dirExtendInfoMap:  make(map[uint64]*DirExtendInfo),
 		fileExtendInfoMap: make(map[uint64]*FileExtendInfo),

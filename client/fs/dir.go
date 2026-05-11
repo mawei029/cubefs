@@ -264,20 +264,14 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 	isCache := false
 	if proto.IsCold(d.super.volType) || proto.IsStorageClassBlobStore(info.StorageClass) {
 		isCache = true
-	}
-	d.super.ec.OpenStream(info.Inode, openForWrite, isCache, path.Join(child.(*File).getParentPath(), child.(*File).name))
-	defer func() {
+		args, err := child.(*File).buildECStreamOpenArgs(info, uint32(req.Flags&0x0f), info.Size)
 		if err != nil {
-			_ = d.super.ec.CloseStream(info.Inode)
+			log.LogErrorf("Create: buildECStreamOpenArgs ino(%v) err(%v)", info.Inode, err)
+			return nil, nil, ParseError(err)
 		}
-	}()
-	if proto.IsStorageClassBlobStore(info.StorageClass) {
-		childFile := child.(*File)
-		if errOec := childFile.openOECStream(info, uint32(req.Flags&0x0f), info.Size); errOec != nil {
-			err = errOec
-			log.LogErrorf("Create: openOECStream ino(%v) err(%v)", info.Inode, errOec)
-			return nil, nil, ParseError(errOec)
-		}
+		d.super.oec.OpenStreamWithArgs(args)
+	} else {
+		d.super.ec.OpenStream(info.Inode, openForWrite, isCache, path.Join(child.(*File).getParentPath(), child.(*File).name))
 	}
 	d.super.fslock.Lock()
 	d.super.nodeCache[info.Inode] = child
@@ -320,7 +314,13 @@ func (d *Dir) Forget() {
 		}
 	}
 	if !d.super.metaCacheAcceleration {
-		d.deleteExtendInfo()
+		// Forget 可能在目录仍有 fd（Dir.Open 已 openCnt++）时先于 Release 到达；若此时 deleteExtendInfo，
+		// 后续 Lookup 会 getOrCreate 出 openCnt=0 的新 DirExtendInfo，再 Release 会 -- 打成 -1（见 WARN DirRelease negative openCnt）。
+		if ei, ok := d.getExtendInfo(); ok && ei != nil && atomic.LoadInt64(&ei.openCnt) > 0 {
+			log.LogDebugf("Forget:dir skip deleteExtendInfo while openCnt>0 ino(%v) name(%v) openCnt(%v)", ino, d.name, atomic.LoadInt64(&ei.openCnt))
+		} else {
+			d.deleteExtendInfo()
+		}
 	}
 	d.super.fslock.Lock()
 	delete(d.super.nodeCache, ino)

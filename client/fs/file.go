@@ -231,38 +231,15 @@ func (f *File) Forget() {
 		delete(f.super.nodeCache, ino)
 		f.super.fslock.Unlock()
 		fullPath := f.getParentPath() + f.name
-		if f.super.usesBlobStoreDataPath() {
-			// EC/冷 Blob 路径：先 Evict oec，再尝试副本 ec；后者因 streamer request 队列与 server 单协程竞态
-			// 可能瞬时返回 evict: streamer(... refcnt(0))（实为 len(request)!=0），短暂重试后再降级日志，不阻断 orphan/mw。
+		if proto.IsCold(f.super.volType) || proto.IsStorageClassBlobStore(f.storageClass()) {
+			// 先 Evict oec；冷卷数据面仅 Blob/EC，无副本 ec streamer，不再调 ec.EvictStream。
 			if err := f.super.oec.EvictStream(ino); err != nil {
 				log.LogWarnf("Forget: oec EvictStream not ready, ino(%v) path(%v) err(%v)", ino, fullPath, err)
 				return
 			}
-			const replicaEvictRetries = 5
-			const replicaEvictBackoff = 2 * time.Millisecond
-			var lastEcEvictErr error
-			for attempt := 0; attempt < replicaEvictRetries; attempt++ {
-				if err := f.super.ec.EvictStream(ino); err == nil {
-					lastEcEvictErr = nil
-					break
-				} else {
-					lastEcEvictErr = err
-					if attempt+1 < replicaEvictRetries {
-						time.Sleep(replicaEvictBackoff)
-					}
-				}
-			}
-			if lastEcEvictErr != nil {
-				log.LogDebugf("Forget: replica ec EvictStream after oec (exhausted retries), ino(%v) path(%v) err(%v); continue orphan/mw cleanup",
-					ino, fullPath, lastEcEvictErr)
-			}
 		} else {
 			if err := f.super.ec.EvictStream(ino); err != nil {
 				log.LogWarnf("Forget: stream not ready to evict, ino(%v) err(%v)", ino, err)
-				return
-			}
-			if err := f.super.oec.EvictStream(ino); err != nil {
-				log.LogWarnf("Forget: oec stream not ready to evict, ino(%v) err(%v)", ino, err)
 				return
 			}
 		}
@@ -319,16 +296,18 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 	isCache := false
 	if proto.IsCold(f.super.volType) || proto.IsStorageClassBlobStore(info.StorageClass) {
 		isCache = true
-	}
-	if needBCache {
-		f.super.ec.OpenStreamWithCache(ino, needBCache, openForWrite, isCache, path.Join(f.getParentPath(), f.name))
 	} else {
-		f.super.ec.OpenStream(ino, openForWrite, isCache, path.Join(f.getParentPath(), f.name))
+		if needBCache {
+			f.super.ec.OpenStreamWithCache(ino, needBCache, openForWrite, isCache, path.Join(f.getParentPath(), f.name))
+		} else {
+			f.super.ec.OpenStream(ino, openForWrite, isCache, path.Join(f.getParentPath(), f.name))
+		}
 	}
 	// 后续任一步失败须配对 ec.CloseStream，避免副本流 ref 泄漏（oec 未 OpenStream 成功时无对应 oec ref）。
 	defer func() {
 		if err != nil {
 			_ = f.super.ec.CloseStream(ino)
+			_ = f.super.oec.CloseStream(ino)
 		}
 	}()
 
@@ -352,71 +331,18 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 		log.LogDebugf("TRANCE open ino(%v) info(%v), poolId(%v)", ino, info, info.PoolId)
 
 		fileSize, _ := f.fileSizeVersion2(ino)
-		if proto.IsStorageClassBlobStore(info.StorageClass) {
-			if f.super.oec.Writer(ino) != nil {
-				if flushErr := f.super.oec.Flush(ino); flushErr != nil {
-					log.LogErrorf("Open: oec flush before replace stream ino(%v) err(%v)", ino, flushErr)
-					return nil, ParseError(flushErr)
-				}
-				if w := f.super.oec.Writer(ino); w != nil {
-					w.FreeCache()
-				}
+		if s := f.super.oec.GetStreamer(ino); s != nil {
+			if flushErr := s.FlushAndFreeCache(context.Background()); flushErr != nil {
+				log.LogErrorf("Open: oec flush before replace stream ino(%v) err(%v)", ino, flushErr)
+				return nil, ParseError(flushErr)
 			}
-			if err := f.openOECStream(info, uint32(req.Flags&0x0f), uint64(fileSize)); err != nil {
-				log.LogErrorf("Open: openOECStream ino(%v) err: %v", ino, err)
-				return nil, err
-			}
-			log.LogDebugf("TRACE file open (oec), ino(%v) req.Flags(%v) reader(%v) writer(%v)", ino, req.Flags, f.super.oec.Reader(ino), f.super.oec.Writer(ino))
-		} else {
-			ebsc, err := f.super.getBlobStoreClient(info.PoolId)
-			if err != nil {
-				log.LogErrorf("Open: get blobstore client for pool(%v) err: %v", info.PoolId, err)
-				return nil, err
-			}
-
-			aheadEn, aheadMin, aheadTotalMem := f.super.BlobStoreAheadReadForReader()
-			clientConf := blobstore.ClientConfig{
-				VolName:         f.super.volname,
-				VolType:         f.super.volType,
-				BlockSize:       f.super.EbsBlockSize,
-				Ino:             f.ino,
-				Bc:              f.super.bc,
-				Mw:              f.super.mw,
-				LimitManager:    f.super.blobClientLimitManager(),
-				Ebsc:            ebsc,
-				EnableBcache:    f.super.enableBcache,
-				WConcurrency:    f.super.writeThreads,
-				ReadConcurrency: f.super.readThreads,
-				FileCache:       false,
-				FileSize:        uint64(fileSize),
-				PoolId:          info.PoolId,
-			}
-			if w := f.coldBlobWriter(); w != nil {
-				if flushErr := w.Flush(ino, context.Background()); flushErr != nil {
-					log.LogErrorf("Open: flush blob writer before replace ino(%v) err(%v)", ino, flushErr)
-					return nil, ParseError(flushErr)
-				}
-				w.FreeCache()
-			}
-			var reader *blobstore.Reader
-			var writer *blobstore.Writer
-			clientConf.AheadReadEnable = aheadEn
-			clientConf.MinReadAheadSize = aheadMin
-			clientConf.PrefetchTotalMem = aheadTotalMem
-			switch req.Flags & 0x0f {
-			case syscall.O_RDONLY:
-				reader = blobstore.NewReader(clientConf)
-			case syscall.O_WRONLY:
-				writer = blobstore.NewWriter(clientConf)
-			case syscall.O_RDWR:
-				reader = blobstore.NewReader(clientConf)
-				writer = blobstore.NewWriter(clientConf)
-			default:
-				writer = blobstore.NewWriter(clientConf)
-			}
-			f.setColdBlobReaderWriter(reader, writer)
-			log.LogDebugf("TRACE file open,ino(%v)  req.Flags(%v) reader(%v)  writer(%v)", ino, req.Flags, reader, writer)
 		}
+
+		if err := f.openOECStream(info, uint32(req.Flags&0x0f), uint64(fileSize)); err != nil {
+			log.LogErrorf("Open: openOECStream ino(%v) err: %v", ino, err)
+			return nil, err
+		}
+		log.LogDebugf("TRACE file open (oec), ino(%v) req.Flags(%v) reader(%v) writer(%v)", ino, req.Flags, f.super.oec.Reader(ino), f.super.oec.Writer(ino))
 	}
 
 	elapsed := time.Since(start)
@@ -434,12 +360,6 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) (err error
 
 	defer func() {
 		stat.EndStat("Release:file", err, bgTime, 1)
-		if proto.IsStorageClassBlobStore(f.storageClass()) {
-			log.LogInfof("action[Release] oec writer %v", f.super.oec.Writer(ino))
-		} else if w := f.coldBlobWriter(); w != nil {
-			log.LogInfof("action[Release] %v", w)
-			w.FreeCache()
-		}
 		oecRef := f.super.oec.RefCnt(ino)
 		if f.super.ec.RefCnt(ino) == 0 && oecRef == 0 && !f.super.metaCacheAcceleration {
 			// keep nodeCache hold the latest inode info
@@ -457,21 +377,32 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) (err error
 	log.LogDebugf("TRACE Release enter: ino(%v) req(%v)", ino, req)
 
 	start := time.Now()
-	errEc := f.super.ec.CloseStream(ino)
-	errOec := f.super.oec.CloseStream(ino)
-	if errEc != nil {
-		log.LogErrorf("Release: ec CloseStream ino(%v) req(%v) err(%v)", ino, req, errEc)
-		if errOec != nil {
-			log.LogErrorf("Release: oec CloseStream ino(%v) err(%v) (after ec err)", ino, errOec)
+	var errEc, errOec error
+	// ec：Dir.Create 对「任意卷、任意存储类」都会 ec.OpenStream（client/fs/dir.go）；与 File.Open 是否走 oec 无关。
+	// 因此 Release 必须总是 ec.CloseStream 以配对 Create；无 ec 流时 ExtentClient.CloseStream 为 no-op。
+	// oec：仅当 File.Open 会 openOECStream 时可能持有引用，即冷卷或 inode 为 BlobStore（与 Open 第二段条件一致）。
+	info, getErr := f.getInfo()
+	if getErr != nil {
+		log.LogWarnf("Release: getInfo ino(%v) err(%v); fallback ec+oec CloseStream", ino, getErr)
+		return ParseError(getErr)
+	}
+
+	if proto.IsCold(f.super.volType) || proto.IsStorageClassBlobStore(info.StorageClass) {
+		if errOec = f.super.oec.CloseStream(ino); errOec != nil {
+			log.LogErrorf("Release: oec CloseStream ino(%v) req(%v) err(%v)", ino, req, errOec)
+			// CloseStream 在 Flush 失败时会回滚 refCnt 且不进入 teardownStreamer 的 FreeCache；在此释放 Writer 池化缓冲。
+			if w := f.super.oec.Writer(ino); w != nil {
+				w.FreeCache()
+			}
+			return ParseError(errOec)
 		}
-		err = errEc
-		return ParseError(errEc)
+	} else {
+		if errEc = f.super.ec.CloseStream(ino); errEc != nil {
+			log.LogErrorf("Release: ec CloseStream ino(%v) req(%v) err(%v)", ino, req, errEc)
+			return ParseError(errEc)
+		}
 	}
-	if errOec != nil {
-		log.LogErrorf("Release: oec CloseStream ino(%v) err(%v)", ino, errOec)
-		err = errOec
-		return ParseError(errOec)
-	}
+
 	if log.EnableDebug() {
 		elapsed := time.Since(start)
 		log.LogDebugf("TRACE FileRelease: ino(%v) req(%v) name(%v)(%v)ns", ino, req, path.Join(f.getParentPath(), f.name), elapsed.Nanoseconds())
@@ -515,31 +446,8 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 		size, err = f.super.ec.Read(f.ino, resp.Data[fuse.OutHeaderSize:], int(req.Offset),
 			req.Size, info.PoolId, false)
 	} else {
-		if proto.IsStorageClassBlobStore(storageClass) {
-			reader := f.super.oec.Reader(f.ino)
-			if reader == nil {
-				log.LogErrorf("Read: oec reader not opened, ino(%v) offset(%v) reqsize(%v)", f.ino, req.Offset, req.Size)
-				return ParseError(syscall.EBADF)
-			}
-			// 读视图与写缓冲对齐由 blobstore.Reader.EnsureAlignedForRead（dirty 时内部 ensureReadViewCurrent）与
-			// oec.Read→ECStreamer.Read 首部 ensureReadViewCurrent 完成；此处不再单独 oec.Flush，避免 LTP gf07 等并行读写双重全量同步卡死。
-			if err = reader.EnsureAlignedForRead(info.Generation, info.Size); err != nil {
-				return ParseError(err)
-			}
-			// 经过 EnsureAligned 后统一走 oec.Read，以复用 ECStreamer 读写互斥与版本门控。
-			size, err = f.super.oec.Read(f.ino, resp.Data[fuse.OutHeaderSize:], int(req.Offset), req.Size, info.PoolId, false)
-		} else {
-			reader := f.coldBlobReader()
-			if reader == nil {
-				log.LogErrorf("Read: cold blob reader not opened, ino(%v) offset(%v) reqsize(%v)", f.ino, req.Offset, req.Size)
-				return ParseError(syscall.EBADF)
-			}
-			// 冷卷非 oec 路径保留原有对齐逻辑。
-			if err = reader.EnsureAlignedForRead(info.Generation, info.Size); err != nil {
-				return ParseError(err)
-			}
-			size, err = reader.Read(ctx, resp.Data[fuse.OutHeaderSize:], int(req.Offset), req.Size)
-		}
+		// 对齐与「dirty 时先同步再读」封装在 oec.ReadWithInodeView → Reader.EnsureAlignedForRead + ECStreamer.Read。
+		size, err = f.super.oec.ReadWithInodeView(ctx, f.ino, resp.Data[fuse.OutHeaderSize:], int(req.Offset), req.Size, info.PoolId, false, info.Generation, info.Size)
 	}
 	if err != nil && err != io.EOF {
 		msg := fmt.Sprintf("Read: ino(%v) req(%v) err(%v) size(%v)", f.ino, req, err, size)
@@ -617,7 +525,7 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 			log.LogDebugf("fallocate: ino(%v) origFilesize(%v) req(%v) err(%v)", f.ino, filesize, req, err)
 			return
 		}
-	} else if proto.IsStorageClassBlobStore(storageClass) {
+	} else {
 		filesize, _ := f.fileSizeVersion2(ino)
 		if req.Offset > int64(filesize) && reqlen == 1 && req.Data[0] == 0 {
 			// posix_fallocate may degrade to writing one trailing zero byte when fallocate is unsupported; keep behavior aligned with Hot/Replica branch.
@@ -695,17 +603,8 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 		}
 	} else {
 		f.storeIdle(0)
-		if proto.IsStorageClassBlobStore(storageClass) {
-			size, err = f.super.oec.Write(ino, int(req.Offset), req.Data, flags, checkFunc,
-				pool.Id, info.StorageClass, false, waitForFlush)
-		} else {
-			writer := f.coldBlobWriter()
-			if writer == nil {
-				log.LogErrorf("Write: cold blob writer not opened, ino(%v) offset(%v) len(%v)", ino, req.Offset, reqlen)
-				return ParseError(syscall.EBADF)
-			}
-			size, err = writer.Write(context.Background(), int(req.Offset), req.Data, flags)
-		}
+		size, err = f.super.oec.Write(ino, int(req.Offset), req.Data, flags, checkFunc,
+			pool.Id, info.StorageClass, false, waitForFlush)
 	}
 
 	if err != nil {
@@ -759,23 +658,13 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 
 // flushNonReplicaWriter 刷非副本路径的 Blob Writer：EC/BlobStore 使用 oec；冷卷非 EC 使用 coldBlobWriter。只读且无 Writer 时 O_RDONLY 视为成功。
 func (f *File) flushNonReplicaWriter(ino uint64, storageClass uint32) error {
-	if proto.IsStorageClassBlobStore(storageClass) {
-		if f.super.oec.Writer(ino) == nil {
-			if f.getFlag()&0x0f == syscall.O_RDONLY {
-				return nil
-			}
-			return syscall.EBADF
-		}
-		return f.super.oec.Flush(ino)
-	}
-	w := f.coldBlobWriter()
-	if w == nil {
+	if f.super.oec.Writer(ino) == nil {
 		if f.getFlag()&0x0f == syscall.O_RDONLY {
 			return nil
 		}
 		return syscall.EBADF
 	}
-	return w.Flush(ino, context.Background())
+	return f.super.oec.Flush(ino)
 }
 
 // Flush only when fsyncOnClose is enabled.
@@ -962,7 +851,6 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 				return ParseError(err)
 			}
 			f.super.ic.Delete(ino)
-			f.super.ec.RefreshExtentsCache(ino)
 			// After truncate, update Writer logical file size on opened fds and sync Reader ObjExtents + inode view via syncBlobReaderAfterMetaChange.
 			if w := f.super.oec.Writer(ino); w != nil {
 				w.SetFileSize(req.Size)
@@ -1228,23 +1116,26 @@ func (f *File) fileSizeVersion2(ino uint64) (size int, gen uint64) {
 				gen = info.Generation
 			}
 		}
-	} else if proto.IsStorageClassBlobStore(f.storageClass()) {
+	} else {
 		// TODO: ec file size
 		size, gen, valid = f.super.oec.FileSize(ino)
-		// inode.Size 为权威逻辑长度（稀疏文件 extent 尾可小于 inode）；与写缓存取大，保证 Attr/Open 与 Read 上界一致。
-		if info, err := f.super.InodeGet(ino); err == nil {
-			if int(info.Size) > size {
-				size = int(info.Size)
-			}
-			gen = info.Generation
-			if w := f.super.oec.Writer(ino); w != nil {
-				cacheSize := w.CacheFileSize()
-				if cacheSize > size {
-					size = cacheSize
+		if !valid {
+			// inode.Size 为权威逻辑长度（稀疏文件 extent 尾可小于 inode）；与写缓存取大，保证 Attr/Open 与 Read 上界一致。
+			if info, err := f.super.InodeGet(ino); err == nil {
+				if int(info.Size) > size {
+					size = int(info.Size)
+				}
+				gen = info.Generation
+				// Open 尚未 openOECStream、或 Release 后表项已删时无 streamer；勿调 oec.Writer(ino) 触发无意义告警。
+				if s := f.super.oec.GetStreamer(ino); s != nil {
+					if w := s.Writer(); w != nil {
+						cacheSize := w.CacheFileSize()
+						if cacheSize > size {
+							size = cacheSize
+						}
+					}
 				}
 			}
-		} else if !valid {
-			// 无流表且无 inode：保持 oec 返回值
 		}
 	}
 

@@ -10,12 +10,11 @@ import (
 )
 
 func TestObjExtentClient_FileSizeUsesStreamerSize(t *testing.T) {
-	c := NewObjExtentClient(&ObjExtentConfig{})
-	s := NewECStreamer(11, nil, nil)
-	s.fReader = &Reader{
+	c := NewObjExtentClient(ObjExtentConfig{})
+	s := NewECStreamer(11, &Reader{
 		valid:            true,
 		metaReportedSize: 1024,
-	}
+	}, nil)
 	atomic.StoreUint64(&s.fileSize, 128)
 	atomic.StoreUint64(&s.inoVersion, 9)
 	c.streamers[11] = s
@@ -27,7 +26,7 @@ func TestObjExtentClient_FileSizeUsesStreamerSize(t *testing.T) {
 }
 
 func TestObjExtentClient_ReadWriteBadfdWhenStreamMissing(t *testing.T) {
-	c := NewObjExtentClient(&ObjExtentConfig{})
+	c := NewObjExtentClient(ObjExtentConfig{})
 
 	_, err := c.Read(1, make([]byte, 4), 0, 4, 0, false)
 	require.ErrorIs(t, err, syscall.EBADF)
@@ -39,7 +38,7 @@ func TestObjExtentClient_ReadWriteBadfdWhenStreamMissing(t *testing.T) {
 }
 
 func TestObjExtentClient_EvictStreamRefBusy(t *testing.T) {
-	c := NewObjExtentClient(&ObjExtentConfig{})
+	c := NewObjExtentClient(ObjExtentConfig{})
 	s := NewECStreamer(22, nil, nil)
 	atomic.StoreInt32(&s.refCnt, 1)
 	c.streamers[22] = s
@@ -50,7 +49,7 @@ func TestObjExtentClient_EvictStreamRefBusy(t *testing.T) {
 }
 
 func TestObjExtentClient_CloseStreamEvictWhenRefZero(t *testing.T) {
-	c := NewObjExtentClient(&ObjExtentConfig{})
+	c := NewObjExtentClient(ObjExtentConfig{})
 	s := NewECStreamer(33, nil, nil)
 	atomic.StoreInt32(&s.refCnt, 1)
 	c.streamers[33] = s

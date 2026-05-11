@@ -75,16 +75,12 @@ type ECExtentClient struct {
 	mu           sync.RWMutex // 读多写少：查询/IO 路径 RLock，Open/Close/Evict 全表修改 Lock
 	streamers    map[uint64]*ECStreamer
 	LimitManager *manager.LimitManager
-
-	// BeforeEBSShrinkHook 在 Blob 缩容调用 Writer.TruncateV2 之前执行（与原先 file.doECTruncateV2 中 ec.OpenStream+Flush+defer Close 一致）。
-	// 返回的 cleanup 在 Truncate 返回前必须调用；为 nil 时不做副本同步（测试或特殊场景）。
-	BeforeEBSShrinkHook func(ino uint64, fullPath string) (cleanup func(), err error)
 }
 
 // NewObjExtentClient 创建客户端；cfg 可为 nil。
-func NewObjExtentClient(cfg *ObjExtentConfig) *ECExtentClient {
+func NewObjExtentClient(cfg ObjExtentConfig) *ECExtentClient {
 	lm := (*manager.LimitManager)(nil)
-	if cfg != nil {
+	if cfg.LimitManager != nil {
 		lm = cfg.LimitManager
 	}
 	if lm == nil {
@@ -99,19 +95,19 @@ func NewObjExtentClient(cfg *ObjExtentConfig) *ECExtentClient {
 // OpenStreamWithArgs：EC/Blob 打开流（携带 EBS、池、块大小等）；数据面须调用本方法（ExtentClientAPI.OpenStream 四参在 EC 上返回 ENOTSUP）。
 func (c *ECExtentClient) OpenStreamWithArgs(args ECStreamOpenArgs) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	s, ok := c.streamers[args.Ino]
 	if !ok {
 		s = NewECStreamer(args.Ino, nil, nil)
 		c.streamers[args.Ino] = s
 		log.LogDebugf("ECExtentClient OpenStreamWithArgs: new ECStreamer ino(%v)", args.Ino)
 	}
-
 	atomic.AddInt32(&s.refCnt, 1)
+	c.mu.Unlock()
+
+	// merge / NewReader+NewWriter 移出 c.mu：避免多文件 Open 或与其它 inode 的 Read/Write 争用同一把全局锁导致 LTP 长时间卡顿。
 	s.mergeOpenSnapshot(args.FileSize, args.InodeGeneration)
 	cfg := args.toClientConfig(c, s)
-	s.ensureOpenEndpoints(cfg)
+	s.lazyInitReaderWriter(cfg)
 	log.LogDebugf("ECExtentClient OpenStreamWithArgs: ino(%v) ref(%v)", args.Ino, atomic.LoadInt32(&s.refCnt))
 	return nil
 }
@@ -144,12 +140,13 @@ func (c *ECExtentClient) CloseStream(ino uint64) error {
 	s := c.streamers[ino]
 	if s == nil {
 		c.mu.Unlock()
+		log.LogWarnf("ECExtentClient CloseStream: streamer not found, ino(%v)", ino)
 		return nil
 	}
 	n := atomic.AddInt32(&s.refCnt, -1)
 	if n > 0 {
 		c.mu.Unlock()
-		log.LogDebugf("ECExtentClient CloseStream: ino(%v) ref(%v)", ino, n)
+		log.LogDebugf("ECExtentClient CloseStream: ref not zero, ino(%v) ref(%v)", ino, n)
 		return nil
 	}
 	if n < 0 {
@@ -160,25 +157,12 @@ func (c *ECExtentClient) CloseStream(ino uint64) error {
 	}
 	c.mu.Unlock()
 
-	w := s.Writer()
-	if w != nil {
-		if err := w.Flush(ino, context.Background()); err != nil {
-			atomic.AddInt32(&s.refCnt, 1)
-			log.LogErrorf("ECExtentClient CloseStream: flush writer failed, ino(%v) err(%v)", ino, err)
-			return err
-		}
-		w.FreeCache()
+	if err := c.teardownStreamer(ino, s); err != nil {
+		// Flush 失败 → 不能把这次 Close 当成成功扣完引用 → refCnt 回滚，避免在「未刷盘」时进入 refCnt==0 的回收语义。
+		atomic.AddInt32(&s.refCnt, 1)
+		log.LogErrorf("ECExtentClient CloseStream: flush writer failed, ino(%v) err(%v)", ino, err)
+		return err
 	}
-	if r := s.Reader(); r != nil {
-		r.Close(context.Background())
-	}
-
-	c.mu.Lock()
-	if cur := c.streamers[ino]; cur == s && atomic.LoadInt32(&s.refCnt) == 0 {
-		s.Cleanup()
-		delete(c.streamers, ino)
-	}
-	c.mu.Unlock()
 	log.LogDebugf("ECExtentClient CloseStream: ino(%v) evicted", ino)
 	return nil
 }
@@ -198,23 +182,10 @@ func (c *ECExtentClient) EvictStream(ino uint64) error {
 	}
 	c.mu.Unlock()
 
-	if w := s.Writer(); w != nil {
-		if err := w.Flush(ino, context.Background()); err != nil {
-			log.LogErrorf("ECExtentClient EvictStream: flush writer failed, ino(%v) err(%v)", ino, err)
-			return err
-		}
-		w.FreeCache()
+	if err := c.teardownStreamer(ino, s); err != nil {
+		log.LogErrorf("ECExtentClient EvictStream: flush writer failed, ino(%v) err(%v)", ino, err)
+		return err
 	}
-	if r := s.Reader(); r != nil {
-		r.Close(context.Background())
-	}
-
-	c.mu.Lock()
-	if cur := c.streamers[ino]; cur == s && atomic.LoadInt32(&s.refCnt) == 0 {
-		s.Cleanup()
-		delete(c.streamers, ino)
-	}
-	c.mu.Unlock()
 	return nil
 }
 
@@ -230,6 +201,7 @@ func (c *ECExtentClient) Reader(ino uint64) *Reader {
 	s := c.streamers[ino]
 	c.mu.RUnlock()
 	if s == nil {
+		log.LogWarnf("ECExtentClient GetStreamer: streamer not found, ino(%v)", ino)
 		return nil
 	}
 	return s.Reader()
@@ -240,6 +212,7 @@ func (c *ECExtentClient) Writer(ino uint64) *Writer {
 	s := c.streamers[ino]
 	c.mu.RUnlock()
 	if s == nil {
+		log.LogWarnf("ECExtentClient Writer: streamer not found, ino(%v)", ino)
 		return nil
 	}
 	return s.Writer()
@@ -281,6 +254,30 @@ func (c *ECExtentClient) Read(ino uint64, data []byte, offset int, size int, poo
 	return s.Read(context.Background(), data, offset, size, poolId, isMigration)
 }
 
+// ReadWithInodeView 在 Read 前按 InodeGet 的 generation/size 做 Reader 与流视图对齐（EnsureAlignedForRead），再经 ECStreamer.Read（dirty 时内部 Flush+Refresh）。
+// 供 Blob/EC FUSE 读路径使用，避免调用方每次读前单独 Flush 或重复对齐。
+func (c *ECExtentClient) ReadWithInodeView(ctx context.Context, ino uint64, data []byte, offset int, size int, poolId uint8, isMigration bool, inodeGen, inodeSize uint64) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c.mu.RLock()
+	s := c.streamers[ino]
+	c.mu.RUnlock()
+	if s == nil {
+		log.LogErrorf("ECExtentClient ReadWithInodeView: stream not opened, ino(%v) offset(%v) size(%v)", ino, offset, size)
+		return 0, syscall.EBADF
+	}
+	r := s.Reader()
+	if r == nil {
+		log.LogErrorf("ECExtentClient ReadWithInodeView: reader nil, ino(%v)", ino)
+		return 0, syscall.EBADF
+	}
+	if err := r.EnsureAlignedForRead(inodeGen, inodeSize); err != nil {
+		return 0, err
+	}
+	return s.Read(ctx, data, offset, size, poolId, isMigration)
+}
+
 // Write 与副本 ExtentClient.Write 参数顺序及含义对齐；waitForFlush 为真时 ECStreamer.WriteWithOpts 在成功后 ensureReadViewCurrent（Flush+Refresh）。
 //
 //go:noinline
@@ -297,7 +294,7 @@ func (c *ECExtentClient) Write(ino uint64, offset int, data []byte, flags int, c
 	return s.WriteWithOpts(context.Background(), offset, data, flags, checkFunc, poolId, storageClass, isMigration, waitForFlush)
 }
 
-// NeedsReadViewSync 为真表示 ECStreamer.dirty 置位，读路径应先 Flush 再 EnsureAlignedForRead，避免在未刷写缓冲时仅 Refresh 导致不一致。
+// NeedsReadViewSync 为真表示 ECStreamer.dirty 置位（写缓冲未落盘或显式 markDirty），读路径应走 EnsureAligned/Read 内 ensureReadViewCurrent。
 // O_RDWR 打开的文件在无未同步写时恒为 false，避免 LTP 等场景下每次读都走 Flush。
 func (c *ECExtentClient) NeedsReadViewSync(ino uint64) bool {
 	c.mu.RLock()
@@ -334,5 +331,26 @@ func (c *ECExtentClient) Truncate(mw *meta.MetaWrapper, parentIno uint64, ino ui
 		return syscall.EBADF
 	}
 	targetSize := uint64(size)
-	return s.truncateV2(context.Background(), mw, ino, targetSize, fullPath, c.BeforeEBSShrinkHook)
+	return s.truncateV2(context.Background(), mw, ino, targetSize, fullPath)
+}
+
+// teardownStreamer 在未持 c.mu 下：Flush Writer、FreeCache、Close Reader；再持 c.mu，若表项仍为 s 且 refCnt==0 则 Cleanup 并删表。
+// CloseStream（最后一次关）与 EvictStream 共用。
+func (c *ECExtentClient) teardownStreamer(ino uint64, s *ECStreamer) error {
+	if w := s.Writer(); w != nil {
+		if err := w.Flush(ino, context.Background()); err != nil {
+			return err
+		}
+		w.FreeCache()
+	}
+	if r := s.Reader(); r != nil {
+		r.Close(context.Background())
+	}
+	c.mu.Lock()
+	if cur := c.streamers[ino]; cur == s && atomic.LoadInt32(&s.refCnt) == 0 {
+		s.Cleanup()
+		delete(c.streamers, ino)
+	}
+	c.mu.Unlock()
+	return nil
 }

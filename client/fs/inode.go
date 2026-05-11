@@ -89,6 +89,7 @@ func (s *Super) InodeGet(ino uint64) (info *proto.InodeInfo, err error) {
 				clientConf.AheadReadEnable = aheadEn
 				clientConf.MinReadAheadSize = aheadMin
 				clientConf.PrefetchTotalMem = aheadTotalMem
+				clientConf.ECStreamer = blobstore.NewECStreamer(f.ino, nil, nil)
 				ei.Lock()
 				// inode cache miss triggers this refresh: must persist buffered blob data before
 				// FreeCache/NewWriter or unflushed bytes are dropped (e.g. Write defers ic.Delete then Flush -> InodeGet).

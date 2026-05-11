@@ -47,7 +47,7 @@ func newTestSuperForFile() *Super {
 		mw:                &meta.MetaWrapper{},
 		volname:           "vol",
 		EbsBlockSize:      4096,
-		oec:               blobstore.NewObjExtentClient(&blobstore.ObjExtentConfig{}),
+		oec:               blobstore.NewObjExtentClient(blobstore.ObjExtentConfig{}),
 	}
 }
 
@@ -119,6 +119,7 @@ func TestFile_FilterSuffixAndFileSizeVersion2Fallback(t *testing.T) {
 		})
 
 	writer := &blobstore.Writer{}
+	registerOecTestStreamer(s, 10, nil, writer)
 	writer.SetFileSize(128)
 	f.setColdBlobReaderWriter(nil, writer)
 	s.ic.Put(&proto.InodeInfo{Inode: f.ino, Size: 100, Generation: 9})
@@ -183,12 +184,12 @@ func TestFile_Write_BlobFallocatePath(t *testing.T) {
 	}
 	f := &File{super: s, ino: 10, parentIno: 1, name: "f"}
 	writer := &blobstore.Writer{}
-	writer.SetFileSize(10)
 
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 	patchOecWriterForMisc(patches, writer)
 	registerOecTestStreamer(s, 10, nil, writer)
+	writer.SetFileSize(10)
 	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet", func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
 		return &proto.InodeInfo{Inode: 10, PoolId: 1, StorageClass: proto.StorageClass_BlobStore}, nil
 	})
@@ -220,13 +221,13 @@ func TestFile_Setattr_BlobTruncateAndSyncReaderWriter(t *testing.T) {
 	}
 	f := &File{super: s, ino: 11, parentIno: 1, name: "f2"}
 	writer := &blobstore.Writer{}
-	writer.SetFileSize(32)
 	reader := &blobstore.Reader{}
 
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 	patchOecReaderWriterForMisc(patches, reader, writer)
 	registerOecTestStreamer(s, 11, reader, writer)
+	writer.SetFileSize(32)
 
 	callN := 0
 	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet", func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
@@ -353,28 +354,19 @@ func TestFile_Read_BlobUsesOecReadAfterAlign(t *testing.T) {
 		1: {Id: 1, StorageClass: uint8(proto.StorageClass_BlobStore)},
 	}
 	f := &File{super: s, ino: 15, parentIno: 1, name: "rf"}
-	reader := &blobstore.Reader{}
 
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
-	patchOecReaderWriterForMisc(patches, reader, nil)
 
 	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet", func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
 		return &proto.InodeInfo{Inode: 15, PoolId: 1, StorageClass: proto.StorageClass_BlobStore, Generation: 7, Size: 16}, nil
 	})
 
-	aligned := false
-	patches.ApplyMethod(reflect.TypeOf(reader), "EnsureAlignedForRead", func(_ *blobstore.Reader, gen, sz uint64) error {
-		require.Equal(t, uint64(7), gen)
-		require.Equal(t, uint64(16), sz)
-		aligned = true
-		return nil
-	})
-
 	calledOecRead := false
-	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "Read",
-		func(_ *blobstore.ECExtentClient, ino uint64, _ []byte, offset int, size int, _ uint8, _ bool) (int, error) {
-			require.True(t, aligned)
+	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "ReadWithInodeView",
+		func(_ *blobstore.ECExtentClient, _ context.Context, ino uint64, _ []byte, offset int, size int, _ uint8, _ bool, gen, sz uint64) (int, error) {
+			require.Equal(t, uint64(7), gen)
+			require.Equal(t, uint64(16), sz)
 			require.Equal(t, uint64(15), ino)
 			require.Equal(t, 0, offset)
 			require.Equal(t, 4, size)
@@ -414,7 +406,7 @@ func TestFile_Open_BlobFlushExistingWriterError(t *testing.T) {
 	patches.ApplyMethod(reflect.TypeOf(s.ec), "FileSize", func(_ *stream.ExtentClient, _ uint64) (int, uint64, bool) {
 		return 0, 1, false
 	})
-	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "Flush", func(_ *blobstore.ECExtentClient, _ uint64) error {
+	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECStreamer)(nil)), "FlushAndFreeCache", func(_ *blobstore.ECStreamer, _ context.Context) error {
 		return errors.New("flush failed")
 	})
 
