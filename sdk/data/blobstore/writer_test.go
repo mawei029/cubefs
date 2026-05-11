@@ -70,6 +70,7 @@ func init() {
 		ReadConcurrency: 10,
 		FileCache:       false,
 		FileSize:        0,
+		ECStreamer:      NewECStreamer(1000, nil, nil),
 	}
 
 	buf.InitCachePool(8388608)
@@ -243,6 +244,7 @@ func TestNewWriter(t *testing.T) {
 		ReadConcurrency: 10,
 		FileCache:       false,
 		FileSize:        0,
+		ECStreamer:      NewECStreamer(1000, nil, nil),
 	}
 	w := NewWriter(config)
 	_ = w.String()
@@ -431,6 +433,7 @@ func TestTryOverWrite_Basic(t *testing.T) {
 		ReadConcurrency: 10,
 		FileCache:       false,
 		FileSize:        0,
+		ECStreamer:      NewECStreamer(1000, nil, nil),
 	}
 
 	testWriter := NewWriter(config)
@@ -488,6 +491,7 @@ func TestFlushExt_Basic(t *testing.T) {
 		ReadConcurrency: 10,
 		FileCache:       false,
 		FileSize:        0,
+		ECStreamer:      NewECStreamer(1000, nil, nil),
 	}
 
 	testWriter := NewWriter(config)
@@ -542,7 +546,7 @@ func TestWriterWrite_NewGuardBranches(t *testing.T) {
 }
 
 func TestWriterSetFileSizeAndTruncateV2GrowNoShrink(t *testing.T) {
-	w := &Writer{}
+	w := &Writer{ecStreamer: NewECStreamer(1, nil, nil)}
 	w.SetFileSize(123)
 	require.Equal(t, 123, w.CacheFileSize())
 
@@ -625,6 +629,7 @@ func TestWriterCoverageMoreLowFunctions(t *testing.T) {
 			limitManager: manager.NewLimitManager(nil),
 			ebsc:         &BlobStoreClient{},
 			mw:           &meta.MetaWrapper{},
+			ecStreamer:   NewECStreamer(1, nil, nil),
 		}
 		_, err = w.WriteWithoutPool(context.Background(), 1, []byte("a"))
 		require.ErrorIs(t, err, syscall.EOPNOTSUPP)
@@ -652,6 +657,7 @@ func TestWriterCoverageMoreLowFunctions(t *testing.T) {
 			Ebsc:         &BlobStoreClient{},
 			Mw:           &meta.MetaWrapper{},
 			WConcurrency: 1,
+			ECStreamer:   NewECStreamer(2, nil, nil),
 		})
 		w.buf = make([]byte, 0, 8)
 
@@ -691,6 +697,7 @@ func TestWriterCoverageMoreLowFunctions(t *testing.T) {
 			limitManager:  manager.NewLimitManager(nil),
 			ebsc:          &BlobStoreClient{},
 			mw:            &meta.MetaWrapper{},
+			ecStreamer:    NewECStreamer(3, nil, nil),
 		}
 		copy(w.buf, []byte("data"))
 		err := gohook.HookMethod(w.ebsc, "Write", MockEbscWriteTrue, nil)
@@ -718,6 +725,7 @@ func TestWriterCoverageMoreLowFunctions(t *testing.T) {
 			limitManager:  newTestLimitManager(),
 			ebsc:          &BlobStoreClient{},
 			mw:            &meta.MetaWrapper{},
+			ecStreamer:    NewECStreamer(5, nil, nil),
 		}
 		err := gohook.HookMethod(w.ebsc, "Write", MockEbscWriteTrue, nil)
 		require.NoError(t, err)

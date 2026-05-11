@@ -105,6 +105,8 @@ type Reader struct {
 
 	// oec 路径下与 ECStreamer 共享；dirty / inoVersion / fileSize 落后时失效预读并 RefreshExtents。
 	ecStreamer *ECStreamer
+	// extentEpochSeen：上次 Refresh/加载 ObjExtents 时看到的 ECStreamer.extentMetaEpoch；Writer 提交 meta 后递增 epoch，读侧据此使缓存失效。
+	extentEpochSeen uint32
 }
 
 type ClientConfig struct {
@@ -116,7 +118,7 @@ type ClientConfig struct {
 	Mw        *meta.MetaWrapper
 	// LimitManager 与副本 ExtentClient / ECExtentClient 侧共享（例如 ec.LimitManager 或 oec.LimitManager）。
 	LimitManager *manager.LimitManager
-	// ECStreamer 非空时，blob Writer 在成功写入后更新其 fileSize 并置 dirty。
+	// ECStreamer 非空时，blob Writer 缓冲或元数据提交与流上 fileSize/dirty/extentMetaEpoch 协同。
 	ECStreamer      *ECStreamer
 	Ebsc            *BlobStoreClient
 	EnableBcache    bool
@@ -615,7 +617,12 @@ func (reader *Reader) needCacheL1() bool {
 // Keep historical behavior: return syscall.EIO to upper layers on fetch failure for easier FUSE-path handling.
 func (reader *Reader) ensureExtentsLoaded() error {
 	if reader.valid {
-		return nil
+		if atomic.LoadUint32(&reader.ecStreamer.extentMetaEpoch) != reader.extentEpochSeen {
+			reader.valid = false
+		}
+		if reader.valid {
+			return nil
+		}
 	}
 	if err := reader.refreshEbsExtents(); err != nil {
 		return syscall.EIO
@@ -625,26 +632,20 @@ func (reader *Reader) ensureExtentsLoaded() error {
 
 // EnsureAlignedForRead 比对 InodeGet 的 Generation/Size 与流上 inoVersion/fileSize 及 Reader cache；不一致时 RefreshExtents。
 func (reader *Reader) EnsureAlignedForRead(inodeGen, inodeSize uint64) error {
-	var es *ECStreamer
 	reader.Lock()
+	es := reader.ecStreamer
 	stale := !reader.valid
-	if reader.ecStreamer != nil {
-		es = reader.ecStreamer
-		if !stale {
-			// dirty 时仅 Refresh 看不到写缓冲中的数据；先走 ensureReadViewCurrent（与 ECStreamer.Read 首部一致）。
-			stale = atomic.LoadUint32(&es.dirty) != 0 ||
-				atomic.LoadUint64(&es.inoVersion) < inodeGen ||
-				atomic.LoadUint64(&es.fileSize) < inodeSize
-		}
-	}
-	if !stale && reader.ecStreamer == nil {
-		stale = reader.metaReportedSize != inodeSize
+	if !stale {
+		// dirty 时仅 Refresh 看不到写缓冲中的数据；先走 ensureReadViewCurrent（与 ECStreamer.Read 首部一致）。
+		stale = atomic.LoadUint32(&es.dirty) != 0 ||
+			atomic.LoadUint64(&es.inoVersion) < inodeGen ||
+			atomic.LoadUint64(&es.fileSize) < inodeSize
 	}
 	reader.Unlock()
 	if !stale {
 		return nil
 	}
-	if es != nil && atomic.LoadUint32(&es.dirty) != 0 && es.hasReaderForViewSync() {
+	if atomic.LoadUint32(&es.dirty) != 0 && es.hasReaderForViewSync() {
 		if err := es.ensureReadViewCurrent(context.Background()); err != nil {
 			return err
 		}
@@ -658,9 +659,6 @@ func (reader *Reader) EnsureAlignedForRead(inodeGen, inodeSize uint64) error {
 
 // SyncInodeView updates inode-view anchor after alignment with meta (for example via RefreshExtents), preventing next Read from false stale detection.
 func (reader *Reader) SyncInodeView(inodeGen, inodeSize uint64) {
-	if reader.ecStreamer == nil {
-		return
-	}
 	es := reader.ecStreamer
 	for {
 		oldG := atomic.LoadUint64(&es.inoVersion)
@@ -695,6 +693,7 @@ func (reader *Reader) refreshEbsExtents() error {
 	reader.metaReportedSize = sz
 	reader.objExtentKeys = oeks
 	_ = eks
+	reader.extentEpochSeen = atomic.LoadUint32(&reader.ecStreamer.extentMetaEpoch)
 	log.LogDebugf("TRACE blobStore refreshEbsExtents ok. ino(%v) gen(%v) metaSz(%v) objExtentKeys(%v) ",
 		reader.ino, gen, sz, reader.objExtentKeys)
 	return nil
@@ -719,11 +718,9 @@ func (reader *Reader) fileSize() (uint64, bool) {
 	}
 	// logicalReadBound：GetObjExtents 的 Size 与 extent 最远尾。
 	logical := logicalReadBound(reader.metaReportedSize, reader.objExtentKeys)
-	if reader.ecStreamer != nil {
-		streamSize := atomic.LoadUint64(&reader.ecStreamer.fileSize)
-		if streamSize > logical {
-			return streamSize, true
-		}
+	streamSize := atomic.LoadUint64(&reader.ecStreamer.fileSize)
+	if streamSize > logical {
+		return streamSize, true
 	}
 	return logical, true
 }
@@ -733,11 +730,9 @@ func (reader *Reader) logicalReadBoundLocked() (uint64, bool) {
 		return 0, false
 	}
 	logical := logicalReadBound(reader.metaReportedSize, reader.objExtentKeys)
-	if reader.ecStreamer != nil {
-		streamSize := atomic.LoadUint64(&reader.ecStreamer.fileSize)
-		if streamSize > logical {
-			return streamSize, true
-		}
+	streamSize := atomic.LoadUint64(&reader.ecStreamer.fileSize)
+	if streamSize > logical {
+		return streamSize, true
 	}
 	return logical, true
 }
@@ -769,6 +764,7 @@ func (reader *Reader) RefreshExtents() (gen uint64, err error) {
 	reader.metaReportedSize = sz
 	reader.objExtentKeys = oeks
 	_ = eks
+	reader.extentEpochSeen = atomic.LoadUint32(&reader.ecStreamer.extentMetaEpoch)
 	reader.invalidateReadBuf()
 	reader.Unlock()
 	log.LogDebugf("RefreshExtents: ino(%v) gen(%v) metaSz(%v) objExtentKeysLen(%v)",

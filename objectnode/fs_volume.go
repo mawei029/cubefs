@@ -3147,6 +3147,7 @@ func (v *Volume) getEbsWriter(ino uint64, poolId uint8) (writer *blobstore.Write
 		FileSize:        0,
 		PoolId:          poolId,
 	}
+	clientConf.ECStreamer = blobstore.NewECStreamer(ino, nil, nil)
 
 	writer = blobstore.NewWriter(clientConf)
 	log.LogDebugf("getEbsWriter: writer(%v) ", writer)
@@ -3170,6 +3171,7 @@ func (v *Volume) getEbsReader(ino uint64, poolId uint8) (reader *blobstore.Reade
 		FileSize:        0,
 		PoolId:          poolId,
 	}
+	clientConf.ECStreamer = blobstore.NewECStreamer(ino, nil, nil)
 
 	reader = blobstore.NewReader(clientConf)
 	log.LogDebugf("getEbsReader: reader(%v) ", reader)

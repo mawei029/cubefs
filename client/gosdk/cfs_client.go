@@ -1143,6 +1143,7 @@ func (c *Client) allocFD(ino uint64, flags int, mode uint32, fileCache bool, fil
 			FileCache:       fileCache,
 			FileSize:        fileSize,
 		}
+		clientConf.ECStreamer = blobstore.NewECStreamer(ino, nil, nil)
 		f.fileWriter.FreeCache()
 		switch flags & 0xff {
 		case syscall.O_RDONLY:

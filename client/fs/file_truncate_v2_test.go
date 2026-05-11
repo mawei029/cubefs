@@ -39,7 +39,7 @@ func newTestECStreamerWithReaderWriter(ino uint64, r *blobstore.Reader, w *blobs
 
 func newBlobFileForTruncateTest() (*File, *blobstore.Writer) {
 	w := &blobstore.Writer{}
-	oec := blobstore.NewObjExtentClient(nil)
+	oec := blobstore.NewObjExtentClient(blobstore.ObjExtentConfig{})
 	s := newTestECStreamerWithWriter(100, w)
 	oec.SetStreamer(100, s)
 	f := &File{
@@ -49,16 +49,6 @@ func newBlobFileForTruncateTest() (*File, *blobstore.Writer) {
 			oec: oec,
 		},
 		ino: 100,
-	}
-	f.super.oec.BeforeEBSShrinkHook = func(ino uint64, fullPath string) (func(), error) {
-		if err := f.super.ec.OpenStream(ino, true, true, fullPath); err != nil {
-			return nil, err
-		}
-		if err := f.super.ec.Flush(ino); err != nil {
-			_ = f.super.ec.CloseStream(ino)
-			return nil, err
-		}
-		return func() { _ = f.super.ec.CloseStream(ino) }, nil
 	}
 	return f, w
 }

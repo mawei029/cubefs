@@ -84,17 +84,16 @@ type Super struct {
 	suspendCh chan interface{}
 
 	// data lake
-	volType                int
-	volAllowedStorageClass []uint32 // 与 mount opt 一致；用于判断冷/Blob 数据路径（Forget evict 顺序等）
-	ebsEndpoint            string
-	EbsBlockSize           int
-	enableBcache           bool
-	bcacheDir              string
-	bcacheFilterFiles      string
-	bcacheCheckInterval    int64
-	bcacheBatchCnt         int64
-	runningMonitor         *RunningMonitor
-	syncMetaCache          int32
+	volType             int
+	ebsEndpoint         string
+	EbsBlockSize        int
+	enableBcache        bool
+	bcacheDir           string
+	bcacheFilterFiles   string
+	bcacheCheckInterval int64
+	bcacheBatchCnt      int64
+	runningMonitor      *RunningMonitor
+	syncMetaCache       int32
 
 	logpath string
 
@@ -140,12 +139,6 @@ type Super struct {
 // Same knobs: aheadReadEnable and minReadAheadSize (default comes from proto.InitMountOptions.MinReadAheadSize, usually 1 MiB; files smaller than this do not use the Reader prefetch window).
 func (s *Super) BlobStoreAheadReadForReader() (enable bool, minReadAhead int, totalMem int64) {
 	return s.aheadReadEnable, int(s.minReadAheadSize), s.aheadReadTotalMem
-}
-
-// usesBlobStoreDataPath 与 NewSuper 中启动 scheduleFlush 的条件一致：冷卷或允许 Blob 存储类时可能走 oec/EBS。
-// Forget 时优先 Evict oec，避免副本 ec Streamer 请求队列竞态阻塞 EC 卷孤儿 inode 清理。
-func (s *Super) usesBlobStoreDataPath() bool {
-	return proto.IsCold(s.volType) || proto.IsVolSupportStorageClass(s.volAllowedStorageClass, proto.StorageClass_BlobStore)
 }
 
 // Functions that Super needs to implement
@@ -312,7 +305,6 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 	}
 
 	s.volType = opt.VolType
-	s.volAllowedStorageClass = opt.VolAllowedStorageClass
 	s.ebsEndpoint = opt.EbsEndpoint
 	s.EbsBlockSize = opt.EbsBlockSize
 	s.enableBcache = opt.EnableBcache
@@ -386,19 +378,9 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 	if err != nil {
 		return nil, errors.Trace(err, "NewExtentClient failed!")
 	}
-	s.oec = blobstore.NewObjExtentClient(&blobstore.ObjExtentConfig{
+	s.oec = blobstore.NewObjExtentClient(blobstore.ObjExtentConfig{
 		LimitManager: s.ec.LimitManager,
 	})
-	s.oec.BeforeEBSShrinkHook = func(ino uint64, fullPath string) (func(), error) {
-		if err := s.ec.OpenStream(ino, true, true, fullPath); err != nil {
-			return nil, err
-		}
-		if err := s.ec.Flush(ino); err != nil {
-			_ = s.ec.CloseStream(ino)
-			return nil, err
-		}
-		return func() { _ = s.ec.CloseStream(ino) }, nil
-	}
 	s.mw.VerReadSeq = s.ec.GetReadVer()
 
 	s.mw.Client = s.ec
