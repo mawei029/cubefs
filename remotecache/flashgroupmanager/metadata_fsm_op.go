@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/util/errors"
@@ -110,7 +111,7 @@ func (c *Cluster) loadClusterValue() (err error) {
 		c.cfg.FlashWriteFlowLimit = cv.FlashWriteFlowLimit
 		c.cfg.RemoteClientFlowLimit = cv.RemoteClientFlowLimit
 		c.cfg.FlashKeyFlowLimit = cv.FlashKeyFlowLimit
-		c.flashNodeTopo.SetMaxDisableFlashGroupPercent(cv.MaxDisableFlashGroupPercent)
+		c.syncMaxDisableFlashGroupPercentToFlashTopos()
 
 		c.cfg.FlashNodeReadDataNodeTimeout = cv.FlashNodeReadDataNodeTimeout
 		log.LogInfof("action[loadClusterValue] flashNodeHandleReadTimeout %v(ms), flashNodeReadDataNodeTimeout%v(ms), flashHotKeyMissCount(%v), maxDisableFlashGroupPercent(%v), flashReadFlowLimit(%v), flashWriteFlowLimit(%v), remoteClientFlowLimit(%v), flashKeyFlowLimit(%v)",
@@ -148,6 +149,83 @@ func (c *Cluster) loadClusterValue() (err error) {
 	return
 }
 
+func (c *Cluster) syncMaxDisableFlashGroupPercentToFlashTopos() {
+	c.flashNodeTopo.Range(func(_, value interface{}) bool {
+		topo, ok := value.(*FlashNodeTopology)
+		if !ok || topo == nil {
+			return true
+		}
+		topo.SetMaxDisableFlashGroupPercent(c.cfg.MaxDisableFlashGroupPercent)
+		return true
+	})
+}
+
+func (c *Cluster) defaultFlashNodeHeartbeatConfig() FlashNodeHeartbeatConfig {
+	return FlashNodeHeartbeatConfig{
+		FlashNodeHandleReadTimeout:   c.cfg.FlashNodeHandleReadTimeout,
+		FlashNodeReadDataNodeTimeout: c.cfg.FlashNodeReadDataNodeTimeout,
+		FlashHotKeyMissCount:         c.cfg.FlashHotKeyMissCount,
+		FlashReadFlowLimit:           c.cfg.FlashReadFlowLimit,
+		FlashWriteFlowLimit:          c.cfg.FlashWriteFlowLimit,
+		FlashKeyFlowLimit:            c.cfg.FlashKeyFlowLimit,
+	}
+}
+
+func (c *Cluster) loadFlashTopos() (err error) {
+	result, err := c.fsm.store.SeekForPrefix([]byte(flashTopoPrefix))
+	if err != nil {
+		return fmt.Errorf("action[loadFlashTopos],err:%v", err.Error())
+	}
+
+	c.flashNodeTopo = new(sync.Map)
+	if len(result) == 0 {
+		if err = c.AddFlashTopo(proto.DefaultTopoName, proto.DefaultRegion); err != nil {
+			return
+		}
+		if err = c.AddFlashTopo(proto.IdleTopoName, proto.DefaultRegion); err != nil {
+			return
+		}
+		return nil
+	}
+
+	findIdle := false
+	for _, value := range result {
+		ftv := &FlashNodeTopologyValue{}
+		if err = json.Unmarshal(value, ftv); err != nil {
+			return fmt.Errorf("action[loadFlashTopos],value:%v,unmarshal err:%v", string(value), err)
+		}
+		topo := NewFlashNodeTopology(ftv.Name, ftv.Region, ftv.ID, ftv.Status)
+		topo.DeleteExecTime = ftv.DeleteExecTime
+		topo.DeleteStep = ftv.DeleteStep
+		topo.DeleteGradualFlag = ftv.DeleteGradualFlag
+		if ftv.RemoteCacheReadFlowMap != nil {
+			topo.RemoteCacheReadFlowMap = ftv.RemoteCacheReadFlowMap
+		}
+		if ftv.RemoteCacheWriteFlowMap != nil {
+			topo.RemoteCacheWriteFlowMap = ftv.RemoteCacheWriteFlowMap
+		}
+		topo.FlashNodeHandleReadTimeout = ftv.FlashNodeHandleReadTimeout
+		topo.FlashNodeReadDataNodeTimeout = ftv.FlashNodeReadDataNodeTimeout
+		topo.FlashHotKeyMissCount = ftv.FlashHotKeyMissCount
+		topo.FlashReadFlowLimit = ftv.FlashReadFlowLimit
+		topo.FlashWriteFlowLimit = ftv.FlashWriteFlowLimit
+		topo.FlashKeyFlowLimit = ftv.FlashKeyFlowLimit
+		topo.FillHeartbeatConfigDefaults(c.defaultFlashNodeHeartbeatConfig())
+		topo.SyncFlashGroupFunc = c.syncUpdateFlashGroup
+		topo.SetMaxDisableFlashGroupPercent(c.cfg.MaxDisableFlashGroupPercent)
+		c.flashNodeTopo.Store(topo.Name, topo)
+		if topo.Name == proto.IdleTopoName {
+			findIdle = true
+		}
+	}
+	if !findIdle {
+		if err = c.AddFlashTopo(proto.IdleTopoName, proto.DefaultRegion); err != nil {
+			return
+		}
+	}
+	return nil
+}
+
 func (c *Cluster) loadFlashNodes() (err error) {
 	result, err := c.fsm.store.SeekForPrefix([]byte(flashNodePrefix))
 	if err != nil {
@@ -166,16 +244,40 @@ func (c *Cluster) loadFlashNodes() (err error) {
 		// load later in loadFlashTopology
 		flashNode.FlashGroupID = fnv.FlashGroupID
 
-		_, err = c.flashNodeTopo.GetZone(flashNode.ZoneName)
+		topoName := flashNode.FlashNodeTopoName
+		if topoName == "" {
+			topoName = proto.DefaultTopoName
+			if flashNode.FlashGroupID == UnusedFlashNodeFlashGroupID {
+				topoName = proto.IdleTopoName
+			}
+		}
+
+		flashTopo, topoErr := c.PeekFlashTopo(topoName)
+		if topoErr != nil {
+			log.LogWarnf("action[loadFlashNodes], topo(%v) not found for flashNode(%v), fallback to default", topoName, flashNode.Addr)
+			flashTopo, topoErr = c.PeekFlashTopo(proto.DefaultTopoName)
+			if topoErr != nil {
+				return topoErr
+			}
+		}
+
+		_, err = flashTopo.GetZone(flashNode.ZoneName)
 		if err != nil {
-			c.flashNodeTopo.PutZoneIfAbsent(NewFlashNodeZone(flashNode.ZoneName))
+			flashTopo.PutZoneIfAbsent(NewFlashNodeZone(flashNode.ZoneName))
 			err = nil
 		}
-		err = c.flashNodeTopo.PutFlashNode(flashNode)
+		err = flashTopo.PutFlashNode(flashNode)
 		if err != nil {
 			log.LogWarnf("action[loadFlashNodes], flashNode[flashNodeId:%v addr:%s flashGroupId:%v topo: %v region:%v] put topo %v failed %v",
-				flashNode.ID, flashNode.Addr, flashNode.FlashGroupID, flashNode.FlashNodeTopoName, flashNode.Region, c.flashNodeTopo.Name, err.Error())
-			return
+				flashNode.ID, flashNode.Addr, flashNode.FlashGroupID, flashNode.FlashNodeTopoName, flashNode.Region, flashTopo.Name, err.Error())
+			idleTopo, idleErr := c.PeekFlashTopo(proto.IdleTopoName)
+			if idleErr != nil {
+				return idleErr
+			}
+			if putErr := idleTopo.PutFlashNode(flashNode); putErr != nil {
+				return putErr
+			}
+			flashNode.FlashNodeTopoName = proto.IdleTopoName
 		}
 		log.LogInfof("action[loadFlashNodes], flashNode[flashNodeId:%v addr:%s flashGroupId:%v topo: %v]",
 			flashNode.ID, flashNode.Addr, flashNode.FlashGroupID, flashNode.FlashNodeTopoName)
@@ -196,15 +298,29 @@ func (c *Cluster) loadFlashGroups() (err error) {
 			return
 		}
 		flashGroup := NewFlashGroupFromFgv(fgv)
-		c.flashNodeTopo.SaveFlashGroup(flashGroup)
+		flashTopo, topoErr := c.PeekFlashTopo(flashGroup.FlashNodeTopoName)
+		if topoErr != nil {
+			log.LogWarnf("action[loadFlashGroups], flashGroup(%v) topo(%v) not found", flashGroup.ID, flashGroup.FlashNodeTopoName)
+			continue
+		}
+		if err = flashTopo.SaveFlashGroup(flashGroup); err != nil {
+			return err
+		}
 		log.LogInfof("action[loadFlashGroups],flashGroup[%v] topo %v", flashGroup.ID, flashGroup.FlashNodeTopoName)
 	}
 	return
 }
 
 func (c *Cluster) loadFlashTopology() (err error) {
-	// TODO: read syncMap
-	return c.flashNodeTopo.Load()
+	c.flashNodeTopo.Range(func(_, value interface{}) bool {
+		topo, ok := value.(*FlashNodeTopology)
+		if !ok || topo == nil {
+			return true
+		}
+		err = topo.Load()
+		return err == nil
+	})
+	return err
 }
 
 func (m *RaftCmd) setOpType() {

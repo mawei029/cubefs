@@ -120,20 +120,14 @@ func formatClusterView(cv *proto.ClusterView, cn *proto.ClusterNodeInfo, cp *pro
 	sb.WriteString(fmt.Sprintf("  DpTagMapRules                            : %v\n", cv.DefaultDpTag))
 	sb.WriteString(fmt.Sprintf("  MpTagMapRules                            : %v\n", cv.DefaultMpTag))
 
-	sb.WriteString(fmt.Sprintf("  FlashNodeHandleReadTimeout       : %v ms\n", cv.FlashNodeHandleReadTimeout))
-	sb.WriteString(fmt.Sprintf("  FlashNodeReadDataNodeTimeout     : %v ms\n", cv.FlashNodeReadDataNodeTimeout))
 	sb.WriteString(fmt.Sprintf("  RemoteCacheTTL                   : %v s\n", cv.RemoteCacheTTL))
 	sb.WriteString(fmt.Sprintf("  RemoteCacheReadTimeout           : %v ms\n", cv.RemoteCacheReadTimeout))
 	sb.WriteString(fmt.Sprintf("  RemoteCacheMultiRead             : %v\n", cv.RemoteCacheMultiRead))
 	sb.WriteString(fmt.Sprintf("  FlashNodeTimeoutCount            : %v\n", cv.FlashNodeTimeoutCount))
 	// sb.WriteString(fmt.Sprintf("  RemoteCacheSameZoneTimeout       : %v microsecond\n", cv.RemoteCacheSameZoneTimeout))
 	// sb.WriteString(fmt.Sprintf("  RemoteCacheSameRegionTimeout     : %v millisecond\n", cv.RemoteCacheSameRegionTimeout))
-	sb.WriteString(fmt.Sprintf("  FlashHotKeyMissCount             : %v\n", cv.FlashHotKeyMissCount))
 	sb.WriteString(fmt.Sprintf("  PreheatTotalTask                 : %v\n", cv.PreheatTotalTask))
 	sb.WriteString(fmt.Sprintf("  MaxDisableFlashGroupPercent      : %v\n", cv.MaxDisableFlashGroupPercent))
-	sb.WriteString(fmt.Sprintf("  FlashReadFlowLimit               : %v\n", cv.FlashReadFlowLimit))
-	sb.WriteString(fmt.Sprintf("  FlashWriteFlowLimit              : %v\n", cv.FlashWriteFlowLimit))
-	sb.WriteString(fmt.Sprintf("  FlashKeyFlowLimit                : %v\n", cv.FlashKeyFlowLimit))
 
 	return sb.String()
 }

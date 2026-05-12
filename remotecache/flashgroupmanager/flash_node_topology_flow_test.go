@@ -72,3 +72,51 @@ func TestFlashNodeTopology_DeleteRemoteCacheFlowsForVol(t *testing.T) {
 		require.False(t, topo.DeleteRemoteCacheFlowsForVol("any"))
 	})
 }
+
+func TestFlashNodeTopology_CreateFlashNodeHeartBeatTasksUsesTopoConfig(t *testing.T) {
+	topoA := NewFlashNodeTopology("topo-a", proto.DefaultRegion, 1, proto.TopoStatusNormal)
+	topoA.SetHeartbeatConfig(FlashNodeHeartbeatConfig{
+		FlashNodeHandleReadTimeout:   101,
+		FlashNodeReadDataNodeTimeout: 201,
+		FlashHotKeyMissCount:         301,
+		FlashReadFlowLimit:           401,
+		FlashWriteFlowLimit:          501,
+		FlashKeyFlowLimit:            0,
+	})
+	topoA.PutZoneIfAbsent(NewFlashNodeZone("zone-a"))
+	nodeA := NewFlashNode("127.0.0.1:10001", "zone-a", "c1", "v1", "topo-a", proto.DefaultRegion, true)
+	require.NoError(t, topoA.PutFlashNode(nodeA))
+
+	topoB := NewFlashNodeTopology("topo-b", proto.DefaultRegion, 2, proto.TopoStatusNormal)
+	topoB.SetHeartbeatConfig(FlashNodeHeartbeatConfig{
+		FlashNodeHandleReadTimeout:   102,
+		FlashNodeReadDataNodeTimeout: 202,
+		FlashHotKeyMissCount:         302,
+		FlashReadFlowLimit:           402,
+		FlashWriteFlowLimit:          502,
+		FlashKeyFlowLimit:            1,
+	})
+	topoB.PutZoneIfAbsent(NewFlashNodeZone("zone-b"))
+	nodeB := NewFlashNode("127.0.0.1:10002", "zone-b", "c1", "v1", "topo-b", proto.DefaultRegion, true)
+	require.NoError(t, topoB.PutFlashNode(nodeB))
+
+	tasksA := topoA.CreateFlashNodeHeartBeatTasks("leader-a", nil, nil, nil)
+	tasksB := topoB.CreateFlashNodeHeartBeatTasks("leader-b", nil, nil, nil)
+	require.Len(t, tasksA, 1)
+	require.Len(t, tasksB, 1)
+
+	reqA, ok := tasksA[0].Request.(*proto.HeartBeatRequest)
+	require.True(t, ok)
+	reqB, ok := tasksB[0].Request.(*proto.HeartBeatRequest)
+	require.True(t, ok)
+
+	require.Equal(t, 101, reqA.FlashNodeHandleReadTimeout)
+	require.Equal(t, int64(401), reqA.FlashReadFlowLimit)
+	require.Equal(t, int64(0), reqA.FlashKeyFlowLimit)
+	require.Equal(t, "topo-a", reqA.TopoName)
+
+	require.Equal(t, 102, reqB.FlashNodeHandleReadTimeout)
+	require.Equal(t, int64(402), reqB.FlashReadFlowLimit)
+	require.Equal(t, int64(1), reqB.FlashKeyFlowLimit)
+	require.Equal(t, "topo-b", reqB.TopoName)
+}

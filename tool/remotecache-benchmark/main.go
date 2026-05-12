@@ -55,7 +55,7 @@ type BenchmarkResult struct {
 	IOPS          float64
 }
 
-func NewBenchmarkTester(dataDir, hddBase, nvmeBase string, verify bool, master string, clearPageCache bool, logLevel string, disableBatch bool, activateTime int64, connWorkers int, flowLimit int64, writeChunkSize int) *BenchmarkTester {
+func NewBenchmarkTester(dataDir, hddBase, nvmeBase string, verify bool, master string, topoName string, clearPageCache bool, logLevel string, disableBatch bool, activateTime int64, connWorkers int, flowLimit int64, writeChunkSize int) *BenchmarkTester {
 	os.MkdirAll(dataDir, 0o755)
 	tester := &BenchmarkTester{
 		dataDir:        dataDir,
@@ -93,6 +93,7 @@ func NewBenchmarkTester(dataDir, hddBase, nvmeBase string, verify bool, master s
 			ConnWorkers:        connWorkers,
 			FlowLimit:          flowLimit,
 			WriteChunkSize:     int64(writeChunkSize),
+			RemoteCacheName:    topoName,
 		}
 		tester.cacheStorage, err = remotecache.NewRemoteCacheClient(cfg)
 		if err != nil {
@@ -210,6 +211,7 @@ func main() {
 	hddBase := flag.String("hdd", "", "HDD storage directory")
 	nvmeBase := flag.String("nvme", "", "NVME storage directory")
 	master := flag.String("master", "", "Master address")
+	topoName := flag.String("topo-name", proto.DefaultTopoName, "Remote cache topology name")
 	runPutTest := flag.Bool("put-test", false, "Run the PUT test")
 	runGetTest := flag.Bool("get-test", false, "Run the Get test")
 	verify := flag.Bool("verify", true, "Verify with the source file")
@@ -237,6 +239,7 @@ func main() {
 	fmt.Printf("  -concurrency: %v\n", *concurrency)
 	fmt.Printf("  -verify: %v\n", *verify)
 	fmt.Printf("  -master: %v\n", *master)
+	fmt.Printf("  -topo-name: %v\n", *topoName)
 	fmt.Printf("  -clear-cache: %v\n", *clear)
 	fmt.Printf("  -remove-key: %v\n", *removeKey)
 	fmt.Printf("  -block-key: %v\n", *blockKey)
@@ -247,7 +250,7 @@ func main() {
 	fmt.Printf("  -flash-conn-workers: %v\n", *flashConnWorkers)
 	fmt.Printf("  -flow-limit: %v\n", *flowLimit)
 	fmt.Printf("  -write-chunk-size: %v\n", *writeChunkSize)
-	tester := NewBenchmarkTester(ensureAbsolutePath(*dataDir), *hddBase, *nvmeBase, *verify, *master, *clear, *logLevel, *disableBatch, *activateTime, *flashConnWorkers, *flowLimit, *writeChunkSize)
+	tester := NewBenchmarkTester(ensureAbsolutePath(*dataDir), *hddBase, *nvmeBase, *verify, *master, *topoName, *clear, *logLevel, *disableBatch, *activateTime, *flashConnWorkers, *flowLimit, *writeChunkSize)
 	if *needGenerate {
 		if err := tester.GenerateTestData(*totalSizeGB, *genConcurrency); err != nil {
 			fmt.Printf("generate test files failed: %v\n", err)

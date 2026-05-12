@@ -138,6 +138,13 @@ func (c *Cluster) loadFlashTopos() (err error) {
 			if ftv.RemoteCacheWriteFlowMap != nil {
 				topo.RemoteCacheWriteFlowMap = ftv.RemoteCacheWriteFlowMap
 			}
+			topo.FlashNodeHandleReadTimeout = ftv.FlashNodeHandleReadTimeout
+			topo.FlashNodeReadDataNodeTimeout = ftv.FlashNodeReadDataNodeTimeout
+			topo.FlashHotKeyMissCount = ftv.FlashHotKeyMissCount
+			topo.FlashReadFlowLimit = ftv.FlashReadFlowLimit
+			topo.FlashWriteFlowLimit = ftv.FlashWriteFlowLimit
+			topo.FlashKeyFlowLimit = ftv.FlashKeyFlowLimit
+			topo.FillHeartbeatConfigDefaults(c.defaultFlashNodeHeartbeatConfig())
 			topo.SyncFlashGroupFunc = c.syncUpdateFlashGroup
 			c.flashNodeTopo.Store(ftv.Name, topo)
 			// collect markDeleted topos
@@ -172,6 +179,17 @@ func (c *Cluster) loadFlashTopos() (err error) {
 	}
 	c.syncMaxDisableFlashGroupPercentToFlashTopos()
 	return
+}
+
+func (c *Cluster) defaultFlashNodeHeartbeatConfig() flashgroupmanager.FlashNodeHeartbeatConfig {
+	return flashgroupmanager.FlashNodeHeartbeatConfig{
+		FlashNodeHandleReadTimeout:   c.cfg.flashNodeHandleReadTimeout,
+		FlashNodeReadDataNodeTimeout: c.cfg.flashNodeReadDataNodeTimeout,
+		FlashHotKeyMissCount:         c.cfg.flashHotKeyMissCount,
+		FlashReadFlowLimit:           c.cfg.flashReadFlowLimit,
+		FlashWriteFlowLimit:          c.cfg.flashWriteFlowLimit,
+		FlashKeyFlowLimit:            c.cfg.flashKeyFlowLimit,
+	}
 }
 
 func (c *Cluster) syncMaxDisableFlashGroupPercentToFlashTopos() {

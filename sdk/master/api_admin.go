@@ -1635,6 +1635,36 @@ func (api *AdminAPI) RenameFlashTopo(srcName, dstName string) (result string, er
 	return string(data), nil
 }
 
+func (api *AdminAPI) UpdateFlashTopo(name string, flashNodeHandleReadTimeout, flashNodeReadDataNodeTimeout,
+	flashHotKeyMissCount int, flashReadFlowLimit, flashWriteFlowLimit, flashKeyFlowLimit int64,
+) (result string, err error) {
+	req := newRequest(post, proto.AdminFlashTopoUpdate).Header(api.h)
+	req.addParam("name", name)
+	if flashNodeHandleReadTimeout >= 0 {
+		req.addParamAny("flashNodeHandleReadTimeout", flashNodeHandleReadTimeout)
+	}
+	if flashNodeReadDataNodeTimeout >= 0 {
+		req.addParamAny("flashNodeReadDataNodeTimeout", flashNodeReadDataNodeTimeout)
+	}
+	if flashHotKeyMissCount >= 0 {
+		req.addParamAny("flashHotKeyMissCount", flashHotKeyMissCount)
+	}
+	if flashReadFlowLimit >= 0 {
+		req.addParamAny("flashReadFlowLimit", flashReadFlowLimit)
+	}
+	if flashWriteFlowLimit >= 0 {
+		req.addParamAny("flashWriteFlowLimit", flashWriteFlowLimit)
+	}
+	if flashKeyFlowLimit >= 0 {
+		req.addParamAny("flashKeyFlowLimit", flashKeyFlowLimit)
+	}
+	var data []byte
+	if data, err = api.mc.serveRequest(req); err != nil {
+		return
+	}
+	return string(data), nil
+}
+
 func (api *AdminAPI) SetFlashTopoVolReadLimit(topoName, volName string, readFlow int64) (result string, err error) {
 	req := newRequest(post, proto.AdminFlashTopoSetVolReadFlow).Header(api.h)
 	req.addParam("name", topoName)

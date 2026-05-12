@@ -36,7 +36,8 @@ func newFlashNodeCmd(client *master.MasterClient) *cobra.Command {
 }
 
 func newCmdFlashNodeSet(client *master.MasterClient) *cobra.Command {
-	return &cobra.Command{
+	var name string
+	cmd := &cobra.Command{
 		Use:   CliOpSet + _flashnodeAddr + " [IsEnable]",
 		Short: "set flash node enable or not",
 		Args:  cobra.MinimumNArgs(2),
@@ -46,17 +47,23 @@ func newCmdFlashNodeSet(client *master.MasterClient) *cobra.Command {
 			if err != nil {
 				return
 			}
-			if err = client.NodeAPI().SetFlashNode(addr, enable); err != nil {
+			if name == "" {
+				name = proto.DefaultTopoName
+			}
+			if err = client.NodeAPI().SetFlashNodeByTopo(addr, enable, name); err != nil {
 				return
 			}
 			stdoutlnf("set flashnode:%s enable:%v success", addr, enable)
 			return
 		},
 	}
+	cmd.Flags().StringVarP(&name, "topoName", "n", proto.DefaultTopoName, "flash topology name")
+	return cmd
 }
 
 func newCmdFlashNodeRemove(client *master.MasterClient) *cobra.Command {
 	var optYes bool
+	var name string
 	cmd := &cobra.Command{
 		Use:   CliOpRemove + _flashnodeAddr,
 		Short: "remove flash node by addr",
@@ -72,7 +79,10 @@ func newCmdFlashNodeRemove(client *master.MasterClient) *cobra.Command {
 					return
 				}
 			}
-			result, err := client.NodeAPI().RemoveFlashNode(args[0])
+			if name == "" {
+				name = proto.IdleTopoName
+			}
+			result, err := client.NodeAPI().RemoveFlashNodeByTopo(args[0], name)
 			if err != nil {
 				return
 			}
@@ -81,11 +91,13 @@ func newCmdFlashNodeRemove(client *master.MasterClient) *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVarP(&optYes, "yes", "y", false, "Answer yes for all questions")
+	cmd.Flags().StringVarP(&name, "topoName", "n", proto.IdleTopoName, "flash topology name")
 	return cmd
 }
 
 func newCmdFlashNodeRemoveAllInactive(client *master.MasterClient) *cobra.Command {
 	var optYes bool
+	var name string
 	cmd := &cobra.Command{
 		Use:   "removeAllInactive",
 		Short: "remove all inactive flash nodes",
@@ -102,7 +114,10 @@ func newCmdFlashNodeRemoveAllInactive(client *master.MasterClient) *cobra.Comman
 				}
 			}
 			var rmNodes []string
-			rmNodes, err = client.NodeAPI().RemoveAllInactiveFlashNodes()
+			if name == "" {
+				name = proto.DefaultTopoName
+			}
+			rmNodes, err = client.NodeAPI().RemoveAllInactiveFlashNodesByTopo(name)
 			if err != nil {
 				return
 			}
@@ -115,16 +130,21 @@ func newCmdFlashNodeRemoveAllInactive(client *master.MasterClient) *cobra.Comman
 		},
 	}
 	cmd.Flags().BoolVarP(&optYes, "yes", "y", false, "Answer yes for all questions")
+	cmd.Flags().StringVarP(&name, "topoName", "n", proto.DefaultTopoName, "flash topology name")
 	return cmd
 }
 
 func newCmdFlashNodeGet(client *master.MasterClient) *cobra.Command {
-	return &cobra.Command{
+	var name string
+	cmd := &cobra.Command{
 		Use:   CliOpInfo + _flashnodeAddr,
 		Short: "get flash node by addr",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) (err error) {
-			fn, err := client.NodeAPI().GetFlashNode(args[0])
+			if name == "" {
+				name = proto.DefaultTopoName
+			}
+			fn, err := client.NodeAPI().GetFlashNodeByTopo(args[0], name)
 			if err != nil {
 				return
 			}
@@ -132,35 +152,34 @@ func newCmdFlashNodeGet(client *master.MasterClient) *cobra.Command {
 			return
 		},
 	}
+	cmd.Flags().StringVarP(&name, "topoName", "n", proto.DefaultTopoName, "flash topology name")
+	return cmd
 }
 
 func newCmdFlashNodeList(client *master.MasterClient) *cobra.Command {
-	return &cobra.Command{
+	var name string
+	var showAllTopo bool
+	var active int
+	cmd := &cobra.Command{
 		Use:   CliOpList,
 		Short: "list all flash nodes or [active true/false] flash nodes",
 		Args:  cobra.MinimumNArgs(0),
 		RunE: func(cmd *cobra.Command, args []string) (err error) {
-			var active bool
-			activeFilter := -1
-			filterStr := "all"
-			if len(args) == 1 {
-				if active, err = strconv.ParseBool(args[0]); err != nil {
-					err = fmt.Errorf("Parse bool fail: %v\n", err)
-					return
-				}
-				if active {
-					activeFilter = 1
-					filterStr = "active:true"
-				} else {
-					activeFilter = 0
-					filterStr = "active:false"
-				}
+			var filterStr string
+			switch active {
+			case 1:
+				filterStr = "active:true"
+			default:
+				filterStr = "all"
 			}
-			zoneFlashNodes, err := client.NodeAPI().ListFlashNodes(activeFilter)
+			if name == "" {
+				name = proto.DefaultTopoName
+			}
+			zoneFlashNodes, err := client.NodeAPI().ListFlashNodesByTopo(active, name, showAllTopo)
 			if err != nil {
 				return
 			}
-			stdoutln(fmt.Sprintf("[FlashNodes] %s", filterStr))
+			stdoutln(fmt.Sprintf("[FlashNodes] %s, showAllTopo[%v]", filterStr, showAllTopo))
 			tbl := table{formatFlashNodeViewTableTitle}
 			for _, flashNodeViewInfos := range zoneFlashNodes {
 				tbl = showFlashNodesView(flashNodeViewInfos, true, nil, tbl)
@@ -169,16 +188,23 @@ func newCmdFlashNodeList(client *master.MasterClient) *cobra.Command {
 			return
 		},
 	}
+	cmd.Flags().StringVarP(&name, "topoName", "n", proto.DefaultTopoName, "flash topology name")
+	cmd.Flags().BoolVar(&showAllTopo, "showAllTopo", false, "list flash nodes across all topologies (default false)")
+	cmd.Flags().IntVar(&active, "active", -1, "filter flash nodes by activity: 1(true), -1(all)")
+	return cmd
 }
 
 func newCmdFlashNodeHTTPStat(client *master.MasterClient) *cobra.Command {
-	return &cobra.Command{
+	var name string
+	cmd := &cobra.Command{
 		Use:   "httpStat" + _flashnodeAddr,
 		Short: "show flashnode stat",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) (err error) {
-			// check flashnode whether exist
-			_, err = client.NodeAPI().GetFlashNode(args[0])
+			if name == "" {
+				name = proto.DefaultTopoName
+			}
+			_, err = client.NodeAPI().GetFlashNodeByTopo(args[0], name)
 			if err != nil {
 				return
 			}
@@ -190,16 +216,21 @@ func newCmdFlashNodeHTTPStat(client *master.MasterClient) *cobra.Command {
 			return
 		},
 	}
+	cmd.Flags().StringVarP(&name, "topoName", "n", proto.DefaultTopoName, "flash topology name")
+	return cmd
 }
 
 func newCmdFlashNodeHTTPStatAll(client *master.MasterClient) *cobra.Command {
-	return &cobra.Command{
+	var name string
+	cmd := &cobra.Command{
 		Use:   "httpStatAll" + _flashnodeAddr,
 		Short: "show flashnode stat all(key with expired time)",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) (err error) {
-			// check flashnode whether exist
-			_, err = client.NodeAPI().GetFlashNode(args[0])
+			if name == "" {
+				name = proto.DefaultTopoName
+			}
+			_, err = client.NodeAPI().GetFlashNodeByTopo(args[0], name)
 			if err != nil {
 				return
 			}
@@ -211,16 +242,21 @@ func newCmdFlashNodeHTTPStatAll(client *master.MasterClient) *cobra.Command {
 			return
 		},
 	}
+	cmd.Flags().StringVarP(&name, "topoName", "n", proto.DefaultTopoName, "flash topology name")
+	return cmd
 }
 
 func newCmdFlashNodeHTTPSlotStat(client *master.MasterClient) *cobra.Command {
-	return &cobra.Command{
+	var name string
+	cmd := &cobra.Command{
 		Use:   "httpSlotStat" + _flashnodeAddr,
 		Short: "show flashnode slot stat",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) (err error) {
-			// check flashnode whether exist
-			_, err = client.NodeAPI().GetFlashNode(args[0])
+			if name == "" {
+				name = proto.DefaultTopoName
+			}
+			_, err = client.NodeAPI().GetFlashNodeByTopo(args[0], name)
 			if err != nil {
 				return
 			}
@@ -236,17 +272,22 @@ func newCmdFlashNodeHTTPSlotStat(client *master.MasterClient) *cobra.Command {
 			return
 		},
 	}
+	cmd.Flags().StringVarP(&name, "topoName", "n", proto.DefaultTopoName, "flash topology name")
+	return cmd
 }
 
 func newCmdFlashNodeHTTPEvict(client *master.MasterClient) *cobra.Command {
-	return &cobra.Command{
+	var name string
+	cmd := &cobra.Command{
 		Use:   "httpEvict" + _flashnodeAddr + " [volume]",
 		Short: "evict cache in flashnode",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) (err error) {
 			addr := args[0]
-			// check flashnode whether exist
-			_, err = client.NodeAPI().GetFlashNode(addr)
+			if name == "" {
+				name = proto.DefaultTopoName
+			}
+			_, err = client.NodeAPI().GetFlashNodeByTopo(addr, name)
 			if err != nil {
 				return
 			}
@@ -263,17 +304,22 @@ func newCmdFlashNodeHTTPEvict(client *master.MasterClient) *cobra.Command {
 			return
 		},
 	}
+	cmd.Flags().StringVarP(&name, "topoName", "n", proto.DefaultTopoName, "flash topology name")
+	return cmd
 }
 
 func newCmdFlashNodeHTTPInactiveDisk(client *master.MasterClient) *cobra.Command {
-	return &cobra.Command{
+	var name string
+	cmd := &cobra.Command{
 		Use:   "httpInactiveDisk" + _flashnodeAddr + " [dataPath]",
 		Short: "inactive the disk in flashnode",
 		Args:  cobra.MinimumNArgs(2),
 		RunE: func(_ *cobra.Command, args []string) (err error) {
 			addr := args[0]
-			// check flashnode whether exist
-			_, err = client.NodeAPI().GetFlashNode(addr)
+			if name == "" {
+				name = proto.DefaultTopoName
+			}
+			_, err = client.NodeAPI().GetFlashNodeByTopo(addr, name)
 			if err != nil {
 				return
 			}
@@ -284,23 +330,28 @@ func newCmdFlashNodeHTTPInactiveDisk(client *master.MasterClient) *cobra.Command
 			return
 		},
 	}
+	cmd.Flags().StringVarP(&name, "topoName", "n", proto.DefaultTopoName, "flash topology name")
+	return cmd
 }
 
 func showFlashNodesView(flashNodeViewInfos []*proto.FlashNodeViewInfo, showStat bool, groupStats map[uint64]string, tbl table) table {
 	sort.Slice(flashNodeViewInfos, func(i, j int) bool {
-		return flashNodeViewInfos[i].ID < flashNodeViewInfos[j].ID
+		if flashNodeViewInfos[i].Region == flashNodeViewInfos[j].Region {
+			return flashNodeViewInfos[i].ID < flashNodeViewInfos[j].ID
+		}
+		return flashNodeViewInfos[i].Region < flashNodeViewInfos[j].Region
 	})
 	var groupActiveInfo string
 	for _, fn := range flashNodeViewInfos {
 		groupActiveInfo = ""
-		nodeInfo := arow(fn.ZoneName, fn.ID, fn.Addr, formatYesNo(fn.IsActive), formatYesNo(fn.IsEnable),
-			fn.FlashGroupID, formatTimeToString(fn.ReportTime))
+		nodeInfo := arow(fn.ZoneName, fn.Region, fn.ID, fn.Addr, formatYesNo(fn.IsActive), formatYesNo(fn.IsEnable),
+			fn.FlashGroupID, fn.FlashNodeTopoName, formatTimeToString(fn.ReportTime))
 		if groupStats != nil {
 			if v, ok := groupStats[fn.FlashGroupID]; ok {
 				groupActiveInfo = v
 			}
-			nodeInfo = arow(fn.ZoneName, fn.ID, fn.Addr, formatYesNo(fn.IsActive), formatYesNo(fn.IsEnable),
-				fn.FlashGroupID, groupActiveInfo, formatTimeToString(fn.ReportTime))
+			nodeInfo = arow(fn.ZoneName, fn.Region, fn.ID, fn.Addr, formatYesNo(fn.IsActive), formatYesNo(fn.IsEnable),
+				fn.FlashGroupID, groupActiveInfo, fn.FlashNodeTopoName, formatTimeToString(fn.ReportTime))
 		}
 		if !showStat {
 			tbl = tbl.append(nodeInfo)
@@ -325,9 +376,9 @@ func showFlashNodesView(flashNodeViewInfos []*proto.FlashNodeViewInfo, showStat 
 			}
 			if index != 0 {
 				if groupStats != nil {
-					nodeInfo = arow("", "", "", "", "", "", "", "")
+					nodeInfo = arow("", "", "", "", "", "", "", "", "", "")
 				} else {
-					nodeInfo = arow("", "", "", "", "", "", "")
+					nodeInfo = arow("", "", "", "", "", "", "", "", "")
 				}
 			}
 			nodeInfo = append(nodeInfo, dataPath, hitRate, evicts, limit, maxAlloc, hasAlloc, num, status)

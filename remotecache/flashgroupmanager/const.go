@@ -10,8 +10,15 @@ const (
 )
 
 const (
-	idKey   = "id"
-	addrKey = "addr"
+	idKey                = "id"
+	addrKey              = "addr"
+	nameKey              = "name"
+	countKey             = "count"
+	newNameKey           = "newName"
+	regionKey            = "region"
+	volNameKey           = "volName"
+	remoteCacheReadFlow  = "freadFlow"
+	remoteCacheWriteFlow = "fwriteFlow"
 )
 
 const (
@@ -21,6 +28,7 @@ const (
 	clusterPrefix    = keySeparator + clusterAcronym + keySeparator
 	flashNodePrefix  = keySeparator + "fn" + keySeparator
 	flashGroupPrefix = keySeparator + "fg" + keySeparator
+	flashTopoPrefix  = keySeparator + "ft" + keySeparator
 )
 
 const (
@@ -32,5 +40,8 @@ const (
 	opSyncAddFlashGroup    uint32 = 0x6D
 	opSyncDeleteFlashGroup uint32 = 0x6E
 	opSyncUpdateFlashGroup uint32 = 0x6F
+	opSyncAddFlashTopo     uint32 = 0x70
+	opSyncDeleteFlashTopo  uint32 = 0x71
+	opSyncUpdateFlashTopo  uint32 = 0x72
 	opSyncPutCluster       uint32 = 0x0D
 )

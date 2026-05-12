@@ -759,6 +759,56 @@ func (m *Server) renameFlashTopo(w http.ResponseWriter, r *http.Request) {
 	sendOkReply(w, r, newSuccessHTTPReply(fmt.Sprintf("topo[%v] rename to [%v] success", srcName, dstName)))
 }
 
+func (m *Server) updateFlashTopo(w http.ResponseWriter, r *http.Request) {
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.AdminFlashTopoUpdate))
+	defer func() {
+		doStatAndMetric(proto.AdminFlashTopoUpdate, metric, nil, nil)
+	}()
+
+	args, err := parseRequestToUpdateFlashTopo(r)
+	if err != nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
+
+	topo, err := m.cluster.PeekFlashTopo(args.Name)
+	if err != nil {
+		sendErrReply(w, r, newErrHTTPReply(fmt.Errorf("topo[%v] is not exist", args.Name)))
+		return
+	}
+	if topo.IsMarkDelete() {
+		sendErrReply(w, r, newErrHTTPReply(fmt.Errorf("topo[%v] is markDeleted, operation not allowed", args.Name)))
+		return
+	}
+
+	cfg := topo.GetHeartbeatConfig()
+	if args.FlashNodeHandleReadTimeout != nil {
+		cfg.FlashNodeHandleReadTimeout = *args.FlashNodeHandleReadTimeout
+	}
+	if args.FlashNodeReadDataNodeTimeout != nil {
+		cfg.FlashNodeReadDataNodeTimeout = *args.FlashNodeReadDataNodeTimeout
+	}
+	if args.FlashHotKeyMissCount != nil {
+		cfg.FlashHotKeyMissCount = *args.FlashHotKeyMissCount
+	}
+	if args.FlashReadFlowLimit != nil {
+		cfg.FlashReadFlowLimit = *args.FlashReadFlowLimit
+	}
+	if args.FlashWriteFlowLimit != nil {
+		cfg.FlashWriteFlowLimit = *args.FlashWriteFlowLimit
+	}
+	if args.FlashKeyFlowLimit != nil {
+		cfg.FlashKeyFlowLimit = *args.FlashKeyFlowLimit
+	}
+	topo.SetHeartbeatConfig(cfg)
+
+	if err = m.cluster.syncUpdateFlashTopo(topo); err != nil {
+		sendErrReply(w, r, newErrHTTPReply(fmt.Errorf("update topo[%v] failed %v", args.Name, err.Error())))
+		return
+	}
+	sendOkReply(w, r, newSuccessHTTPReply(topo.GetFlashTopoAdminView()))
+}
+
 func (m *Server) cancelDeleteFlashTopo(w http.ResponseWriter, r *http.Request) {
 	metric := exporter.NewTPCnt(apiToMetricsName(proto.AdminFlashTopoCancelDelete))
 	var err error

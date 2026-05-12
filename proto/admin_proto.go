@@ -375,6 +375,7 @@ const (
 	AdminFlashTopoAdd             = "/flashTopo/add"
 	AdminFlashTopoDel             = "/flashTopo/delete"
 	AdminFlashTopoRename          = "/flashTopo/rename"
+	AdminFlashTopoUpdate          = "/flashTopo/update"
 	AdminFlashTopoSetVolReadFlow  = "/flashTopo/setVolReadFlow"
 	AdminFlashTopoSetVolWriteFlow = "/flashTopo/setVolWriteFlow"
 	AdminFlashTopoQueryCacheVols  = "/flashTopo/queryCacheVols"
@@ -411,6 +412,7 @@ var GApiInfo map[string]string = map[string]string{
 	"adminsetmastervoldeletiondelaytime":       AdminSetMasterVolDeletionDelayTime,
 	"adminsetmasterflashtopodeletiondelaytime": AdminSetMasterFlashTopoDeletionDelayTime,
 	"adminflashtopocanceldelete":               AdminFlashTopoCancelDelete,
+	"adminflashtopoupdate":                     AdminFlashTopoUpdate,
 	"adminlistvols":                            AdminListVols,
 	"adminsetnodeinfo":                         AdminSetNodeInfo,
 	"admingetnodeinfo":                         AdminGetNodeInfo,

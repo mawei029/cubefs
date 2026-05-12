@@ -133,7 +133,7 @@ func (mf *MetadataFsm) Apply(command []byte, index uint64) (resp interface{}, er
 	cmdMap[applied] = []byte(strconv.FormatUint(uint64(index), 10))
 
 	switch cmd.Op {
-	case opSyncDeleteFlashNode, opSyncDeleteFlashGroup:
+	case opSyncDeleteFlashNode, opSyncDeleteFlashGroup, opSyncDeleteFlashTopo:
 		if err = mf.delKeyAndPutIndex(cmd.K, cmdMap); err != nil {
 			panic(err)
 		}

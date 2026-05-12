@@ -51,6 +51,7 @@ func NewRootCmd(client *master.MasterClient) *CubeFSCmd {
 		newClusterCmd(client),
 		newFlashNodeCmd(client),
 		newFlashGroupCmd(client),
+		newFlashTopoCmd(client),
 	)
 	return cmd
 }

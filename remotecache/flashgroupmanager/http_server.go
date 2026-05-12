@@ -84,6 +84,13 @@ func (m *FlashGroupManager) registerAPIRoutes(router *mux.Router) {
 	router.NewRoute().Methods(http.MethodGet).Path(proto.AdminFlashGroupList).HandlerFunc(m.listFlashGroups)
 	router.NewRoute().Methods(http.MethodGet).Path(proto.ClientFlashGroups).HandlerFunc(m.clientFlashGroups)
 
+	// APIs for FlashTopology
+	router.NewRoute().Methods(http.MethodGet).Path(proto.AdminFlashTopoList).HandlerFunc(m.listFlashTopo)
+	router.NewRoute().Methods(http.MethodGet, http.MethodPost).Path(proto.AdminFlashTopoAdd).HandlerFunc(m.addFlashTopo)
+	router.NewRoute().Methods(http.MethodGet, http.MethodPost).Path(proto.AdminFlashTopoDel).HandlerFunc(m.deleteFlashTopo)
+	router.NewRoute().Methods(http.MethodGet, http.MethodPost).Path(proto.AdminFlashTopoRename).HandlerFunc(m.renameFlashTopo)
+	router.NewRoute().Methods(http.MethodGet, http.MethodPost).Path(proto.AdminFlashTopoUpdate).HandlerFunc(m.updateFlashTopo)
+
 	// APIs for FlashNode
 	router.NewRoute().Methods(http.MethodGet, http.MethodPost).Path(proto.FlashNodeAdd).HandlerFunc(m.addFlashNode)
 	router.NewRoute().Methods(http.MethodGet).Path(proto.FlashNodeList).HandlerFunc(m.listFlashNodes)

@@ -242,12 +242,6 @@ func (c *Cluster) checkFlashNodeHeartbeat() {
 		}
 		tasks := topo.CreateFlashNodeHeartBeatTasks(
 			c.masterAddr(),
-			c.cfg.flashNodeHandleReadTimeout,
-			c.cfg.flashNodeReadDataNodeTimeout,
-			c.cfg.flashHotKeyMissCount,
-			c.cfg.flashReadFlowLimit,
-			c.cfg.flashWriteFlowLimit,
-			c.cfg.flashKeyFlowLimit,
 			remoteCacheDisableTTLMap,
 			topo.GetRemoteCacheReadFlowMap(),
 			topo.GetRemoteCacheWriteFlowMap(),

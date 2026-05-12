@@ -1984,3 +1984,62 @@ func TestParseRequestToUpdateStoragePool_invalidPoolId(t *testing.T) {
 	_, _, err := parseRequestToUpdateStoragePool(apiArgsNewGet(t, "id=notint&name=p1"))
 	require.Error(t, err)
 }
+
+func TestParseRequestToUpdateFlashTopo(t *testing.T) {
+	t.Run("parse_form_error", func(t *testing.T) {
+		req := apiArgsNewGet(t, "%zz")
+		_, err := parseRequestToUpdateFlashTopo(req)
+		require.Error(t, err)
+	})
+
+	t.Run("all_fields", func(t *testing.T) {
+		args, err := parseRequestToUpdateFlashTopo(apiArgsNewGet(t,
+			"name=topo-a&flashNodeHandleReadTimeout=11&flashNodeReadDataNodeTimeout=12&flashHotKeyMissCount=13"+
+				"&flashReadFlowLimit=14&flashWriteFlowLimit=15&flashKeyFlowLimit=16"))
+		require.NoError(t, err)
+		require.Equal(t, "topo-a", args.Name)
+		require.NotNil(t, args.FlashNodeHandleReadTimeout)
+		require.Equal(t, 11, *args.FlashNodeHandleReadTimeout)
+		require.NotNil(t, args.FlashNodeReadDataNodeTimeout)
+		require.Equal(t, 12, *args.FlashNodeReadDataNodeTimeout)
+		require.NotNil(t, args.FlashHotKeyMissCount)
+		require.Equal(t, 13, *args.FlashHotKeyMissCount)
+		require.NotNil(t, args.FlashReadFlowLimit)
+		require.Equal(t, int64(14), *args.FlashReadFlowLimit)
+		require.NotNil(t, args.FlashWriteFlowLimit)
+		require.Equal(t, int64(15), *args.FlashWriteFlowLimit)
+		require.NotNil(t, args.FlashKeyFlowLimit)
+		require.Equal(t, int64(16), *args.FlashKeyFlowLimit)
+	})
+
+	t.Run("default_topo_name", func(t *testing.T) {
+		args, err := parseRequestToUpdateFlashTopo(apiArgsNewGet(t, "flashKeyFlowLimit=1"))
+		require.NoError(t, err)
+		require.Equal(t, proto.DefaultTopoName, args.Name)
+		require.NotNil(t, args.FlashKeyFlowLimit)
+		require.Equal(t, int64(1), *args.FlashKeyFlowLimit)
+	})
+
+	t.Run("missing_update_config", func(t *testing.T) {
+		_, err := parseRequestToUpdateFlashTopo(apiArgsNewGet(t, "name=topo-a"))
+		require.Error(t, err)
+	})
+
+	t.Run("invalid_int_config", func(t *testing.T) {
+		_, err := parseRequestToUpdateFlashTopo(apiArgsNewGet(t, "flashNodeHandleReadTimeout=bad"))
+		require.Error(t, err)
+		_, err = parseRequestToUpdateFlashTopo(apiArgsNewGet(t, "flashNodeReadDataNodeTimeout=bad"))
+		require.Error(t, err)
+		_, err = parseRequestToUpdateFlashTopo(apiArgsNewGet(t, "flashHotKeyMissCount=bad"))
+		require.Error(t, err)
+	})
+
+	t.Run("invalid_flow_config", func(t *testing.T) {
+		_, err := parseRequestToUpdateFlashTopo(apiArgsNewGet(t, "flashReadFlowLimit=bad"))
+		require.Error(t, err)
+		_, err = parseRequestToUpdateFlashTopo(apiArgsNewGet(t, "flashWriteFlowLimit=bad"))
+		require.Error(t, err)
+		_, err = parseRequestToUpdateFlashTopo(apiArgsNewGet(t, "flashKeyFlowLimit=bad"))
+		require.Error(t, err)
+	})
+}

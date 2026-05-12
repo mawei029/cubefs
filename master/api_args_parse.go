@@ -2478,6 +2478,78 @@ func parseSetConfigParam(r *http.Request) (config map[string]string, err error) 
 	return
 }
 
+type flashTopoUpdateArgs struct {
+	Name                         string
+	FlashNodeHandleReadTimeout   *int
+	FlashNodeReadDataNodeTimeout *int
+	FlashHotKeyMissCount         *int
+	FlashReadFlowLimit           *int64
+	FlashWriteFlowLimit          *int64
+	FlashKeyFlowLimit            *int64
+}
+
+func parseRequestToUpdateFlashTopo(r *http.Request) (args *flashTopoUpdateArgs, err error) {
+	if err = r.ParseForm(); err != nil {
+		return
+	}
+
+	args = &flashTopoUpdateArgs{Name: extractStrWithDefault(r, nameKey, proto.DefaultTopoName)}
+	hasValue := false
+
+	if value := r.FormValue(flashNodeHandleReadTimeout); value != "" {
+		val, parseErr := strconv.Atoi(value)
+		if parseErr != nil {
+			return nil, unmatchedKey(flashNodeHandleReadTimeout)
+		}
+		args.FlashNodeHandleReadTimeout = &val
+		hasValue = true
+	}
+	if value := r.FormValue(flashNodeReadDataNodeTimeout); value != "" {
+		val, parseErr := strconv.Atoi(value)
+		if parseErr != nil {
+			return nil, unmatchedKey(flashNodeReadDataNodeTimeout)
+		}
+		args.FlashNodeReadDataNodeTimeout = &val
+		hasValue = true
+	}
+	if value := r.FormValue(flashHotKeyMissCount); value != "" {
+		val, parseErr := strconv.Atoi(value)
+		if parseErr != nil {
+			return nil, unmatchedKey(flashHotKeyMissCount)
+		}
+		args.FlashHotKeyMissCount = &val
+		hasValue = true
+	}
+	if value := r.FormValue(flashReadFlowLimit); value != "" {
+		val, parseErr := strconv.ParseInt(value, 10, 64)
+		if parseErr != nil {
+			return nil, unmatchedKey(flashReadFlowLimit)
+		}
+		args.FlashReadFlowLimit = &val
+		hasValue = true
+	}
+	if value := r.FormValue(flashWriteFlowLimit); value != "" {
+		val, parseErr := strconv.ParseInt(value, 10, 64)
+		if parseErr != nil {
+			return nil, unmatchedKey(flashWriteFlowLimit)
+		}
+		args.FlashWriteFlowLimit = &val
+		hasValue = true
+	}
+	if value := r.FormValue(flashKeyFlowLimit); value != "" {
+		val, parseErr := strconv.ParseInt(value, 10, 64)
+		if parseErr != nil {
+			return nil, unmatchedKey(flashKeyFlowLimit)
+		}
+		args.FlashKeyFlowLimit = &val
+		hasValue = true
+	}
+	if !hasValue {
+		return nil, keyNotFound("flash topo config")
+	}
+	return
+}
+
 func parseGetConfigParam(r *http.Request) (key string, err error) {
 	if err = r.ParseForm(); err != nil {
 		return

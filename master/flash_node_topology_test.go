@@ -15,9 +15,13 @@
 package master
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"sync"
 	"testing"
 
+	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/remotecache/flashgroupmanager"
 	"github.com/stretchr/testify/require"
 )
@@ -31,6 +35,7 @@ func TestFlash(t *testing.T) {
 func testFlashTopology(t *testing.T) {
 	t.Run("Clear", testFlashTopologyClear)
 	t.Run("Load", testFlashTopologyLoad)
+	t.Run("LoadHeartbeatConfigDefaults", testFlashTopologyLoadHeartbeatConfigDefaults)
 	t.Run("RemoveRemoteCacheFlowLimits", testFlashTopologyRemoveRemoteCacheFlowLimits)
 }
 
@@ -61,6 +66,19 @@ func testFlashTopologyLoad(t *testing.T) {
 	server.cluster.loadFlashNodes()
 	server.cluster.loadFlashGroups()
 	require.NoError(t, server.cluster.loadFlashTopology())
+}
+
+func testFlashTopologyLoadHeartbeatConfigDefaults(t *testing.T) {
+	require.NoError(t, server.cluster.loadFlashTopos())
+	topo, err := server.cluster.PeekFlashTopo(proto.DefaultTopoName)
+	require.NoError(t, err)
+	cfg := topo.GetHeartbeatConfig()
+	require.Equal(t, server.cluster.cfg.flashNodeHandleReadTimeout, cfg.FlashNodeHandleReadTimeout)
+	require.Equal(t, server.cluster.cfg.flashNodeReadDataNodeTimeout, cfg.FlashNodeReadDataNodeTimeout)
+	require.Equal(t, server.cluster.cfg.flashHotKeyMissCount, cfg.FlashHotKeyMissCount)
+	require.Equal(t, server.cluster.cfg.flashReadFlowLimit, cfg.FlashReadFlowLimit)
+	require.Equal(t, server.cluster.cfg.flashWriteFlowLimit, cfg.FlashWriteFlowLimit)
+	require.Equal(t, server.cluster.cfg.flashKeyFlowLimit, cfg.FlashKeyFlowLimit)
 }
 
 // testFlashTopologyRemoveRemoteCacheFlowLimits checks that Cluster.removeRemoteCacheFlowLimitsForVol
@@ -107,4 +125,59 @@ func testFlashTopologyRemoveRemoteCacheFlowLimits(t *testing.T) {
 	})
 
 	server.cluster.removeRemoteCacheFlowLimitsForVol(volB)
+}
+
+func TestUpdateFlashTopoHandler(t *testing.T) {
+	s := &Server{cluster: &Cluster{
+		Name: "test-cluster",
+		ClusterFlashTopoSubItem: ClusterFlashTopoSubItem{
+			flashNodeTopo: new(sync.Map),
+		},
+		cfg:       newClusterConfig(),
+		partition: &mockPartition{isLeader: true},
+	}}
+	topo := flashgroupmanager.NewFlashNodeTopology(proto.DefaultTopoName, proto.DefaultRegion, 1, proto.TopoStatusNormal)
+	s.cluster.flashNodeTopo.Store(proto.DefaultTopoName, topo)
+
+	t.Run("success", func(t *testing.T) {
+		values := url.Values{}
+		values.Set(flashNodeHandleReadTimeout, "11")
+		values.Set(flashNodeReadDataNodeTimeout, "12")
+		values.Set(flashHotKeyMissCount, "13")
+		values.Set(flashReadFlowLimit, "14")
+		values.Set(flashWriteFlowLimit, "15")
+		values.Set(flashKeyFlowLimit, "16")
+
+		req := httptest.NewRequest(http.MethodGet, "/?"+values.Encode(), nil)
+		reply := decodeReply(t, callHandler(s.updateFlashTopo, req))
+		require.EqualValues(t, proto.ErrCodeSuccess, reply.Code)
+		cfg := topo.GetHeartbeatConfig()
+		require.Equal(t, 11, cfg.FlashNodeHandleReadTimeout)
+		require.Equal(t, 12, cfg.FlashNodeReadDataNodeTimeout)
+		require.Equal(t, 13, cfg.FlashHotKeyMissCount)
+		require.Equal(t, int64(14), cfg.FlashReadFlowLimit)
+		require.Equal(t, int64(15), cfg.FlashWriteFlowLimit)
+		require.Equal(t, int64(16), cfg.FlashKeyFlowLimit)
+	})
+
+	t.Run("param_error", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/?name="+proto.DefaultTopoName, nil)
+		reply := decodeReply(t, callHandler(s.updateFlashTopo, req))
+		require.NotEqualValues(t, proto.ErrCodeSuccess, reply.Code)
+	})
+
+	t.Run("not_found", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/?name=missing&"+flashKeyFlowLimit+"=1", nil)
+		reply := decodeReply(t, callHandler(s.updateFlashTopo, req))
+		require.NotEqualValues(t, proto.ErrCodeSuccess, reply.Code)
+	})
+
+	t.Run("mark_deleted", func(t *testing.T) {
+		deletedTopo := flashgroupmanager.NewFlashNodeTopology("deleted-topo", proto.DefaultRegion, 2, proto.TopoStatusMarkDelete)
+		s.cluster.flashNodeTopo.Store(deletedTopo.Name, deletedTopo)
+
+		req := httptest.NewRequest(http.MethodGet, "/?name=deleted-topo&"+flashKeyFlowLimit+"=1", nil)
+		reply := decodeReply(t, callHandler(s.updateFlashTopo, req))
+		require.NotEqualValues(t, proto.ErrCodeSuccess, reply.Code)
+	})
 }

@@ -5,6 +5,7 @@ import (
 	syslog "log"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/cubefs/cubefs/depends/tiglabs/raft/proto"
 	cfsProto "github.com/cubefs/cubefs/proto"
@@ -45,10 +46,7 @@ func (m *FlashGroupManager) handleLeaderChange(leader uint64) {
 }
 
 func (m *FlashGroupManager) clearMetadata() {
-	m.cluster.flashNodeTopo.Clear()
-	// TODO-chi
-	m.cluster.flashNodeTopo = NewFlashNodeTopology(cfsProto.DefaultTopoName, cfsProto.DefaultRegion, 0, cfsProto.TopoStatusNormal)
-	m.cluster.flashNodeTopo.SyncFlashGroupFunc = m.cluster.syncUpdateFlashGroup
+	m.cluster.flashNodeTopo = new(sync.Map)
 }
 
 func (m *FlashGroupManager) loadMetadata() {
@@ -60,6 +58,10 @@ func (m *FlashGroupManager) loadMetadata() {
 	m.cluster.fsm.restore()
 
 	if err = m.cluster.loadClusterValue(); err != nil {
+		panic(err)
+	}
+
+	if err = m.cluster.loadFlashTopos(); err != nil {
 		panic(err)
 	}
 

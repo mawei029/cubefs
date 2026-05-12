@@ -8074,6 +8074,7 @@ func (c *Cluster) AddFlashTopo(name, region string) (err error) {
 		}
 	}
 	topo := flashgroupmanager.NewFlashNodeTopology(name, region, id, proto.TopoStatusNormal)
+	topo.SetHeartbeatConfig(c.defaultFlashNodeHeartbeatConfig())
 	topo.SyncFlashGroupFunc = c.syncUpdateFlashGroup
 	topo.SetMaxDisableFlashGroupPercent(c.cfg.maxDisableFlashGroupPercent)
 	c.flashNodeTopo.Store(name, topo)
