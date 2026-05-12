@@ -24,8 +24,8 @@ const (
 type objExtentDelItem struct {
 	TsMs  int64
 	Inode uint64
-	Uniq  uint64 // (raftApplyIndex << 20) | seqInBatch
-	Oek   proto.ObjExtentKey
+	Uniq  uint64             // (raftApplyIndex << 20) | seqInBatch
+	Oek   proto.ObjExtentKey // TODO：这个多个oec放到一个item
 }
 
 func (x *objExtentDelItem) Less(than BtreeItem) bool {

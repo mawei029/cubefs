@@ -68,6 +68,20 @@ func TestNew(t *testing.T) {
 	pool.Close()
 }
 
+func TestNewClampsNegativeSize(t *testing.T) {
+	pool := New(1, -1)
+	defer pool.Close()
+	done := make(chan struct{}, 1)
+	pool.Execute(&rwSlice{}, func(op *rwSlice) {
+		done <- struct{}{}
+	})
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("New(1, negative size) must still accept tasks (size clamped to 0)")
+	}
+}
+
 func TestNewClampsZeroWorkers(t *testing.T) {
 	pool := New(0, 2)
 	defer pool.Close()
@@ -111,5 +125,18 @@ func TestExecutorRun(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("executor run timeout")
+	}
+}
+
+func TestNewExecutorClampsZeroConcurrency(t *testing.T) {
+	exec := NewExecutor(0)
+	done := make(chan struct{}, 1)
+	exec.Run(func() {
+		done <- struct{}{}
+	})
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("NewExecutor(0) must clamp maxConcurrency to 1")
 	}
 }

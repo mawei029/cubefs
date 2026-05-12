@@ -17,7 +17,6 @@ package blobstore
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"sort"
 	"sync"
@@ -67,13 +66,12 @@ func (s rwSlice) String() string {
 }
 
 func (reader *Reader) String() string {
-	return fmt.Sprintf("Reader{address(%v),volName(%v),volType(%v),ino(%v),enableBcache(%v),fileCache(%v)},readConcurrency(%v)",
-		&reader, reader.volName, reader.volType, reader.ino, reader.enableBcache, reader.fileCache, reader.readConcurrency)
+	return fmt.Sprintf("Reader{address(%v),volName(%v),ino(%v),enableBcache(%v)},readConcurrency(%v)",
+		&reader, reader.volName, reader.ino, reader.enableBcache, reader.readConcurrency)
 }
 
 type Reader struct {
 	volName         string
-	volType         int
 	ino             uint64
 	bc              *bcache.BcacheClient
 	mw              *meta.MetaWrapper
@@ -86,7 +84,6 @@ type Reader struct {
 	ebsReadInflight int32
 	objExtentKeys   []proto.ObjExtentKey
 	enableBcache    bool
-	fileCache       bool
 	valid           bool
 	inflightCache   sync.Map
 	limitManager    *manager.LimitManager
@@ -106,7 +103,7 @@ type Reader struct {
 	prefetchReserved int64 // bytes reserved from global blob prefetch budget for this reader
 	prefetchLimiter  *blobReadPrefetchLimiter
 
-	// oec 路径下与 ECStreamer 共享；dirty / inoVersion / fileSize 落后时失效预读并 RefreshExtents。
+	// oec / 冷卷 Blob：与所属 ECStreamer 绑定；须非 nil（见 NewReader）。dirty / inoVersion / fileSize 与流协同。
 	ecStreamer *ECStreamer
 	// extentEpochSeen：上次 Refresh/加载 ObjExtents 时看到的 ECStreamer.extentMetaEpoch；Writer 提交 meta 后递增 epoch，读侧据此使缓存失效。
 	extentEpochSeen uint32
@@ -121,7 +118,7 @@ type ClientConfig struct {
 	Mw        *meta.MetaWrapper
 	// LimitManager 与副本 ExtentClient / ECExtentClient 侧共享（例如 ec.LimitManager 或 oec.LimitManager）。
 	LimitManager *manager.LimitManager
-	// ECStreamer 非空时，blob Writer 缓冲或元数据提交与流上 fileSize/dirty/extentMetaEpoch 协同。
+	// ECStreamer 必填：须与 OpenStreamWithArgs / inode 冷路径构造的 ClientConfig 一致传入非 nil，否则 NewReader/NewWriter 会 panic。
 	ECStreamer      *ECStreamer
 	Ebsc            *BlobStoreClient
 	EnableBcache    bool
@@ -187,17 +184,18 @@ func getBlobReadPrefetchLimiter(totalMem int64) *blobReadPrefetchLimiter {
 }
 
 func NewReader(config ClientConfig) (reader *Reader) {
+	if config.ECStreamer == nil {
+		panic("blobstore.NewReader: ClientConfig.ECStreamer is required")
+	}
 	reader = new(Reader)
 
 	reader.volName = config.VolName
-	reader.volType = config.VolType
 	reader.ino = config.Ino
 	reader.bc = config.Bc
 	reader.ebs = config.Ebsc
 	reader.mw = config.Mw
 	reader.enableBcache = config.EnableBcache
 	reader.readConcurrency = config.ReadConcurrency
-	reader.fileCache = config.FileCache
 
 	reader.limitManager = config.LimitManager
 	reader.blockSize = config.BlockSize
@@ -271,8 +269,9 @@ func (reader *Reader) Read(ctx context.Context, buf []byte, offset int, size int
 		log.LogErrorf("Reader: invoke fileSize fail. ino(%v)  offset(%v) size(%v)", reader.ino, offset, size)
 		return 0, syscall.EIO
 	}
+	// 与副本 Streamer.read 一致：起点已在文件逻辑尾之后时返回 0 字节、err=nil（POSIX：EOF 以 n==0 表示，不要求 io.EOF）。
 	if uint64(offset) >= fileSize {
-		return 0, io.EOF
+		return 0, nil
 	}
 	if uint64(offset)+uint64(size) > fileSize {
 		size = int(fileSize - uint64(offset))
@@ -318,7 +317,7 @@ func (reader *Reader) Read(ctx context.Context, buf []byte, offset int, size int
 			fetch = rem
 		}
 		if fetch <= 0 {
-			return 0, io.EOF
+			return 0, nil
 		}
 		data, err := reader.readEbsRange(ctx, offset, uint32(fetch))
 		if err != nil {
@@ -327,7 +326,7 @@ func (reader *Reader) Read(ctx context.Context, buf []byte, offset int, size int
 		if len(data) == 0 {
 			log.LogErrorf("reader Read prefetch buffer is empty. ino(%v) offset(%v) fetchLen(%v)", reader.ino, offset, fetch)
 			reader.invalidateReadBuf()
-			return 0, io.EOF
+			return 0, syscall.EIO
 		}
 		ebsFetchSize = len(data)
 		if len(data) > len(reader.readBuf) {
@@ -342,7 +341,7 @@ func (reader *Reader) Read(ctx context.Context, buf []byte, offset int, size int
 
 	if reader.bufValidLen <= 0 {
 		log.LogErrorf("reader Read prefetch buffer is invalid. ino(%v) offset(%v) bufValidLen(%v)", reader.ino, offset, reader.bufValidLen)
-		return 0, io.EOF
+		return 0, syscall.EIO
 	}
 
 	if offset < reader.bufBaseOff || offset >= reader.bufBaseOff+reader.bufValidLen {
@@ -450,8 +449,9 @@ func (reader *Reader) prepareEbsSlice(offset int, size uint32) ([]*rwSlice, erro
 		return nil, syscall.EIO
 	}
 	log.LogDebugf("TRACE blobStore prepareEbsSlice. ino(%v)  offset(%v) size(%v)", reader.ino, offset, size)
+	// 与副本 Streamer.read 对「空洞请求且 FileOffset > filesize」一致：无切片、无错误，readEbsRange 得到空结果。
 	if uint64(offset) >= fileSize {
-		return nil, io.EOF
+		return nil, nil
 	}
 
 	if uint64(offset)+uint64(size) > fileSize {
@@ -665,9 +665,13 @@ func (reader *Reader) ensureAlignedForRead(inodeGen, inodeSize uint64, skipDirty
 	es := reader.ecStreamer
 	stale := !reader.valid
 	if !stale {
+		streamSz := atomic.LoadUint64(&es.fileSize)
+		// inodeSize 来自 File.Read 合并后的读上界（InodeGet + fileSizeVersion2）；若流上仍保留截断前的更大 logical tail，
+		// 仅靠「streamSz < inodeSize」无法失效缓存（LTP ftest01/03/05/07：path truncate / ftruncate 与随机读交错）。
 		stale = atomic.LoadUint32(&es.dirty) != 0 ||
 			atomic.LoadUint64(&es.inoVersion) < inodeGen ||
-			atomic.LoadUint64(&es.fileSize) < inodeSize
+			streamSz < inodeSize ||
+			streamSz > inodeSize
 	}
 	reader.Unlock()
 	if !stale {
@@ -704,6 +708,11 @@ func (reader *Reader) SyncInodeView(inodeGen, inodeSize uint64) {
 		if inodeSize > nextS {
 			nextS = inodeSize
 		}
+		// 与「只抬高不降低」相反：元数据或路径 truncate 后 inode 锚点变小，必须把流上 logical 顶降下来，
+		// 否则 fileSize() 仍取 max(logical, streamSz) 会把已截断区间当仍有数据（洞区读到旧字节 / fstat 偏大）。
+		if inodeSize < nextS {
+			nextS = inodeSize
+		}
 		if atomic.CompareAndSwapUint64(&es.fileSize, oldS, nextS) {
 			break
 		}
@@ -726,6 +735,8 @@ func (reader *Reader) refreshEbsExtents() error {
 	reader.objExtentKeys = oeks
 	_ = eks
 	reader.extentEpochSeen = atomic.LoadUint32(&reader.ecStreamer.extentMetaEpoch)
+	lb := logicalReadBound(reader.metaReportedSize, reader.objExtentKeys)
+	reader.ecStreamer.mergeMaxFileSize(lb)
 	log.LogDebugf("TRACE blobStore refreshEbsExtents ok. ino(%v) gen(%v) metaSz(%v) objExtentKeys(%v) ",
 		reader.ino, gen, sz, reader.objExtentKeys)
 	return nil
@@ -748,28 +759,18 @@ func (reader *Reader) fileSize() (uint64, bool) {
 	if !reader.valid {
 		return 0, false
 	}
-	// logicalReadBound：GetObjExtents 的 Size 与 extent 最远尾。
-	logical := logicalReadBound(reader.metaReportedSize, reader.objExtentKeys)
-	streamSize := atomic.LoadUint64(&reader.ecStreamer.fileSize)
-	if streamSize > logical {
-		return streamSize, true
-	}
-	return logical, true
+	// 逻辑文件尾以 ECStreamer.fileSize 为准（Open/写/截断/SyncInodeView/RefreshExtents 已维护）。
+	return atomic.LoadUint64(&reader.ecStreamer.fileSize), true
 }
 
 func (reader *Reader) logicalReadBoundLocked() (uint64, bool) {
 	if !reader.valid {
 		return 0, false
 	}
-	logical := logicalReadBound(reader.metaReportedSize, reader.objExtentKeys)
-	streamSize := atomic.LoadUint64(&reader.ecStreamer.fileSize)
-	if streamSize > logical {
-		return streamSize, true
-	}
-	return logical, true
+	return atomic.LoadUint64(&reader.ecStreamer.fileSize), true
 }
 
-// LogicalReadBound 与 Read 路径一致：max(元数据逻辑长度, ObjExtent 覆盖最远端, inodeViewSize)。用于 Stat/oec.FileSize。
+// LogicalReadBound 返回与 Read/prepareEbsSlice 一致的逻辑文件尾（即 ECStreamer.fileSize）。
 func (reader *Reader) LogicalReadBound() (uint64, bool) {
 	if reader == nil {
 		return 0, false
@@ -801,6 +802,8 @@ func (reader *Reader) RefreshExtents() (gen uint64, err error) {
 	reader.objExtentKeys = oeks
 	_ = eks
 	reader.extentEpochSeen = atomic.LoadUint32(&reader.ecStreamer.extentMetaEpoch)
+	lb := logicalReadBound(reader.metaReportedSize, reader.objExtentKeys)
+	reader.ecStreamer.mergeMaxFileSize(lb)
 	reader.invalidateReadBuf()
 	reader.Unlock()
 	log.LogDebugf("RefreshExtents: ino(%v) gen(%v) metaSz(%v) objExtentKeysLen(%v)",

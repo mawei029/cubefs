@@ -192,12 +192,26 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 		log.LogErrorf("Attr: ino(%v) err(%v)", ino, err)
 		return ParseError(err)
 	}
+	pool := f.getStorageClassByPoolId(info.PoolId)
+	storageClass := uint32(pool.StorageClass)
+	// Blob/EC：与 Read 一致，避免 icache 命中「未过期但已落后」的 inode，导致 fstat 与数据面/读上界不一致（LTP ftest）。
+	if !proto.IsSymlink(info.Mode) {
+		if !proto.IsStorageClassReplica(storageClass) {
+			f.super.ic.Delete(ino)
+			if info, err = f.super.InodeGet(ino); err != nil {
+				log.LogErrorf("Attr: ino(%v) err(%v)", ino, err)
+				return ParseError(err)
+			}
+		}
+	}
 
 	fillAttr(info, a)
 	a.ParentIno = f.parentIno
 
 	fileSize, gen := f.fileSizeVersion2(ino)
 	log.LogDebugf("Attr: ino(%v) fileSize(%v) gen(%v) inode.gen(%v)", ino, fileSize, gen, info.Generation)
+	// LTP ftest01（m_fstat）：write 返回后须 st_size==file_max；EC/Blob 上 meta 的 inode.Size 可能略晚于 streamer/Writer 逻辑尾。
+	// 与 1c79c58 一致：非 symlink 时仅当本机合并视图更大则抬高 st_size；symlink 仍以 target 长度为准。
 	if gen >= info.Generation {
 		a.Size = uint64(fileSize)
 	}
@@ -428,6 +442,16 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 	// Get storage class from poolId if available, otherwise use existing StorageClass
 	pool := f.getStorageClassByPoolId(info.PoolId)
 	storageClass := uint32(pool.StorageClass)
+	// 与 Attr 一致：Blob/EC 上 icache 可能仍保留截断前的 Size/Generation；若不刷新，readSize 会与过期 lz 合并，
+	// EnsureAlignedForRead 内 SyncInodeView 会把 stream.fileSize 重新抬大，洞区读到旧数据（LTP ftest01/05）。
+	if !proto.IsSymlink(info.Mode) && !proto.IsStorageClassReplica(storageClass) {
+		f.super.ic.Delete(f.ino)
+		if info, err = f.super.InodeGet(f.ino); err != nil {
+			return ParseError(err)
+		}
+		pool = f.getStorageClassByPoolId(info.PoolId)
+		storageClass = uint32(pool.StorageClass)
+	}
 
 	log.LogDebugf("TRACE Read enter: ino(%v) poolId(%v) storageClass(%v) offset(%v) filesize(%v) reqsize(%v) req(%v)",
 		f.ino, info.PoolId, storageClass, req.Offset, info.Size, req.Size, req)
@@ -446,8 +470,19 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 		size, err = f.super.ec.Read(f.ino, resp.Data[fuse.OutHeaderSize:], int(req.Offset),
 			req.Size, info.PoolId, false)
 	} else {
-		// 对齐与「dirty 时先同步再读」封装在 oec.ReadWithInodeView → Reader.EnsureAlignedForRead + ECStreamer.Read。
-		size, err = f.super.oec.ReadWithInodeView(ctx, f.ino, resp.Data[fuse.OutHeaderSize:], int(req.Offset), req.Size, info.PoolId, false, info.Generation, info.Size)
+		// Blob/EC：InodeGet 的 Size/Generation 可能落后于本机 streamer 上未刷元数据的写；
+		// 读上界须与 Attr 使用的 fileSizeVersion2 一致；extent 与 meta 对齐由 ReadWithInodeView 内 EnsureAlignedForRead 完成。
+		readGen, readSize := info.Generation, info.Size
+		lz, lg := f.fileSizeVersion2(f.ino)
+		// 仅当流 inoVersion 不低于 inode 代际时才用 lz 抬高 readSize：否则 meta 已前进（截断）而 lz 仍大，
+		// 会经 SyncInodeView 把 fileSize 错误抬回截断前（ftest01/05/07）。
+		if uint64(lz) > readSize && lg >= info.Generation {
+			readSize = uint64(lz)
+		}
+		if lg > readGen {
+			readGen = lg
+		}
+		size, err = f.super.oec.ReadWithInodeView(ctx, f.ino, resp.Data[fuse.OutHeaderSize:], int(req.Offset), req.Size, info.PoolId, false, readGen, readSize)
 	}
 	if err != nil && err != io.EOF {
 		msg := fmt.Sprintf("Read: ino(%v) req(%v) err(%v) size(%v)", f.ino, req, err, size)
@@ -479,9 +514,8 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 
 	if size > 0 {
 		resp.Data = resp.Data[:size+fuse.OutHeaderSize]
-	} else if size <= 0 {
+	} else if size <= 0 && req.Size > 0 {
 		resp.Data = resp.Data[:fuse.OutHeaderSize]
-		log.LogWarnf("Read: ino(%v) offset(%v) reqsize(%v) req(%v) size(%v)", f.ino, req.Offset, req.Size, req, size)
 	}
 
 	elapsed := time.Since(start)
@@ -819,8 +853,9 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 	log.LogDebugf("Setattr: ino(%v) openForWrite(%v) isCache(%v) targetSize(%v) isHot(%v) storageClass(%v)",
 		ino, openForWrite, isCache, req.Valid.Size(), proto.IsHot(f.super.volType), storageClass)
 
-	// Handle truncate by storage-class-exclusive branches to avoid running ec.Truncate and doECTruncateV2 at the same time.
-	if req.Valid.Size() {
+	// 已在 meta 上的逻辑长度与 req.Size 一致时跳过 Truncate：Linux FUSE 常在带 FATTR_LOCKOWNER 的 setattr 里仍置 FATTR_SIZE，
+	// Size 为当前长度或 0（空文件），误走 doECTruncateV2/ec.Truncate 会空刷 GetObjExtents/Reader 并与并发 Read 交织（LTP ftest Create 后立即 Read）。
+	if req.Valid.Size() && uint64(req.Size) != info.Size {
 		fullPath := path.Join(f.getParentPath(), f.name)
 		switch {
 		case proto.IsHot(f.super.volType) || proto.IsStorageClassReplica(storageClass):
@@ -1117,8 +1152,15 @@ func (f *File) fileSizeVersion2(ino uint64) (size int, gen uint64) {
 			}
 		}
 	} else {
-		// TODO: ec file size
+		// Blob/EC：ECStreamer.fileSize 与 Writer.fileSize 在 tryOverWrite 等路径上可能短暂不一致，须与 CacheFileSize 取大。
 		size, gen, valid = f.super.oec.FileSize(ino)
+		if s := f.super.oec.GetStreamer(ino); s != nil {
+			if w := s.Writer(); w != nil {
+				if cacheSize := w.CacheFileSize(); cacheSize > size {
+					size = cacheSize
+				}
+			}
+		}
 		if !valid {
 			// inode.Size 为权威逻辑长度（稀疏文件 extent 尾可小于 inode）；与写缓存取大，保证 Attr/Open 与 Read 上界一致。
 			if info, err := f.super.InodeGet(ino); err == nil {
@@ -1126,15 +1168,6 @@ func (f *File) fileSizeVersion2(ino uint64) (size int, gen uint64) {
 					size = int(info.Size)
 				}
 				gen = info.Generation
-				// Open 尚未 openOECStream、或 Release 后表项已删时无 streamer；勿调 oec.Writer(ino) 触发无意义告警。
-				if s := f.super.oec.GetStreamer(ino); s != nil {
-					if w := s.Writer(); w != nil {
-						cacheSize := w.CacheFileSize()
-						if cacheSize > size {
-							size = cacheSize
-						}
-					}
-				}
 			}
 		}
 	}

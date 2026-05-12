@@ -136,7 +136,7 @@ type Super struct {
 // BlobStoreAheadReadForReader returns mount ahead-read flags for blobstore.Reader.
 // Replica path: ExtentClient uses AheadReadWindow (pooled blocks + background prefetch).
 // Blob/EC path: Reader uses a sequential buffer to merge FUSE-sized reads into one EBS read up to EbsBlockSize.
-// Same knobs: aheadReadEnable and minReadAheadSize (default comes from proto.InitMountOptions.MinReadAheadSize, usually 1 MiB; files smaller than this do not use the Reader prefetch window).
+// Same knobs: aheadReadEnable and minReadAheadSize（与 MountOptions / ExtentConfig 一致，见 NewSuper 回填）；PrefetchTotalMem 同源 AheadReadTotalMem。
 func (s *Super) BlobStoreAheadReadForReader() (enable bool, minReadAhead int, totalMem int64) {
 	return s.aheadReadEnable, int(s.minReadAheadSize), s.aheadReadTotalMem
 }
@@ -377,6 +377,14 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 	s.ec, err = stream.NewExtentClient(extentConfig)
 	if err != nil {
 		return nil, errors.Trace(err, "NewExtentClient failed!")
+	}
+	// 与 ExtentConfig 注入的预读开关一致，供 BlobStoreAheadReadForReader → buildECStreamOpenArgs / InodeGet 冷路径构造 Reader。
+	s.aheadReadEnable = opt.AheadReadEnable
+	s.aheadReadTotalMem = opt.AheadReadTotalMem
+	if opt.MinReadAheadSize > 0 {
+		s.minReadAheadSize = uint64(opt.MinReadAheadSize)
+	} else {
+		s.minReadAheadSize = uint64(proto.DefaultMinReadAheadSize)
 	}
 	s.oec = blobstore.NewObjExtentClient(blobstore.ObjExtentConfig{
 		LimitManager: s.ec.LimitManager,

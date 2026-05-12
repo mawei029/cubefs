@@ -112,6 +112,18 @@ func TestWriter_TruncateV2FromExtents_NilReturnsError(t *testing.T) {
 	assert.Contains(t, err.Error(), "nil")
 }
 
+func TestWriter_TruncateV2FromExtentsNilEbsc(t *testing.T) {
+	w := &Writer{mw: &meta.MetaWrapper{}, ino: 1, volName: "v", ebsc: nil}
+	_, _, err := w.TruncateV2FromExtents(context.Background(), 10, 100, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ebsc nil")
+}
+
+func TestWriter_CloseWithZeroInflight(t *testing.T) {
+	w := &Writer{}
+	w.Close(context.Background())
+}
+
 func TestWriter_doBufferWrite_(t *testing.T) {
 	// write data to buffer,not write to ebs when len(buffer)<BlockSize
 	ctx := context.Background()
@@ -569,8 +581,8 @@ func TestWriterSetFileSizeAndTruncateV2GrowNoShrink(t *testing.T) {
 }
 
 func TestWriterCoverageAdditionalBranches(t *testing.T) {
-	t.Run("flush overwrite selector", func(t *testing.T) {
-		w := &Writer{overwrite: true}
+	t.Run("flush empty buffer returns nil", func(t *testing.T) {
+		w := &Writer{}
 		require.NoError(t, w.Flush(1, context.Background()))
 	})
 
@@ -721,7 +733,6 @@ func TestWriterCoverageMoreLowFunctions(t *testing.T) {
 			fileOffset:    100,
 			dirty:         true,
 			buf:           make([]byte, blockSize),
-			overwrite:     true,
 			limitManager:  newTestLimitManager(),
 			ebsc:          &BlobStoreClient{},
 			mw:            &meta.MetaWrapper{},
