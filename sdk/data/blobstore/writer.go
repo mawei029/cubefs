@@ -25,7 +25,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cubefs/cubefs/client/blockcache/bcache"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/manager"
 	"github.com/cubefs/cubefs/sdk/meta"
@@ -67,49 +66,44 @@ type wSliceErr struct {
 }
 
 type Writer struct {
-	volType      int
 	volName      string
 	blockSize    int
 	ino          uint64
 	err          chan *wSliceErr
-	bc           *bcache.BcacheClient
 	mw           *meta.MetaWrapper
 	ebsc         *BlobStoreClient
 	wConcurrency int
 	wg           sync.WaitGroup
 	once         sync.Once
 	sync.RWMutex
-	enableBcache  bool
 	buf           []byte
 	fileOffset    int
-	fileCache     bool
 	fileSize      uint64
 	dirty         bool
 	blockPosition int
 	limitManager  *manager.LimitManager
-	ecStreamer    *ECStreamer
-	overwrite     bool // true: overwrite mode(flushExt); false: append mode(flush).
+	// 与所属 ECStreamer 绑定；须非 nil（见 NewWriter）。
+	ecStreamer *ECStreamer
 	// ebsWriteInflight：writeSlice 写 EBS 及后续元数据路径可能脱离外层 Writer 锁（如 doParallelWrite 子协程）；Close 须等该窗口结束，避免与 teardown 交错（对齐 Reader.ebsReadInflight）。
 	ebsWriteInflight int32
 }
 
 func NewWriter(config ClientConfig) (writer *Writer) {
+	if config.ECStreamer == nil {
+		panic("blobstore.NewWriter: ClientConfig.ECStreamer is required")
+	}
 	writer = new(Writer)
 
 	writer.volName = config.VolName
-	writer.volType = config.VolType
 	writer.blockSize = config.BlockSize
 	writer.ino = config.Ino
 	writer.err = nil
-	writer.bc = config.Bc
 	writer.mw = config.Mw
 	writer.ebsc = config.Ebsc
 	writer.wConcurrency = config.WConcurrency
 	writer.wg = sync.WaitGroup{}
 	writer.once = sync.Once{}
 	writer.RWMutex = sync.RWMutex{}
-	writer.enableBcache = config.EnableBcache
-	writer.fileCache = config.FileCache
 	writer.fileSize = config.FileSize
 	writer.dirty = false
 	writer.allocateCache()
@@ -132,8 +126,8 @@ func (writer *Writer) markECStreamerReadViewStale() {
 }
 
 func (writer *Writer) String() string {
-	return fmt.Sprintf("Writer{address(%v),volName(%v),volType(%v),ino(%v),blockSize(%v),fileSize(%v),enableBcache(%v),fileCache(%v)},wConcurrency(%v)",
-		&writer, writer.volName, writer.volType, writer.ino, writer.blockSize, writer.fileSize, writer.enableBcache, writer.fileCache, writer.wConcurrency)
+	return fmt.Sprintf("Writer{address(%v),volName(%v),ino(%v),blockSize(%v),fileSize(%v)},wConcurrency(%v)",
+		&writer, writer.volName, writer.ino, writer.blockSize, writer.fileSize, writer.wConcurrency)
 }
 
 func (writer *Writer) WriteWithoutPool(ctx context.Context, offset int, data []byte) (size int, err error) {
@@ -165,8 +159,8 @@ func (writer *Writer) Write(ctx context.Context, offset int, data []byte, flags 
 	if writer == nil {
 		return 0, fmt.Errorf("writer is not opened yet")
 	}
-	log.LogDebugf("TRACE blobStore Write Enter: ino(%v) offset(%v) len(%v) flags&proto.FlagsAppend(%v) fileSize(%v) overwrite(%t)",
-		writer.ino, offset, len(data), flags&proto.FlagsAppend, writer.CacheFileSize(), writer.overwrite)
+	log.LogDebugf("TRACE blobStore Write Enter: ino(%v) offset(%v) len(%v) flags&proto.FlagsAppend(%v) fileSize(%v) seqAppend(%t)",
+		writer.ino, offset, len(data), flags&proto.FlagsAppend, writer.CacheFileSize(), offset == writer.CacheFileSize())
 
 	// Case 1: Validate write request: data too large
 	if len(data) > MaxBufferSize {
@@ -177,8 +171,8 @@ func (writer *Writer) Write(ctx context.Context, offset int, data []byte, flags 
 
 	// Case 1.1: O_APPEND - kernel guarantees append-to-end, so offset must equal CacheFileSize.
 	if flags&proto.FlagsAppend != 0 && offset != writer.CacheFileSize() {
-		log.LogErrorf("filesize need reset. blobStore Write: ino(%v) offset(%v) len(%v) flags&proto.FlagsAppend(%v) fileSize(%v) overwrite(%t)",
-			writer.ino, offset, len(data), flags&proto.FlagsAppend, writer.CacheFileSize(), writer.overwrite)
+		log.LogErrorf("filesize need reset. blobStore Write: ino(%v) offset(%v) len(%v) flags&proto.FlagsAppend(%v) fileSize(%v) seqAppend(%t)",
+			writer.ino, offset, len(data), flags&proto.FlagsAppend, writer.CacheFileSize(), offset == writer.CacheFileSize())
 		return 0, syscall.EOPNOTSUPP
 	}
 

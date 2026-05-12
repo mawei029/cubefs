@@ -496,3 +496,44 @@ func TestFile_Fsync_BlobNilWriterWriteModeBadFd(t *testing.T) {
 	require.Error(t, err)
 	require.Equal(t, fuse.Errno(syscall.EBADF), err)
 }
+
+func TestFile_BuildECStreamOpenArgsPoolMissing(t *testing.T) {
+	s := newTestSuperForFile()
+	f := &File{super: s, ino: 10}
+	_, err := f.buildECStreamOpenArgs(&proto.InodeInfo{PoolId: 88, Generation: 1, StorageClass: proto.StorageClass_BlobStore}, syscall.O_RDONLY, 50)
+	require.Error(t, err)
+}
+
+func TestFile_BuildECStreamOpenArgsSuccess(t *testing.T) {
+	s := newTestSuperForFile()
+	s.ebsc = make(map[uint8]*blobstore.BlobStoreClient)
+	dummy := &blobstore.BlobStoreClient{}
+	s.ebsc[3] = dummy
+	s.volname = "vn"
+	s.volType = 1
+	f := &File{super: s, ino: 42}
+	args, err := f.buildECStreamOpenArgs(&proto.InodeInfo{PoolId: 3, Generation: 9, StorageClass: proto.StorageClass_BlobStore}, uint32(syscall.O_RDWR), 1000)
+	require.NoError(t, err)
+	require.Equal(t, uint64(42), args.Ino)
+	require.Equal(t, uint8(3), args.PoolId)
+	require.Equal(t, uint64(1000), args.FileSize)
+	require.Equal(t, uint64(9), args.InodeGeneration)
+	require.Equal(t, uint32(syscall.O_RDWR), args.OpenFlags)
+	require.Same(t, dummy, args.Ebsc)
+}
+
+func TestFile_OpenOECStreamPropagatesOpenStreamError(t *testing.T) {
+	s := newTestSuperForFile()
+	s.ebsc = make(map[uint8]*blobstore.BlobStoreClient)
+	s.ebsc[1] = &blobstore.BlobStoreClient{}
+	f := &File{super: s, ino: 7}
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "OpenStreamWithArgs",
+		func(_ *blobstore.ECExtentClient, _ blobstore.ECStreamOpenArgs) error {
+			return errors.New("open fail")
+		})
+	err := f.openOECStream(&proto.InodeInfo{PoolId: 1, Generation: 1}, syscall.O_RDONLY, 10)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "open fail")
+}

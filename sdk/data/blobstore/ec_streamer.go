@@ -23,7 +23,8 @@ var _ stream.ECStreamerAPI = (*ECStreamer)(nil)
 type ECStreamer struct {
 	ino    uint64
 	refCnt int32 // Open/NewFile 引用 +1，Release 最后一个句柄 -1 至 0 时 Close reader/writer 并 map.Delete
-	// 句柄无关的「合并逻辑长度」与 inode 版本视图：Open 时 mergeOpenSnapshot；写路径抬高 fileSize；RefreshExtents/InodeGet 对齐 inoVersion/fileSize。
+	// 句柄无关的「逻辑文件尾」与 inode 版本视图：Open 时 mergeOpenSnapshot；写/截断/Flush 路径更新；GetObjExtents 刷新后经 mergeMaxFileSize 仅抬高持久化尾（不降低）；
+	// 截断或 InodeGet 锚点变小由 syncEffectiveSize / SyncInodeView 压低。Reader.Read 在 oec 路径下只读此 fileSize，不再与 Reader 内 extent 推导做 max 双线。
 	fileSize   uint64
 	inoVersion uint64
 	// dirty：Reader 可见视图可能落后于 Writer/元数据（缓冲内有未落盘字节或 SetFileSize 等后置 1）；ensureReadViewCurrent 在 Flush+RefreshExtents 后，
@@ -36,7 +37,7 @@ type ECStreamer struct {
 	// extentMetaEpoch：Writer 每次将 ObjExtents 提交到 meta 后原子递增；Reader 用 extentEpochSeen 对比，在无 dirty 时仍能发现 oeks 过期并 Refresh。
 	extentMetaEpoch uint32
 
-	// mu：单锁串行化本 inode 的 fReader/fWriter、Open/Close 与 lazyInit/teardown、以及 Read/Write/Flush 与 ensureReadViewCurrent。
+	// mu：单锁串行化本 inode 的 fReader/fWriter、Open/Close 与 lazyInit/closeReaderWriterLocked、以及 Read/Write/Flush 与 ensureReadViewCurrent。
 	// 与副本 Streamer 由单 goroutine server 串行处理请求等价；网络 IO 在持锁下完成，换吞吐换正确性（LTP gf04/gf05）。
 	mu      sync.Mutex
 	fReader *Reader
@@ -115,6 +116,7 @@ func (s *ECStreamer) NewReader(cfg ClientConfig) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.fReader == nil {
+		cfg.ECStreamer = s
 		s.fReader = NewReader(cfg)
 	}
 }
@@ -123,6 +125,7 @@ func (s *ECStreamer) NewWriter(cfg ClientConfig) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.fWriter == nil {
+		cfg.ECStreamer = s
 		s.fWriter = NewWriter(cfg)
 	}
 }
@@ -238,18 +241,7 @@ func (s *ECStreamer) ensureReadViewCurrentLocked(ctx context.Context) error {
 			return err
 		}
 		s.mergeInodeGen(extGen)
-		if lb, ok := reader.LogicalReadBound(); ok {
-			for {
-				old := atomic.LoadUint64(&s.fileSize)
-				next := old
-				if lb > next {
-					next = lb
-				}
-				if atomic.CompareAndSwapUint64(&s.fileSize, old, next) {
-					break
-				}
-			}
-		}
+		// 持久化 logical 尾已在 Reader.RefreshExtents 内 bump 进 ECStreamer.fileSize；读侧仅以流上 fileSize 为真值。
 		if writer != nil && writer.HasDirtyBuffer() {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -276,6 +268,7 @@ func (s *ECStreamer) hasReaderForViewSync() bool {
 
 // lazyInitReaderWriter 由 OpenStreamWithArgs 在已持 s.mu 下调用。
 func (s *ECStreamer) lazyInitReaderWriter(cfg ClientConfig) {
+	cfg.ECStreamer = s
 	if s.fReader == nil {
 		s.fReader = NewReader(cfg)
 	}
@@ -299,10 +292,10 @@ func (s *ECStreamer) loadObjExtentsFromMetaLocked() {
 	s.mergeInodeGen(gen)
 }
 
-// teardownEndpointsLocked 在持 s.mu 下回收 Reader/Writer。
+// closeReaderWriterLocked 在已持 s.mu 下 Flush 并关闭 Blob Reader/Writer，清空 fReader/fWriter。
 // 与副本 Streamer 一致：最后一关 Close 后若从 ECExtentClient.streamers 删除本对象，下次 Open 走 NewECStreamer，
 // onceObjExtents 随新实例为零值，无需像「复用同一 heap 对象且仅换 Reader」那样手动清空 sync.Once。
-func (s *ECStreamer) teardownEndpointsLocked(ino uint64, ctx context.Context) error {
+func (s *ECStreamer) closeReaderWriterLocked(ino uint64, ctx context.Context) error {
 	w := s.fWriter
 	r := s.fReader
 	if w != nil {
@@ -339,6 +332,24 @@ func (s *ECStreamer) mergeInodeGen(inodeGen uint64) {
 			nextG = inodeGen
 		}
 		if atomic.CompareAndSwapUint64(&s.inoVersion, oldG, nextG) {
+			return
+		}
+	}
+}
+
+// mergeMaxFileSize 线程安全的 只增不减 的文件大小更新逻辑
+// 用 CAS 将 fileSize 与 lb 做 max 合并：仅当 lb 更大时抬高，永不在此路径降低（缩小由 SyncInodeView、syncEffectiveSize 等处理）。
+// lb 一般为 GetObjExtents 刷新后由 meta + ObjExtent 推导的持久化 logical 尾；与并发读安全。
+func (s *ECStreamer) mergeMaxFileSize(lb uint64) {
+	if s == nil {
+		return
+	}
+	for {
+		old := atomic.LoadUint64(&s.fileSize)
+		if lb <= old {
+			return
+		}
+		if atomic.CompareAndSwapUint64(&s.fileSize, old, lb) {
 			return
 		}
 	}

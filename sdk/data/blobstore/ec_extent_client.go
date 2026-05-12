@@ -139,7 +139,7 @@ func (c *ECExtentClient) OpenStream(ino uint64, openForWrite bool, isCache bool,
 
 // CloseStream 对齐副本 ExtentClient.CloseStream：不在本路径从 streamers 删表项（删表仅在 EvictStream 等 evict 流程）。
 // - rdonly：仅 refCnt--（与副本仅 refcnt--、不 IssueReleaseRequest 一致），资源留待 EvictStream 在 ref==0 时回收。
-// - 非 rdonly：对齐 IssueReleaseRequest → release()，refCnt--，ref==0 时 teardown Reader/Writer，仍保留 map 项直至 EvictStream。
+// - 非 rdonly：对齐 IssueReleaseRequest → release()，refCnt--，ref==0 时 closeReaderWriterLocked 回收端点，仍保留 map 项直至 EvictStream。
 func (c *ECExtentClient) CloseStream(ino uint64) error {
 	c.mu.Lock()
 	s, ok := c.streamers[ino]
@@ -174,7 +174,7 @@ func (c *ECExtentClient) CloseStream(ino uint64) error {
 		return nil
 	}
 
-	if err := s.teardownEndpointsLocked(ino, context.Background()); err != nil {
+	if err := s.closeReaderWriterLocked(ino, context.Background()); err != nil {
 		atomic.AddInt32(&s.refCnt, 1)
 		s.mu.Unlock()
 		log.LogErrorf("ECExtentClient CloseStream: flush writer failed, ino(%v) err(%v)", ino, err)
@@ -222,7 +222,7 @@ func (c *ECExtentClient) EvictStream(ino uint64) error {
 		return nil
 	}
 
-	if err := s.teardownEndpointsLocked(ino, context.Background()); err != nil {
+	if err := s.closeReaderWriterLocked(ino, context.Background()); err != nil {
 		s.mu.Unlock()
 		log.LogErrorf("ECExtentClient EvictStream: flush writer failed, ino(%v) err(%v)", ino, err)
 		return err

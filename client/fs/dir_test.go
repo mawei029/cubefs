@@ -277,3 +277,37 @@ func TestDirExtendInfoHelpers(t *testing.T) {
 	dir.deleteNegativeDcache("missing")
 	require.False(t, dir.negativeDcacheHit("missing"))
 }
+
+func TestDir_ForgetKeepsExtendInfoWhenOpenCountPositive(t *testing.T) {
+	s := newTestSuperForDir()
+	const ino uint64 = 77
+	ei := &DirExtendInfo{}
+	atomic.StoreInt64(&ei.openCnt, 1)
+	s.dirExtendInfoMap[ino] = ei
+	s.nodeCache[ino] = &Dir{super: s, ino: ino, parentIno: 1, name: "x"}
+
+	d := &Dir{super: s, ino: ino, parentIno: 1, name: "x"}
+	d.Forget()
+
+	_, still := s.dirExtendInfoMap[ino]
+	require.True(t, still, "Forget 在 openCnt>0 时应保留 DirExtendInfo，避免 Release 将计数打成负数")
+	_, inNode := s.nodeCache[ino]
+	require.False(t, inNode)
+}
+
+func TestDir_ForgetRemovesExtendInfoWhenOpenCountZero(t *testing.T) {
+	s := newTestSuperForDir()
+	const ino uint64 = 78
+	ei := &DirExtendInfo{}
+	atomic.StoreInt64(&ei.openCnt, 0)
+	s.dirExtendInfoMap[ino] = ei
+	s.nodeCache[ino] = &Dir{super: s, ino: ino, parentIno: 1, name: "y"}
+
+	d := &Dir{super: s, ino: ino, parentIno: 1, name: "y"}
+	d.Forget()
+
+	_, still := s.dirExtendInfoMap[ino]
+	require.False(t, still)
+	_, inNode := s.nodeCache[ino]
+	require.False(t, inNode)
+}
