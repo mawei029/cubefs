@@ -389,6 +389,9 @@ func (f *File) removeParentDcacheEntry() {
 	parent.deleteDcacheEntry(f.name)
 }
 
+// storageClass 返回 inode 存储类；icache 命中则只读本地，未命中则 getInfo→InodeGet。
+// 注意：InodeGet 在更新 nodeCache 相关路径时会申请 s.fslock。禁止在**当前 goroutine 已持有 s.fslock** 时调用本方法，
+// 否则与 InodeGet 内再次 Lock(fslock) 形成自死锁（历史上 scheduleFlush 曾踩坑）。
 func (f *File) storageClass() uint32 {
 	if info := f.super.ic.Get(f.ino); info != nil {
 		return info.StorageClass

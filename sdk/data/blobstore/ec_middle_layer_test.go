@@ -43,8 +43,9 @@ func TestObjExtentClient_EvictStreamRefBusy(t *testing.T) {
 	atomic.StoreInt32(&s.refCnt, 1)
 	c.streamers[22] = s
 
+	// rdonly 默认 1：与副本 EvictStream(rdonly) 一致，ref>0 时 return nil 且不删表
 	err := c.EvictStream(22)
-	require.ErrorIs(t, err, syscall.EAGAIN)
+	require.NoError(t, err)
 	require.NotNil(t, c.streamers[22])
 }
 
@@ -54,9 +55,53 @@ func TestObjExtentClient_CloseStreamEvictWhenRefZero(t *testing.T) {
 	atomic.StoreInt32(&s.refCnt, 1)
 	c.streamers[33] = s
 
-	got := c.CloseStream(33)
-	require.NoError(t, got)
+	require.NoError(t, c.CloseStream(33))
+	// CloseStream 不删表项；rdonly 路径也不 teardown
+	require.NotNil(t, c.streamers[33])
+	require.Equal(t, int32(0), atomic.LoadInt32(&c.streamers[33].refCnt))
+
+	require.NoError(t, c.EvictStream(33))
 	require.Nil(t, c.streamers[33])
+}
+
+func TestObjExtentClient_CloseStreamWritableTeardownNoDelete(t *testing.T) {
+	c := NewObjExtentClient(ObjExtentConfig{})
+	s := NewECStreamer(44, nil, nil)
+	atomic.StoreUint32(&s.rdonly, 0)
+	atomic.StoreInt32(&s.refCnt, 1)
+	c.streamers[44] = s
+
+	require.NoError(t, c.CloseStream(44))
+	require.NotNil(t, c.streamers[44])
+	require.Equal(t, int32(0), atomic.LoadInt32(&c.streamers[44].refCnt))
+
+	require.NoError(t, c.EvictStream(44))
+	require.Nil(t, c.streamers[44])
+}
+
+func TestObjExtentClient_EvictStreamWritableRefBusyReturnsNil(t *testing.T) {
+	c := NewObjExtentClient(ObjExtentConfig{})
+	s := NewECStreamer(55, nil, nil)
+	atomic.StoreUint32(&s.rdonly, 0)
+	atomic.StoreInt32(&s.refCnt, 1)
+	c.streamers[55] = s
+
+	// 与副本 EvictStream(rdonly) refcnt>0 一致：Warn 语义 + return nil，非 EAGAIN
+	require.NoError(t, c.EvictStream(55))
+	require.NotNil(t, c.streamers[55])
+}
+
+func TestObjExtentClient_CloseStreamMissingIsNoop(t *testing.T) {
+	c := NewObjExtentClient(ObjExtentConfig{})
+	require.NoError(t, c.CloseStream(999))
+}
+
+func TestObjExtentClient_CloseEvictsAllStreams(t *testing.T) {
+	c := NewObjExtentClient(ObjExtentConfig{})
+	c.streamers[1] = NewECStreamer(1, nil, nil)
+	c.streamers[2] = NewECStreamer(2, nil, nil)
+	require.NoError(t, c.Close())
+	require.Empty(t, c.streamers)
 }
 
 func TestECStreamer_BadfdOnMissingReaderWriter(t *testing.T) {

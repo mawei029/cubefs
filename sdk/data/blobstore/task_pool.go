@@ -23,7 +23,15 @@ type task struct {
 	fn func(op *rwSlice)
 }
 
+// New starts worker goroutines that drain mq. worker is clamped to at least 1; with 0 workers,
+// parallel slice work would never run and callers would deadlock on wg.Wait (e.g. blob Reader readEbsRange).
 func New(worker int, size int) Instance {
+	if worker < 1 {
+		worker = 1
+	}
+	if size < 0 {
+		size = 0
+	}
 	mq := make(chan task, size)
 	for i := 0; i < worker; i++ {
 		go func() {
@@ -55,6 +63,9 @@ type Executor struct {
 }
 
 func NewExecutor(maxConcurrency int) *Executor {
+	if maxConcurrency < 1 {
+		maxConcurrency = 1
+	}
 	exec := &Executor{
 		tokens: make(chan int, maxConcurrency),
 	}

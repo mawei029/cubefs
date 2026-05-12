@@ -80,13 +80,16 @@ type Reader struct {
 	ebs             *BlobStoreClient
 	readConcurrency int
 	sync.Mutex
-	close         bool
-	objExtentKeys []proto.ObjExtentKey
-	enableBcache  bool
-	fileCache     bool
-	valid         bool
-	inflightCache sync.Map
-	limitManager  *manager.LimitManager
+	close bool
+	// ebsReadInflight：readEbsRange 并行读 EBS 时会临时 Unlock；Close 须等该窗口结束再置 close，避免与并发 Read/AIO 交错。
+	// 不设「超时后仍关」：否则可能在读未完成时关 Reader，引发 EIO / 数据错乱（LTP growfiles）。
+	ebsReadInflight int32
+	objExtentKeys   []proto.ObjExtentKey
+	enableBcache    bool
+	fileCache       bool
+	valid           bool
+	inflightCache   sync.Map
+	limitManager    *manager.LimitManager
 
 	// metaReportedSize comes from MetaWrapper.GetObjExtents Size.
 	metaReportedSize uint64
@@ -231,10 +234,15 @@ func (reader *Reader) ensurePrefetchBuf() bool {
 	return true
 }
 
-func (reader *Reader) Read(ctx context.Context, buf []byte, offset int, size int) (int, error) {
+func (reader *Reader) Read(ctx context.Context, buf []byte, offset int, size int) (n int, err error) {
 	beg := time.Now()
 	defer func() {
-		readerMetric.WithLabelValues("BlobstorRead").Observe(float64(time.Since(beg).Microseconds()))
+		d := time.Since(beg)
+		readerMetric.WithLabelValues("BlobstorRead").Observe(float64(d.Microseconds()))
+		if d >= slowOpInfoThreshold {
+			log.LogInfof("blobstore slow Reader.Read ino(%v) off(%v) dur(%v) retN(%v) err(%v)",
+				reader.ino, offset, d, n, err)
+		}
 	}()
 
 	if reader == nil {
@@ -370,8 +378,12 @@ func (reader *Reader) readEbsRange(ctx context.Context, offset int, size uint32)
 		return make([]byte, 0), nil
 	}
 
+	atomic.AddInt32(&reader.ebsReadInflight, 1)
 	reader.Unlock()
-	defer reader.Lock()
+	defer func() {
+		reader.Lock()
+		atomic.AddInt32(&reader.ebsReadInflight, -1)
+	}()
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, sliceSize)
@@ -405,7 +417,14 @@ func (reader *Reader) invalidateReadBuf() {
 }
 
 func (reader *Reader) Close(ctx context.Context) {
+	const waitStep = 2 * time.Millisecond
 	reader.Lock()
+	// 循环内会 Unlock：不得再套 defer Unlock，避免二次解锁。
+	for atomic.LoadInt32(&reader.ebsReadInflight) > 0 {
+		reader.Unlock()
+		time.Sleep(waitStep)
+		reader.Lock()
+	}
 	reader.close = true
 	if reader.prefetchReserved > 0 {
 		reader.prefetchLimiter.release(reader.prefetchReserved)
@@ -556,7 +575,12 @@ func (reader *Reader) readSliceRange(ctx context.Context, rs *rwSlice, errCh cha
 		reader.limitManager.ReadAlloc(ctx, int(rs.rSize))
 	}
 
+	t0 := time.Now()
 	_, err = reader.ebs.Read(ctx, reader.volName, buf, rs.rOffset, uint64(rs.rSize), rs.objExtentKey)
+	if d := time.Since(t0); d >= slowOpInfoThreshold {
+		log.LogInfof("blobstore slow ebs.Read ino(%v) fileOff(%v) rOff(%v) rSize(%v) dur(%v) err(%v)",
+			reader.ino, rs.fileOffset, rs.rOffset, rs.rSize, d, err)
+	}
 	if err != nil {
 		errCh <- err
 		return
@@ -631,12 +655,16 @@ func (reader *Reader) ensureExtentsLoaded() error {
 }
 
 // EnsureAlignedForRead 比对 InodeGet 的 Generation/Size 与流上 inoVersion/fileSize 及 Reader cache；不一致时 RefreshExtents。
+// skipDirtyFlush 为真表示调用方已在 ECStreamer.readAfterFlush 中执行过 ensureReadViewCurrentLocked，此处不再二次刷 dirty（且调用方已持 s.mu）。
 func (reader *Reader) EnsureAlignedForRead(inodeGen, inodeSize uint64) error {
+	return reader.ensureAlignedForRead(inodeGen, inodeSize, false)
+}
+
+func (reader *Reader) ensureAlignedForRead(inodeGen, inodeSize uint64, skipDirtyFlush bool) error {
 	reader.Lock()
 	es := reader.ecStreamer
 	stale := !reader.valid
 	if !stale {
-		// dirty 时仅 Refresh 看不到写缓冲中的数据；先走 ensureReadViewCurrent（与 ECStreamer.Read 首部一致）。
 		stale = atomic.LoadUint32(&es.dirty) != 0 ||
 			atomic.LoadUint64(&es.inoVersion) < inodeGen ||
 			atomic.LoadUint64(&es.fileSize) < inodeSize
@@ -645,8 +673,8 @@ func (reader *Reader) EnsureAlignedForRead(inodeGen, inodeSize uint64) error {
 	if !stale {
 		return nil
 	}
-	if atomic.LoadUint32(&es.dirty) != 0 && es.hasReaderForViewSync() {
-		if err := es.ensureReadViewCurrent(context.Background()); err != nil {
+	if !skipDirtyFlush && atomic.LoadUint32(&es.dirty) != 0 && es.hasReaderForViewSync() {
+		if err := es.ensureReadViewCurrentExternal(context.Background()); err != nil {
 			return err
 		}
 	}
@@ -683,7 +711,11 @@ func (reader *Reader) SyncInodeView(inodeGen, inodeSize uint64) {
 }
 
 func (reader *Reader) refreshEbsExtents() error {
+	t0 := time.Now()
 	gen, sz, eks, oeks, err := reader.mw.GetObjExtents(reader.ino)
+	if d := time.Since(t0); d >= slowOpInfoThreshold {
+		log.LogInfof("blobstore slow GetObjExtents(refreshEbsExtents) ino(%v) dur(%v) err(%v)", reader.ino, d, err)
+	}
 	if err != nil {
 		reader.valid = false
 		log.LogErrorf("TRACE blobStore refreshEbsExtents error. ino(%v)  err(%v) ", reader.ino, err)
@@ -751,7 +783,11 @@ func (reader *Reader) LogicalReadBound() (uint64, bool) {
 // Do not call GetObjExtents while holding lock to avoid blocking other Reads.
 // 返回值 gen 来自 GetObjExtents，供 ECStreamer 与 inode 代际对齐。
 func (reader *Reader) RefreshExtents() (gen uint64, err error) {
+	t0 := time.Now()
 	gen, sz, eks, oeks, err := reader.mw.GetObjExtents(reader.ino)
+	if d := time.Since(t0); d >= slowOpInfoThreshold {
+		log.LogInfof("blobstore slow GetObjExtents(RefreshExtents) ino(%v) dur(%v) err(%v)", reader.ino, d, err)
+	}
 	if err != nil {
 		reader.Lock()
 		reader.valid = false

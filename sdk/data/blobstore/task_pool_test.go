@@ -68,6 +68,20 @@ func TestNew(t *testing.T) {
 	pool.Close()
 }
 
+func TestNewClampsZeroWorkers(t *testing.T) {
+	pool := New(0, 2)
+	defer pool.Close()
+	done := make(chan struct{}, 1)
+	pool.Execute(&rwSlice{}, func(op *rwSlice) {
+		done <- struct{}{}
+	})
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("New(0, n) must still run tasks (worker clamped to 1)")
+	}
+}
+
 func TestTaskPoolInstanceExecuteAndClose(t *testing.T) {
 	pool := New(1, 2)
 	defer pool.Close()

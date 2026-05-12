@@ -23,6 +23,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/cubefs/cubefs/client/blockcache/bcache"
 	"github.com/cubefs/cubefs/proto"
@@ -37,6 +38,8 @@ import (
 
 const (
 	MaxBufferSize = 512 * util.MB
+	// slowOpInfoThreshold 仅当单次操作超过该时长时打一条 LogInfof（LTP/rwtest 排障，正常路径无输出）。
+	slowOpInfoThreshold = 10 * time.Second
 )
 
 var errPutNoKeys = errors.New("ebs put returned no extent keys")
@@ -86,6 +89,8 @@ type Writer struct {
 	limitManager  *manager.LimitManager
 	ecStreamer    *ECStreamer
 	overwrite     bool // true: overwrite mode(flushExt); false: append mode(flush).
+	// ebsWriteInflight：writeSlice 写 EBS 及后续元数据路径可能脱离外层 Writer 锁（如 doParallelWrite 子协程）；Close 须等该窗口结束，避免与 teardown 交错（对齐 Reader.ebsReadInflight）。
+	ebsWriteInflight int32
 }
 
 func NewWriter(config ClientConfig) (writer *Writer) {
@@ -224,6 +229,9 @@ func (writer *Writer) tryOverWrite(ctx context.Context, offset int, data []byte,
 		}
 		writer.fileOffset = offset
 	}
+	if buf.CachePool != nil && writer.buf == nil {
+		writer.allocateCache()
+	}
 	writer.reshapeBufForCopyPath()
 
 	remainSize, position := len(data), 0
@@ -233,11 +241,20 @@ func (writer *Writer) tryOverWrite(ctx context.Context, offset int, data []byte,
 	// Process data in chunks until all data is written to buffer
 	for remainSize > 0 {
 		freeSize := writer.blockSize - writer.blockPosition
+		if freeSize <= 0 {
+			log.LogErrorf("tryOverWrite: invalid freeSize ino(%v) blockPosition(%v) blockSize(%v) bufLen(%v)",
+				writer.ino, writer.blockPosition, writer.blockSize, len(writer.buf))
+			return 0, syscall.EINVAL
+		}
 		if remainSize < freeSize {
 			freeSize = remainSize
 		}
 
 		// Copy data and update position: advance in both input data and buffer
+		if writer.buf == nil || len(writer.buf) < writer.blockPosition+freeSize {
+			log.LogErrorf("tryOverWrite: buf too short ino(%v) bufLen(%v) needEnd(%v)", writer.ino, len(writer.buf), writer.blockPosition+freeSize)
+			return 0, syscall.EINVAL
+		}
 		copy(writer.buf[writer.blockPosition:], data[position:position+freeSize])
 		position += freeSize             // Move forward in input data
 		writer.blockPosition += freeSize // Move forward in buffer
@@ -520,13 +537,25 @@ func (writer *Writer) doBufferWrite(ctx context.Context, data []byte, offset int
 	log.LogDebugf("TRACE blobStore doBufferWrite: ino(%v) writer.buf.len(%v) writer.blocksize(%v)", writer.ino, len(writer.buf), writer.blockSize)
 	writer.Lock()
 	defer writer.Unlock()
+	if buf.CachePool != nil && writer.buf == nil {
+		writer.allocateCache()
+	}
 	writer.reshapeBufForCopyPath()
 	for dataSize > 0 {
 		freeSize := writer.blockSize - writer.blockPosition
+		if freeSize <= 0 {
+			log.LogErrorf("doBufferWrite: invalid freeSize ino(%v) blockPosition(%v) blockSize(%v) bufLen(%v)",
+				writer.ino, writer.blockPosition, writer.blockSize, len(writer.buf))
+			return 0, syscall.EINVAL
+		}
 		if dataSize < freeSize {
 			freeSize = dataSize
 		}
 		log.LogDebugf("TRACE blobStore doBufferWrite: ino(%v) writer.fileSize(%v) writer.fileOffset(%v) writer.blockPosition(%v) position(%v) freeSize(%v)", writer.ino, writer.fileSize, writer.fileOffset, writer.blockPosition, position, freeSize)
+		if writer.buf == nil || len(writer.buf) < writer.blockPosition+freeSize {
+			log.LogErrorf("doBufferWrite: buf too short ino(%v) bufLen(%v) needEnd(%v)", writer.ino, len(writer.buf), writer.blockPosition+freeSize)
+			return 0, syscall.EINVAL
+		}
 		copy(writer.buf[writer.blockPosition:], data[position:position+freeSize])
 		log.LogDebugf("TRACE blobStore doBufferWrite:ino(%v) writer.buf.len(%v)", writer.ino, len(writer.buf))
 		position += freeSize
@@ -569,7 +598,13 @@ func (writer *Writer) Flush(ino uint64, ctx context.Context) (err error) {
 		return
 	}
 	writer.Lock()
-	defer writer.Unlock()
+	t0 := time.Now()
+	defer func() {
+		if d := time.Since(t0); d >= slowOpInfoThreshold {
+			log.LogInfof("blobstore slow Writer.Flush ino(%v) dur(%v) err(%v)", ino, d, err)
+		}
+		writer.Unlock()
+	}()
 	if len(writer.buf) == 0 || !writer.dirty {
 		return nil
 	}
@@ -632,11 +667,18 @@ func (writer *Writer) writeSlice(ctx context.Context, wSlice *rwSlice, wg bool) 
 			}
 		}()
 	}
+	atomic.AddInt32(&writer.ebsWriteInflight, 1)
+	defer atomic.AddInt32(&writer.ebsWriteInflight, -1)
 	if writer.limitManager != nil {
 		writer.limitManager.WriteAlloc(ctx, int(wSlice.size))
 	}
 	log.LogDebugf("TRACE blobStore,writeSlice to ebs. ino(%v) fileOffset(%v) len(%v)", writer.ino, wSlice.fileOffset, wSlice.size)
+	t0 := time.Now()
 	location, err := writer.ebsc.Write(ctx, writer.volName, wSlice.Data, wSlice.size)
+	if d := time.Since(t0); d >= slowOpInfoThreshold {
+		log.LogInfof("blobstore slow ebsc.Write ino(%v) fileOff(%v) size(%v) dur(%v) err(%v)",
+			writer.ino, wSlice.fileOffset, wSlice.size, d, err)
+	}
 	if err != nil {
 		if wg {
 			writer.err <- &wSliceErr{err: err, fileOffset: wSlice.fileOffset, size: wSlice.size}
@@ -680,12 +722,18 @@ func (writer *Writer) resetBufferWithoutPool() {
 
 // reshapeBufForCopyPath doBufferWrite/tryOverWrite 依赖 len(buf)==blockSize 的池化块；flushWithoutPool 等
 // 仅 [:0] 保留 cap 时，在进入 copy 前恢复长度，避免 copy 写 0 字节却推进 blockPosition。
+// 从 len==0 扩回整块时逻辑上为空，必须清零 blockPosition；否则 stale blockPosition 会使 freeSize 为负或
+// copy 不写数据却累加 position，最终在 data[position:position+freeSize] 处 panic（LTP append 多 fd）。
 func (writer *Writer) reshapeBufForCopyPath() {
 	if writer == nil || writer.blockSize <= 0 {
 		return
 	}
+	if writer.blockPosition > writer.blockSize {
+		writer.blockPosition = 0
+	}
 	if len(writer.buf) == 0 && cap(writer.buf) >= writer.blockSize {
 		writer.buf = writer.buf[:writer.blockSize]
+		writer.blockPosition = 0
 	}
 }
 
@@ -1061,6 +1109,23 @@ func (writer *Writer) FreeCache() {
 			buf.CachePool.Put(tmpBuf)
 		}
 	})
+}
+
+// Close 等待进行中的 writeSlice（EBS/元数据）结束；ECExtentClient.teardownStreamer 在 nil 掉 fWriter 前调用。
+// 循环内会 Unlock：不得再套 defer Unlock，避免二次解锁（与 Reader.Close 一致）。
+func (writer *Writer) Close(ctx context.Context) {
+	_ = ctx
+	if writer == nil {
+		return
+	}
+	const waitStep = 2 * time.Millisecond
+	writer.Lock()
+	for atomic.LoadInt32(&writer.ebsWriteInflight) > 0 {
+		writer.Unlock()
+		time.Sleep(waitStep)
+		writer.Lock()
+	}
+	writer.Unlock()
 }
 
 func (writer *Writer) allocateCache() {
