@@ -27,7 +27,7 @@ type ObjExtentConfig struct {
 //   - InodeGeneration：当前 InodeGet 返回的 info.Generation；与流上 inoVersion 做 max 合并，用于 Reader 与元数据视图对齐（非「权威代际」，写入后仍以 RefreshExtents/InodeGet 抬高为准）。
 type ECStreamOpenArgs struct {
 	Ino             uint64
-	OpenFlags       uint32 // 保留：与 FUSE 打开模式一致；Reader/Writer 现由 OpenStreamWithArgs 内一并创建，本字段不参与端点选择。
+	OpenFlags       uint32 // 与 FUSE 打开模式一致；用于 noteOpenAccessMode 维护 rdonly（对齐副本 if !s.rdonly||s.dirty）。
 	PoolId          uint8
 	FileSize        uint64
 	InodeGeneration uint64
@@ -101,13 +101,16 @@ func (c *ECExtentClient) OpenStreamWithArgs(args ECStreamOpenArgs) error {
 		c.streamers[args.Ino] = s
 		log.LogDebugf("ECExtentClient OpenStreamWithArgs: new ECStreamer ino(%v)", args.Ino)
 	}
-	atomic.AddInt32(&s.refCnt, 1)
+	s.mu.Lock()
 	c.mu.Unlock()
 
-	// merge / NewReader+NewWriter 移出 c.mu：避免多文件 Open 或与其它 inode 的 Read/Write 争用同一把全局锁导致 LTP 长时间卡顿。
+	atomic.AddInt32(&s.refCnt, 1)
 	s.mergeOpenSnapshot(args.FileSize, args.InodeGeneration)
+	s.noteOpenAccessMode(args.OpenFlags)
 	cfg := args.toClientConfig(c, s)
 	s.lazyInitReaderWriter(cfg)
+	s.mu.Unlock()
+
 	log.LogDebugf("ECExtentClient OpenStreamWithArgs: ino(%v) ref(%v)", args.Ino, atomic.LoadInt32(&s.refCnt))
 	return nil
 }
@@ -134,58 +137,103 @@ func (c *ECExtentClient) OpenStream(ino uint64, openForWrite bool, isCache bool,
 	return syscall.ENOTSUP
 }
 
-// CloseStream：refCnt--，为 0 时回收 Reader/Writer 并删表项。
+// CloseStream 对齐副本 ExtentClient.CloseStream：不在本路径从 streamers 删表项（删表仅在 EvictStream 等 evict 流程）。
+// - rdonly：仅 refCnt--（与副本仅 refcnt--、不 IssueReleaseRequest 一致），资源留待 EvictStream 在 ref==0 时回收。
+// - 非 rdonly：对齐 IssueReleaseRequest → release()，refCnt--，ref==0 时 teardown Reader/Writer，仍保留 map 项直至 EvictStream。
 func (c *ECExtentClient) CloseStream(ino uint64) error {
 	c.mu.Lock()
-	s := c.streamers[ino]
-	if s == nil {
+	s, ok := c.streamers[ino]
+	if !ok {
 		c.mu.Unlock()
-		log.LogWarnf("ECExtentClient CloseStream: streamer not found, ino(%v)", ino)
 		return nil
 	}
+	if log.EnableDebug() {
+		log.LogDebugf("CloseStream: stream(%s)", s.String())
+	}
+	s.mu.Lock()
+	c.mu.Unlock()
+
+	if atomic.LoadUint32(&s.rdonly) != 0 {
+		atomic.AddInt32(&s.refCnt, -1)
+		s.mu.Unlock()
+		return nil
+	}
+
 	n := atomic.AddInt32(&s.refCnt, -1)
 	if n > 0 {
-		c.mu.Unlock()
-		log.LogDebugf("ECExtentClient CloseStream: ref not zero, ino(%v) ref(%v)", ino, n)
+		s.mu.Unlock()
+		if log.EnableDebug() {
+			log.LogDebugf("ECExtentClient CloseStream: ref not zero, ino(%v) ref(%v)", ino, n)
+		}
 		return nil
 	}
 	if n < 0 {
 		log.LogWarnf("ECExtentClient CloseStream: negative ref detected, ino(%v) ref(%v), reset to 0", ino, n)
 		atomic.StoreInt32(&s.refCnt, 0)
-		c.mu.Unlock()
+		s.mu.Unlock()
 		return nil
 	}
-	c.mu.Unlock()
 
-	if err := c.teardownStreamer(ino, s); err != nil {
-		// Flush 失败 → 不能把这次 Close 当成成功扣完引用 → refCnt 回滚，避免在「未刷盘」时进入 refCnt==0 的回收语义。
+	if err := s.teardownEndpointsLocked(ino, context.Background()); err != nil {
 		atomic.AddInt32(&s.refCnt, 1)
+		s.mu.Unlock()
 		log.LogErrorf("ECExtentClient CloseStream: flush writer failed, ino(%v) err(%v)", ino, err)
 		return err
 	}
-	log.LogDebugf("ECExtentClient CloseStream: ino(%v) evicted", ino)
+	s.mu.Unlock()
 	return nil
 }
 
-// EvictStream 与副本 ExtentClient.EvictStream 语义对齐：无活跃引用时回收 Reader/Writer 并删表项。
+// Close 在进程/挂载退出等场景下清理本客户端注册的全部 ECStreamer，对齐副本 ExtentClient.Close 中
+// 「在 streamerLock 下拷贝 inode 列表，再逐个 EvictStream」的核心行为。
+// 不包含副本侧的 stopCh、WaitGroup、dataWrapper.Stop、RemoteCache.Stop；上层仍须按既有顺序关闭 MetaWrapper 等。
+func (c *ECExtentClient) Close() error {
+	var inodes []uint64
+	c.mu.Lock()
+	inodes = make([]uint64, 0, len(c.streamers))
+	for inode := range c.streamers {
+		inodes = append(inodes, inode)
+	}
+	c.mu.Unlock()
+	for _, inode := range inodes {
+		_ = c.EvictStream(inode)
+	}
+	return nil
+}
+
+// EvictStream 对齐副本 ExtentClient.EvictStream：仅在本路径在 refCnt==0 时回收端点并 delete。
+// 与副本 rdonly 分支 extent_client.go 638-643 一致：refCnt>0 时 LogWarnf("evict: streamer...") 并 return nil（不删表项），
+// 不因可写/只读分支返回 EAGAIN——Forget 等调用方与副本 ec.EvictStream 一样按「本次未驱逐」处理即可。
 func (c *ECExtentClient) EvictStream(ino uint64) error {
 	c.mu.Lock()
-	s := c.streamers[ino]
-	if s == nil {
+	s, ok := c.streamers[ino]
+	if !ok {
 		c.mu.Unlock()
 		return nil
 	}
-	if atomic.LoadInt32(&s.refCnt) > 0 {
-		c.mu.Unlock()
-		log.LogWarnf("ECExtentClient EvictStream: streamer still referenced, ino(%v) ref(%v)", ino, atomic.LoadInt32(&s.refCnt))
-		return syscall.EAGAIN
-	}
+	log.LogDebugf("EvictStream: stream(%v)", s.String())
+
+	s.mu.Lock()
 	c.mu.Unlock()
 
-	if err := c.teardownStreamer(ino, s); err != nil {
+	if atomic.LoadInt32(&s.refCnt) > 0 {
+		s.mu.Unlock()
+		log.LogWarnf("evict: streamer(%v) refcnt(%v)", s.String(), atomic.LoadInt32(&s.refCnt))
+		return nil
+	}
+
+	if err := s.teardownEndpointsLocked(ino, context.Background()); err != nil {
+		s.mu.Unlock()
 		log.LogErrorf("ECExtentClient EvictStream: flush writer failed, ino(%v) err(%v)", ino, err)
 		return err
 	}
+	s.mu.Unlock()
+
+	c.mu.Lock()
+	if cur := c.streamers[ino]; cur == s {
+		delete(c.streamers, ino)
+	}
+	c.mu.Unlock()
 	return nil
 }
 
@@ -254,8 +302,7 @@ func (c *ECExtentClient) Read(ino uint64, data []byte, offset int, size int, poo
 	return s.Read(context.Background(), data, offset, size, poolId, isMigration)
 }
 
-// ReadWithInodeView 在 Read 前按 InodeGet 的 generation/size 做 Reader 与流视图对齐（EnsureAlignedForRead），再经 ECStreamer.Read（dirty 时内部 Flush+Refresh）。
-// 供 Blob/EC FUSE 读路径使用，避免调用方每次读前单独 Flush 或重复对齐。
+// ReadWithInodeView：对齐副本 ExtentClient.Read——once 拉 ObjExtents、按可写/脏做视图同步，再 readAfterFlush 内单次 reader.Read。
 func (c *ECExtentClient) ReadWithInodeView(ctx context.Context, ino uint64, data []byte, offset int, size int, poolId uint8, isMigration bool, inodeGen, inodeSize uint64) (int, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -267,15 +314,7 @@ func (c *ECExtentClient) ReadWithInodeView(ctx context.Context, ino uint64, data
 		log.LogErrorf("ECExtentClient ReadWithInodeView: stream not opened, ino(%v) offset(%v) size(%v)", ino, offset, size)
 		return 0, syscall.EBADF
 	}
-	r := s.Reader()
-	if r == nil {
-		log.LogErrorf("ECExtentClient ReadWithInodeView: reader nil, ino(%v)", ino)
-		return 0, syscall.EBADF
-	}
-	if err := r.EnsureAlignedForRead(inodeGen, inodeSize); err != nil {
-		return 0, err
-	}
-	return s.Read(ctx, data, offset, size, poolId, isMigration)
+	return s.readAfterFlush(ctx, data, offset, size, poolId, isMigration, true, inodeGen, inodeSize)
 }
 
 // Write 与副本 ExtentClient.Write 参数顺序及含义对齐；waitForFlush 为真时 ECStreamer.WriteWithOpts 在成功后 ensureReadViewCurrent（Flush+Refresh）。
@@ -319,38 +358,26 @@ func (c *ECExtentClient) Flush(ino uint64) error {
 }
 
 // Truncate 与副本 ExtentClient.Truncate 对齐：要求 oec 上该 ino 已 Open 且存在 Writer（与 doECTruncateV2 先 ensureBlobStoreWriter 一致）。
-// 调用链：Truncate -> ECStreamer.truncateV2 -> Writer.Flush / mw.GetObjExtents / Writer.TruncateV2 -> mw.TruncateV2。
+// 调用链：Truncate -> ECStreamer.truncateV2Locked -> Writer.Flush / mw.GetObjExtents / Writer.TruncateV2 -> mw.TruncateV2。
 func (c *ECExtentClient) Truncate(mw *meta.MetaWrapper, parentIno uint64, ino uint64, size int, fullPath string) error {
 	_ = parentIno
 	if mw == nil {
 		return syscall.EINVAL
 	}
-	s := c.GetStreamer(ino)
+	c.mu.RLock()
+	s := c.streamers[ino]
+	c.mu.RUnlock()
 	if s == nil {
 		log.LogErrorf("ECExtentClient Truncate: stream not opened, ino(%v)", ino)
 		return syscall.EBADF
 	}
 	targetSize := uint64(size)
-	return s.truncateV2(context.Background(), mw, ino, targetSize, fullPath)
-}
-
-// teardownStreamer 在未持 c.mu 下：Flush Writer、FreeCache、Close Reader；再持 c.mu，若表项仍为 s 且 refCnt==0 则 Cleanup 并删表。
-// CloseStream（最后一次关）与 EvictStream 共用。
-func (c *ECExtentClient) teardownStreamer(ino uint64, s *ECStreamer) error {
-	if w := s.Writer(); w != nil {
-		if err := w.Flush(ino, context.Background()); err != nil {
-			return err
-		}
-		w.FreeCache()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	w := s.fWriter
+	if w == nil {
+		log.LogErrorf("ECExtentClient Truncate: writer nil, ino(%v)", ino)
+		return syscall.EBADF
 	}
-	if r := s.Reader(); r != nil {
-		r.Close(context.Background())
-	}
-	c.mu.Lock()
-	if cur := c.streamers[ino]; cur == s && atomic.LoadInt32(&s.refCnt) == 0 {
-		s.Cleanup()
-		delete(c.streamers, ino)
-	}
-	c.mu.Unlock()
-	return nil
+	return s.truncateV2Locked(context.Background(), mw, ino, targetSize, fullPath, w)
 }

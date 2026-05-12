@@ -541,8 +541,11 @@ func (s *Super) scheduleFlush() {
 				writer := ei.coldBlobWriter
 				idle := atomic.LoadInt32(&ei.idle)
 				ei.RUnlock()
-				if writer == nil && proto.IsStorageClassBlobStore(file.storageClass()) {
-					writer = s.oec.Writer(ino)
+				if writer == nil {
+					// 禁止持 fslock 调用 file.storageClass()：其 miss 路径会 getInfo→InodeGet→再次抢 fslock，自死锁后全挂载点 FUSE 卡在 InodeGet（与 pprof 一致）。
+					if info := s.ic.Get(ino); info != nil && proto.IsStorageClassBlobStore(info.StorageClass) {
+						writer = s.oec.Writer(ino)
+					}
 				}
 				if idle >= BlobWriterIdleTimeoutPeriod {
 					if writer != nil {
@@ -1053,6 +1056,7 @@ func getDelInodes(src []uint64, act []*proto.InodeInfo) []uint64 {
 
 func (s *Super) Close() {
 	close(s.closeC)
+	_ = s.oec.Close()
 	s.mw.Close()
 }
 
