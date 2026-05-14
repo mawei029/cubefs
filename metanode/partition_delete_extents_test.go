@@ -108,6 +108,35 @@ func TestRunObjExtentDelTreeGCOnce_Dequeue(t *testing.T) {
 	require.Equal(t, 0, mp.objExtentDelTree.Len(), "dequeue should remove item after successful delete")
 }
 
+// TestRunObjExtentDelTreeGCOnce_DequeueMultiOek verifies one btree item carrying multiple ObjExtentKeys is flattened for EBS delete.
+func TestRunObjExtentDelTreeGCOnce_DequeueMultiOek(t *testing.T) {
+	rootDir, err := os.MkdirTemp("", "obj_extent_del_tree_gc_multi")
+	require.NoError(t, err)
+	defer os.RemoveAll(rootDir)
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mp := newTestMetaPartition(rootDir, ctrl)
+	mp.blobClientWrapper = &BlobStoreClientWrapper{blobClient: &blobstore.BlobStoreClient{}}
+
+	oek1 := createTestObjExtentKey(0, 1024, 1)
+	oek2 := createTestObjExtentKey(1024, 512, 2)
+	mp.objExtentDelTree.EnqueueFromApply(42, 1700000000, 7, []proto.ObjExtentKey{oek1, oek2})
+	require.Equal(t, 1, mp.objExtentDelTree.Len())
+
+	patches := gomonkey.NewPatches()
+	patches.ApplyMethod(reflect.TypeOf(&blobstore.BlobStoreClient{}), "Delete",
+		func(_ *blobstore.BlobStoreClient, oeks []proto.ObjExtentKey) error {
+			require.Len(t, oeks, 2)
+			return nil
+		})
+	defer patches.Reset()
+
+	mp.runObjExtentDelTreeGCOnce()
+	require.Equal(t, 0, mp.objExtentDelTree.Len(), "dequeue should remove item after successful delete")
+}
+
 // TestRunObjExtentDelTreeGCOnce_PunishRequeue on EBS failure submits punish op; FSM re-inserts with later TsMs.
 func TestRunObjExtentDelTreeGCOnce_PunishRequeue(t *testing.T) {
 	rootDir, err := os.MkdirTemp("", "obj_extent_del_tree_punish")

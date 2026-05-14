@@ -959,7 +959,8 @@ func TestFsmExtentsTruncateV2(t *testing.T) {
 	require.Len(t, items, 1)
 	require.Equal(t, int64(mp.fsmRaftApplyIndex), items[0].TsMs)
 	require.Equal(t, mp.fsmRaftApplyIndex<<20, items[0].Uniq)
-	require.True(t, items[0].Oek.IsEquals(&toDeletes[0]))
+	require.Len(t, items[0].Oeks, 1)
+	require.True(t, items[0].Oeks[0].IsEquals(&toDeletes[0]))
 }
 
 func TestFsmExtentsTruncateV2_Errors(t *testing.T) {
