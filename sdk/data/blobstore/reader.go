@@ -92,7 +92,7 @@ type Reader struct {
 	metaReportedSize uint64
 
 	// blockSize + readBuf: when aheadRead is enabled and file size is larger than minReadAheadSize in EC/BlobStore reads,
-	// merge multiple small FUSE reads (for example max_read=128KiB) into at most one EBS fetch of blockSize (EbsBlockSize), and cache result in readBuf.
+	// merge multiple small FUSE reads (for example max_read=128KiB) into at most one EBS fetch of up to prefetchBufCap() (2×blockSize, e.g. 2×8MiB), cached in readBuf.
 	// Semantics are similar to replica-stream AheadReadWindow, but implementation is Reader-side buffering instead of stream module logic.
 	blockSize        int
 	aheadReadEnable  bool
@@ -207,20 +207,29 @@ func NewReader(config ClientConfig) (reader *Reader) {
 	reader.minReadAheadSize = uint64(mra)
 	reader.prefetchLimiter = getBlobReadPrefetchLimiter(config.PrefetchTotalMem)
 	reader.ecStreamer = config.ECStreamer
-	// readBuf is allocated lazily on first prefetch Read to avoid holding EbsBlockSize per open file
+	// readBuf is allocated lazily on first prefetch Read to avoid holding 2×EbsBlockSize per open file
 	// when the file turns out tiny or ahead-read is off after fileSize check.
 	return
 }
 
-// ensurePrefetchBuf ensures readBuf capacity is at least blockSize and reserves global prefetch budget; on budget shortage it returns false and Read falls back to per-call readEbsRange.
-func (reader *Reader) ensurePrefetchBuf() bool {
+// prefetchBufCap is readBuf capacity and the max single prefetch fetch size (two EBS logical blocks).
+func (reader *Reader) prefetchBufCap() int {
 	if reader.blockSize <= 0 {
+		return 0
+	}
+	return reader.blockSize * 2
+}
+
+// ensurePrefetchBuf ensures readBuf capacity is at least prefetchBufCap (2×blockSize) and reserves global prefetch budget; on budget shortage it returns false and Read falls back to per-call readEbsRange.
+func (reader *Reader) ensurePrefetchBuf() bool {
+	capW := reader.prefetchBufCap()
+	if capW <= 0 {
 		return false
 	}
-	if reader.readBuf != nil && len(reader.readBuf) >= reader.blockSize {
+	if reader.readBuf != nil && len(reader.readBuf) >= capW {
 		return true
 	}
-	need := int64(reader.blockSize) - reader.prefetchReserved
+	need := int64(capW) - reader.prefetchReserved
 	if need > 0 && !reader.prefetchLimiter.tryAcquire(need) {
 		log.LogDebugf("TRACE reader prefetch budget exhausted. ino(%v) need(%v)", reader.ino, need)
 		return false
@@ -228,7 +237,7 @@ func (reader *Reader) ensurePrefetchBuf() bool {
 	if need > 0 {
 		reader.prefetchReserved += need
 	}
-	reader.readBuf = make([]byte, reader.blockSize)
+	reader.readBuf = make([]byte, capW)
 	return true
 }
 
@@ -306,12 +315,15 @@ func (reader *Reader) Read(ctx context.Context, buf []byte, offset int, size int
 		return normalReadFunc()
 	}
 
-	// case 4: aggregate small reads with prefetch window: one readEbsRange fetches at most [offset, offset+fetch), fetch<=blockSize; repeated FUSE reads in same window copy from readBuf without extra EBS calls.
+	// case 4: aggregate small reads with prefetch window: one readEbsRange fetches at most [offset, offset+fetch), fetch<=prefetchBufCap; repeated FUSE reads in same window copy from readBuf without extra EBS calls.
 	ebsFetchSize := 0
 	if reader.bufValidLen == 0 || offset < reader.bufBaseOff || offset >= reader.bufBaseOff+reader.bufValidLen {
-		// Buffer is empty or request falls outside current window -> invalidate old window and fetch a new block from the new offset.
+		// rem: bytes from offset to logical file end (meta / ObjExtent tail / stream fileSize). fetch is capped by prefetchBufCap and rem,
+		// so a 1MiB tail yields a 1MiB window; a 20MiB tail yields at most prefetchBufCap (e.g. 16MiB when blockSize is 8MiB).
+		// readEbsRange/prepareEbsSlice materialize [offset, offset+fetch): ObjExtent ranges go through EBS Read; holes are zero-filled.
+		// On success the merged buffer length equals fetch (the requested logical span); if offset is already at EOF, fetch<=0 above.
 		reader.invalidateReadBuf()
-		fetch := reader.blockSize
+		fetch := reader.prefetchBufCap()
 		rem := int(fileSize - uint64(offset))
 		if fetch > rem {
 			fetch = rem
