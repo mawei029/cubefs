@@ -528,9 +528,13 @@ func (mp *metaPartition) runObjExtentDelTreeGCOnce() {
 	if len(items) == 0 {
 		return
 	}
-	oeks := make([]proto.ObjExtentKey, 0, len(items))
+	nKeys := 0
 	for _, it := range items {
-		oeks = append(oeks, it.Oek)
+		nKeys += len(it.Oeks)
+	}
+	oeks := make([]proto.ObjExtentKey, 0, nKeys)
+	for _, it := range items {
+		oeks = append(oeks, it.Oeks...)
 	}
 	if err := mp.deleteObjExtents(oeks); err != nil {
 		log.LogWarnf("[runObjExtentDelTreeGCOnce] mp(%v) delete ebs failed cnt(%v): %v", mp.config.PartitionId, len(oeks), err)
