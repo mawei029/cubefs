@@ -34,10 +34,10 @@ import (
 // -----------------------------------------------------------------------------
 
 const (
-	ltpSimEnvChild         = "CUBEFS_LTP_SIM_CHILD"
-	ltpSimEnvMe            = "CUBEFS_LTP_SIM_ME"
-	ltpSimEnvSeed          = "CUBEFS_LTP_SIM_SEED"
-	ltpSimEnvIter          = "CUBEFS_LTP_SIM_ITERATIONS"
+	ltpSimEnvChild          = "CUBEFS_LTP_SIM_CHILD"
+	ltpSimEnvMe             = "CUBEFS_LTP_SIM_ME"
+	ltpSimEnvSeed           = "CUBEFS_LTP_SIM_SEED"
+	ltpSimEnvIter           = "CUBEFS_LTP_SIM_ITERATIONS"
 	ltpSimEnvRelaxReadGuard = "CUBEFS_LTP_SIM_RELAX_READ_GUARD" // 设为 1 时关闭 Read inodeView 上界校验（仅排障）
 )
 
@@ -58,8 +58,8 @@ func ltpReadViewGuardEnabled() bool {
 }
 
 type ltpFtest01VM struct {
-	mu sync.Mutex
-	buf  []byte
+	mu  sync.Mutex
+	buf []byte
 	// meta 视图：与 Attr / Read 注入一致
 	metaSize uint64
 	metaGen  uint64
@@ -135,7 +135,7 @@ func ltpInstallFtest01Patches(t *testing.T, patches *gomonkey.Patches, s *Super,
 		defer vm.mu.Unlock()
 		return &proto.InodeInfo{
 			Inode: f.ino, PoolId: 1, StorageClass: proto.StorageClass_BlobStore,
-			Size: vm.metaSize, Generation: vm.metaGen, Mode: proto.Mode(0644),
+			Size: vm.metaSize, Generation: vm.metaGen, Mode: proto.Mode(0o644),
 		}, nil
 	})
 
@@ -223,7 +223,8 @@ func ltpFtest01ClearBitsFromTrunc(bits []byte, truncChunk, nchunks int) {
 
 // ltpFtest01Domisc 对齐 ftest01.c domisc：fsync → trunc → sync → fstat 轮转。
 func ltpFtest01Domisc(t *testing.T, f *File, miscType *int, fileMax *int64, lastTrunc *int64,
-	bits []byte, nchunks, csize int, rng *rand.Rand, truncCount *int) {
+	bits []byte, nchunks, csize int, rng *rand.Rand, truncCount *int,
+) {
 	t.Helper()
 	switch *miscType {
 	case 0: // m_fsync
@@ -417,7 +418,7 @@ func TestFile_LtpSim_blob_attr_raises_size_when_stream_matches_inode_gen(t *test
 	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet", func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
 		return &proto.InodeInfo{
 			Inode: f.ino, PoolId: 1, StorageClass: proto.StorageClass_BlobStore,
-			Size: inodeSize, Generation: gen, Mode: proto.Mode(0644),
+			Size: inodeSize, Generation: gen, Mode: proto.Mode(0o644),
 		}, nil
 	})
 	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "FileSize",
@@ -446,7 +447,7 @@ func TestFile_LtpSim_blob_attr_ignores_stale_stream_when_inode_gen_newer(t *test
 	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet", func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
 		return &proto.InodeInfo{
 			Inode: f.ino, PoolId: 1, StorageClass: proto.StorageClass_BlobStore,
-			Size: inodeSize, Generation: inodeGen, Mode: proto.Mode(0644),
+			Size: inodeSize, Generation: inodeGen, Mode: proto.Mode(0o644),
 		}, nil
 	})
 	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "FileSize",
@@ -477,7 +478,7 @@ func TestFile_LtpSim_blob_read_does_not_extend_past_inode_when_stream_gen_stale(
 	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet", func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
 		return &proto.InodeInfo{
 			Inode: f.ino, PoolId: 1, StorageClass: proto.StorageClass_BlobStore,
-			Size: inodeSize, Generation: inodeGen, Mode: proto.Mode(0644),
+			Size: inodeSize, Generation: inodeGen, Mode: proto.Mode(0o644),
 		}, nil
 	})
 	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "FileSize",
@@ -516,7 +517,7 @@ func TestFile_LtpSim_blob_read_extends_read_size_when_stream_gen_matches_inode(t
 	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet", func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
 		return &proto.InodeInfo{
 			Inode: f.ino, PoolId: 1, StorageClass: proto.StorageClass_BlobStore,
-			Size: inodeSize, Generation: gen, Mode: proto.Mode(0644),
+			Size: inodeSize, Generation: gen, Mode: proto.Mode(0o644),
 		}, nil
 	})
 	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "FileSize",
@@ -549,7 +550,7 @@ func TestFile_LtpSim_blob_fstat_after_write_sequence(t *testing.T) {
 	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet", func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
 		return &proto.InodeInfo{
 			Inode: f.ino, PoolId: 1, StorageClass: proto.StorageClass_BlobStore,
-			Size: inodeSize, Generation: gen, Mode: proto.Mode(0644),
+			Size: inodeSize, Generation: gen, Mode: proto.Mode(0o644),
 		}, nil
 	})
 	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "Write",
