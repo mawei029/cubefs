@@ -232,6 +232,8 @@ func (d *Dir) Release(ctx context.Context, req *fuse.ReleaseRequest) (err error)
 // Create handles the create request.
 func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
 	start := time.Now()
+	d.super.BeginDirMutation(d.info.Inode)
+	defer d.super.EndDirMutation(d.info.Inode)
 
 	bgTime := stat.BeginStat()
 	var err error
@@ -328,6 +330,8 @@ func (d *Dir) Forget() {
 // Mkdir handles the mkdir request.
 func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
 	start := time.Now()
+	d.super.BeginDirMutation(d.info.Inode)
+	defer d.super.EndDirMutation(d.info.Inode)
 
 	bgTime := stat.BeginStat()
 	var err error
@@ -369,7 +373,9 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 // Remove handles the remove request.
 func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	start := time.Now()
-	d.super.SetDirtyDir(d.ino, 0)
+	d.super.BeginDirMutation(d.ino)
+	defer d.super.EndDirMutation(d.ino)
+
 	d.deleteDcacheEntry(req.Name)
 	dcacheKey := d.buildDcacheKey(d.ino, req.Name)
 	d.super.dc.Delete(dcacheKey)
@@ -402,6 +408,7 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	if info != nil {
 		deletedInode = info.Inode
 	}
+
 	d.super.ic.Delete(d.ino)
 
 	if info != nil && info.Nlink == 0 && !proto.IsDir(info.Mode) {
@@ -528,8 +535,9 @@ func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.Lo
 				d.super.fslock.Lock()
 				delete(d.super.nodeCache, ino)
 				d.super.fslock.Unlock()
-				d.super.SetDirtyDir(d.ino, ino)
+				d.super.BeginDirMutation(d.ino)
 				d.super.ic.Delete(ino)
+				d.super.EndDirMutation(d.ino)
 				_, err = d.super.InodeGet(ino)
 				if err == nil {
 					continue
@@ -561,6 +569,14 @@ func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.Lo
 				d.super.readDirPool.Run(func() {
 					log.LogDebugf("trigger ReadDirAll for ino(%v) name(%v)", d.ino, d.getCwd())
 					auditlog.LogClientOp("TriggerReadDirAllParent", d.getCwd(), "", err, time.Since(*bgTime).Microseconds(), ino, 0)
+
+					if d.super.readDirAllCacheBegin(d.info.Inode) {
+						log.LogDebugf("readDirAllCacheBegin skip for ino(%v) name(%v)", d.info.Inode, d.getCwd())
+						return
+					}
+
+					defer d.super.ReleaseDirDirty(d.info.Inode)
+
 					d.ReadDirAll(context.Background())
 					d.storeLastDoing(0)
 				})
@@ -757,9 +773,6 @@ func (d *Dir) ReadDir(ctx context.Context, req *fuse.ReadRequest, resp *fuse.Rea
 
 // ReadDirAll gets all the dentries in a directory and puts them into the cache.
 func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
-	d.super.AddDirtyDir(d.ino)
-	defer d.super.RemoveDirtyDir(d.ino)
-
 	start := time.Now()
 	bgTime := stat.BeginStat()
 	var err error
@@ -802,11 +815,6 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 		dcache = NewDentryCache(d.super.metaCacheAcceleration)
 	}
 
-	var dcachev2 bool
-	if d.needDentrycache() {
-		dcachev2 = true
-	}
-
 	for _, child := range children {
 		dentry := fuse.Dirent{
 			Inode: child.Inode,
@@ -816,15 +824,7 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 
 		inodes = append(inodes, child.Inode)
 		dirents = append(dirents, dentry)
-		if dcachev2 {
-			info := &proto.DentryInfo{
-				Name:  d.buildDcacheKey(d.ino, child.Name),
-				Inode: child.Inode,
-			}
-			d.super.dc.Put(info)
-		} else {
-			dcache.Put(child.Name, child.Inode)
-		}
+		dcache.Put(child.Name, child.Inode)
 	}
 
 	var infos []*proto.InodeInfo
@@ -875,9 +875,11 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 		}
 	}
 
-	d.super.SetDirtyDir(d.ino, srcInode)
-	d.super.SetDirtyDir(dstDir.ino, dstInode)
-	d.deleteDcacheEntry(req.OldName)
+	d.super.BeginDirMutation(d.ino)
+	defer d.super.EndDirMutation(d.ino)
+	d.super.BeginDirMutation(dstDir.ino)
+	defer d.super.EndDirMutation(dstDir.ino)
+
 	dcacheKey := d.buildDcacheKey(d.ino, req.OldName)
 	d.super.dc.Delete(dcacheKey)
 
@@ -935,6 +937,8 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 
 // Setattr handles the setattr request.
 func (d *Dir) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
+	d.super.BeginDirMutation(d.info.Inode)
+	defer d.super.EndDirMutation(d.info.Inode)
 	var err error
 	bgTime := stat.BeginStat()
 	runningStat := d.super.runningMonitor.AddClientOp("setattr", req.Hdr().Pid)
@@ -973,6 +977,8 @@ func (d *Dir) Mknod(ctx context.Context, req *fuse.MknodRequest) (fs.Node, error
 	}
 
 	start := time.Now()
+	d.super.BeginDirMutation(d.info.Inode)
+	defer d.super.EndDirMutation(d.info.Inode)
 
 	bgTime := stat.BeginStat()
 	var err error
@@ -1009,6 +1015,8 @@ func (d *Dir) Mknod(ctx context.Context, req *fuse.MknodRequest) (fs.Node, error
 func (d *Dir) Symlink(ctx context.Context, req *fuse.SymlinkRequest) (fs.Node, error) {
 	parentIno := d.ino
 	start := time.Now()
+	d.super.BeginDirMutation(parentIno)
+	defer d.super.EndDirMutation(parentIno)
 
 	bgTime := stat.BeginStat()
 	var err error
@@ -1061,6 +1069,8 @@ func (d *Dir) Link(ctx context.Context, req *fuse.LinkRequest, old fs.Node) (fs.
 	}
 
 	start := time.Now()
+	d.super.BeginDirMutation(d.info.Inode)
+	defer d.super.EndDirMutation(d.info.Inode)
 
 	bgTime := stat.BeginStat()
 	var err error
