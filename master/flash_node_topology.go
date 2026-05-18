@@ -144,6 +144,7 @@ func (c *Cluster) loadFlashTopos() (err error) {
 			topo.FlashReadFlowLimit = ftv.FlashReadFlowLimit
 			topo.FlashWriteFlowLimit = ftv.FlashWriteFlowLimit
 			topo.FlashKeyFlowLimit = ftv.FlashKeyFlowLimit
+			topo.FlashNodeConnectionLimit = ftv.FlashNodeConnectionLimit
 			topo.FillHeartbeatConfigDefaults(c.defaultFlashNodeHeartbeatConfig())
 			topo.SyncFlashGroupFunc = c.syncUpdateFlashGroup
 			c.flashNodeTopo.Store(ftv.Name, topo)
@@ -189,6 +190,7 @@ func (c *Cluster) defaultFlashNodeHeartbeatConfig() flashgroupmanager.FlashNodeH
 		FlashReadFlowLimit:           c.cfg.flashReadFlowLimit,
 		FlashWriteFlowLimit:          c.cfg.flashWriteFlowLimit,
 		FlashKeyFlowLimit:            c.cfg.flashKeyFlowLimit,
+		FlashNodeConnectionLimit:     c.cfg.flashNodeConnectionLimit,
 	}
 }
 

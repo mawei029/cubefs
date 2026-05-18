@@ -584,7 +584,7 @@ func TestFlashGroupManagerSetConfigSyncsDisablePercentToTopos(t *testing.T) {
 func TestParseRequestToUpdateFlashTopo(t *testing.T) {
 	args, err := parseRequestToUpdateFlashTopo(httptest.NewRequest(http.MethodGet,
 		"/?name=topo-a&flashNodeHandleReadTimeout=11&flashNodeReadDataNodeTimeout=12&flashHotKeyMissCount=13"+
-			"&flashReadFlowLimit=14&flashWriteFlowLimit=15&flashKeyFlowLimit=16", nil))
+			"&flashReadFlowLimit=14&flashWriteFlowLimit=15&flashKeyFlowLimit=16&flashNodeConnectionLimit=17", nil))
 	require.NoError(t, err)
 	require.Equal(t, "topo-a", args.Name)
 	require.Equal(t, 11, *args.FlashNodeHandleReadTimeout)
@@ -593,6 +593,7 @@ func TestParseRequestToUpdateFlashTopo(t *testing.T) {
 	require.Equal(t, int64(14), *args.FlashReadFlowLimit)
 	require.Equal(t, int64(15), *args.FlashWriteFlowLimit)
 	require.Equal(t, int64(16), *args.FlashKeyFlowLimit)
+	require.Equal(t, int64(17), *args.FlashNodeConnectionLimit)
 
 	args, err = parseRequestToUpdateFlashTopo(httptest.NewRequest(http.MethodGet, "/?flashKeyFlowLimit=1", nil))
 	require.NoError(t, err)
@@ -603,12 +604,14 @@ func TestParseRequestToUpdateFlashTopo(t *testing.T) {
 	require.Error(t, err)
 	_, err = parseRequestToUpdateFlashTopo(httptest.NewRequest(http.MethodGet, "/?flashReadFlowLimit=bad", nil))
 	require.Error(t, err)
+	_, err = parseRequestToUpdateFlashTopo(httptest.NewRequest(http.MethodGet, "/?flashNodeConnectionLimit=bad", nil))
+	require.Error(t, err)
 }
 
 func TestFlashGroupManagerUpdateFlashTopoErrorsBeforeSync(t *testing.T) {
 	manager := newAPIServiceTestManager(t)
 
-	reply := runAPIServiceRequest(t, manager.updateFlashTopo, "name=topo-a&flashNodeHandleReadTimeout=11&flashNodeReadDataNodeTimeout=12&flashHotKeyMissCount=13&flashReadFlowLimit=14&flashWriteFlowLimit=15&flashKeyFlowLimit=16")
+	reply := runAPIServiceRequest(t, manager.updateFlashTopo, "name=topo-a&flashNodeHandleReadTimeout=11&flashNodeReadDataNodeTimeout=12&flashHotKeyMissCount=13&flashReadFlowLimit=14&flashWriteFlowLimit=15&flashKeyFlowLimit=16&flashNodeConnectionLimit=17")
 	view := decodeAPIServiceReplyData[proto.FlashTopologyAdminView](t, reply)
 	require.Equal(t, "topo-a", view.Name)
 	require.Equal(t, 11, view.FlashNodeHandleReadTimeout)
@@ -617,6 +620,7 @@ func TestFlashGroupManagerUpdateFlashTopoErrorsBeforeSync(t *testing.T) {
 	require.Equal(t, int64(14), view.FlashReadFlowLimit)
 	require.Equal(t, int64(15), view.FlashWriteFlowLimit)
 	require.Equal(t, int64(16), view.FlashKeyFlowLimit)
+	require.Equal(t, int64(17), view.FlashNodeConnectionLimit)
 
 	reply = runAPIServiceRequest(t, manager.updateFlashTopo, "name=topo-a")
 	require.NotEqualValues(t, proto.ErrCodeSuccess, reply.Code)

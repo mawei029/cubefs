@@ -2486,6 +2486,7 @@ type flashTopoUpdateArgs struct {
 	FlashReadFlowLimit           *int64
 	FlashWriteFlowLimit          *int64
 	FlashKeyFlowLimit            *int64
+	FlashNodeConnectionLimit     *int64
 }
 
 func parseRequestToUpdateFlashTopo(r *http.Request) (args *flashTopoUpdateArgs, err error) {
@@ -2542,6 +2543,14 @@ func parseRequestToUpdateFlashTopo(r *http.Request) (args *flashTopoUpdateArgs, 
 			return nil, unmatchedKey(flashKeyFlowLimit)
 		}
 		args.FlashKeyFlowLimit = &val
+		hasValue = true
+	}
+	if value := r.FormValue(flashNodeConnectionLimit); value != "" {
+		val, parseErr := strconv.ParseInt(value, 10, 64)
+		if parseErr != nil || val <= 0 {
+			return nil, unmatchedKey(flashNodeConnectionLimit)
+		}
+		args.FlashNodeConnectionLimit = &val
 		hasValue = true
 	}
 	if !hasValue {

@@ -61,6 +61,7 @@ func formatFlashTopoViews(ftvs []*proto.FlashTopologyAdminView) string {
 		sb.WriteString(fmt.Sprintf("    ReadFlowLimit       : %d\n", ftv.FlashReadFlowLimit))
 		sb.WriteString(fmt.Sprintf("    WriteFlowLimit      : %d\n", ftv.FlashWriteFlowLimit))
 		sb.WriteString(fmt.Sprintf("    KeyFlowLimit        : %d\n", ftv.FlashKeyFlowLimit))
+		sb.WriteString(fmt.Sprintf("    ConnectionLimit     : %d\n", ftv.FlashNodeConnectionLimit))
 	}
 	return sb.String()
 }
@@ -75,6 +76,7 @@ func newCmdFlashTopoUpdate(client *master.MasterClient) *cobra.Command {
 		flashReadFlowLimit           int64
 		flashWriteFlowLimit          int64
 		flashKeyFlowLimit            int64
+		flashNodeConnectionLimit     int64
 	)
 	cmd := &cobra.Command{
 		Use:   "update",
@@ -97,6 +99,7 @@ func newCmdFlashTopoUpdate(client *master.MasterClient) *cobra.Command {
 			appendFlashTopoInt64Change(&confirmString, "FlashReadFlowLimit", topo.FlashReadFlowLimit, flashReadFlowLimit, &isChange)
 			appendFlashTopoInt64Change(&confirmString, "FlashWriteFlowLimit", topo.FlashWriteFlowLimit, flashWriteFlowLimit, &isChange)
 			appendFlashTopoInt64Change(&confirmString, "FlashKeyFlowLimit", topo.FlashKeyFlowLimit, flashKeyFlowLimit, &isChange)
+			appendFlashTopoInt64Change(&confirmString, "FlashNodeConnectionLimit", topo.FlashNodeConnectionLimit, flashNodeConnectionLimit, &isChange)
 			if !isChange {
 				stdout("No changes has been set.\n")
 				return
@@ -111,7 +114,7 @@ func newCmdFlashTopoUpdate(client *master.MasterClient) *cobra.Command {
 				}
 			}
 			_, err = client.AdminAPI().UpdateFlashTopo(name, flashNodeHandleReadTimeout,
-				flashNodeReadDataNodeTimeout, flashHotKeyMissCount, flashReadFlowLimit, flashWriteFlowLimit, flashKeyFlowLimit)
+				flashNodeReadDataNodeTimeout, flashHotKeyMissCount, flashReadFlowLimit, flashWriteFlowLimit, flashKeyFlowLimit, flashNodeConnectionLimit)
 			if err != nil {
 				return
 			}
@@ -127,6 +130,7 @@ func newCmdFlashTopoUpdate(client *master.MasterClient) *cobra.Command {
 	cmd.Flags().Int64Var(&flashReadFlowLimit, "flashReadFlowLimit", -1, "flash read flow limit")
 	cmd.Flags().Int64Var(&flashWriteFlowLimit, "flashWriteFlowLimit", -1, "flash write flow limit")
 	cmd.Flags().Int64Var(&flashKeyFlowLimit, "flashKeyFlowLimit", -1, "flash key flow limit")
+	cmd.Flags().Int64Var(&flashNodeConnectionLimit, "flashNodeConnectionLimit", -1, "flash node active connection limit")
 	return cmd
 }
 

@@ -937,6 +937,7 @@ type FlashNodeHeartBeatInfos struct {
 	FlashReadFlowLimit           int64
 	FlashWriteFlowLimit          int64
 	FlashKeyFlowLimit            int64
+	FlashNodeConnectionLimit     int64
 	TopoName                     string
 	FlashNodeSlots               []uint32
 	FlashNodeID                  uint64
@@ -2011,6 +2012,7 @@ func IsFlashNodeLimitError(err error) bool {
 	if strings.Compare(err.Error(), util.LimitedRunError.Error()) == 0 ||
 		strings.Compare(err.Error(), util.LimitedFlowError.Error()) == 0 ||
 		strings.Compare(err.Error(), util.LimitedIoError.Error()) == 0 ||
+		strings.Compare(err.Error(), ErrFlashNodeConnectionLimited.Error()) == 0 ||
 		strings.Compare(err.Error(), "context deadline exceeded") == 0 ||
 		strings.Compare(err.Error(), "require data is caching") == 0 {
 		return true

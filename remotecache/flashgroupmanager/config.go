@@ -26,6 +26,7 @@ const (
 	defaultFlashReadFlowLimit           = 2147483648
 	defaultFlashWriteFlowLimit          = 2147483648
 	defaultFlashKeyFlowLimit            = 0
+	defaultFlashNodeConnectionLimit     = 100000
 	defaultRemoteClientFlowLimit        = 0
 )
 
@@ -43,6 +44,7 @@ const (
 	cfgFlashReadFlowLimit           = "flashReadFlowLimit"
 	cfgFlashWriteFlowLimit          = "flashWriteFlowLimit"
 	cfgFlashKeyFlowLimit            = "flashKeyFlowLimit"
+	cfgFlashNodeConnectionLimit     = "flashNodeConnectionLimit"
 	cfgRemoteClientFlowLimit        = "remoteClientFlowLimit"
 )
 
@@ -74,6 +76,7 @@ func newClusterConfig() (cfg *clusterConfig) {
 	cfg.FlashReadFlowLimit = defaultFlashReadFlowLimit
 	cfg.FlashWriteFlowLimit = defaultFlashWriteFlowLimit
 	cfg.FlashKeyFlowLimit = defaultFlashKeyFlowLimit
+	cfg.FlashNodeConnectionLimit = defaultFlashNodeConnectionLimit
 	cfg.RemoteClientFlowLimit = defaultRemoteClientFlowLimit
 
 	return

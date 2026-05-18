@@ -454,6 +454,8 @@ type FlashNodeViewInfo struct {
 type FlashNodeStat struct {
 	WaitForCacheBlock bool
 	NodeLimit         uint64
+	ConnectionLimit   int64
+	ActiveConnections int64
 	VolLimit          map[string]uint64
 	CacheStatus       []*CacheStatus
 }
@@ -508,6 +510,7 @@ type RemoteCacheConfig struct {
 	FlashReadFlowLimit           int64
 	FlashWriteFlowLimit          int64
 	FlashKeyFlowLimit            int64
+	FlashNodeConnectionLimit     int64
 	RemoteClientFlowLimit        int64
 	WriteChunkSize               int64
 }
@@ -846,6 +849,7 @@ type FlashTopologyAdminView struct {
 	FlashReadFlowLimit           int64
 	FlashWriteFlowLimit          int64
 	FlashKeyFlowLimit            int64
+	FlashNodeConnectionLimit     int64
 }
 
 func (m *PreheatAsyncReq) String() string {

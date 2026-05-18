@@ -128,6 +128,7 @@ var (
 	ErrNoMpMigratePlan                         = errors.New("no meta partition migrate plan")
 	ErrFlashNodeFlowLimited                    = errors.New("flow limited")
 	ErrFlashNodeRunLimited                     = errors.New("run limited")
+	ErrFlashNodeConnectionLimited              = errors.New("connection limited")
 	ErrNoRenewMpStoreModeTask                  = errors.New("no renew meta partition store mode task")
 	ErrNoCheckSumPlan                          = errors.New("no check sum plan")
 	ErrNoPromoteLearnerPlan                    = errors.New("no promote learner plan")

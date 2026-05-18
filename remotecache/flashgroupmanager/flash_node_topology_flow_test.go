@@ -82,6 +82,7 @@ func TestFlashNodeTopology_CreateFlashNodeHeartBeatTasksUsesTopoConfig(t *testin
 		FlashReadFlowLimit:           401,
 		FlashWriteFlowLimit:          501,
 		FlashKeyFlowLimit:            0,
+		FlashNodeConnectionLimit:     601,
 	})
 	topoA.PutZoneIfAbsent(NewFlashNodeZone("zone-a"))
 	nodeA := NewFlashNode("127.0.0.1:10001", "zone-a", "c1", "v1", "topo-a", proto.DefaultRegion, true)
@@ -95,6 +96,7 @@ func TestFlashNodeTopology_CreateFlashNodeHeartBeatTasksUsesTopoConfig(t *testin
 		FlashReadFlowLimit:           402,
 		FlashWriteFlowLimit:          502,
 		FlashKeyFlowLimit:            1,
+		FlashNodeConnectionLimit:     602,
 	})
 	topoB.PutZoneIfAbsent(NewFlashNodeZone("zone-b"))
 	nodeB := NewFlashNode("127.0.0.1:10002", "zone-b", "c1", "v1", "topo-b", proto.DefaultRegion, true)
@@ -113,10 +115,12 @@ func TestFlashNodeTopology_CreateFlashNodeHeartBeatTasksUsesTopoConfig(t *testin
 	require.Equal(t, 101, reqA.FlashNodeHandleReadTimeout)
 	require.Equal(t, int64(401), reqA.FlashReadFlowLimit)
 	require.Equal(t, int64(0), reqA.FlashKeyFlowLimit)
+	require.Equal(t, int64(601), reqA.FlashNodeConnectionLimit)
 	require.Equal(t, "topo-a", reqA.TopoName)
 
 	require.Equal(t, 102, reqB.FlashNodeHandleReadTimeout)
 	require.Equal(t, int64(402), reqB.FlashReadFlowLimit)
 	require.Equal(t, int64(1), reqB.FlashKeyFlowLimit)
+	require.Equal(t, int64(602), reqB.FlashNodeConnectionLimit)
 	require.Equal(t, "topo-b", reqB.TopoName)
 }

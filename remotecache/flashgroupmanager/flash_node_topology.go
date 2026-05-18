@@ -87,6 +87,7 @@ type FlashNodeTopologyValue struct {
 	FlashReadFlowLimit           *int64
 	FlashWriteFlowLimit          *int64
 	FlashKeyFlowLimit            *int64
+	FlashNodeConnectionLimit     *int64
 	RemoteCacheReadFlowMap       map[string]int64
 	RemoteCacheWriteFlowMap      map[string]int64
 }
@@ -98,6 +99,7 @@ type FlashNodeHeartbeatConfig struct {
 	FlashReadFlowLimit           int64
 	FlashWriteFlowLimit          int64
 	FlashKeyFlowLimit            int64
+	FlashNodeConnectionLimit     int64
 }
 
 type FlashNodeTopology struct {
@@ -160,6 +162,7 @@ func (t *FlashNodeTopology) SetHeartbeatConfig(cfg FlashNodeHeartbeatConfig) {
 	t.FlashReadFlowLimit = int64Ptr(cfg.FlashReadFlowLimit)
 	t.FlashWriteFlowLimit = int64Ptr(cfg.FlashWriteFlowLimit)
 	t.FlashKeyFlowLimit = int64Ptr(cfg.FlashKeyFlowLimit)
+	t.FlashNodeConnectionLimit = int64Ptr(cfg.FlashNodeConnectionLimit)
 }
 
 func (t *FlashNodeTopology) FillHeartbeatConfigDefaults(cfg FlashNodeHeartbeatConfig) {
@@ -183,6 +186,9 @@ func (t *FlashNodeTopology) FillHeartbeatConfigDefaults(cfg FlashNodeHeartbeatCo
 	}
 	if t.FlashKeyFlowLimit == nil {
 		t.FlashKeyFlowLimit = int64Ptr(cfg.FlashKeyFlowLimit)
+	}
+	if t.FlashNodeConnectionLimit == nil {
+		t.FlashNodeConnectionLimit = int64Ptr(cfg.FlashNodeConnectionLimit)
 	}
 }
 
@@ -208,6 +214,9 @@ func (t *FlashNodeTopology) GetHeartbeatConfig() FlashNodeHeartbeatConfig {
 	}
 	if t.FlashKeyFlowLimit != nil {
 		cfg.FlashKeyFlowLimit = *t.FlashKeyFlowLimit
+	}
+	if t.FlashNodeConnectionLimit != nil {
+		cfg.FlashNodeConnectionLimit = *t.FlashNodeConnectionLimit
 	}
 	return cfg
 }
@@ -1306,7 +1315,7 @@ func (t *FlashNodeTopology) CreateFlashNodeHeartBeatTasks(leader string, remoteC
 		}
 		task := node.createHeartbeatTask(leader, cfg.FlashNodeHandleReadTimeout, cfg.FlashNodeReadDataNodeTimeout,
 			cfg.FlashHotKeyMissCount, cfg.FlashReadFlowLimit, cfg.FlashWriteFlowLimit, cfg.FlashKeyFlowLimit,
-			slots, remoteCacheDisableTTLMap, remoteCacheReadFlowMap, remoteCacheWriteFlowMap)
+			cfg.FlashNodeConnectionLimit, slots, remoteCacheDisableTTLMap, remoteCacheReadFlowMap, remoteCacheWriteFlowMap)
 		tasks = append(tasks, task)
 		return true
 	})
@@ -1514,6 +1523,7 @@ func (t *FlashNodeTopology) GetFlashTopoAdminView() (ftv *proto.FlashTopologyAdm
 		FlashReadFlowLimit:           cfg.FlashReadFlowLimit,
 		FlashWriteFlowLimit:          cfg.FlashWriteFlowLimit,
 		FlashKeyFlowLimit:            cfg.FlashKeyFlowLimit,
+		FlashNodeConnectionLimit:     cfg.FlashNodeConnectionLimit,
 	}
 	return ftv
 }

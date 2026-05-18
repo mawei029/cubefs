@@ -1228,6 +1228,7 @@ func (m *Server) getCluster(w http.ResponseWriter, r *http.Request) {
 		FlashReadFlowLimit:                        m.cluster.cfg.flashReadFlowLimit,
 		FlashWriteFlowLimit:                       m.cluster.cfg.flashWriteFlowLimit,
 		FlashKeyFlowLimit:                         m.cluster.cfg.flashKeyFlowLimit,
+		FlashNodeConnectionLimit:                  m.cluster.cfg.flashNodeConnectionLimit,
 		RemoteClientFlowLimit:                     m.cluster.cfg.remoteClientFlowLimit,
 		MetaAutoAddReplicaLimit:                   m.cluster.MetaAutoAddReplicaLimit.Load(),
 		MetaManualDecommissionLimit:               m.cluster.MetaManualDecommissionLimit.Load(),

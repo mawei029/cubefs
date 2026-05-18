@@ -64,6 +64,7 @@ func (m *FlashGroupManager) getCluster(w http.ResponseWriter, r *http.Request) {
 		FlashReadFlowLimit:           m.cluster.cfg.FlashReadFlowLimit,
 		FlashWriteFlowLimit:          m.cluster.cfg.FlashWriteFlowLimit,
 		FlashKeyFlowLimit:            m.cluster.cfg.FlashKeyFlowLimit,
+		FlashNodeConnectionLimit:     m.cluster.cfg.FlashNodeConnectionLimit,
 		RemoteClientFlowLimit:        m.cluster.cfg.RemoteClientFlowLimit,
 		RemoteCacheTTL:               m.config.RemoteCacheTTL,
 		RemoteCacheReadTimeout:       m.config.RemoteCacheReadTimeout,
@@ -946,6 +947,9 @@ func (m *FlashGroupManager) updateFlashTopo(w http.ResponseWriter, r *http.Reque
 	}
 	if args.FlashKeyFlowLimit != nil {
 		cfg.FlashKeyFlowLimit = *args.FlashKeyFlowLimit
+	}
+	if args.FlashNodeConnectionLimit != nil {
+		cfg.FlashNodeConnectionLimit = *args.FlashNodeConnectionLimit
 	}
 	topo.SetHeartbeatConfig(cfg)
 

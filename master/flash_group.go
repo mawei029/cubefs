@@ -800,6 +800,9 @@ func (m *Server) updateFlashTopo(w http.ResponseWriter, r *http.Request) {
 	if args.FlashKeyFlowLimit != nil {
 		cfg.FlashKeyFlowLimit = *args.FlashKeyFlowLimit
 	}
+	if args.FlashNodeConnectionLimit != nil {
+		cfg.FlashNodeConnectionLimit = *args.FlashNodeConnectionLimit
+	}
 	topo.SetHeartbeatConfig(cfg)
 
 	if err = m.cluster.syncUpdateFlashTopo(topo); err != nil {

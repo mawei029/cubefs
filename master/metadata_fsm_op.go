@@ -101,6 +101,7 @@ type clusterValue struct {
 	FlashReadFlowLimit                     int64
 	FlashWriteFlowLimit                    int64
 	FlashKeyFlowLimit                      int64
+	FlashNodeConnectionLimit               int64
 	RemoteClientFlowLimit                  int64
 	LearnerRecoverTimeoutSeconds           int64
 	DpLimitSsdBaseCount                    uint64
@@ -183,6 +184,7 @@ func newClusterValue(c *Cluster) (cv *clusterValue) {
 		FlashReadFlowLimit:                     c.cfg.flashReadFlowLimit,
 		FlashWriteFlowLimit:                    c.cfg.flashWriteFlowLimit,
 		FlashKeyFlowLimit:                      c.cfg.flashKeyFlowLimit,
+		FlashNodeConnectionLimit:               c.cfg.flashNodeConnectionLimit,
 		RemoteClientFlowLimit:                  c.cfg.remoteClientFlowLimit,
 		LearnerRecoverTimeoutSeconds:           c.cfg.LearnerRecoverTimeoutSeconds,
 		DpLimitSsdBaseCount:                    c.cfg.DpLimitSsdBaseCount,
@@ -1726,11 +1728,15 @@ func (c *Cluster) loadClusterValue() (err error) {
 		c.cfg.flashReadFlowLimit = cv.FlashReadFlowLimit
 		c.cfg.flashWriteFlowLimit = cv.FlashWriteFlowLimit
 		c.cfg.flashKeyFlowLimit = cv.FlashKeyFlowLimit
+		if cv.FlashNodeConnectionLimit == 0 {
+			cv.FlashNodeConnectionLimit = defaultFlashNodeConnectionLimit
+		}
+		c.cfg.flashNodeConnectionLimit = cv.FlashNodeConnectionLimit
 		c.cfg.remoteClientFlowLimit = cv.RemoteClientFlowLimit
 
 		c.cfg.flashNodeReadDataNodeTimeout = cv.FlashNodeReadDataNodeTimeout
-		log.LogInfof("action[loadClusterValue] flashNodeHandleReadTimeout %v(ms), flashNodeReadDataNodeTimeout %v(ms), flashHotKeyMissCount %v, preheatTotalTask %v, maxDisableFlashGroupPercent %v, flashReadFlowLimit %v, flashWriteFlowLimit %v, flashKeyFlowLimit %v, remoteClientFlowLimit %v",
-			cv.FlashNodeHandleReadTimeout, cv.FlashNodeReadDataNodeTimeout, cv.FlashHotKeyMissCount, cv.PreheatTotalTask, cv.MaxDisableFlashGroupPercent, cv.FlashReadFlowLimit, cv.FlashWriteFlowLimit, cv.FlashKeyFlowLimit, cv.RemoteClientFlowLimit)
+		log.LogInfof("action[loadClusterValue] flashNodeHandleReadTimeout %v(ms), flashNodeReadDataNodeTimeout %v(ms), flashHotKeyMissCount %v, preheatTotalTask %v, maxDisableFlashGroupPercent %v, flashReadFlowLimit %v, flashWriteFlowLimit %v, flashKeyFlowLimit %v, flashNodeConnectionLimit %v, remoteClientFlowLimit %v",
+			cv.FlashNodeHandleReadTimeout, cv.FlashNodeReadDataNodeTimeout, cv.FlashHotKeyMissCount, cv.PreheatTotalTask, cv.MaxDisableFlashGroupPercent, cv.FlashReadFlowLimit, cv.FlashWriteFlowLimit, cv.FlashKeyFlowLimit, cv.FlashNodeConnectionLimit, cv.RemoteClientFlowLimit)
 
 		if cv.DpLimitSsdBaseCount == 0 {
 			cv.DpLimitSsdBaseCount = defaultDpLimitSsdBaseCount

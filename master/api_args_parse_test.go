@@ -1995,7 +1995,7 @@ func TestParseRequestToUpdateFlashTopo(t *testing.T) {
 	t.Run("all_fields", func(t *testing.T) {
 		args, err := parseRequestToUpdateFlashTopo(apiArgsNewGet(t,
 			"name=topo-a&flashNodeHandleReadTimeout=11&flashNodeReadDataNodeTimeout=12&flashHotKeyMissCount=13"+
-				"&flashReadFlowLimit=14&flashWriteFlowLimit=15&flashKeyFlowLimit=16"))
+				"&flashReadFlowLimit=14&flashWriteFlowLimit=15&flashKeyFlowLimit=16&flashNodeConnectionLimit=17"))
 		require.NoError(t, err)
 		require.Equal(t, "topo-a", args.Name)
 		require.NotNil(t, args.FlashNodeHandleReadTimeout)
@@ -2010,6 +2010,8 @@ func TestParseRequestToUpdateFlashTopo(t *testing.T) {
 		require.Equal(t, int64(15), *args.FlashWriteFlowLimit)
 		require.NotNil(t, args.FlashKeyFlowLimit)
 		require.Equal(t, int64(16), *args.FlashKeyFlowLimit)
+		require.NotNil(t, args.FlashNodeConnectionLimit)
+		require.Equal(t, int64(17), *args.FlashNodeConnectionLimit)
 	})
 
 	t.Run("default_topo_name", func(t *testing.T) {
@@ -2040,6 +2042,8 @@ func TestParseRequestToUpdateFlashTopo(t *testing.T) {
 		_, err = parseRequestToUpdateFlashTopo(apiArgsNewGet(t, "flashWriteFlowLimit=bad"))
 		require.Error(t, err)
 		_, err = parseRequestToUpdateFlashTopo(apiArgsNewGet(t, "flashKeyFlowLimit=bad"))
+		require.Error(t, err)
+		_, err = parseRequestToUpdateFlashTopo(apiArgsNewGet(t, "flashNodeConnectionLimit=bad"))
 		require.Error(t, err)
 	})
 }

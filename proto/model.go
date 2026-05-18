@@ -268,6 +268,7 @@ type ClusterView struct {
 	FlashReadFlowLimit                        int64
 	FlashWriteFlowLimit                       int64
 	FlashKeyFlowLimit                         int64
+	FlashNodeConnectionLimit                  int64
 	RemoteClientFlowLimit                     int64
 	DefaultDpTag                              string
 	DefaultMpTag                              string

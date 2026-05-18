@@ -84,6 +84,7 @@ const (
 	flashReadFlowLimit           = "flashReadFlowLimit"
 	flashWriteFlowLimit          = "flashWriteFlowLimit"
 	flashKeyFlowLimit            = "flashKeyFlowLimit"
+	flashNodeConnectionLimit     = "flashNodeConnectionLimit"
 	remoteClientFlowLimit        = "remoteClientFlowLimit"
 
 	cfgDefaultVolStoreMode = "defaultVolStoreMode"
@@ -145,6 +146,7 @@ const (
 	defaultFlashReadFlowLimit           = 2147483648
 	defaultFlashWriteFlowLimit          = 2147483648
 	defaultFlashKeyFlowLimit            = 0
+	defaultFlashNodeConnectionLimit     = 100000
 	defaultRemoteClientFlowLimit        = 0
 
 	defaultDpLimitUnitSizeGB   uint64 = 120
@@ -243,6 +245,7 @@ type clusterConfig struct {
 	flashReadFlowLimit           int64
 	flashWriteFlowLimit          int64
 	flashKeyFlowLimit            int64
+	flashNodeConnectionLimit     int64
 	remoteClientFlowLimit        int64
 
 	metaNodeGOGC int
@@ -311,6 +314,7 @@ func newClusterConfig() (cfg *clusterConfig) {
 	cfg.flashReadFlowLimit = defaultFlashReadFlowLimit
 	cfg.flashWriteFlowLimit = defaultFlashWriteFlowLimit
 	cfg.flashKeyFlowLimit = defaultFlashKeyFlowLimit
+	cfg.flashNodeConnectionLimit = defaultFlashNodeConnectionLimit
 	cfg.remoteClientFlowLimit = defaultRemoteClientFlowLimit
 	cfg.metaNodeGOGC = defaultMetaNodeGOGC
 	cfg.dataNodeGOGC = defaultDataNodeGOGC

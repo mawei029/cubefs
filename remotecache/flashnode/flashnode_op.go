@@ -193,6 +193,7 @@ func (f *FlashNode) opFlashNodeHeartbeat(conn net.Conn, p *proto.Packet) (err er
 			f.keyLimiterFlow = req.FlashKeyFlowLimit
 			f.cacheEngine.SetKeyLimiterFlow(req.FlashKeyFlowLimit)
 		}
+		f.setConnectionLimit(req.FlashNodeConnectionLimit)
 		if !f.localChangeWriteFlow && req.FlashWriteFlowLimit != int64(f.diskWriteFlow) {
 			f.diskWriteFlow = int(req.FlashWriteFlowLimit)
 			f.limitWrite.ResetFlow(f.diskWriteFlow)
@@ -268,8 +269,8 @@ end:
 	adminTask.TopoName = f.getTopoName()
 	f.respondToMaster(adminTask)
 	if log.EnableInfo() {
-		log.LogInfof("[opMasterHeartbeat] master:%s handleReadTimeout %v(ms) readDataNodeTimeout %v(ms) hotkeymisscount %v FlashNodeSlots is nil(%v)",
-			conn.RemoteAddr().String(), req.FlashNodeHandleReadTimeout, req.FlashNodeReadDataNodeTimeout, req.FlashHotKeyMissCount, req.FlashNodeSlots == nil)
+		log.LogInfof("[opMasterHeartbeat] master:%s handleReadTimeout %v(ms) readDataNodeTimeout %v(ms) hotkeymisscount %v connectionLimit %v FlashNodeSlots is nil(%v)",
+			conn.RemoteAddr().String(), req.FlashNodeHandleReadTimeout, req.FlashNodeReadDataNodeTimeout, req.FlashHotKeyMissCount, req.FlashNodeConnectionLimit, req.FlashNodeSlots == nil)
 	}
 	return
 }
