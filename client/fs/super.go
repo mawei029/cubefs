@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -127,6 +128,7 @@ type Super struct {
 	dirDirtyCount     map[uint64]int
 	dirDirtyCacheLock sync.Mutex
 
+	negativeDentryCache sync.Map // string (parentIno/name) -> *negativeDentryEntry
 	// same mount flags as stream ahead-read; used by blobstore.Reader to prefetch EbsBlockSize bytes
 	aheadReadEnable   bool
 	minReadAheadSize  uint64
@@ -426,6 +428,7 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 	s.poolCache = make(map[uint8]*proto.StoragePoolInfo)
 	s.updatePoolCache()
 	go s.loopUpdatePoolCache()
+	go s.loopNegativeDentryRevalidate()
 
 	return s, nil
 }
@@ -562,6 +565,44 @@ func (s *Super) getBlobStoreClient(poolId uint8) (*blobstore.BlobStoreClient, er
 
 	s.ebsc[pool.Id] = ebsc
 	return ebsc, nil
+}
+
+func (s *Super) loopNegativeDentryRevalidate() {
+	ticker := time.NewTicker(NegativeDentryRevalidateTicker)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.closeC:
+			return
+		case <-ticker.C:
+			s.revalidateNegativeDentries()
+		}
+	}
+}
+
+func (s *Super) revalidateNegativeDentries() {
+	now := time.Now().UnixNano()
+	s.negativeDentryCache.Range(func(key, value interface{}) bool {
+		entry := value.(*negativeDentryEntry)
+		if !negativeDentryDue(atomic.LoadInt64(&entry.nextValidateAt), now) {
+			return true
+		}
+		_, _, err := s.mw.Lookup_ll(entry.parentIno, entry.name, false)
+		if err == nil {
+			s.negativeDentryCache.Delete(key)
+			if log.EnableDebug() {
+				log.LogDebugf("revalidateNegativeDentries: parent(%v) name(%v) now exists, removed from negative cache",
+					entry.parentIno, entry.name)
+			}
+			return true
+		}
+		if err == syscall.ENOENT {
+			s.negativeDentryBumpNextValidate(entry, now)
+			return true
+		}
+		log.LogWarnf("revalidateNegativeDentries: parent(%v) name(%v) err(%v)", entry.parentIno, entry.name, err)
+		return true
+	})
 }
 
 func (s *Super) scheduleFlush() {

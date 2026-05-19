@@ -15,7 +15,10 @@
 package fs
 
 import (
+	"math/rand"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -94,74 +97,61 @@ func (dc *DentryCache) Clear() {
 	dc.cache = nil
 }
 
-// NegativeDentryCache defines the cache for non-existent dentries.
-// This cache stores entries that were confirmed to not exist by the backend,
-// with a very short expiration time to avoid stale cache.
-type NegativeDentryCache struct {
-	sync.Mutex
-	cache map[string]int64 // int64 stores Unix timestamp in nanoseconds
+type negativeDentryEntry struct {
+	parentIno      uint64
+	name           string
+	nextValidateAt int64
 }
 
-// NewNegativeDentryCache returns a new negative dentry cache.
-func NewNegativeDentryCache() *NegativeDentryCache {
-	return &NegativeDentryCache{
-		cache: make(map[string]int64),
-	}
+func negativeDentryKey(parentIno uint64, name string) string {
+	return strconv.FormatUint(parentIno, 10) + "/" + name
 }
 
-// Put puts a non-existent dentry into the cache with current timestamp.
-func (ndc *NegativeDentryCache) Put(name string) {
-	if ndc == nil {
-		return
+func negativeDentryJitterNanos() int64 {
+	maxJitter := int64(float64(NegativeDentryRevalidatePeriod) * NegativeDentryRevalidateJitterRatio)
+	if maxJitter <= 0 {
+		return 0
 	}
-	ndc.Lock()
-	defer ndc.Unlock()
-	if ndc.cache == nil {
-		ndc.cache = make(map[string]int64)
-	}
-	ndc.cache[name] = time.Now().UnixNano()
+	return rand.Int63n(maxJitter + 1)
 }
 
-// Get checks if the dentry is in the negative cache and still valid.
-// Returns true if the dentry is cached as non-existent and the cache is still valid.
-func (ndc *NegativeDentryCache) Get(name string) bool {
-	if ndc == nil {
-		return false
-	}
-	ndc.Lock()
-	defer ndc.Unlock()
-	if ndc.cache == nil {
-		return false
-	}
-	timestamp, ok := ndc.cache[name]
-	if !ok {
-		return false
-	}
-	// Check if cache is still valid
-	if time.Now().UnixNano()-timestamp > int64(NegativeDentryValidDuration) {
-		// Cache expired, remove it
-		delete(ndc.cache, name)
-		return false
-	}
-	return true
+func negativeDentryScheduleNextValidate(now int64) int64 {
+	return now + int64(NegativeDentryRevalidatePeriod) + negativeDentryJitterNanos()
 }
 
-// Delete deletes the negative cache entry for the given name.
-func (ndc *NegativeDentryCache) Delete(name string) {
-	if ndc == nil {
-		return
-	}
-	ndc.Lock()
-	defer ndc.Unlock()
-	delete(ndc.cache, name)
+func negativeDentryDue(nextValidateAt int64, now int64) bool {
+	return now >= nextValidateAt
 }
 
-// Clear clears all negative cache entries.
-func (ndc *NegativeDentryCache) Clear() {
-	if ndc == nil {
-		return
+func (s *Super) NegativeDentryPut(parentIno uint64, name string) {
+	now := time.Now().UnixNano()
+	entry := &negativeDentryEntry{
+		parentIno:      parentIno,
+		name:           name,
+		nextValidateAt: negativeDentryScheduleNextValidate(now),
 	}
-	ndc.Lock()
-	defer ndc.Unlock()
-	ndc.cache = nil
+	s.negativeDentryCache.Store(negativeDentryKey(parentIno, name), entry)
+}
+
+func (s *Super) negativeDentryBumpNextValidate(entry *negativeDentryEntry, now int64) {
+	atomic.StoreInt64(&entry.nextValidateAt, negativeDentryScheduleNextValidate(now))
+}
+
+func (s *Super) NegativeDentryGet(parentIno uint64, name string) bool {
+	_, ok := s.negativeDentryCache.Load(negativeDentryKey(parentIno, name))
+	return ok
+}
+
+func (s *Super) NegativeDentryDelete(parentIno uint64, name string) {
+	s.negativeDentryCache.Delete(negativeDentryKey(parentIno, name))
+}
+
+func (s *Super) NegativeDentryClear(parentIno uint64) {
+	s.negativeDentryCache.Range(func(key, value interface{}) bool {
+		entry := value.(*negativeDentryEntry)
+		if entry.parentIno == parentIno {
+			s.negativeDentryCache.Delete(key)
+		}
+		return true
+	})
 }

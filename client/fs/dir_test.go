@@ -630,7 +630,6 @@ func TestDirOpenCreatesExtendInfoAndKeepsCacheFlag(t *testing.T) {
 	require.NotNil(t, ei)
 	require.Equal(t, int64(1), atomic.LoadInt64(&ei.openCnt))
 	require.NotNil(t, ei.dctx)
-	require.NotNil(t, ei.dcacheNoEnt)
 }
 
 func TestDirReleaseClearsExtendInfoWhenLastOpenClosed(t *testing.T) {
@@ -642,7 +641,6 @@ func TestDirReleaseClearsExtendInfoWhenLastOpenClosed(t *testing.T) {
 	atomic.StoreInt64(&ei.openCnt, 1)
 	ei.dcache = NewDentryCache(false)
 	ei.dcache.Put("child", 101)
-	ei.dcacheNoEnt.Put("missing")
 	ei.dctx.Put(7, &DirContext{Name: "cursor"})
 
 	require.NoError(t, dir.Release(context.Background(), &fuse.ReleaseRequest{Handle: 7}))
@@ -673,7 +671,6 @@ func TestDirForgetDropsNodeAndExtendInfo(t *testing.T) {
 	super.nodeCache[dir.ino] = dir
 	ei := dir.getOrCreateExtendInfo()
 	ei.dcache = NewDentryCache(false)
-	ei.dcacheNoEnt.Put("missing")
 	ei.dctx.Put(7, &DirContext{Name: "cursor"})
 
 	dir.Forget()
@@ -712,12 +709,6 @@ func TestDirExtendInfoHelpers(t *testing.T) {
 	dir.deleteDcacheEntry("child")
 	_, ok = dir.getDcacheEntry("child")
 	require.False(t, ok)
-
-	require.False(t, dir.negativeDcacheHit("missing"))
-	dir.putNegativeDcache("missing")
-	require.True(t, dir.negativeDcacheHit("missing"))
-	dir.deleteNegativeDcache("missing")
-	require.False(t, dir.negativeDcacheHit("missing"))
 }
 
 func TestDir_ForgetKeepsExtendInfoWhenOpenCountPositive(t *testing.T) {

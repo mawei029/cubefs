@@ -10,13 +10,12 @@ import (
 )
 
 type DirExtendInfo struct {
-	dcache      *DentryCache
-	dcacheNoEnt *NegativeDentryCache
-	dctx        *DirContexts
-	openCnt     int64
-	missCount   uint32
-	lastDoing   int32
-	lastTime    int64
+	dcache    *DentryCache
+	dctx      *DirContexts
+	openCnt   int64
+	missCount uint32
+	lastDoing int32
+	lastTime  int64
 }
 
 type FileExtendInfo struct {
@@ -68,8 +67,7 @@ func (d *Dir) getOrCreateExtendInfo() *DirExtendInfo {
 	}
 
 	ei = &DirExtendInfo{
-		dctx:        NewDirContexts(),
-		dcacheNoEnt: NewNegativeDentryCache(),
+		dctx: NewDirContexts(),
 	}
 	s.dirExtendInfoMap[d.ino] = ei
 	return ei
@@ -241,30 +239,6 @@ func (d *Dir) getOrCreateDcache(acceleration bool) *DentryCache {
 		ei.dcache = NewDentryCache(acceleration)
 	}
 	return ei.dcache
-}
-
-func (d *Dir) negativeDcacheHit(name string) bool {
-	ei := d.getOrCreateExtendInfo()
-	if ei == nil || ei.dcacheNoEnt == nil {
-		return false
-	}
-	return ei.dcacheNoEnt.Get(name)
-}
-
-func (d *Dir) putNegativeDcache(name string) {
-	ei := d.getOrCreateExtendInfo()
-	if ei == nil || ei.dcacheNoEnt == nil {
-		return
-	}
-	ei.dcacheNoEnt.Put(name)
-}
-
-func (d *Dir) deleteNegativeDcache(name string) {
-	ei, ok := d.getExtendInfo()
-	if !ok || ei == nil || ei.dcacheNoEnt == nil {
-		return
-	}
-	ei.dcacheNoEnt.Delete(name)
 }
 
 func (f *File) getInfo() (*proto.InodeInfo, error) {

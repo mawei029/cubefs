@@ -41,11 +41,6 @@ func TestCoverageDirExtendInfoStateFlow(t *testing.T) {
 	_, ok = d.getDcacheEntry("a")
 	require.False(t, ok)
 
-	d.putNegativeDcache("missing")
-	require.True(t, d.negativeDcacheHit("missing"))
-	d.deleteNegativeDcache("missing")
-	require.False(t, d.negativeDcacheHit("missing"))
-
 	d.deleteExtendInfo()
 	_, ok = d.getExtendInfo()
 	require.False(t, ok)

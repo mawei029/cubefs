@@ -219,16 +219,14 @@ func (d *Dir) Release(ctx context.Context, req *fuse.ReleaseRequest) (err error)
 		if ei.dcache != nil {
 			ei.dcache.Clear()
 		}
-		if ei.dcacheNoEnt != nil {
-			ei.dcacheNoEnt.Clear()
-		}
+		d.super.NegativeDentryClear(d.ino)
 		if ei.dctx != nil {
 			ei.dctx.Clear()
 		}
 		d.deleteExtendInfo()
-	}
-	if DisableMetaCache {
-		d.super.ic.Delete(d.ino)
+		if DisableMetaCache {
+			d.super.ic.Delete(d.ino)
+		}
 	}
 	log.LogDebugf("TRACE DirRelease: ino(%v) name(%v) openCnt(%v)", d.ino, d.name, ref)
 
@@ -255,7 +253,7 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 	}()
 
 	// Delete from negative cache if file is being created
-	d.deleteNegativeDcache(req.Name)
+	d.super.NegativeDentryDelete(d.ino, req.Name)
 	info, err := d.super.mw.Create_ll(d.ino, req.Name, proto.Mode(req.Mode.Perm()), req.Uid, req.Gid, nil,
 		fullPath, false)
 	if err != nil {
@@ -309,9 +307,7 @@ func (d *Dir) Forget() {
 		if ei.dcache != nil {
 			ei.dcache.Clear()
 		}
-		if ei.dcacheNoEnt != nil {
-			ei.dcacheNoEnt.Clear()
-		}
+		d.super.NegativeDentryClear(d.ino)
 	}
 	if DisableMetaCache {
 		d.super.ic.Delete(ino)
@@ -354,7 +350,7 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 	log.LogDebugf("TRACE Mkdir:enter")
 
 	// Delete from negative cache if directory is being created
-	d.deleteNegativeDcache(req.Name)
+	d.super.NegativeDentryDelete(d.ino, req.Name)
 	info, err := d.super.mw.Create_ll(d.ino, req.Name, proto.Mode(os.ModeDir|req.Mode.Perm()), req.Uid,
 		req.Gid, nil, fullPath, false)
 	if err != nil {
@@ -458,8 +454,7 @@ func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.Lo
 		dcachev2 = true
 	}
 	if dcachev2 {
-		// First check negative cache (file doesn't exist)
-		if d.negativeDcacheHit(req.Name) {
+		if d.super.NegativeDentryGet(d.ino, req.Name) {
 			if log.EnableDebug() {
 				log.LogDebugf("Lookup %v from parent %v hit negative cache (dcachev2), return ENOENT", path.Join(d.getCwd(), req.Name), d.ino)
 			}
@@ -477,8 +472,7 @@ func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.Lo
 			ino, _, err = d.super.mw.Lookup_ll(d.ino, req.Name, false)
 			if err != nil {
 				if err == syscall.ENOENT {
-					// Cache the negative result (file doesn't exist)
-					d.putNegativeDcache(req.Name)
+					d.super.NegativeDentryPut(d.ino, req.Name)
 					if log.EnableDebug() {
 						log.LogDebugf("Lookup %v from parent %v ENOENT (dcachev2), cached in negative cache", path.Join(d.getCwd(), req.Name), d.ino)
 					}
@@ -498,8 +492,7 @@ func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.Lo
 			ino = dentryInfo.Inode
 		}
 	} else {
-		// First check negative cache (file doesn't exist)
-		if d.negativeDcacheHit(req.Name) {
+		if d.super.NegativeDentryGet(d.ino, req.Name) {
 			if log.EnableDebug() {
 				log.LogDebugf("Lookup %v from parent %v hit negative cache, return ENOENT", path.Join(d.getCwd(), req.Name), d.ino)
 			}
@@ -515,8 +508,7 @@ func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.Lo
 			cino, _, err = d.super.mw.Lookup_ll(d.ino, req.Name, false)
 			if err != nil {
 				if err == syscall.ENOENT {
-					// Cache the negative result (file doesn't exist)
-					d.putNegativeDcache(req.Name)
+					d.super.NegativeDentryPut(d.ino, req.Name)
 					if log.EnableDebug() {
 						log.LogDebugf("Lookup %v from parent %v ENOENT, cached in negative cache", path.Join(d.getCwd(), req.Name), d.ino)
 					}
@@ -1001,7 +993,7 @@ func (d *Dir) Mknod(ctx context.Context, req *fuse.MknodRequest) (fs.Node, error
 	fullPath := path.Join(d.getCwd(), req.Name)
 
 	// Delete from negative cache if file is being created
-	d.deleteNegativeDcache(req.Name)
+	d.super.NegativeDentryDelete(d.ino, req.Name)
 	info, err := d.super.mw.Create_ll(d.ino, req.Name, proto.Mode(req.Mode), req.Uid, req.Gid,
 		nil, fullPath, false)
 	if err != nil {
@@ -1039,7 +1031,7 @@ func (d *Dir) Symlink(ctx context.Context, req *fuse.SymlinkRequest) (fs.Node, e
 	fullPath := path.Join(d.getCwd(), req.NewName)
 
 	// Delete from negative cache if symlink is being created
-	d.deleteNegativeDcache(req.NewName)
+	d.super.NegativeDentryDelete(d.ino, req.NewName)
 	info, err := d.super.mw.Create_ll(parentIno, req.NewName, proto.Mode(os.ModeSymlink|os.ModePerm), req.Uid,
 		req.Gid, []byte(req.Target), fullPath, false)
 	if err != nil {

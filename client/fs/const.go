@@ -44,7 +44,13 @@ const (
 	// the expiration duration of the negative dentry cache (file not exists)
 	// This should be very short to avoid stale cache when file is created quickly
 	NegativeDentryValidDuration = 200 * time.Millisecond
-	DefaultReaddirLimit         = 1024
+	// NegativeDentryRevalidatePeriod is the base interval before the super probes meta again.
+	NegativeDentryRevalidatePeriod = 5 * NegativeDentryValidDuration
+	// NegativeDentryRevalidateJitterRatio is the max extra delay as a fraction of RevalidatePeriod (spread Lookup_ll).
+	NegativeDentryRevalidateJitterRatio = 0.2
+	// NegativeDentryRevalidateTicker is the super background worker wake interval.
+	NegativeDentryRevalidateTicker = NegativeDentryRevalidatePeriod
+	DefaultReaddirLimit            = 1024
 )
 
 const (
