@@ -171,27 +171,21 @@ func ltpInstallFtest01Patches(t *testing.T, patches *gomonkey.Patches, s *Super,
 		})
 
 	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "ReadWithInodeView",
-		func(_ *blobstore.ECExtentClient, _ context.Context, ino uint64, data []byte, offset int, size int, _ uint8, _ bool, _ uint64, inodeViewSize uint64) (int, error) {
+		func(_ *blobstore.ECExtentClient, _ context.Context, ino uint64, data []byte, offset int, size int, _ uint8, _ bool, _, _ uint64) (int, error) {
 			require.Equal(t, f.ino, ino)
-			if ltpReadViewGuardEnabled() {
-				vm.mu.Lock()
-				meta := vm.metaSize
-				vm.mu.Unlock()
-				var wmax uint64
-				if ww := s.oec.Writer(f.ino); ww != nil {
-					wmax = uint64(ww.CacheFileSize())
-				}
-				auth := meta
-				if wmax > auth {
-					auth = wmax
-				}
-				// File.Read 合并后的读上界不得大于「权威 meta ∪ 写缓存尾」；若大于则易读到截断前物理残留（LTP bad verify）。
-				if inodeViewSize > auth {
-					require.FailNowf(t, "ReadWithInodeView 读上界异常",
-						"inodeViewSize=0x%x > auth(meta∪cache)=0x%x (EC ftest01 bad verify / 洞区非零 常见根因)", inodeViewSize, auth)
-				}
+			vm.mu.Lock()
+			meta := vm.metaSize
+			vm.mu.Unlock()
+			var wmax uint64
+			if ww := s.oec.Writer(f.ino); ww != nil {
+				wmax = uint64(ww.CacheFileSize())
 			}
-			return vm.readAt(offset, data[:size], inodeViewSize), nil
+			auth := meta
+			if wmax > auth {
+				auth = wmax
+			}
+			// 读上界与 oec.FileSizeView / ECStreamer.EffectiveLogicalSize 一致（meta ∪ 未下刷写尾）。
+			return vm.readAt(offset, data[:size], auth), nil
 		})
 
 	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "FileSize",
@@ -414,6 +408,7 @@ func TestFile_LtpSim_blob_attr_raises_size_when_stream_matches_inode_gen(t *test
 	const inodeSize = 960512
 	const logicalMax = 0xeb000
 	gen := uint64(7)
+	blobstore.SeedLogicalViewForTest(s.oec.GetStreamer(f.ino), logicalMax, gen)
 
 	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet", func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
 		return &proto.InodeInfo{
@@ -421,10 +416,6 @@ func TestFile_LtpSim_blob_attr_raises_size_when_stream_matches_inode_gen(t *test
 			Size: inodeSize, Generation: gen, Mode: proto.Mode(0o644),
 		}, nil
 	})
-	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "FileSize",
-		func(_ *blobstore.ECExtentClient, _ uint64) (int, uint64, bool) {
-			return logicalMax, gen, true
-		})
 
 	attr := &fuse.Attr{}
 	require.NoError(t, f.Attr(context.Background(), attr))
@@ -443,6 +434,7 @@ func TestFile_LtpSim_blob_attr_ignores_stale_stream_when_inode_gen_newer(t *test
 	inodeGen := uint64(20)
 	staleStreamSize := uint64(1038336)
 	staleStreamGen := uint64(9)
+	blobstore.SeedLogicalViewForTest(s.oec.GetStreamer(f.ino), staleStreamSize, staleStreamGen)
 
 	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet", func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
 		return &proto.InodeInfo{
@@ -450,10 +442,6 @@ func TestFile_LtpSim_blob_attr_ignores_stale_stream_when_inode_gen_newer(t *test
 			Size: inodeSize, Generation: inodeGen, Mode: proto.Mode(0o644),
 		}, nil
 	})
-	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "FileSize",
-		func(_ *blobstore.ECExtentClient, _ uint64) (int, uint64, bool) {
-			return int(staleStreamSize), staleStreamGen, true
-		})
 
 	attr := &fuse.Attr{}
 	require.NoError(t, f.Attr(context.Background(), attr))
@@ -471,20 +459,14 @@ func TestFile_LtpSim_blob_read_does_not_extend_past_inode_when_stream_gen_stale(
 
 	const inodeSize = 0x39800
 	inodeGen := uint64(20)
-	const staleLz = 0xfc800
-	const staleLg uint64 = 5
 
-	var gotInodeGen, gotInodeSize uint64
 	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet", func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
 		return &proto.InodeInfo{
 			Inode: f.ino, PoolId: 1, StorageClass: proto.StorageClass_BlobStore,
 			Size: inodeSize, Generation: inodeGen, Mode: proto.Mode(0o644),
 		}, nil
 	})
-	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "FileSize",
-		func(_ *blobstore.ECExtentClient, _ uint64) (int, uint64, bool) {
-			return staleLz, staleLg, true
-		})
+	var gotInodeGen, gotInodeSize uint64
 	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "ReadWithInodeView",
 		func(_ *blobstore.ECExtentClient, _ context.Context, ino uint64, _ []byte, _ int, _ int, _ uint8, _ bool, inodeGenArg, inodeSizeArg uint64) (int, error) {
 			require.Equal(t, f.ino, ino)
@@ -496,8 +478,9 @@ func TestFile_LtpSim_blob_read_does_not_extend_past_inode_when_stream_gen_stale(
 	req := &fuse.ReadRequest{Offset: 0x3800, Size: 2048}
 	resp := &fuse.ReadResponse{Data: make([]byte, fuse.OutHeaderSize+2048)}
 	require.NoError(t, f.Read(context.Background(), req, resp))
-	require.Equal(t, inodeGen, gotInodeGen)
-	require.Equal(t, uint64(inodeSize), gotInodeSize)
+	// 读路径不再传入 inode 快照，由 ECStreamer 内 ensureAlignedForRead 对齐。
+	require.Equal(t, uint64(0), gotInodeGen)
+	require.Equal(t, uint64(0), gotInodeSize)
 }
 
 func TestFile_LtpSim_blob_read_extends_read_size_when_stream_gen_matches_inode(t *testing.T) {
@@ -510,20 +493,15 @@ func TestFile_LtpSim_blob_read_extends_read_size_when_stream_gen_matches_inode(t
 	registerOecTestStreamer(s, f.ino, r, w)
 
 	const inodeSize = 100_000
-	const logicalMax = 200_000
 	gen := uint64(3)
 
-	var gotInodeSize uint64
 	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet", func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
 		return &proto.InodeInfo{
 			Inode: f.ino, PoolId: 1, StorageClass: proto.StorageClass_BlobStore,
 			Size: inodeSize, Generation: gen, Mode: proto.Mode(0o644),
 		}, nil
 	})
-	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "FileSize",
-		func(_ *blobstore.ECExtentClient, _ uint64) (int, uint64, bool) {
-			return logicalMax, gen, true
-		})
+	var gotInodeSize uint64
 	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "ReadWithInodeView",
 		func(_ *blobstore.ECExtentClient, _ context.Context, _ uint64, _ []byte, _ int, _ int, _ uint8, _ bool, _, inodeSizeArg uint64) (int, error) {
 			gotInodeSize = inodeSizeArg
@@ -533,7 +511,7 @@ func TestFile_LtpSim_blob_read_extends_read_size_when_stream_gen_matches_inode(t
 	req := &fuse.ReadRequest{Offset: 0, Size: 1}
 	resp := &fuse.ReadResponse{Data: make([]byte, fuse.OutHeaderSize+1)}
 	require.NoError(t, f.Read(context.Background(), req, resp))
-	require.Equal(t, uint64(logicalMax), gotInodeSize)
+	require.Equal(t, uint64(0), gotInodeSize)
 }
 
 func TestFile_LtpSim_blob_fstat_after_write_sequence(t *testing.T) {
@@ -567,10 +545,8 @@ func TestFile_LtpSim_blob_fstat_after_write_sequence(t *testing.T) {
 
 	logicalMax := uint64(off + chunk)
 	w.SetFileSize(logicalMax)
-	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "FileSize",
-		func(_ *blobstore.ECExtentClient, _ uint64) (int, uint64, bool) {
-			return int(logicalMax), gen, true
-		})
+	blobstore.SeedLogicalViewForTest(s.oec.GetStreamer(f.ino), logicalMax, gen)
+	inodeSize = logicalMax
 
 	attr := &fuse.Attr{}
 	require.NoError(t, f.Attr(context.Background(), attr))
@@ -597,6 +573,31 @@ func TestFile_LtpSim_ec_fault_log_fstat_st_size_1038336_file_max_fa000(t *testin
 // 日志: bad verify @ 0x3800 for val 54 ... file_max 0x39800, last_trunc 0x1800 — Read 传入 ReadWithInodeView 的 inode 视图不得大于截断后权威上界。
 func TestFile_LtpSim_ec_fault_log_bad_verify_0x3800_file_max_39800(t *testing.T) {
 	TestFile_LtpSim_blob_read_does_not_extend_past_inode_when_stream_gen_stale(t)
+}
+
+// TestFile_LtpSim_ftest03_fstat_after_expand_trunc 对齐 ftest03：expand-truncate 后 fstat 的 st_size 须等于 file_max（日志 st_size=f3800,file_max=f4000）。
+func TestFile_LtpSim_ftest03_fstat_after_expand_trunc(t *testing.T) {
+	const csize = 0x800
+	const fileMax = 0xf4000
+	const staleExtentSz = 0xf3800
+	s, f := ltpContractSuper(9303)
+	w := &blobstore.Writer{}
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patchOecWriterForMisc(patches, w)
+	registerOecTestStreamer(s, f.ino, nil, w)
+	blobstore.SeedLogicalViewForTest(s.oec.GetStreamer(f.ino), staleExtentSz, 12)
+
+	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet", func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
+		return &proto.InodeInfo{
+			Inode: f.ino, PoolId: 1, StorageClass: proto.StorageClass_BlobStore,
+			Size: fileMax, Generation: 12,
+		}, nil
+	})
+
+	attr := &fuse.Attr{}
+	require.NoError(t, f.Attr(context.Background(), attr))
+	require.Equal(t, uint64(fileMax), attr.Size)
 }
 
 // TestFile_LtpSim_ec_fault_deterministic_trunc_then_read_hole

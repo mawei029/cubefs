@@ -71,6 +71,13 @@ func TestObjExtentDelTreeEdgeBranches(t *testing.T) {
 	require.Nil(t, ot.PeekFirstN(0))
 }
 
+func TestObjExtentDelItemCopy_emptyOeks(t *testing.T) {
+	it := &objExtentDelItem{TsMs: 1, Inode: 2, Uniq: 3, Oeks: nil}
+	cp := it.Copy().(*objExtentDelItem)
+	require.Nil(t, cp.Oeks)
+	require.Equal(t, it.TsMs, cp.TsMs)
+}
+
 func TestObjExtentDelTreeEncodeDecodeAndErrors(t *testing.T) {
 	oek := createTestObjExtentKey(0, 64, 3)
 	it := &objExtentDelItem{

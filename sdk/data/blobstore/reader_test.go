@@ -20,11 +20,13 @@ import (
 	"io"
 	"math/rand"
 	"os"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
 
+	"github.com/agiledragon/gomonkey/v2"
 	"github.com/brahma-adshonor/gohook"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -38,7 +40,7 @@ import (
 	"github.com/cubefs/cubefs/util/errors"
 )
 
-// syncECStreamerSizeWithExtentCacheForTest 将 Reader 缓存的 meta+ObjExtents 推导尾经 mergeMaxFileSize 并入 ECStreamer（仅抬高），与 RefreshExtents 内一致；供单测里手工 valid 的 Reader 与流上 fileSize 对齐。
+// syncECStreamerSizeWithExtentCacheForTest 将 Reader 缓存的 meta+ObjExtents 推导尾经 mergeMaxFileSize 并入 ECStreamer（仅抬高），与 refreshExtents 内一致；供单测里手工 valid 的 Reader 与流上 fileSize 对齐。
 func syncECStreamerSizeWithExtentCacheForTest(r *Reader) {
 	if r == nil || !r.valid {
 		return
@@ -120,12 +122,12 @@ func TestFileSize(t *testing.T) {
 		gotSize, gotOk := reader.fileSize()
 		assert.Equal(t, tc.expectSize, gotSize)
 		assert.Equal(t, tc.expectOk, gotOk)
-		lb, lbOk := reader.LogicalReadBound()
-		assert.Equal(t, gotSize, lb, "LogicalReadBound 应与 fileSize 一致")
+		lb, lbOk := reader.logicalReadBound()
+		assert.Equal(t, gotSize, lb, "logicalReadBound 应与 fileSize 一致")
 		assert.Equal(t, gotOk, lbOk)
 	}
 	var nilReader *Reader
-	nz, nok := nilReader.LogicalReadBound()
+	nz, nok := nilReader.logicalReadBound()
 	assert.Equal(t, uint64(0), nz)
 	assert.False(t, nok)
 
@@ -169,7 +171,7 @@ func TestFileSize(t *testing.T) {
 	//reader.Close(ctx)
 }
 
-func TestRefreshEbsExtents(t *testing.T) {
+func TestRefreshExtentsSetsValid(t *testing.T) {
 	testCase := []struct {
 		getObjFunc  func(*meta.MetaWrapper, uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error)
 		expectValid bool
@@ -189,7 +191,12 @@ func TestRefreshEbsExtents(t *testing.T) {
 			panic(fmt.Sprintf("Hook advance instance method failed:%s", err.Error()))
 		}
 		reader.mw = mw
-		reader.refreshEbsExtents()
+		_, rerr := reader.refreshExtents()
+		if tc.expectValid {
+			assert.NoError(t, rerr)
+		} else {
+			assert.Error(t, rerr)
+		}
 		assert.Equal(t, reader.valid, tc.expectValid)
 	}
 }
@@ -221,7 +228,9 @@ func TestPrepareEbsSlice(t *testing.T) {
 			ecStreamer:   NewECStreamer(0, nil, nil),
 			mw:           mw,
 		}
+		reader.Lock()
 		_, got := reader.prepareEbsSlice(tc.offset, tc.size)
+		reader.Unlock()
 		assert.Equal(t, tc.expectError, got)
 	}
 }
@@ -376,8 +385,8 @@ func TestNeedCacheL1(t *testing.T) {
 	}
 }
 
-func TestBlobPrefetchLimiterAndEnsurePrefetchBuf(t *testing.T) {
-	l := &blobReadPrefetchLimiter{maxBytes: 8}
+func TestBlobPreReadLimiterAndEnsurePrefetchBuf(t *testing.T) {
+	l := &blobPreReadLimiter{maxBytes: 8}
 	assert.True(t, l.tryAcquire(4))
 	assert.False(t, l.tryAcquire(5))
 	l.release(2)
@@ -387,10 +396,10 @@ func TestBlobPrefetchLimiterAndEnsurePrefetchBuf(t *testing.T) {
 	assert.False(t, r.ensurePrefetchBuf())
 
 	r.blockSize = 8
-	r.prefetchLimiter = &blobReadPrefetchLimiter{maxBytes: 4}
+	r.preReadLimiter = &blobPreReadLimiter{maxBytes: 4}
 	assert.False(t, r.ensurePrefetchBuf())
 
-	r.prefetchLimiter = &blobReadPrefetchLimiter{maxBytes: 16}
+	r.preReadLimiter = &blobPreReadLimiter{maxBytes: 16}
 	assert.True(t, r.ensurePrefetchBuf())
 	assert.True(t, len(r.readBuf) >= 16)
 }
@@ -455,7 +464,7 @@ func TestReaderPrefetch_fillToMinOfCapAndRem(t *testing.T) {
 			blockSize:        blockSize,
 			aheadReadEnable:  true,
 			minReadAheadSize: 0,
-			prefetchLimiter:  &blobReadPrefetchLimiter{maxBytes: 512},
+			preReadLimiter:   &blobPreReadLimiter{maxBytes: 512},
 			limitManager:     manager.NewLimitManager(nil),
 			ebs:              ebsc,
 			ecStreamer:       NewECStreamer(701, nil, nil),
@@ -491,7 +500,7 @@ func TestReaderPrefetch_fillToMinOfCapAndRem(t *testing.T) {
 			blockSize:        blockSize,
 			aheadReadEnable:  true,
 			minReadAheadSize: 0,
-			prefetchLimiter:  &blobReadPrefetchLimiter{maxBytes: 512},
+			preReadLimiter:   &blobPreReadLimiter{maxBytes: 512},
 			limitManager:     manager.NewLimitManager(nil),
 			ebs:              ebsc,
 			ecStreamer:       NewECStreamer(702, nil, nil),
@@ -654,16 +663,16 @@ func MockGetFalse(bc *bcache.BcacheClient, vol, key string, buf []byte, offset u
 
 func TestReaderCoveragePrefetchAndAlignment(t *testing.T) {
 	t.Run("limiter singleton and ensurePrefetchBuf branches", func(t *testing.T) {
-		blobReadPrefetchLimiterGV = nil
-		l1 := getBlobReadPrefetchLimiter(16)
+		blobPreReadLimiterGV = nil
+		l1 := getBlobPreReadLimiter(16)
 		require.NotNil(t, l1)
-		l2 := getBlobReadPrefetchLimiter(32)
+		l2 := getBlobPreReadLimiter(32)
 		require.Equal(t, l1, l2)
 		require.Equal(t, int64(16), l2.maxBytes)
 
-		r := &Reader{blockSize: 4, prefetchLimiter: &blobReadPrefetchLimiter{maxBytes: 1}}
+		r := &Reader{blockSize: 4, preReadLimiter: &blobPreReadLimiter{maxBytes: 1}}
 		require.False(t, r.ensurePrefetchBuf())
-		r.prefetchLimiter.maxBytes = 8
+		r.preReadLimiter.maxBytes = 8
 		require.True(t, r.ensurePrefetchBuf())
 		require.True(t, r.ensurePrefetchBuf())
 		r.Close(context.Background())
@@ -678,7 +687,7 @@ func TestReaderCoveragePrefetchAndAlignment(t *testing.T) {
 			blockSize:        4,
 			aheadReadEnable:  true,
 			minReadAheadSize: 0,
-			prefetchLimiter:  &blobReadPrefetchLimiter{maxBytes: 8},
+			preReadLimiter:   &blobPreReadLimiter{maxBytes: 8},
 			limitManager:     manager.NewLimitManager(nil),
 			ebs:              newSafeBlobStoreClientForTest(),
 			ecStreamer:       NewECStreamer(1, nil, nil),
@@ -702,18 +711,18 @@ func TestReaderCoveragePrefetchAndAlignment(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, 0, n)
 
-		r.prefetchLimiter.maxBytes = 0
+		r.preReadLimiter.maxBytes = 0
 		n, err = r.Read(context.Background(), make([]byte, 2), 0, 2)
 		require.NoError(t, err)
 		require.Equal(t, 2, n)
 
-		r.prefetchLimiter.maxBytes = 8
+		r.preReadLimiter.maxBytes = 8
 		n, err = r.Read(context.Background(), make([]byte, 4), 0, 4)
 		require.NoError(t, err)
 		require.Equal(t, 4, n)
 		require.Equal(t, 0, r.bufValidLen)
 
-		r.prefetchLimiter.maxBytes = 8
+		r.preReadLimiter.maxBytes = 8
 		r.bufValidLen = 1
 		r.bufBaseOff = 0
 		r.readBuf = make([]byte, 1)
@@ -731,7 +740,7 @@ func TestReaderCoveragePrefetchAndAlignment(t *testing.T) {
 		}
 		atomic.StoreUint64(&es.fileSize, 10)
 		atomic.StoreUint64(&es.inoVersion, 1)
-		require.NoError(t, r.EnsureAlignedForRead(1, 10))
+		require.NoError(t, r.ensureAlignedForRead(false))
 
 		mw := &meta.MetaWrapper{}
 		err := gohook.HookMethod(mw, "GetObjExtents", func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
@@ -743,15 +752,59 @@ func TestReaderCoveragePrefetchAndAlignment(t *testing.T) {
 		r.mw = mw
 		r.ino = 100
 		r.valid = false
-		require.NoError(t, r.EnsureAlignedForRead(2, 8))
+		require.NoError(t, r.ensureAlignedForRead(false))
 		require.Equal(t, uint64(2), atomic.LoadUint64(&es.inoVersion))
 		require.Equal(t, uint64(8), atomic.LoadUint64(&es.fileSize))
 
 		atomic.StoreUint32(&es.dirty, 1)
-		require.NoError(t, r.EnsureAlignedForRead(2, 8))
-		_, err = r.RefreshExtents()
+		require.NoError(t, r.ensureAlignedForRead(false))
+		_, err = r.refreshExtents()
 		require.NoError(t, err)
 	})
+}
+
+func TestReader_syncInodeView_and_reloadExtentsLocked_err(t *testing.T) {
+	es := NewECStreamer(501, nil, nil)
+	r := &Reader{valid: true, ecStreamer: es, ino: 501, mw: &meta.MetaWrapper{}}
+	atomic.StoreUint64(&es.fileSize, 100)
+	r.syncInodeView(5, 300)
+	require.Equal(t, uint64(5), atomic.LoadUint64(&es.inoVersion))
+	require.Equal(t, uint64(300), atomic.LoadUint64(&es.fileSize))
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(r.mw), "GetObjExtents",
+		func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
+			return 0, 0, nil, nil, syscall.EIO
+		})
+	r.Lock()
+	_, err := r.reloadExtentsLocked()
+	r.Unlock()
+	require.ErrorIs(t, err, syscall.EIO)
+	require.False(t, r.valid)
+}
+
+func TestReader_ensureAlignedForRead_EBADF_and_underLock_flushErr(t *testing.T) {
+	r := &Reader{}
+	require.ErrorIs(t, r.ensureAlignedForRead(false), syscall.EBADF)
+
+	var nilR *Reader
+	require.ErrorIs(t, nilR.ensureAlignedForReadUnderStreamerLock(nil, false), syscall.EBADF)
+	es := NewECStreamer(502, nil, nil)
+	require.ErrorIs(t, (&Reader{ecStreamer: es}).ensureAlignedForReadUnderStreamerLock(nil, false), syscall.EBADF)
+
+	mw := &meta.MetaWrapper{}
+	r2 := &Reader{valid: true, ino: 502, mw: mw, ecStreamer: es}
+	atomic.AddUint32(&es.extentMetaEpoch, 1)
+	atomic.StoreUint32(&es.dirty, 1)
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyPrivateMethod(reflect.TypeOf((*ECStreamer)(nil)), "ensureReadViewCurrentLocked",
+		func(_ *ECStreamer, _ context.Context) error { return fmt.Errorf("flush blocked") })
+	es.mu.Lock()
+	err := r2.ensureAlignedForReadUnderStreamerLock(es, false)
+	es.mu.Unlock()
+	require.Error(t, err)
 }
 
 func TestReaderCoverageHelperBranches(t *testing.T) {
@@ -786,7 +839,9 @@ func TestReaderCoverageHelperBranches(t *testing.T) {
 			limitManager:    manager.NewLimitManager(nil),
 			ecStreamer:      NewECStreamer(1, nil, nil),
 		}
+		r.Lock()
 		require.Error(t, r.ensureExtentsLoaded())
+		r.Unlock()
 		r.Lock()
 		_, err = r.readEbsRange(context.Background(), -1, 1)
 		r.Unlock()
@@ -833,7 +888,9 @@ func TestReaderEnsureExtentsLoadedOnExtentEpochDrift(t *testing.T) {
 		limitManager:    manager.NewLimitManager(nil),
 		readConcurrency: 1,
 	}
+	r.Lock()
 	require.NoError(t, r.ensureExtentsLoaded())
+	r.Unlock()
 	require.True(t, r.valid)
 	require.Equal(t, uint32(7), r.extentEpochSeen)
 }
