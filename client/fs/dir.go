@@ -202,21 +202,12 @@ func (d *Dir) Release(ctx context.Context, req *fuse.ReleaseRequest) (err error)
 	if req != nil && ei.dctx != nil {
 		ei.dctx.Remove(req.Handle)
 	}
-	// 并发 Release 或 FUSE 边界情况下可能对同一 DirExtendInfo 多投递一次 Release；用 CAS 避免 openCnt 被打成负数。
-	var ref int64
-	for {
-		cur := atomic.LoadInt64(&ei.openCnt)
-		if cur <= 0 {
-			log.LogDebugf("DirRelease: skip dec openCnt, ino(%v) name(%v) cur(%v)", d.ino, d.name, cur)
-			if DisableMetaCache {
-				d.super.ic.Delete(d.ino)
-			}
-			return nil
-		}
-		if atomic.CompareAndSwapInt64(&ei.openCnt, cur, cur-1) {
-			ref = cur - 1
-			break
-		}
+	// TODO 并发 Release 或 FUSE 边界情况下可能对同一 DirExtendInfo 多投递一次 Release；用 CAS 避免 openCnt 被打成负数。
+	ref := atomic.AddInt64(&ei.openCnt, -1)
+	if ref < 0 {
+		log.LogWarnf("DirRelease: negative openCnt detected, ino(%v) name(%v) openCnt(%v)", d.ino, d.name, ref)
+		atomic.StoreInt64(&ei.openCnt, 0)
+		ref = 0
 	}
 	if ref == 0 && !d.super.metaCacheAcceleration {
 		if ei.dcache != nil {
@@ -274,12 +265,10 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 	isCache := false
 	if proto.IsCold(d.super.volType) || proto.IsStorageClassBlobStore(info.StorageClass) {
 		isCache = true
-		args, err := child.(*File).buildECStreamOpenArgs(info, uint32(req.Flags&0x0f), info.Size)
-		if err != nil {
-			log.LogErrorf("Create: buildECStreamOpenArgs ino(%v) err(%v)", info.Inode, err)
+		if err := child.(*File).openOECStream(info, uint32(req.Flags&0x0f), info.Size); err != nil {
+			log.LogErrorf("Create: openOECStream ino(%v) err(%v)", info.Inode, err)
 			return nil, nil, ParseError(err)
 		}
-		d.super.oec.OpenStreamWithArgs(args)
 	} else {
 		d.super.ec.OpenStream(info.Inode, openForWrite, isCache, path.Join(child.(*File).getParentPath(), child.(*File).name))
 	}

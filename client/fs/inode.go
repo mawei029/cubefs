@@ -19,8 +19,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cubefs/cubefs/sdk/data/blobstore"
-
 	"github.com/cubefs/cubefs/depends/bazil.org/fuse"
 
 	"github.com/cubefs/cubefs/proto"
@@ -60,66 +58,33 @@ func (s *Super) InodeGet(ino uint64) (info *proto.InodeInfo, err error) {
 			if s.oec.Reader(ino) != nil || s.oec.Writer(ino) != nil {
 				return info, nil
 			}
-			ei, found := f.getExtendInfo()
-			if found && ei != nil {
-				ebsc, err := s.getBlobStoreClient(info.PoolId)
-				if err != nil {
-					log.LogErrorf("InodeGet: get blobstore client for pool(%v) err: %v", info.PoolId, err)
-					return nil, err
-				}
-
-				fileSize, _ := f.fileSizeVersion2(f.ino)
-				aheadEn, aheadMin, aheadTotalMem := s.BlobStoreAheadReadForReader()
-				clientConf := blobstore.ClientConfig{
-					VolName:         s.volname,
-					VolType:         s.volType,
-					BlockSize:       s.EbsBlockSize,
-					Ino:             f.ino,
-					Bc:              s.bc,
-					Mw:              s.mw,
-					LimitManager:    s.blobClientLimitManager(),
-					Ebsc:            ebsc,
-					EnableBcache:    s.enableBcache,
-					WConcurrency:    s.writeThreads,
-					ReadConcurrency: s.readThreads,
-					FileCache:       false,
-					FileSize:        uint64(fileSize),
-					PoolId:          info.PoolId,
-				}
-				clientConf.AheadReadEnable = aheadEn
-				clientConf.MinReadAheadSize = aheadMin
-				clientConf.PrefetchTotalMem = aheadTotalMem
-				clientConf.ECStreamer = blobstore.NewECStreamer(f.ino, nil, nil)
-				ei.Lock()
-				// inode cache miss triggers this refresh: must persist buffered blob data before
-				// FreeCache/NewWriter or unflushed bytes are dropped (e.g. Write defers ic.Delete then Flush -> InodeGet).
-				if ei.coldBlobWriter != nil {
-					if flushErr := ei.coldBlobWriter.Flush(ino, context.Background()); flushErr != nil {
-						ei.Unlock()
-						log.LogErrorf("InodeGet: flush blob writer before refresh on cache miss ino(%v) err(%v)", ino, flushErr)
+			// inode cache miss：与 File.Open 一致，经 openOECStream → oec.OpenStreamWithArgs 建立/恢复数据面。
+			openFlags := uint32(syscall.O_RDONLY)
+			if ei, found := f.getExtendInfo(); found && ei != nil {
+				ei.RLock()
+				openFlags = uint32(ei.flag & 0x0f)
+				// 冷卷遗留 coldBlobWriter（非 oec）须先刷盘，避免未落盘字节丢失。
+				if w := ei.coldBlobWriter; w != nil {
+					if flushErr := w.Flush(ino, context.Background()); flushErr != nil {
+						ei.RUnlock()
+						log.LogErrorf("InodeGet: flush legacy cold blob writer ino(%v) err(%v)", ino, flushErr)
 						return nil, ParseError(flushErr)
 					}
-					ei.coldBlobWriter.FreeCache()
+					w.FreeCache()
 				}
-				switch ei.flag & 0x0f {
-				case syscall.O_RDONLY:
-					log.LogDebugf("InodeGet: ino(%v) info(%v) flag(%v) O_RDONLY", ino, info, ei.flag)
-					ei.coldBlobReader = blobstore.NewReader(clientConf)
-					ei.coldBlobWriter = nil
-				case syscall.O_WRONLY:
-					log.LogDebugf("InodeGet: ino(%v) info(%v) flag(%v) O_WRONLY", ino, info, ei.flag)
-					ei.coldBlobWriter = blobstore.NewWriter(clientConf)
-					ei.coldBlobReader = nil
-				case syscall.O_RDWR:
-					log.LogDebugf("InodeGet: ino(%v) info(%v) flag(%v) O_RDWR", ino, info, ei.flag)
-					ei.coldBlobReader = blobstore.NewReader(clientConf)
-					ei.coldBlobWriter = blobstore.NewWriter(clientConf)
-				default:
-					log.LogDebugf("InodeGet: ino(%v) info(%v) flag(%v) default", ino, info, ei.flag)
-					ei.coldBlobWriter = blobstore.NewWriter(clientConf)
-					ei.coldBlobReader = nil
-				}
-				ei.Unlock()
+				ei.RUnlock()
+			}
+			// CloseStream 后 streamer 可能仍在 map 内但 RW 已释放；ref==0 时驱逐以便 OpenStreamWithArgs 重建。
+			if strm := s.oec.GetStreamer(ino); strm != nil && s.oec.RefCnt(ino) == 0 {
+				_ = s.oec.EvictStream(ino)
+			}
+			logicalSize := info.Size
+			if fileSize, _ := f.fileSizeVersion2(f.ino); uint64(fileSize) > logicalSize {
+				logicalSize = uint64(fileSize)
+			}
+			if err := f.openOECStream(info, openFlags, logicalSize); err != nil {
+				log.LogErrorf("InodeGet: openOECStream ino(%v) err(%v)", ino, err)
+				return nil, ParseError(err)
 			}
 		}
 	}

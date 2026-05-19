@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -571,6 +572,151 @@ func TestComputeTruncateReqsAndTruncateV2Extents(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, out, 1)
 		require.Empty(t, del)
+	})
+}
+
+// assertObjExtentsWithinInodeSize 校验 ObjExtentKey 有序、互不重叠，且任意字节范围不超过 inode 逻辑长度。
+func assertObjExtentsWithinInodeSize(t *testing.T, oeks []cproto.ObjExtentKey, inodeSize uint64) {
+	t.Helper()
+	cp := append([]cproto.ObjExtentKey(nil), oeks...)
+	sort.Slice(cp, func(i, j int) bool {
+		if cp[i].FileOffset != cp[j].FileOffset {
+			return cp[i].FileOffset < cp[j].FileOffset
+		}
+		return cp[i].Size < cp[j].Size
+	})
+	var maxEnd uint64
+	for i := range cp {
+		o := cp[i]
+		if o.Size == 0 {
+			continue
+		}
+		require.LessOrEqual(t, o.FileOffset+o.Size, inodeSize,
+			"extent end exceeds inode size: oek=%v inodeSize=%d", o, inodeSize)
+		require.Less(t, o.FileOffset, inodeSize, "extent start beyond tail inodeSize=%d oek=%v", inodeSize, o)
+		if i > 0 {
+			prev := cp[i-1]
+			if prev.Size == 0 {
+				continue
+			}
+			prevEnd := prev.FileOffset + prev.Size
+			require.LessOrEqual(t, prevEnd, o.FileOffset, "overlapping extents prev=%v cur=%v", prev, o)
+		}
+		if e := o.FileOffset + o.Size; e > maxEnd {
+			maxEnd = e
+		}
+	}
+	require.LessOrEqual(t, maxEnd, inodeSize)
+}
+
+func discardDedupKey(o cproto.ObjExtentKey) string {
+	return fmt.Sprintf("%d:%d:%d", o.FileOffset, o.Size, o.Cid)
+}
+
+// TestTruncateV2Extents_MultiRoundConsistency 覆盖多轮 shrink/expand 交替下 ComputeTruncateReqs + ApplyTruncateReqs 链路与 discard 累积。
+// 复现关注点：每轮返回的 newObjExtents 与目标逻辑长度一致、无越界/重叠；跨轮 toDelete 无重复键。
+func TestTruncateV2Extents_MultiRoundConsistency(t *testing.T) {
+	const MiB = uint64(1 << 20)
+	ctx := context.Background()
+	vol := "ut-vol-multi-trunc"
+
+	newEbsWithEchoReadPut := func(t *testing.T) (*BlobStoreClient, func()) {
+		t.Helper()
+		ebs := &BlobStoreClient{}
+		p := gomonkey.NewPatches()
+		var putCnt int
+		p.ApplyMethod(reflect.TypeOf(ebs), "Read",
+			func(_ *BlobStoreClient, _ context.Context, _ string, buf []byte, _ uint64, size uint64, _ cproto.ObjExtentKey) (int, error) {
+				return int(size), nil
+			})
+		p.ApplyMethod(reflect.TypeOf(ebs), "Put",
+			func(_ *BlobStoreClient, _ context.Context, _ string, r io.Reader, size uint64) ([]cproto.ObjExtentKey, [][]byte, error) {
+				_, err := io.Copy(io.Discard, r)
+				if err != nil {
+					return nil, nil, err
+				}
+				putCnt++
+				// FileOffset 由 ApplyTruncateReqs 在返回后覆写；此处占位 0。
+				return []cproto.ObjExtentKey{{FileOffset: 0, Size: size, Cid: uint64(9000 + putCnt)}}, nil, nil
+			})
+		return ebs, func() { p.Reset() }
+	}
+
+	t.Run("16MiB_two_8MiB_stripes_then_4M_12M_6M", func(t *testing.T) {
+		ebs, cleanup := newEbsWithEchoReadPut(t)
+		defer cleanup()
+
+		exts := []cproto.ObjExtentKey{
+			{FileOffset: 0, Size: 8 * MiB, Cid: 1},
+			{FileOffset: 8 * MiB, Size: 8 * MiB, Cid: 2},
+		}
+		var inodeSize uint64
+		var allDel []cproto.ObjExtentKey
+		seenDel := make(map[string]struct{})
+
+		round := func(name string, target uint64) {
+			t.Helper()
+			nex, del, err := ebs.TruncateV2Extents(ctx, vol, exts, target)
+			require.NoError(t, err, name)
+			for _, d := range del {
+				k := discardDedupKey(d)
+				_, dup := seenDel[k]
+				require.False(t, dup, "%s duplicate discard key %v", name, d)
+				seenDel[k] = struct{}{}
+			}
+			allDel = append(allDel, del...)
+			exts = nex
+			inodeSize = target
+			assertObjExtentsWithinInodeSize(t, exts, inodeSize)
+		}
+
+		round("to_4MiB", 4*MiB)
+		require.NotEmpty(t, exts)
+		round("to_12MiB", 12*MiB)
+		round("to_6MiB", 6*MiB)
+
+		require.Equal(t, uint64(6*MiB), inodeSize)
+		assertObjExtentsWithinInodeSize(t, exts, inodeSize)
+		require.NotEmpty(t, allDel, "expected some discard keys across rounds")
+	})
+
+	t.Run("16MiB_two_stripes_shrink_chain_12M_6M_2M_strict_tail", func(t *testing.T) {
+		ebs, cleanup := newEbsWithEchoReadPut(t)
+		defer cleanup()
+
+		exts := []cproto.ObjExtentKey{
+			{FileOffset: 0, Size: 8 * MiB, Cid: 11},
+			{FileOffset: 8 * MiB, Size: 8 * MiB, Cid: 12},
+		}
+		var inodeSize uint64
+		seenDel := make(map[string]struct{})
+
+		round := func(target uint64) {
+			nex, del, err := ebs.TruncateV2Extents(ctx, vol, exts, target)
+			require.NoError(t, err)
+			for _, d := range del {
+				k := discardDedupKey(d)
+				_, dup := seenDel[k]
+				require.False(t, dup, "duplicate discard %v", d)
+				seenDel[k] = struct{}{}
+			}
+			exts = nex
+			inodeSize = target
+			assertObjExtentsWithinInodeSize(t, exts, inodeSize)
+		}
+
+		round(12 * MiB)
+		round(6 * MiB)
+		round(2 * MiB)
+
+		require.Equal(t, uint64(2*MiB), inodeSize)
+		maxEnd := uint64(0)
+		for _, o := range exts {
+			if e := o.FileOffset + o.Size; e > maxEnd {
+				maxEnd = e
+			}
+		}
+		require.Equal(t, inodeSize, maxEnd, "dense tail: logical extent coverage should match inode size, exts=%v", exts)
 	})
 }
 

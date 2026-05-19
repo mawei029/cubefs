@@ -108,7 +108,7 @@ func TestECExtentClient_ReadWithInodeView_nil_ctx(t *testing.T) {
 	r.ecStreamer = s
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
-	patches.ApplyMethod(reflect.TypeOf(r), "RefreshExtents", func(_ *Reader) (uint64, error) { return 1, nil })
+	patches.ApplyPrivateMethod(reflect.TypeOf((*Reader)(nil)), "refreshExtents", func(_ *Reader) (uint64, error) { return 1, nil })
 	patches.ApplyMethod(reflect.TypeOf(r), "Read",
 		func(_ *Reader, _ context.Context, buf []byte, _, _ int) (int, error) {
 			if len(buf) > 0 {
@@ -117,7 +117,7 @@ func TestECExtentClient_ReadWithInodeView_nil_ctx(t *testing.T) {
 			return 1, nil
 		})
 	patches.ApplyPrivateMethod(reflect.TypeOf((*Reader)(nil)), "ensureAlignedForRead",
-		func(_ *Reader, _, _ uint64, _ bool) error { return nil })
+		func(_ *Reader, _ bool) error { return nil })
 	buf := make([]byte, 4)
 	n, err := c.ReadWithInodeView(nil, 2, buf, 0, 1, 0, false, 1, 100)
 	require.NoError(t, err)
@@ -303,6 +303,37 @@ func TestECExtentClient_Close_evicts_all(t *testing.T) {
 	require.NoError(t, c.Close())
 	require.Nil(t, c.GetStreamer(101))
 	require.Nil(t, c.GetStreamer(102))
+}
+
+func TestECExtentClient_SyncReaderViewAfterMetaChange(t *testing.T) {
+	c := NewObjExtentClient(ObjExtentConfig{})
+	require.NoError(t, c.SyncReaderViewAfterMetaChange(nil, 404))
+
+	mw := &meta.MetaWrapper{}
+	r := &Reader{ino: 405, mw: mw, valid: true}
+	s := NewECStreamer(405, r, nil)
+	r.ecStreamer = s
+	c.SetStreamer(405, s)
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyPrivateMethod(reflect.TypeOf((*ECStreamer)(nil)), "syncReaderViewAfterMetaChange",
+		func(_ *ECStreamer, _ context.Context) error { return nil })
+	require.NoError(t, c.SyncReaderViewAfterMetaChange(context.Background(), 405))
+}
+
+func TestECExtentClient_FstatSizeView(t *testing.T) {
+	c := NewObjExtentClient(ObjExtentConfig{})
+	_, _, ok := c.FstatSizeView(1, 5, 100)
+	require.False(t, ok)
+
+	s := NewECStreamer(210, nil, nil)
+	atomic.StoreUint64(&s.fileSize, 0xf3800)
+	atomic.StoreUint64(&s.inoVersion, 12)
+	c.SetStreamer(210, s)
+	sz, gen, ok := c.FstatSizeView(210, 12, 0xf4000)
+	require.True(t, ok)
+	require.Equal(t, 0xf4000, sz)
+	require.Equal(t, uint64(12), gen)
 }
 
 func TestECExtentClient_FileSize(t *testing.T) {

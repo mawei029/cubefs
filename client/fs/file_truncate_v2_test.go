@@ -30,11 +30,15 @@ func registerOecTestStreamer(s *Super, ino uint64, r *blobstore.Reader, w *blobs
 
 // newTestECStreamerWithWriter / newTestECStreamerWithReaderWriter 仅 client/fs 测试用，封装 blobstore.NewECStreamer。
 func newTestECStreamerWithWriter(ino uint64, w *blobstore.Writer) *blobstore.ECStreamer {
-	return blobstore.NewECStreamer(ino, nil, w)
+	args := blobstore.ECStreamOpenArgs{Ino: ino}
+	s, _ := blobstore.NewECStreamer(args, nil, w)
+	return s
 }
 
 func newTestECStreamerWithReaderWriter(ino uint64, r *blobstore.Reader, w *blobstore.Writer) *blobstore.ECStreamer {
-	return blobstore.NewECStreamer(ino, r, w)
+	args := blobstore.ECStreamOpenArgs{Ino: ino}
+	s, _ := blobstore.NewECStreamer(args, r, w)
+	return s
 }
 
 func newBlobFileForTruncateTest() (*File, *blobstore.Writer) {

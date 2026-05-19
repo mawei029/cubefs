@@ -95,6 +95,13 @@ func TestNotInstanceWriter_Write(t *testing.T) {
 }
 
 // TestWriter_TruncateV2_NilReturnsError 校验 nil Writer 调用 TruncateV2 返回错误（EC truncate 基本分支）。
+func TestNewWriter_panicsWithoutECStreamer(t *testing.T) {
+	defer func() {
+		require.NotNil(t, recover())
+	}()
+	_ = NewWriter(ClientConfig{VolName: "v", Ino: 1})
+}
+
 func TestWriter_TruncateV2_NilReturnsError(t *testing.T) {
 	w := newNilWriter()
 	ctx := context.Background()

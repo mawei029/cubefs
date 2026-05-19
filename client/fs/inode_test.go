@@ -48,7 +48,6 @@ func TestInodeGet_BlobStoreFileRefreshReaderWriter(t *testing.T) {
 
 	f := &File{super: s, ino: ino}
 	f.setFlag(syscall.O_RDWR)
-	f.setColdBlobReaderWriter(nil, &blobstore.Writer{})
 	s.nodeCache[ino] = f
 	s.ebsc[poolID] = &blobstore.BlobStoreClient{}
 
@@ -65,16 +64,18 @@ func TestInodeGet_BlobStoreFileRefreshReaderWriter(t *testing.T) {
 				Generation:   7,
 			}, nil
 		})
-	patches.ApplyMethod(reflect.TypeOf(s.ec), "FileSize",
-		func(_ *stream.ExtentClient, _ uint64) (int, uint64, bool) {
-			return 64, 7, true
+	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "OpenStreamWithArgs",
+		func(_ *blobstore.ECExtentClient, _ blobstore.ECStreamOpenArgs) error {
+			return nil
+		})
+	patches.ApplyPrivateMethod(reflect.TypeOf((*File)(nil)), "openOECStream",
+		func(_ *File, _ *proto.InodeInfo, _ uint32, _ uint64) error {
+			return nil
 		})
 
 	got, err := s.InodeGet(ino)
 	require.NoError(t, err)
 	require.True(t, proto.IsStorageClassBlobStore(got.StorageClass))
-	require.NotNil(t, f.coldBlobReader())
-	require.NotNil(t, f.coldBlobWriter())
 }
 
 func TestInodeGet_BlobFlushBeforeRefreshFails(t *testing.T) {
@@ -85,7 +86,8 @@ func TestInodeGet_BlobFlushBeforeRefreshFails(t *testing.T) {
 	f := &File{super: s, ino: ino}
 	f.setFlag(syscall.O_RDONLY)
 	w := &blobstore.Writer{}
-	f.setColdBlobReaderWriter(nil, w)
+	ei := f.getOrCreateExtendInfo()
+	ei.coldBlobWriter = w
 	s.nodeCache[ino] = f
 	s.ebsc[poolID] = &blobstore.BlobStoreClient{}
 
@@ -101,10 +103,6 @@ func TestInodeGet_BlobFlushBeforeRefreshFails(t *testing.T) {
 				Size:         0,
 				Generation:   1,
 			}, nil
-		})
-	patches.ApplyMethod(reflect.TypeOf(s.ec), "FileSize",
-		func(_ *stream.ExtentClient, _ uint64) (int, uint64, bool) {
-			return 0, 1, false
 		})
 	patches.ApplyMethod(reflect.TypeOf(w), "Flush",
 		func(_ *blobstore.Writer, _ uint64, _ context.Context) error {

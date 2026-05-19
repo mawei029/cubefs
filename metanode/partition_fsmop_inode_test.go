@@ -946,6 +946,7 @@ func TestFsmExtentsTruncateV2(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, updatedIno)
 	require.Equal(t, uint64(150), updatedIno.Size)
+	require.Equal(t, uint64(2), updatedIno.Generation)
 	sortedEks := updatedIno.HybridCloudExtents.sortedEks.(*SortedObjExtents)
 	extents := sortedEks.CopyExtents()
 	require.Len(t, extents, 2)

@@ -102,6 +102,46 @@ func TestFile_XattrFeatureSwitchAndSecurityCapabilityBypass(t *testing.T) {
 	require.Equal(t, []byte{}, resp.Xattr)
 }
 
+func TestFile_fileSizeVersion2_ecBlob_invalidFileSize_usesWriterCache(t *testing.T) {
+	s := newTestSuperForFile()
+	s.volType = proto.VolumeTypeCold
+	s.poolCache = map[uint8]*proto.StoragePoolInfo{
+		1: {Id: 1, StorageClass: uint8(proto.StorageClass_BlobStore)},
+	}
+	f := &File{super: s, ino: 16, parentIno: 2, name: "ec.dat"}
+	s.ic.Put(&proto.InodeInfo{Inode: 16, PoolId: 1, StorageClass: proto.StorageClass_BlobStore, Size: 100, Generation: 3})
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	w := &blobstore.Writer{}
+	f.setColdBlobReaderWriter(nil, w)
+	w.SetFileSize(200)
+
+	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "FileSize",
+		func(_ *blobstore.ECExtentClient, _ uint64) (int, uint64, bool) {
+			return 0, 0, false
+		})
+	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet", func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
+		return &proto.InodeInfo{Inode: 16, Size: 100, Generation: 3}, nil
+	})
+
+	size, gen := f.fileSizeVersion2(f.ino)
+	require.Equal(t, 200, size)
+	require.Equal(t, uint64(3), gen)
+}
+
+func TestFile_syncBlobReaderAfterMetaChange_warnOnError(t *testing.T) {
+	s := newTestSuperForFile()
+	f := &File{super: s, ino: 17}
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "SyncReaderViewAfterMetaChange",
+		func(_ *blobstore.ECExtentClient, _ context.Context, _ uint64) error {
+			return errors.New("sync failed")
+		})
+	f.syncBlobReaderAfterMetaChange(f.ino)
+}
+
 func TestFile_FilterSuffixAndFileSizeVersion2Fallback(t *testing.T) {
 	s := newTestSuperForFile()
 	f := &File{super: s, ino: 10, name: "a.log"}
@@ -246,8 +286,8 @@ func TestFile_Setattr_BlobTruncateAndSyncReaderWriter(t *testing.T) {
 			return 1, 32, nil, []proto.ObjExtentKey{{FileOffset: 0, Size: 32}}, nil
 		})
 	patches.ApplyMethod(reflect.TypeOf(s.ec), "RefreshExtentsCache", func(_ *stream.ExtentClient, _ uint64) error { return nil })
-	patches.ApplyMethod(reflect.TypeOf(reader), "RefreshExtents", func(_ *blobstore.Reader) (uint64, error) { return 0, nil })
-	patches.ApplyMethod(reflect.TypeOf(reader), "SyncInodeView", func(_ *blobstore.Reader, _ uint64, _ uint64) {})
+	patches.ApplyPrivateMethod(reflect.TypeOf((*blobstore.Reader)(nil)), "refreshExtents", func(_ *blobstore.Reader) (uint64, error) { return 0, nil })
+	patches.ApplyPrivateMethod(reflect.TypeOf((*blobstore.Reader)(nil)), "syncInodeView", func(_ *blobstore.Reader, _ uint64, _ uint64) {})
 
 	req := &fuse.SetattrRequest{Valid: fuse.SetattrSize, Size: 32}
 	resp := &fuse.SetattrResponse{}
@@ -365,8 +405,8 @@ func TestFile_Read_BlobUsesOecReadAfterAlign(t *testing.T) {
 	calledOecRead := false
 	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "ReadWithInodeView",
 		func(_ *blobstore.ECExtentClient, _ context.Context, ino uint64, _ []byte, offset int, size int, _ uint8, _ bool, gen, sz uint64) (int, error) {
-			require.Equal(t, uint64(7), gen)
-			require.Equal(t, uint64(16), sz)
+			require.Equal(t, uint64(0), gen)
+			require.Equal(t, uint64(0), sz)
 			require.Equal(t, uint64(15), ino)
 			require.Equal(t, 0, offset)
 			require.Equal(t, 4, size)

@@ -1585,6 +1585,9 @@ func (mw *MetaWrapper) truncateV2(mp *MetaPartition, inode, size uint64, fullPat
 		stat.EndStat("truncateV2", err, bgTime, 1)
 	}()
 
+	// TODO：校验newObjExtents东西meta存的相同offset位置的是否一致，一样的不做return ok；
+	// 不一样的做执行。toDeletes删除的第一个，与meta是否一致。参数不一致
+	// 放到状态机 fsm的apply里面
 	req := &proto.TruncateRequest{
 		VolName:       mw.volname,
 		PartitionID:   mp.PartitionID,
@@ -1592,8 +1595,8 @@ func (mw *MetaWrapper) truncateV2(mp *MetaPartition, inode, size uint64, fullPat
 		Size:          size,
 		Timestamp:     time.Now().Unix(),
 		TruncateV2:    true,
-		NewObjExtents: newObjExtents,
-		ToDeletes:     toDeletes,
+		NewObjExtents: newObjExtents, // 替换的单独重叠部分的，只替换1个
+		ToDeletes:     toDeletes,     // 删除只带第1个
 	}
 	req.FullPaths = []string{fullPath}
 
