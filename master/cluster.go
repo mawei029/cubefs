@@ -6509,6 +6509,9 @@ func (c *Cluster) checkDecommissionDisk() {
 				if dataNode.DecommissionLimit != 0 && !dataNode.isBadDisk(disk.DiskPath) {
 					// can allocate dp again
 					c.deleteAndSyncDecommissionedDisk(dataNode, disk.DiskPath)
+					if status == DecommissionSuccess {
+						disk.SetDecommissionStatus(DecommissionInitial)
+					}
 				}
 				return true
 			}
