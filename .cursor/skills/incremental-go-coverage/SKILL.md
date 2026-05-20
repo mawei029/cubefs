@@ -245,7 +245,7 @@ description: 检查并改进 Go 增量测试覆盖率（针对当前未提交改
 ```bash
 base=<commit>
 threshold=80
-. build/cgo_env.sh
+source build/cgo_env.sh
 filter_focus_go_files() {
   while read -r f; do
     [ -n "$f" ] || continue
