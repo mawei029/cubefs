@@ -125,6 +125,7 @@ func newCmdFlashTopoUpdate(client *master.MasterClient) *cobra.Command {
 		flashNodeHandleReadTimeout   int
 		flashNodeReadDataNodeTimeout int
 		flashHotKeyMissCount         int
+		flashNodeReadRps             int64
 		flashReadFlowLimit           int64
 		flashWriteFlowLimit          int64
 		flashKeyFlowLimit            int64
@@ -148,6 +149,7 @@ func newCmdFlashTopoUpdate(client *master.MasterClient) *cobra.Command {
 			appendFlashTopoIntChange(&confirmString, "FlashNodeHandleReadTimeout", topo.FlashNodeHandleReadTimeout, flashNodeHandleReadTimeout, &isChange)
 			appendFlashTopoIntChange(&confirmString, "FlashNodeReadDataNodeTimeout", topo.FlashNodeReadDataNodeTimeout, flashNodeReadDataNodeTimeout, &isChange)
 			appendFlashTopoIntChange(&confirmString, "FlashHotKeyMissCount", topo.FlashHotKeyMissCount, flashHotKeyMissCount, &isChange)
+			appendFlashTopoInt64Change(&confirmString, "FlashNodeReadRps", topo.FlashNodeReadRps, flashNodeReadRps, &isChange)
 			appendFlashTopoInt64Change(&confirmString, "FlashReadFlowLimit", topo.FlashReadFlowLimit, flashReadFlowLimit, &isChange)
 			appendFlashTopoInt64Change(&confirmString, "FlashWriteFlowLimit", topo.FlashWriteFlowLimit, flashWriteFlowLimit, &isChange)
 			appendFlashTopoInt64Change(&confirmString, "FlashKeyFlowLimit", topo.FlashKeyFlowLimit, flashKeyFlowLimit, &isChange)
@@ -166,7 +168,7 @@ func newCmdFlashTopoUpdate(client *master.MasterClient) *cobra.Command {
 				}
 			}
 			_, err = client.AdminAPI().UpdateFlashTopo(name, flashNodeHandleReadTimeout,
-				flashNodeReadDataNodeTimeout, flashHotKeyMissCount, flashReadFlowLimit, flashWriteFlowLimit, flashKeyFlowLimit, flashNodeConnectionLimit)
+				flashNodeReadDataNodeTimeout, flashHotKeyMissCount, flashNodeReadRps, flashReadFlowLimit, flashWriteFlowLimit, flashKeyFlowLimit, flashNodeConnectionLimit)
 			if err != nil {
 				return
 			}
@@ -179,6 +181,7 @@ func newCmdFlashTopoUpdate(client *master.MasterClient) *cobra.Command {
 	cmd.Flags().IntVar(&flashNodeHandleReadTimeout, "flashNodeHandleReadTimeout", -1, "flash node handle read timeout")
 	cmd.Flags().IntVar(&flashNodeReadDataNodeTimeout, "flashNodeReadDataNodeTimeout", -1, "flash node read datanode timeout")
 	cmd.Flags().IntVar(&flashHotKeyMissCount, "flashHotKeyMissCount", -1, "flash hot key miss count")
+	cmd.Flags().Int64Var(&flashNodeReadRps, "flashNodeReadRps", -1, "flash node read request limiter rps")
 	cmd.Flags().Int64Var(&flashReadFlowLimit, "flashReadFlowLimit", -1, "flash read flow limit")
 	cmd.Flags().Int64Var(&flashWriteFlowLimit, "flashWriteFlowLimit", -1, "flash write flow limit")
 	cmd.Flags().Int64Var(&flashKeyFlowLimit, "flashKeyFlowLimit", -1, "flash key flow limit")

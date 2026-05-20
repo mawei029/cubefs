@@ -934,6 +934,7 @@ type FlashNodeHeartBeatInfos struct {
 	FlashNodeHandleReadTimeout   int
 	FlashNodeReadDataNodeTimeout int
 	FlashHotKeyMissCount         int
+	FlashNodeReadRps             int64
 	FlashReadFlowLimit           int64
 	FlashWriteFlowLimit          int64
 	FlashKeyFlowLimit            int64

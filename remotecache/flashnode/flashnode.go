@@ -740,6 +740,20 @@ func (f *FlashNode) initLimiter() {
 	f.readLimiter = rate.NewLimiter(rate.Limit(f.readRps), 2*f.readRps)
 }
 
+func (f *FlashNode) setReadRps(readRps int64) {
+	if readRps <= 0 {
+		return
+	}
+	newReadRps := int(readRps)
+	if f.readRps == newReadRps {
+		return
+	}
+	log.LogInfof("FlashNode set readRps from %d to %d", f.readRps, newReadRps)
+	f.readRps = newReadRps
+	f.readLimiter.SetLimit(rate.Limit(newReadRps))
+	f.readLimiter.SetBurst(2 * newReadRps)
+}
+
 func (f *FlashNode) setConnectionLimit(limit int64) {
 	if limit <= 0 {
 		return

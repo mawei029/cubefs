@@ -1223,6 +1223,7 @@ func (m *Server) getCluster(w http.ResponseWriter, r *http.Request) {
 		FlashNodeReadDataNodeTimeout:              m.cluster.cfg.flashNodeReadDataNodeTimeout,
 		RackAwareLevel:                            m.cluster.cfg.RackAwareLevel,
 		FlashHotKeyMissCount:                      m.cluster.cfg.flashHotKeyMissCount,
+		FlashNodeReadRps:                          m.cluster.cfg.flashNodeReadRps,
 		PreheatTotalTask:                          m.cluster.cfg.preheatTotalTask,
 		MaxDisableFlashGroupPercent:               m.cluster.cfg.maxDisableFlashGroupPercent,
 		FlashReadFlowLimit:                        m.cluster.cfg.flashReadFlowLimit,

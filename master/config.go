@@ -79,6 +79,7 @@ const (
 	flashNodeHandleReadTimeout   = "flashNodeHandleReadTimeout"
 	flashNodeReadDataNodeTimeout = "flashNodeReadDataNodeTimeout"
 	flashHotKeyMissCount         = "flashHotKeyMissCount"
+	flashNodeReadRps             = "flashNodeReadRps"
 	preheatTotalTask             = "preheatTotalTask"
 	maxDisableFlashGroupPercent  = "maxDisableFlashGroupPercent"
 	flashReadFlowLimit           = "flashReadFlowLimit"
@@ -141,6 +142,7 @@ const (
 	defaultFlashNodeHandleReadTimeout   = 1000
 	defaultFlashNodeReadDataNodeTimeout = 3000
 	defaultFlashHotKeyMissCount         = 5
+	defaultFlashNodeReadRps             = 200000
 	defaultPreheatTotalTask             = 8
 	defaultMaxDisableFlashGroupPercent  = flashgroupmanager.DefaultMaxDisableFlashGroupPercent
 	defaultFlashReadFlowLimit           = 2147483648
@@ -240,6 +242,7 @@ type clusterConfig struct {
 	flashNodeHandleReadTimeout   int
 	flashNodeReadDataNodeTimeout int
 	flashHotKeyMissCount         int
+	flashNodeReadRps             int64
 	preheatTotalTask             int
 	maxDisableFlashGroupPercent  int // numerator for fgCount * X / 100, valid 1..100
 	flashReadFlowLimit           int64
@@ -309,6 +312,7 @@ func newClusterConfig() (cfg *clusterConfig) {
 	cfg.flashNodeHandleReadTimeout = defaultFlashNodeHandleReadTimeout
 	cfg.flashNodeReadDataNodeTimeout = defaultFlashNodeReadDataNodeTimeout
 	cfg.flashHotKeyMissCount = defaultFlashHotKeyMissCount
+	cfg.flashNodeReadRps = defaultFlashNodeReadRps
 	cfg.preheatTotalTask = defaultPreheatTotalTask
 	cfg.maxDisableFlashGroupPercent = defaultMaxDisableFlashGroupPercent
 	cfg.flashReadFlowLimit = defaultFlashReadFlowLimit

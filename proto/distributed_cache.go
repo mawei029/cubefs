@@ -454,6 +454,7 @@ type FlashNodeViewInfo struct {
 type FlashNodeStat struct {
 	WaitForCacheBlock bool
 	NodeLimit         uint64
+	ReadRps           int
 	ConnectionLimit   int64
 	ActiveConnections int64
 	VolLimit          map[string]uint64
@@ -507,6 +508,7 @@ type RemoteCacheConfig struct {
 	RemoteCacheSameZoneTimeout   int64
 	RemoteCacheSameRegionTimeout int64
 	FlashHotKeyMissCount         int
+	FlashNodeReadRps             int64
 	FlashReadFlowLimit           int64
 	FlashWriteFlowLimit          int64
 	FlashKeyFlowLimit            int64
@@ -846,6 +848,7 @@ type FlashTopologyAdminView struct {
 	FlashNodeHandleReadTimeout   int
 	FlashNodeReadDataNodeTimeout int
 	FlashHotKeyMissCount         int
+	FlashNodeReadRps             int64
 	FlashReadFlowLimit           int64
 	FlashWriteFlowLimit          int64
 	FlashKeyFlowLimit            int64

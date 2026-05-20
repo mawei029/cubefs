@@ -141,6 +141,7 @@ func (c *Cluster) loadFlashTopos() (err error) {
 			topo.FlashNodeHandleReadTimeout = ftv.FlashNodeHandleReadTimeout
 			topo.FlashNodeReadDataNodeTimeout = ftv.FlashNodeReadDataNodeTimeout
 			topo.FlashHotKeyMissCount = ftv.FlashHotKeyMissCount
+			topo.FlashNodeReadRps = ftv.FlashNodeReadRps
 			topo.FlashReadFlowLimit = ftv.FlashReadFlowLimit
 			topo.FlashWriteFlowLimit = ftv.FlashWriteFlowLimit
 			topo.FlashKeyFlowLimit = ftv.FlashKeyFlowLimit
@@ -187,6 +188,7 @@ func (c *Cluster) defaultFlashNodeHeartbeatConfig() flashgroupmanager.FlashNodeH
 		FlashNodeHandleReadTimeout:   c.cfg.flashNodeHandleReadTimeout,
 		FlashNodeReadDataNodeTimeout: c.cfg.flashNodeReadDataNodeTimeout,
 		FlashHotKeyMissCount:         c.cfg.flashHotKeyMissCount,
+		FlashNodeReadRps:             c.cfg.flashNodeReadRps,
 		FlashReadFlowLimit:           c.cfg.flashReadFlowLimit,
 		FlashWriteFlowLimit:          c.cfg.flashWriteFlowLimit,
 		FlashKeyFlowLimit:            c.cfg.flashKeyFlowLimit,

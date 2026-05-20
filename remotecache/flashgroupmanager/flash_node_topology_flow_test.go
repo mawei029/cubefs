@@ -124,3 +124,10 @@ func TestFlashNodeTopology_CreateFlashNodeHeartBeatTasksUsesTopoConfig(t *testin
 	require.Equal(t, int64(602), reqB.FlashNodeConnectionLimit)
 	require.Equal(t, "topo-b", reqB.TopoName)
 }
+
+func TestFlashNodeTopology_FillHeartbeatConfigDefaultsCorrectsZeroReadRps(t *testing.T) {
+	topo := NewFlashNodeTopology("t", proto.DefaultRegion, 1, proto.TopoStatusNormal)
+	topo.FlashNodeReadRps = int64Ptr(0)
+	topo.FillHeartbeatConfigDefaults(FlashNodeHeartbeatConfig{FlashNodeReadRps: defaultFlashNodeReadRps})
+	require.Equal(t, int64(defaultFlashNodeReadRps), topo.GetHeartbeatConfig().FlashNodeReadRps)
+}

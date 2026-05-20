@@ -135,6 +135,7 @@ func TestLoadFlashToposPersistsDefaultAndIdleTopos(t *testing.T) {
 		FlashNodeHandleReadTimeout:   111,
 		FlashNodeReadDataNodeTimeout: 222,
 		FlashHotKeyMissCount:         333,
+		FlashNodeReadRps:             defaultFlashNodeReadRps,
 		FlashReadFlowLimit:           444,
 		FlashWriteFlowLimit:          555,
 		FlashKeyFlowLimit:            0,
@@ -196,6 +197,7 @@ func TestClusterLoadFlashToposRestoresPersistedTopoAndCreatesIdle(t *testing.T) 
 		FlashNodeHandleReadTimeout:   111,
 		FlashNodeReadDataNodeTimeout: 222,
 		FlashHotKeyMissCount:         333,
+		FlashNodeReadRps:             88888,
 		FlashReadFlowLimit:           444,
 		FlashWriteFlowLimit:          555,
 		FlashKeyFlowLimit:            666,
@@ -213,6 +215,7 @@ func TestClusterLoadFlashToposRestoresPersistedTopoAndCreatesIdle(t *testing.T) 
 	require.True(t, restored.DeleteGradualFlag)
 	require.Equal(t, int64(11), restored.GetRemoteCacheReadFlowMap()["vol-a"])
 	require.Equal(t, int64(22), restored.GetRemoteCacheWriteFlowMap()["vol-a"])
+	require.Equal(t, int64(88888), restored.GetHeartbeatConfig().FlashNodeReadRps)
 	require.Equal(t, int64(666), restored.GetHeartbeatConfig().FlashKeyFlowLimit)
 	require.Equal(t, int64(777), restored.GetHeartbeatConfig().FlashNodeConnectionLimit)
 
