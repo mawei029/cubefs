@@ -202,7 +202,7 @@ func (d *Dir) Release(ctx context.Context, req *fuse.ReleaseRequest) (err error)
 	if req != nil && ei.dctx != nil {
 		ei.dctx.Remove(req.Handle)
 	}
-	// TODO 并发 Release 或 FUSE 边界情况下可能对同一 DirExtendInfo 多投递一次 Release；用 CAS 避免 openCnt 被打成负数。
+	// 并发 Release 或 FUSE 边界情况下可能对同一 DirExtendInfo 多投递一次 Release 吗？需要用 CAS 避免 openCnt 被打成负数？
 	ref := atomic.AddInt64(&ei.openCnt, -1)
 	if ref < 0 {
 		log.LogWarnf("DirRelease: negative openCnt detected, ino(%v) name(%v) openCnt(%v)", d.ino, d.name, ref)

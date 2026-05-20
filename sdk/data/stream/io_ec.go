@@ -14,9 +14,9 @@ type ExtentClientAPI interface {
 
 	Read(inode uint64, data []byte, offset int, size int, poolId uint8, isMigration bool) (int, error)
 	Write(inode uint64, offset int, data []byte, flags int, checkFunc func() error,
-		poolId uint8, storageClass uint32, isMigration, waitForFlush bool) (int, error)
+		poolId uint8, storageClass uint32, isMigration bool) (int, error)
 	Flush(inode uint64) error
-	Truncate(parentIno uint64, inode uint64, size int, fullPath string) error
+	Truncate(parentIno uint64, inode uint64, size uint64, fullPath string) error
 }
 
 // ECStreamerAPI 单 inode EC 流上的外向 IO（Read/Write 不带 inode 参数，接收者即该 inode）；由 *blobstore.ECStreamer 实现。
@@ -27,5 +27,5 @@ type ECStreamerAPI interface {
 	Read(ctx context.Context, dst []byte, offset int, size int, poolId uint8, isMigration bool) (int, error)
 	Write(ctx context.Context, offset int, data []byte, flags int, checkFunc func() error, storageClass uint32, isMigration bool) (int, error)
 	Flush(ctx context.Context) error
-	Truncate(ctx context.Context, size int, fullPath string) error
+	Truncate(ctx context.Context, size uint64, fullPath string) error
 }

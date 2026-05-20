@@ -73,13 +73,12 @@ type Reader struct {
 	bc              *bcache.BcacheClient
 	readConcurrency int
 	enableBcache    bool
-	inflightCache   sync.Map // TODO: 先不管
+	inflightCache   sync.Map // TODO: 先不管，保留起来，看怎么用
 	limitManager    *manager.LimitManager
 
 	// blockSize + readBuf: when aheadRead is enabled and file size is larger than minReadAheadSize in EC/BlobStore reads,
 	// merge multiple small FUSE reads (for example max_read=128KiB) into at most one EBS fetch of up to prefetchBufCap() (2×blockSize, e.g. 2×8MiB), cached in readBuf.
 	// Semantics are similar to replica-stream AheadReadWindow, but implementation is Reader-side buffering instead of stream module logic.
-	blockSize        int
 	aheadReadEnable  bool
 	minReadAheadSize uint64
 	readBuf          []byte
@@ -177,7 +176,6 @@ func NewReader(config ClientConfig) (reader *Reader) {
 	reader.readConcurrency = config.ReadConcurrency
 
 	reader.limitManager = config.LimitManager
-	reader.blockSize = config.BlockSize
 	reader.aheadReadEnable = config.AheadReadEnable
 	mra := config.MinReadAheadSize
 	if mra < 0 {
@@ -193,10 +191,10 @@ func NewReader(config ClientConfig) (reader *Reader) {
 
 // prefetchBufCap is readBuf capacity and the max single prefetch fetch size (two EBS logical blocks).
 func (reader *Reader) prefetchBufCap() int {
-	if reader.blockSize <= 0 {
+	if reader.ecStreamer.BlockSize() <= 0 {
 		return 0
 	}
-	return reader.blockSize * 2
+	return reader.ecStreamer.BlockSize() * 2
 }
 
 // ensurePrefetchBuf ensures readBuf capacity is at least prefetchBufCap (2×blockSize) and reserves global prefetch budget; on budget shortage it returns false and Read falls back to per-call readEbsRange.
@@ -251,7 +249,7 @@ func (reader *Reader) Read(ctx context.Context, buf []byte, offset int, size int
 
 	// 与副本 Streamer.read 一致：起点已在文件逻辑尾之后时返回 0 字节、err=nil（POSIX：EOF 以 n==0 表示，不要求 io.EOF）。
 	if uint64(offset) >= fileSize {
-		// TODD：把buf重新填充一下，zero填充
+		// TODD：next version, 把buf重新填充一下，zero填充
 		return 0, nil
 	}
 	// TODO：空洞填充zero，重新填buf
@@ -272,7 +270,7 @@ func (reader *Reader) Read(ctx context.Context, buf []byte, offset int, size int
 	}
 
 	// Prefetch gate: requires blockSize configured, mount-level aheadRead enabled, and file length > minReadAheadSize (same as stream-side policy to avoid over-buffering small files).
-	usePrefetch := reader.blockSize > 0 && reader.aheadReadEnable && fileSize > reader.minReadAheadSize
+	usePrefetch := reader.ecStreamer.BlockSize() > 0 && reader.aheadReadEnable && fileSize > reader.minReadAheadSize
 	// case 1: prefetch disabled or file too small -> each call does one readEbsRange;
 	if !usePrefetch {
 		return normalReadFunc()
@@ -284,7 +282,7 @@ func (reader *Reader) Read(ctx context.Context, buf []byte, offset int, size int
 	}
 
 	// case 3: single request >= blockSize: cannot fit prefetch window, read EBS range directly and invalidate buffer to avoid half-block logic.
-	if size >= reader.blockSize {
+	if size >= reader.ecStreamer.BlockSize() {
 		reader.invalidateReadBuf()
 		return normalReadFunc()
 	}

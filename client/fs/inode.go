@@ -15,7 +15,6 @@
 package fs
 
 import (
-	"context"
 	"syscall"
 	"time"
 
@@ -64,13 +63,10 @@ func (s *Super) InodeGet(ino uint64) (info *proto.InodeInfo, err error) {
 				ei.RLock()
 				openFlags = uint32(ei.flag & 0x0f)
 				// 冷卷遗留 coldBlobWriter（非 oec）须先刷盘，避免未落盘字节丢失。
-				if w := ei.coldBlobWriter; w != nil {
-					if flushErr := w.Flush(ino, context.Background()); flushErr != nil {
-						ei.RUnlock()
-						log.LogErrorf("InodeGet: flush legacy cold blob writer ino(%v) err(%v)", ino, flushErr)
-						return nil, ParseError(flushErr)
-					}
-					w.FreeCache()
+				if err := s.oec.Flush(ino); err != nil {
+					ei.RUnlock()
+					log.LogErrorf("InodeGet: flush legacy cold blob writer ino(%v) err(%v)", ino, err)
+					return nil, ParseError(err)
 				}
 				ei.RUnlock()
 			}

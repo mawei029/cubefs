@@ -451,7 +451,7 @@ func (ebs *BlobStoreClient) ApplyTruncateReqs(ctx context.Context, volName strin
 	toDelete = make([]proto.ObjExtentKey, 0, len(req.DiscardOnly)+len(req.OverwriteReqs))
 	toDelete = append(toDelete, req.DiscardOnly...)
 
-	// TODO: OverwriteReqs只有1个
+	// TODO: next version, OverwriteReqs只有1个
 	for _, r := range req.OverwriteReqs {
 		discard := r.DiscardExtent
 		if discard.Size == 0 {
