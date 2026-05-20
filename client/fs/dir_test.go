@@ -10,14 +10,20 @@ package fs
 
 import (
 	"context"
+	"errors"
 	"os"
+	"reflect"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/agiledragon/gomonkey/v2"
 	"github.com/cubefs/cubefs/depends/bazil.org/fuse"
 	"github.com/cubefs/cubefs/depends/bazil.org/fuse/fs"
 	"github.com/cubefs/cubefs/proto"
+	"github.com/cubefs/cubefs/sdk/data/blobstore"
+	"github.com/cubefs/cubefs/sdk/meta"
 	"github.com/stretchr/testify/require"
 )
 
@@ -293,6 +299,54 @@ func TestDir_ForgetKeepsExtendInfoWhenOpenCountPositive(t *testing.T) {
 	require.True(t, still, "Forget 在 openCnt>0 时应保留 DirExtendInfo，避免 Release 将计数打成负数")
 	_, inNode := s.nodeCache[ino]
 	require.False(t, inNode)
+}
+
+func TestDir_Create_ColdBlob_openOECStreamError(t *testing.T) {
+	s := newTestSuperForDir()
+	s.volType = proto.VolumeTypeCold
+	s.poolCache = map[uint8]*proto.StoragePoolInfo{
+		1: {Id: 1, StorageClass: uint8(proto.StorageClass_BlobStore)},
+	}
+	s.ebsc = map[uint8]*blobstore.BlobStoreClient{1: {}}
+	d := &Dir{super: s, ino: 10, parentIno: 1, name: "dir"}
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "Create_ll",
+		func(_ *meta.MetaWrapper, _ uint64, _ string, _ uint32, _ uint32, _ uint32, _ []byte, _ string, _ bool, _ bool) (*proto.InodeInfo, error) {
+			return &proto.InodeInfo{Inode: 89, PoolId: 1, StorageClass: proto.StorageClass_BlobStore}, nil
+		})
+	patches.ApplyPrivateMethod(reflect.TypeOf((*File)(nil)), "openOECStream",
+		func(_ *File, _ *proto.InodeInfo, _ uint32, _ uint64) error { return errors.New("create open fail") })
+
+	req := &fuse.CreateRequest{Name: "bad", Flags: fuse.OpenFlags(syscall.O_CREAT)}
+	_, _, err := d.Create(context.Background(), req, &fuse.CreateResponse{})
+	require.Error(t, err)
+}
+
+func TestDir_Create_ColdBlob_openOECStream(t *testing.T) {
+	s := newTestSuperForDir()
+	s.volType = proto.VolumeTypeCold
+	s.poolCache = map[uint8]*proto.StoragePoolInfo{
+		1: {Id: 1, StorageClass: uint8(proto.StorageClass_BlobStore)},
+	}
+	s.ebsc = map[uint8]*blobstore.BlobStoreClient{1: {}}
+	d := &Dir{super: s, ino: 10, parentIno: 1, name: "dir"}
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "Create_ll",
+		func(_ *meta.MetaWrapper, _ uint64, _ string, _ uint32, _ uint32, _ uint32, _ []byte, _ string, _ bool, _ bool) (*proto.InodeInfo, error) {
+			return &proto.InodeInfo{Inode: 88, PoolId: 1, StorageClass: proto.StorageClass_BlobStore, Size: 0}, nil
+		})
+	patches.ApplyPrivateMethod(reflect.TypeOf((*File)(nil)), "openOECStream",
+		func(_ *File, _ *proto.InodeInfo, _ uint32, _ uint64) error { return nil })
+
+	req := &fuse.CreateRequest{Name: "newec", Flags: fuse.OpenFlags(syscall.O_CREAT | syscall.O_RDWR)}
+	resp := &fuse.CreateResponse{}
+	node, _, err := d.Create(context.Background(), req, resp)
+	require.NoError(t, err)
+	require.NotNil(t, node)
 }
 
 func TestDir_ForgetRemovesExtendInfoWhenOpenCountZero(t *testing.T) {

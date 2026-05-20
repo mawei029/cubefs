@@ -14,6 +14,7 @@
 
 package blobstore
 
+// Instance is a worker pool for parallel rwSlice execution in Reader.readEbsRange.
 type Instance struct {
 	mq chan task
 }
@@ -23,8 +24,7 @@ type task struct {
 	fn func(op *rwSlice)
 }
 
-// New starts worker goroutines that drain mq. worker is clamped to at least 1; with 0 workers,
-// parallel slice work would never run and callers would deadlock on wg.Wait (e.g. blob Reader readEbsRange).
+// New starts worker goroutines; worker>=1 required or readEbsRange deadlocks on wg.Wait.
 func New(worker int, size int) Instance {
 	if worker < 1 {
 		worker = 1
@@ -58,10 +58,12 @@ func (r Instance) Close() {
 	close(r.mq)
 }
 
+// Executor is a token-pool concurrency limiter.
 type Executor struct {
 	tokens chan int
 }
 
+// NewExecutor creates up to maxConcurrency slots.
 func NewExecutor(maxConcurrency int) *Executor {
 	if maxConcurrency < 1 {
 		maxConcurrency = 1

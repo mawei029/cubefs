@@ -2,49 +2,40 @@ package fs
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"syscall"
 	"testing"
 
 	"github.com/agiledragon/gomonkey/v2"
-	cfsproto "github.com/cubefs/cubefs/proto"
+	"github.com/stretchr/testify/require"
+
+	"github.com/cubefs/cubefs/depends/bazil.org/fuse"
+	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/blobstore"
 	"github.com/cubefs/cubefs/sdk/data/stream"
 	"github.com/cubefs/cubefs/sdk/meta"
-	"github.com/stretchr/testify/require"
 )
 
 // registerOecTestStreamer 向 oec 注入测试用 ECStreamer（ECExtentClient.SetStreamer；不经过 OpenStreamWithArgs/refCnt）。
 func registerOecTestStreamer(s *Super, ino uint64, r *blobstore.Reader, w *blobstore.Writer) {
 	var st *blobstore.ECStreamer
+	args := blobstore.ECStreamOpenArgs{Ino: ino}
 	switch {
 	case r != nil && w != nil:
-		st = newTestECStreamerWithReaderWriter(ino, r, w)
+		st, _ = blobstore.NewECStreamer(args, r, w)
 	case w != nil:
-		st = newTestECStreamerWithWriter(ino, w)
+		st, _ = blobstore.NewECStreamer(args, nil, w)
 	default:
 		return
 	}
 	s.oec.SetStreamer(ino, st)
 }
 
-// newTestECStreamerWithWriter / newTestECStreamerWithReaderWriter 仅 client/fs 测试用，封装 blobstore.NewECStreamer。
-func newTestECStreamerWithWriter(ino uint64, w *blobstore.Writer) *blobstore.ECStreamer {
-	args := blobstore.ECStreamOpenArgs{Ino: ino}
-	s, _ := blobstore.NewECStreamer(args, nil, w)
-	return s
-}
-
-func newTestECStreamerWithReaderWriter(ino uint64, r *blobstore.Reader, w *blobstore.Writer) *blobstore.ECStreamer {
-	args := blobstore.ECStreamOpenArgs{Ino: ino}
-	s, _ := blobstore.NewECStreamer(args, r, w)
-	return s
-}
-
 func newBlobFileForTruncateTest() (*File, *blobstore.Writer) {
 	w := &blobstore.Writer{}
 	oec := blobstore.NewObjExtentClient(blobstore.ObjExtentConfig{})
-	s := newTestECStreamerWithWriter(100, w)
+	s, _ := blobstore.NewECStreamer(blobstore.ECStreamOpenArgs{Ino: 100, Mw: &meta.MetaWrapper{}}, nil, w)
 	oec.SetStreamer(100, s)
 	f := &File{
 		super: &Super{
@@ -52,173 +43,239 @@ func newBlobFileForTruncateTest() (*File, *blobstore.Writer) {
 			ec:  &stream.ExtentClient{},
 			oec: oec,
 		},
-		ino: 100,
+		ino:       100,
+		parentIno: 1,
 	}
 	return f, w
 }
 
-func TestFileDoECTruncateV2_ENOENTTreatAsNewFile(t *testing.T) {
-	f, w := newBlobFileForTruncateTest()
+func TestFileDoECTruncateV2_delegates_to_oec(t *testing.T) {
+	f, _ := newBlobFileForTruncateTest()
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
-
-	var gotObjExtents []cfsproto.ObjExtentKey
-	patches.ApplyMethod(reflect.TypeOf(w), "Flush",
-		func(_ *blobstore.Writer, _ uint64, _ context.Context) error { return nil })
-	patches.ApplyMethod(reflect.TypeOf(f.super.mw), "GetObjExtents",
-		func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []cfsproto.ExtentKey, []cfsproto.ObjExtentKey, error) {
-			return 0, 0, nil, nil, syscall.ENOENT
-		})
-	patches.ApplyMethod(reflect.TypeOf(f.super.mw), "TruncateV2",
-		func(_ *meta.MetaWrapper, _ uint64, _ uint64, _ string, objExtents []cfsproto.ObjExtentKey, _ []cfsproto.ObjExtentKey) error {
-			gotObjExtents = objExtents
+	patches.ApplyMethod(reflect.TypeOf(f.super.oec), "Truncate",
+		func(_ *blobstore.ECExtentClient, parentIno, ino, size uint64, path string) error {
+			require.Equal(t, uint64(1), parentIno)
+			require.Equal(t, uint64(100), ino)
+			require.Equal(t, uint64(128), size)
+			require.Equal(t, "/a", path)
 			return nil
 		})
-
-	err := f.doECTruncateV2(100, 128, "/a")
-	require.NoError(t, err)
-	require.Nil(t, gotObjExtents)
+	require.NoError(t, f.doECTruncateV2(100, 128, "/a"))
 }
 
-func TestFileDoECTruncateV2_ExpandOnlyMeta(t *testing.T) {
-	f, w := newBlobFileForTruncateTest()
-	current := []cfsproto.ObjExtentKey{{FileOffset: 0, Size: 64}}
-
-	var gotObjExtents []cfsproto.ObjExtentKey
+func TestFileDoECTruncateV2_oec_error_propagates(t *testing.T) {
+	f, _ := newBlobFileForTruncateTest()
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
-	patches.ApplyMethod(reflect.TypeOf(w), "Flush",
-		func(_ *blobstore.Writer, _ uint64, _ context.Context) error { return nil })
-	patches.ApplyMethod(reflect.TypeOf(f.super.mw), "GetObjExtents",
-		func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []cfsproto.ExtentKey, []cfsproto.ObjExtentKey, error) {
-			return 0, 64, nil, current, nil
+	patches.ApplyMethod(reflect.TypeOf(f.super.oec), "Truncate",
+		func(_ *blobstore.ECExtentClient, _, _ uint64, _ uint64, _ string) error {
+			return syscall.EIO
 		})
-	patches.ApplyMethod(reflect.TypeOf(f.super.mw), "TruncateV2",
-		func(_ *meta.MetaWrapper, _ uint64, _ uint64, _ string, objExtents []cfsproto.ObjExtentKey, _ []cfsproto.ObjExtentKey) error {
-			gotObjExtents = objExtents
-			return nil
-		})
-
-	err := f.doECTruncateV2(100, 128, "/a")
-	require.NoError(t, err)
-	require.Equal(t, current, gotObjExtents)
+	require.Error(t, f.doECTruncateV2(100, 64, "/a"))
 }
 
-func TestFileDoECTruncateV2_EqualSizeNoop(t *testing.T) {
-	f, w := newBlobFileForTruncateTest()
-	var truncateCalled bool
-
-	patches := gomonkey.NewPatches()
-	defer patches.Reset()
-	patches.ApplyMethod(reflect.TypeOf(w), "Flush",
-		func(_ *blobstore.Writer, _ uint64, _ context.Context) error { return nil })
-	patches.ApplyMethod(reflect.TypeOf(f.super.mw), "GetObjExtents",
-		func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []cfsproto.ExtentKey, []cfsproto.ObjExtentKey, error) {
-			return 0, 64, nil, nil, nil
-		})
-	patches.ApplyMethod(reflect.TypeOf(f.super.mw), "TruncateV2",
-		func(_ *meta.MetaWrapper, _ uint64, _ uint64, _ string, _ []cfsproto.ObjExtentKey, _ []cfsproto.ObjExtentKey) error {
-			truncateCalled = true
-			return nil
-		})
-
-	err := f.doECTruncateV2(100, 64, "/a")
-	require.NoError(t, err)
-	require.False(t, truncateCalled)
+func TestFileDoECTruncateV2_EBADF_no_streamer(t *testing.T) {
+	f, _ := newBlobFileForTruncateTest()
+	require.ErrorIs(t, f.doECTruncateV2(999, 8, "/a"), syscall.EBADF)
 }
 
-func TestFileDoECTruncateV2_ShrinkPath(t *testing.T) {
-	f, w := newBlobFileForTruncateTest()
-	newObjExtents := []cfsproto.ObjExtentKey{{FileOffset: 0, Size: 32}}
+func blobInode(ino uint64) *proto.InodeInfo {
+	return &proto.InodeInfo{
+		Inode:        ino,
+		PoolId:       1,
+		StorageClass: proto.StorageClass_BlobStore,
+		Size:         64,
+		Generation:   3,
+	}
+}
 
-	var gotObjExtents []cfsproto.ObjExtentKey
+func TestFile_Open_ColdBlobStore_success(t *testing.T) {
+	s := newTestSuperForFile()
+	s.volType = proto.VolumeTypeCold
+	s.poolCache = map[uint8]*proto.StoragePoolInfo{
+		1: {Id: 1, StorageClass: uint8(proto.StorageClass_BlobStore)},
+	}
+	s.ebsc = map[uint8]*blobstore.BlobStoreClient{1: {}}
+	f := &File{super: s, ino: 40, parentIno: 1, name: "ecopen.dat"}
+
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
-	patches.ApplyMethod(reflect.TypeOf(w), "Flush",
-		func(_ *blobstore.Writer, _ uint64, _ context.Context) error { return nil })
-	patches.ApplyMethod(reflect.TypeOf(f.super.mw), "GetObjExtents",
-		func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []cfsproto.ExtentKey, []cfsproto.ObjExtentKey, error) {
-			return 0, 128, nil, []cfsproto.ObjExtentKey{{FileOffset: 0, Size: 128}}, nil
-		})
-	patches.ApplyMethod(reflect.TypeOf(f.super.ec), "OpenStream",
+	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet",
+		func(_ *Super, _ uint64) (*proto.InodeInfo, error) { return blobInode(40), nil })
+	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "RefreshExtentsCache",
+		func(_ *blobstore.ECExtentClient, _ uint64) error { return nil })
+	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "OpenStreamWithArgs",
+		func(_ *blobstore.ECExtentClient, _ blobstore.ECStreamOpenArgs) error { return nil })
+
+	req := &fuse.OpenRequest{Flags: syscall.O_RDWR}
+	resp := &fuse.OpenResponse{}
+	h, err := f.Open(context.Background(), req, resp)
+	require.NoError(t, err)
+	require.Same(t, f, h)
+}
+
+func TestFile_Open_ColdBlob_flushBeforeOpenFails(t *testing.T) {
+	s := newTestSuperForFile()
+	s.volType = proto.VolumeTypeCold
+	s.poolCache = map[uint8]*proto.StoragePoolInfo{
+		1: {Id: 1, StorageClass: uint8(proto.StorageClass_BlobStore)},
+	}
+	s.ebsc = map[uint8]*blobstore.BlobStoreClient{1: {}}
+	f := &File{super: s, ino: 41, parentIno: 1, name: "flushfail.dat"}
+	registerOecTestStreamerWithLogicalView(s, 41, nil, &blobstore.Writer{}, 0, 1)
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet",
+		func(_ *Super, _ uint64) (*proto.InodeInfo, error) { return blobInode(41), nil })
+	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "RefreshExtentsCache",
+		func(_ *blobstore.ECExtentClient, _ uint64) error { return nil })
+	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECStreamer)(nil)), "Flush",
+		func(_ *blobstore.ECStreamer, _ context.Context) error { return errors.New("flush failed") })
+
+	req := &fuse.OpenRequest{Flags: syscall.O_RDONLY}
+	_, err := f.Open(context.Background(), req, &fuse.OpenResponse{})
+	require.Error(t, err)
+}
+
+func TestFile_Open_HotReplica_metaCacheRefreshWithExtents(t *testing.T) {
+	s := newTestSuperForFile()
+	s.volType = proto.VolumeTypeHot
+	s.metaCacheAcceleration = true
+	f := &File{super: s, ino: 42, parentIno: 1, name: "hot.dat"}
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	info := &proto.InodeInfo{
+		Inode: 42, StorageClass: proto.StorageClass_Replica_HDD, Size: 8,
+		Extents: &proto.GetExtentsResponse{Extents: []proto.ExtentKey{{}}},
+	}
+	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet",
+		func(_ *Super, _ uint64) (*proto.InodeInfo, error) { return info, nil })
+	var refreshWithCache bool
+	patches.ApplyMethod(reflect.TypeOf(s.ec), "OpenStream",
 		func(_ *stream.ExtentClient, _ uint64, _ bool, _ bool, _ string) error { return nil })
-	patches.ApplyMethod(reflect.TypeOf(f.super.ec), "CloseStream",
-		func(_ *stream.ExtentClient, _ uint64) error { return nil })
-	patches.ApplyMethod(reflect.TypeOf(f.super.ec), "Flush",
-		func(_ *stream.ExtentClient, _ uint64) error { return nil })
-	patches.ApplyMethod(reflect.TypeOf(w), "TruncateV2FromExtents",
-		func(_ *blobstore.Writer, _ context.Context, _ uint64, _ uint64, _ []cfsproto.ObjExtentKey) ([]cfsproto.ObjExtentKey, []cfsproto.ObjExtentKey, error) {
-			return newObjExtents, nil, nil
-		})
-	patches.ApplyMethod(reflect.TypeOf(f.super.mw), "TruncateV2",
-		func(_ *meta.MetaWrapper, _ uint64, _ uint64, _ string, objExtents []cfsproto.ObjExtentKey, _ []cfsproto.ObjExtentKey) error {
-			gotObjExtents = objExtents
+	patches.ApplyMethod(reflect.TypeOf(s.ec), "RefreshExtentsWithCache",
+		func(_ *stream.ExtentClient, _ *proto.InodeInfo) error {
+			refreshWithCache = true
 			return nil
 		})
 
-	err := f.doECTruncateV2(100, 32, "/a")
+	_, err := f.Open(context.Background(), &fuse.OpenRequest{Flags: syscall.O_RDWR}, &fuse.OpenResponse{})
 	require.NoError(t, err)
-	require.Equal(t, newObjExtents, gotObjExtents)
+	require.True(t, refreshWithCache)
 }
 
-func TestFileDoECTruncateV2_ErrorBranches(t *testing.T) {
-	t.Run("writer flush error", func(t *testing.T) {
-		f, w := newBlobFileForTruncateTest()
-		patches := gomonkey.NewPatches()
-		defer patches.Reset()
-		patches.ApplyMethod(reflect.TypeOf(w), "Flush",
-			func(_ *blobstore.Writer, _ uint64, _ context.Context) error { return syscall.EIO })
-		err := f.doECTruncateV2(100, 8, "/a")
-		require.Error(t, err)
-	})
+func TestFile_Open_ReplicaRefreshExtentsCache(t *testing.T) {
+	s := newTestSuperForFile()
+	s.volType = proto.VolumeTypeHot
+	f := &File{super: s, ino: 43, parentIno: 1, name: "rep.dat"}
 
-	t.Run("GetObjExtents generic error", func(t *testing.T) {
-		f, w := newBlobFileForTruncateTest()
-		patches := gomonkey.NewPatches()
-		defer patches.Reset()
-		patches.ApplyMethod(reflect.TypeOf(w), "Flush",
-			func(_ *blobstore.Writer, _ uint64, _ context.Context) error { return nil })
-		patches.ApplyMethod(reflect.TypeOf(f.super.mw), "GetObjExtents",
-			func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []cfsproto.ExtentKey, []cfsproto.ObjExtentKey, error) {
-				return 0, 0, nil, nil, syscall.EIO
-			})
-		err := f.doECTruncateV2(100, 8, "/a")
-		require.Error(t, err)
-	})
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet",
+		func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
+			return &proto.InodeInfo{Inode: 43, StorageClass: proto.StorageClass_Replica_HDD}, nil
+		})
+	var refreshed bool
+	patches.ApplyMethod(reflect.TypeOf(s.ec), "OpenStream",
+		func(_ *stream.ExtentClient, _ uint64, _ bool, _ bool, _ string) error { return nil })
+	patches.ApplyMethod(reflect.TypeOf(s.ec), "RefreshExtentsCache",
+		func(_ *stream.ExtentClient, ino uint64) error {
+			require.Equal(t, uint64(43), ino)
+			refreshed = true
+			return nil
+		})
 
-	t.Run("OpenStream error in shrink", func(t *testing.T) {
-		f, w := newBlobFileForTruncateTest()
-		patches := gomonkey.NewPatches()
-		defer patches.Reset()
-		patches.ApplyMethod(reflect.TypeOf(w), "Flush",
-			func(_ *blobstore.Writer, _ uint64, _ context.Context) error { return nil })
-		patches.ApplyMethod(reflect.TypeOf(f.super.mw), "GetObjExtents",
-			func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []cfsproto.ExtentKey, []cfsproto.ObjExtentKey, error) {
-				return 0, 128, nil, []cfsproto.ObjExtentKey{{FileOffset: 0, Size: 128}}, nil
-			})
-		patches.ApplyMethod(reflect.TypeOf(f.super.ec), "OpenStream",
-			func(_ *stream.ExtentClient, _ uint64, _ bool, _ bool, _ string) error { return syscall.EIO })
-		err := f.doECTruncateV2(100, 64, "/a")
-		require.Error(t, err)
-	})
+	_, err := f.Open(context.Background(), &fuse.OpenRequest{Flags: syscall.O_RDONLY}, &fuse.OpenResponse{})
+	require.NoError(t, err)
+	require.True(t, refreshed)
+}
 
-	t.Run("ec flush error in shrink", func(t *testing.T) {
-		f, w := newBlobFileForTruncateTest()
-		patches := gomonkey.NewPatches()
-		defer patches.Reset()
-		patches.ApplyMethod(reflect.TypeOf(w), "Flush",
-			func(_ *blobstore.Writer, _ uint64, _ context.Context) error { return nil })
-		patches.ApplyMethod(reflect.TypeOf(f.super.mw), "GetObjExtents",
-			func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []cfsproto.ExtentKey, []cfsproto.ObjExtentKey, error) {
-				return 0, 128, nil, []cfsproto.ObjExtentKey{{FileOffset: 0, Size: 128}}, nil
-			})
-		patches.ApplyMethod(reflect.TypeOf(f.super.ec), "OpenStream",
-			func(_ *stream.ExtentClient, _ uint64, _ bool, _ bool, _ string) error { return nil })
-		patches.ApplyMethod(reflect.TypeOf(f.super.ec), "CloseStream",
-			func(_ *stream.ExtentClient, _ uint64) error { return nil })
-		patches.ApplyMethod(reflect.TypeOf(f.super.ec), "Flush",
-			func(_ *stream.ExtentClient, _ uint64) error { return syscall.EIO })
-		err := f.doECTruncateV2(100, 64, "/a")
-		require.Error(t, err)
-	})
+func TestFile_Open_ReplicaInodeGetFail_fallsBackRefreshCache(t *testing.T) {
+	s := newTestSuperForFile()
+	s.volType = proto.VolumeTypeHot
+	s.metaCacheAcceleration = true
+	f := &File{super: s, ino: 44, parentIno: 1, name: "rep2.dat"}
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet",
+		func(_ *Super, ino uint64) (*proto.InodeInfo, error) {
+			if ino == 44 {
+				return &proto.InodeInfo{Inode: 44, StorageClass: proto.StorageClass_Replica_HDD}, nil
+			}
+			return nil, errors.New("cache miss")
+		})
+	var refreshed bool
+	patches.ApplyMethod(reflect.TypeOf(s.ec), "OpenStream",
+		func(_ *stream.ExtentClient, _ uint64, _ bool, _ bool, _ string) error { return nil })
+	patches.ApplyMethod(reflect.TypeOf(s.ec), "RefreshExtentsCache",
+		func(_ *stream.ExtentClient, ino uint64) error {
+			require.Equal(t, uint64(44), ino)
+			refreshed = true
+			return nil
+		})
+
+	_, err := f.Open(context.Background(), &fuse.OpenRequest{Flags: syscall.O_RDONLY}, &fuse.OpenResponse{})
+	require.NoError(t, err)
+	require.True(t, refreshed)
+}
+
+func TestFile_Write_BlobErrorMetrics(t *testing.T) {
+	s := newTestSuperForFile()
+	s.volType = proto.VolumeTypeCold
+	s.poolCache = map[uint8]*proto.StoragePoolInfo{
+		1: {Id: 1, StorageClass: uint8(proto.StorageClass_BlobStore)},
+	}
+	f := &File{super: s, ino: 50, parentIno: 1, name: "w.dat"}
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet",
+		func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
+			return &proto.InodeInfo{Inode: 50, PoolId: 1, StorageClass: proto.StorageClass_BlobStore}, nil
+		})
+	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "Write",
+		func(_ *blobstore.ECExtentClient, _ uint64, _ int, _ []byte, _ int) (int, error) {
+			return 0, syscall.EOPNOTSUPP
+		})
+
+	req := &fuse.WriteRequest{Offset: 0, Data: []byte("x")}
+	err := f.Write(context.Background(), req, &fuse.WriteResponse{})
+	require.Equal(t, fuse.Errno(syscall.ENOTSUP), err)
+}
+
+func TestFile_Write_BlobOsyncFlush(t *testing.T) {
+	s := newTestSuperForFile()
+	s.volType = proto.VolumeTypeCold
+	s.poolCache = map[uint8]*proto.StoragePoolInfo{
+		1: {Id: 1, StorageClass: uint8(proto.StorageClass_BlobStore)},
+	}
+	f := &File{super: s, ino: 51, parentIno: 1, name: "osync.dat"}
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet",
+		func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
+			return &proto.InodeInfo{Inode: 51, PoolId: 1, StorageClass: proto.StorageClass_BlobStore}, nil
+		})
+	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "Write",
+		func(_ *blobstore.ECExtentClient, _ uint64, _ int, data []byte, _ int) (int, error) {
+			return len(data), nil
+		})
+	flushed := false
+	patches.ApplyMethod(reflect.TypeOf(s.oec), "Flush",
+		func(_ *blobstore.ECExtentClient, ino uint64) error {
+			require.Equal(t, uint64(51), ino)
+			flushed = true
+			return nil
+		})
+
+	req := &fuse.WriteRequest{Offset: 0, Data: []byte("ab"), FileFlags: fuse.OpenSync}
+	resp := &fuse.WriteResponse{}
+	require.NoError(t, f.Write(context.Background(), req, resp))
+	require.True(t, flushed)
+	require.Equal(t, 2, resp.Size)
 }

@@ -3,57 +3,45 @@ package blobstore
 import (
 	"context"
 	"fmt"
+	"hash"
+	"io"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
-	"time"
 
 	"github.com/cubefs/cubefs/proto"
-	"github.com/cubefs/cubefs/sdk/data/stream"
 	"github.com/cubefs/cubefs/sdk/meta"
 	"github.com/cubefs/cubefs/util/log"
 )
 
-// ecSlowEnsureReadViewLogThreshold 与 blobstore.Writer 侧 slow 日志阈值一致思路：仅异常长耗时打 Info。
-const ecSlowEnsureReadViewLogThreshold = 10 * time.Second
-
-var _ stream.ECStreamerAPI = (*ECStreamer)(nil)
-
-// ECStreamer：inode 级共享的 Reader/Writer 占位聚合（与副本 Streamer 概念对齐，实现后续补全）。
+// ECStreamer shares Reader/Writer and logical view (fileSize, inoVersion, oeks, dirty) per inode.
+// refCnt via OpenStreamWithArgs/CloseStream; map delete and nil RW pointers in EvictStream.
 type ECStreamer struct {
 	volName   string
 	ino       uint64
 	blockSize int
 	mw        *meta.MetaWrapper
 	ebsc      *BlobStoreClient
-	// Open/NewFile 引用 +1，Release 最后一个句柄 -1 至 0 时 Close reader/writer 并 map.Delete
-	refCnt int32
-	// 句柄无关的逻辑文件尾与代际，语义对齐副本 Streamer.extents（ExtentCache.size / gen）：
-	// - 写完成/flush：raiseFileSize（noteWriteFinished / noteWriterFlushCommitted，只抬高，覆盖写不缩尾）
-	// - 截断/Setattr：updateMetaInfo(..., &commitSize) → commitFileSize（可压低）
-	// - GetObjExtents 刷新且无脏缓冲：setFileSize(logicalReadBound) 与 meta 对齐（可压低）
-	// - InodeGet 锚点对齐：syncLogicalSizeFromInode（读路径 syncInodeView）
-	fileSize uint64
-	// 对应元数据的变化，看本地副本元数据，开了新extent，truncate，新写Blob也要变化
+	refCnt    int32
+	// Logical file tail and inode generation, aligned with replica Streamer.extents (size/gen):
+	// Writes raise tail only; truncate may lower via updateMetaInfo; clean refresh aligns with meta/oek tail.
+	fileSize   uint64
 	inoVersion uint64
 	oeks       []proto.ObjExtentKey
-	// dirty：对外唯一同步标志。dirty=1 表示读/Flush 前须同步（未落盘缓冲和/或 oeks 旧）；dirty=0 表示已与 meta 对齐且 Writer 无未落盘字节。
-	// 不变式：未落盘字节存在 ⇒ dirty=1；cleanDirty 仅于 completeFlushMeta/updateMetaInfo（无脏缓冲）之后。外部只判断 isDirty()。
+	// dirty: 1=must sync before read/flush (buffer and/or stale oeks); 0=clean. External code uses isDirty() only.
 	dirty uint32
 
-	// mu：单锁串行化本 inode 的 fReader/fWriter、Open/Close 与 lazyInit/closeReaderWriterLocked、以及 Read/Write/Flush 与 ensureReadViewCurrent。
-	// 与副本 Streamer 由单 goroutine server 串行处理请求等价；网络 IO 在持锁下完成，换吞吐换正确性（LTP gf04/gf05）。
+	// mu serializes RW, flush, updateMetaInfo, Read/Write; EBS IO under lock (correctness over throughput, LTP).
 	mu      sync.RWMutex
-	fReader *Reader // TODO：next version，reader和writer合并成一个
+	fReader *Reader // TODO: next version, merge reader and writer into one
 	fWriter *Writer
 
-	// once / objExtentsOnceErr：对齐副本 Streamer.once + ExtentClient Read/Write 首次 s.once.Do(GetExtents)；
-	// 随 ECStreamer 实例只执行一次；最后一关 Close 从 map 删除后由 NewECStreamer 得到新的 zero Once，与副本「删表项再 Open 新建 Streamer」一致。
+	// once: first Read/Write pulls meta; CloseStream zero ref resets once so next Open refreshes.
 	once sync.Once
 }
 
-// NewECStreamer 构造 ECStreamer；生产路径通常 r、w 均为 nil，由 OpenStreamWithArgs 在持 s.mu 下 lazyInitReaderWriter 创建 Reader/Writer。
+// NewECStreamer constructs stream; production passes nil r/w, OpenStreamWithArgs creates RW under s.mu.
 func NewECStreamer(args ECStreamOpenArgs, r *Reader, w *Writer) (*ECStreamer, error) {
 	s := &ECStreamer{
 		volName:    args.VolName,
@@ -77,14 +65,7 @@ func NewECStreamer(args ECStreamOpenArgs, r *Reader, w *Writer) (*ECStreamer, er
 	return s, nil
 }
 
-// ----- ECStreamer 对外方法（首字母大写）-----
-func (s *ECStreamer) Cleanup() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.fReader = nil
-	s.fWriter = nil
-}
-
+// ----- ECStreamer exported methods -----
 func (s *ECStreamer) Flush(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -93,13 +74,11 @@ func (s *ECStreamer) Flush(ctx context.Context) error {
 		return err
 	}
 
-	return s.updateMetaInfo(false, nil)
+	return s.updateMetaInfo(nil)
 }
 
-// FlushAndFreeCache 先走与读路径一致的 Flush（ensureReadViewCurrent），再释放 Writer 池化缓冲；供 Open 重入 oec 流前收敛旧状态。
+// FlushAndFreeCache runs Flush then FreeCache; used before re-Open on same ino to drain old writer buffer.
 func (s *ECStreamer) FlushAndFreeCache(ctx context.Context) error {
-	// todo : 简单，writer调用Flush。 writer.Flush(s.ino, ctx)， 更新reader里的预读。加上获取新 meta， oeks
-	// 如果不是脏数据，diry为false不要操作
 	if err := s.Flush(ctx); err != nil {
 		return err
 	}
@@ -133,12 +112,12 @@ func (s *ECStreamer) RefCnt() int32 {
 	return atomic.LoadInt32(&s.refCnt)
 }
 
-// OeksLocked 在持 RLock 下拷贝 oeks，供 Reader/Writer 在无 ECStreamer.mu 时使用。
+// OeksLocked copies oeks under RLock for Reader/Writer without holding ECStreamer.mu.
 func (s *ECStreamer) OeksLocked() []proto.ObjExtentKey {
 	return append([]proto.ObjExtentKey(nil), s.oeks...)
 }
 
-// String 供调试日志使用，与副本 Streamer.String 用途对齐；仅读原子字段与 ino，调用方无需持 s.mu。
+// String for debug logs; reads atomic fields and ino without s.mu.
 func (s *ECStreamer) String() string {
 	if s == nil {
 		log.LogErrorf("ECStreamer String: s is nil")
@@ -179,7 +158,7 @@ func (s *ECStreamer) Writer() *Writer {
 	return s.fWriter
 }
 
-// Truncate 占位：Blob/EC 截断请走 ECExtentClient.Truncate（需 MetaWrapper）。
+// Truncate under lock: grow/shrink via truncateV2Locked (Flush → GetObjExtents → TruncateV2 → updateMetaInfo).
 func (s *ECStreamer) Truncate(ctx context.Context, size uint64, fullPath string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -192,32 +171,29 @@ func (s *ECStreamer) Truncate(ctx context.Context, size uint64, fullPath string)
 	return s.truncateV2Locked(ctx, s.ino, size, fullPath)
 }
 
-func (s *ECStreamer) Read(ctx context.Context, dst []byte, offset int, size int, poolId uint8, isMigration bool) (int, error) {
-	_, _, _ = poolId, isMigration, size
+func (s *ECStreamer) Read(ctx context.Context, dst []byte, offset int, size int) (int, error) {
 	if size == 0 {
 		return 0, nil
 	}
 
+	// TODO: next version, lock tuning for reads; short term document; mid term split view sync vs data IO or short lock only when dirty.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	var errGetExtents error
 	s.once.Do(func() {
-		errGetExtents = s.updateMetaInfo(false, nil)
+		errGetExtents = s.updateMetaInfo(nil)
 	})
 	if errGetExtents != nil {
 		return 0, fmt.Errorf("get extents err(%w)", errGetExtents)
 	}
 
-	// dirty=1 时须 Flush（落盘缓冲和/或刷新 oeks，LTP gf05/gf19）；持 mu 串行，与 Write 不并发。
+	// When dirty, Flush writer then updateMetaInfo so Reader sees persisted oeks (LTP gf05/gf19).
 	if s.isDirty() {
-		// if err := s.ensureReadViewCurrentLocked(ctx); err != nil {
-		// 	return 0, err
-		// }
 		if err := s.fWriter.Flush(s.ino, ctx); err != nil {
 			return 0, err
 		}
-		if err := s.updateMetaInfo(false, nil); err != nil {
+		if err := s.updateMetaInfo(nil); err != nil {
 			return 0, err
 		}
 	}
@@ -229,11 +205,8 @@ func (s *ECStreamer) Read(ctx context.Context, dst []byte, offset int, size int,
 	return s.fReader.Read(ctx, dst, offset, size)
 }
 
-// Write 实现 stream.ECStreamerAPI；带 pool/waitForFlush 的写见 WriteWithOpts。
-func (s *ECStreamer) Write(ctx context.Context, offset int, data []byte, flags int, checkFunc func() error,
-	storageClass uint32, isMigration bool,
-) (int, error) {
-	_, _, _ = checkFunc, storageClass, isMigration
+// Write performs buffered or direct blob I/O on this inode. O_SYNC / waitForFlush is handled in client/fs after oec.Write returns.
+func (s *ECStreamer) Write(ctx context.Context, offset int, data []byte, flags int) (int, error) {
 	if len(data) == 0 {
 		return 0, nil
 	}
@@ -243,7 +216,7 @@ func (s *ECStreamer) Write(ctx context.Context, offset int, data []byte, flags i
 
 	var errGetExtents error
 	s.once.Do(func() {
-		errGetExtents = s.updateMetaInfo(false, nil)
+		errGetExtents = s.updateMetaInfo(nil)
 	})
 	if errGetExtents != nil {
 		return 0, fmt.Errorf("get extents err(%w)", errGetExtents)
@@ -263,7 +236,7 @@ func (s *ECStreamer) Write(ctx context.Context, offset int, data []byte, flags i
 	return n, nil
 }
 
-// FileSizeView 返回 (effectiveSize, inoVersion)，供 oec.FileSize / 读上界使用（读路径不含 inode 合并）。
+// FileSizeView returns (logical tail, inoVersion) for oec.FileSize and Reader bounds.
 func (s *ECStreamer) FileSizeView() (size int, gen uint64) {
 	if s == nil {
 		log.LogWarnf("ECStreamer FileSizeView: s is nil")
@@ -281,10 +254,43 @@ func (s *ECStreamer) CloseReaderWriter() error {
 func (s *ECStreamer) RefreshExtentsCache() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.updateMetaInfo(false, nil)
+	return s.updateMetaInfo(nil)
 }
 
-// ----- ECStreamer 内部方法（首字母小写）-----
+// For fs_volume.go
+func (s *ECStreamer) WriteFromReader(ctx context.Context, reader io.Reader, h hash.Hash) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var errGetExtents error
+	s.once.Do(func() {
+		errGetExtents = s.updateMetaInfo(nil)
+	})
+	if errGetExtents != nil {
+		return 0, fmt.Errorf("get extents err(%w)", errGetExtents)
+	}
+	return s.fWriter.WriteFromReader(ctx, reader, h)
+}
+
+func (s *ECStreamer) WriteWithoutPool(ctx context.Context, writeOffset int, data []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var errGetExtents error
+	s.once.Do(func() {
+		errGetExtents = s.updateMetaInfo(nil)
+	})
+	if errGetExtents != nil {
+		return 0, fmt.Errorf("get extents err(%w)", errGetExtents)
+	}
+	return s.fWriter.WriteWithoutPool(ctx, writeOffset, data)
+}
+
+func (s *ECStreamer) FlushWithoutPool(ino uint64, ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fWriter.FlushWithoutPool(ino, ctx)
+}
+
+// ----- ECStreamer internal methods -----
 
 func (s *ECStreamer) markDirty() {
 	atomic.StoreUint32(&s.dirty, 1)
@@ -298,8 +304,7 @@ func (s *ECStreamer) isDirty() bool {
 	return atomic.LoadUint32(&s.dirty) != 0
 }
 
-// mergeInodeGen / mergeMaxFileSize / raiseFileSize 在 ECStreamer.mu 串行化写路径下更新；
-// 无锁读者仅 Load，写侧一次 Load + 条件 Store，不做 CAS 重试。
+// mergeInodeGen/raiseFileSize updated under mu on write paths; lock-free readers Load only.
 func (s *ECStreamer) mergeInodeGen(inodeGen uint64) {
 	if s == nil || inodeGen == 0 {
 		log.LogErrorf("ECStreamer mergeInodeGen: s is nil or inodeGen is 0, ino(%v)", s.ino)
@@ -319,7 +324,7 @@ func (s *ECStreamer) setFileSize(size uint64) {
 	atomic.StoreUint64(&s.fileSize, size)
 }
 
-// raiseFileSize 将逻辑尾抬至 lb（取 max）；lb==0 时跳过。将逻辑尾抬至 logicalEnd（取 max）；覆盖写/中间 flush 不得用 setFileSize 以免误缩尾。
+// raiseFileSize raises logical tail to max(current, lb); skip lb==0; do not use setFileSize on overwrite paths.
 func (s *ECStreamer) raiseFileSize(lb uint64) {
 	if s == nil || lb == 0 {
 		log.LogErrorf("ECStreamer raiseFileSize: s is nil or lb is 0, ino(%v) lb(%v)", s.ino, lb)
@@ -331,33 +336,40 @@ func (s *ECStreamer) raiseFileSize(lb uint64) {
 	}
 }
 
-// updateMetaInfo 从 meta 刷新 oeks、inoVersion 与 fileSize。
-// commitSize 非 nil：截断/Setattr，commitFileSize 可压低；否则与 meta 对齐，有脏缓冲时保留 max(meta尾, writer.fileOffset)。
-func (s *ECStreamer) updateMetaInfo(needLock bool, commitSize *uint64) error {
+// updateMetaInfo refreshes oeks, inoVersion, fileSize from meta GetObjExtents.
+// Caller must hold s.mu. With unflushed writer buffer: raise fileSize and stay dirty; else cleanDirty.
+func (s *ECStreamer) updateMetaInfo(commitSize *uint64) error {
 	if s == nil || s.mw == nil {
 		log.LogErrorf("updateMetaInfo: s is nil or mw is nil, ino(%v)", s.ino)
 		return nil
 	}
 
-	// TODO: 配了强制更新往下走；否则先判断dirty，再获取meta，避免重复获取meta
+	// TODO: if force refresh configured, skip dirty short-circuit before GetObjExtents
 	// if !force && !s.isDirty() {
-	// 	return nil // 没有脏数据，直接返回
+	// 	return nil // skip when not dirty
 	// }
 
-	// 1. 先获取最新的 gen，size，oeks
+	// 1. fetch latest gen, size, oeks
 	gen, size, _, objExtents, err := s.mw.GetObjExtents(s.ino)
 	if err != nil {
 		log.LogErrorf("ino(%v) GetObjExtents err(%v)", s.ino, err)
 		return err
 	}
 
-	if needLock {
-		s.mu.Lock()
-		s.oeks = objExtents
-		s.mu.Unlock()
-	} else {
-		s.oeks = objExtents
-	}
+	// must has mutex here, because oeks is used by reader and writer
+	s.oeks = objExtents
+
+	// TODO: only use atomit.StoreUint64 for inoVersion and fileSize
+	// atomic.StoreUint64(&s.inoVersion, gen)
+	// atomic.StoreUint64(&s.fileSize, size)
+	// if w := s.fWriter; w.bufferDirtyLen() > 0 {
+	// 	// dirty with buffer: keep dirty; fileSize = max(meta tail, writer tail)
+	// 	s.raiseFileSize(logicalReadBound(size, objExtents))
+	// 	s.raiseFileSize(uint64(w.fileOffset))
+	// 	s.markDirty()
+	// } else {
+	// 	s.cleanDirty()
+	// }
 
 	s.mergeInodeGen(gen)
 	if commitSize != nil {
@@ -383,66 +395,33 @@ func (s *ECStreamer) updateMetaInfo(needLock bool, commitSize *uint64) error {
 	return nil
 }
 
-// ensureReadViewCurrentLocked：调用方已持 s.mu；Flush 脏缓冲后刷新 oeks/fileSize，直至无脏缓冲。
-func (s *ECStreamer) ensureReadViewCurrentLocked(ctx context.Context) error {
-	const maxSyncLoops = 128
-	const retrySleep = 4 * time.Millisecond
-	t0 := time.Now()
-	defer func() {
-		if d := time.Since(t0); d >= ecSlowEnsureReadViewLogThreshold {
-			log.LogInfof("ECStreamer slow ensureReadViewCurrent: ino(%v) dur(%v)", s.ino, d)
-		}
-	}()
-	for loops := 0; loops < maxSyncLoops; loops++ {
-		w := s.fWriter
-		if w == nil || !s.isDirty() {
-			return nil
-		}
-		if s.fReader == nil {
-			log.LogErrorf("ECStreamer ensureReadViewCurrent: reader is nil, ino(%v)", s.ino)
-			return syscall.EBADF
-		}
-		if w := s.fWriter; w != nil {
-			if err := w.Flush(s.ino, ctx); err != nil {
-				return err
-			}
-		}
-		if err := s.updateMetaInfo(false, nil); err != nil {
-			return err
-		}
-		if s.isDirty() {
-			log.LogWarnf("ECStreamer ensureReadViewCurrent: ino(%v) still dirty after flush", s.ino)
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			time.Sleep(retrySleep)
-			continue
-		}
-		return nil
-	}
-	log.LogInfof("ECStreamer ensureReadViewCurrent exceeded max loops: ino(%v) loops(%v) dur(%v)",
-		s.ino, maxSyncLoops, time.Since(t0))
-	return fmt.Errorf("ECStreamer.ensureReadViewCurrentLocked: exceeded %d sync loops ino(%v) (possible dirty/flush livelock)",
-		maxSyncLoops, s.ino)
+// resetExtentsOnceLocked resets once for next updateMetaInfo; after CloseStream zero ref and dropIOCaches, under mu.
+func (s *ECStreamer) resetExtentsOnceLocked() {
+	s.once = sync.Once{}
 }
 
-// closeReaderWriterLocked 在已持 s.mu 下 Flush 并关闭 Blob Reader/Writer，清空 fReader/fWriter。
-// 与副本 Streamer 一致：最后一关 Close 后若从 ECExtentClient.streamers 删除本对象，下次 Open 走 NewECStreamer，
-// once 随新实例为零值，无需像「复用同一 heap 对象且仅换 Reader」那样手动清空 sync.Once。
+// dropIOCachesLocked frees writer pool buffer and reader prefetch; keeps RW objects; CloseStream zero-ref path.
+func (s *ECStreamer) dropIOCachesLocked() {
+	if r := s.fReader; r != nil {
+		r.releasePrefetchCache()
+	}
+	if w := s.fWriter; w != nil {
+		w.FreeCache()
+	}
+}
+
+// closeReaderWriterLocked under mu: Flush writer + dropIOCaches; nil RW only on EvictStream delete.
 func (s *ECStreamer) closeReaderWriterLocked(ino uint64, ctx context.Context) error {
 	if w := s.fWriter; w != nil {
 		if err := w.Flush(ino, ctx); err != nil {
 			return err
 		}
-		w.FreeCache()
 	}
-	// s.fReader = nil
-	// s.fWriter = nil
+	s.dropIOCachesLocked()
 	return nil
 }
 
-// invalidateReaderPrefetchBuf 丢弃 Reader 侧预读窗口，避免截断/洞区扩展后仍命中旧条带字节（LTP ftest 稀疏+截断+再扩）。
-// 可在已持 s.mu 时调用（与 WriteWithOpts / truncateV2Locked 同序）；内部仅对 Reader 自旋锁。
+// invalidateReaderPrefetchBuf drops reader prefetch after truncate/write (LTP ftest sparse+truncate).
 func (s *ECStreamer) invalidateReaderPrefetchBuf() {
 	if s == nil {
 		log.LogErrorf("ECStreamer invalidateReaderPrefetchBuf: s is nil")
@@ -457,8 +436,7 @@ func (s *ECStreamer) invalidateReaderPrefetchBuf() {
 	r.invalidateReadBuf()
 }
 
-// fileSizeView 返回 max(已提交尾, fWriter 未下刷尾)。直接读 s.fWriter，不抢 s.mu。
-// readAfterFlush 等已持 s.mu 路径及 Reader.fileSize 须用本方法，禁止经 EffectiveLogicalSize 调 Writer() 重入死锁。
+// fileSizeView returns max(atomic fileSize, writer.fileOffset); use under mu or from Reader; avoid Writer() reentry.
 func (s *ECStreamer) fileSizeView() uint64 {
 	if s == nil {
 		log.LogWarnf("ECStreamer fileSizeView: s is nil")
@@ -473,22 +451,7 @@ func (s *ECStreamer) fileSizeView() uint64 {
 	return sz
 }
 
-// noteWriteFinished 缓冲写成功：raiseFileSize(logicalEnd) + dirty；logicalEnd 通常为 writer.fileOffset。
-func (s *ECStreamer) noteWriteFinished(logicalEnd uint64) {
-	s.raiseFileSize(logicalEnd)
-	s.markDirty()
-	s.invalidateReaderPrefetchBuf()
-}
-
-// noteWriterFlushCommitted flush 已提交 meta：raiseFileSize(logicalEnd) + 清 dirty；覆盖写时 logicalEnd 不得小于原尾。
-func (s *ECStreamer) noteWriterFlushCommitted(logicalEnd uint64) {
-	s.raiseFileSize(logicalEnd)
-	s.cleanDirty()
-	s.invalidateReaderPrefetchBuf()
-}
-
-// commitFileSize 将逻辑文件尾设为 size（可压低 atomic fileSize），丢弃 Writer 残余缓冲并清 dirty。
-// 不访问 meta，由 updateMetaInfo 在 GetObjExtents 刷新 oeks 之后调用；截断/Setattr 前须已 Flush。
+// commitFileSize sets logical tail (may shrink), resets writer buffer, cleanDirty; truncate fallback.
 func (s *ECStreamer) commitFileSize(size uint64) {
 	s.setFileSize(size)
 	if w := s.fWriter; w != nil {
@@ -504,19 +467,12 @@ func (s *ECStreamer) commitFileSize(size uint64) {
 	s.cleanDirty()
 }
 
-// commitLogicalSize 仅用于单测或已持锁且无需 GetObjExtents 的本地收敛；生产截断请用 updateMetaInfo(..., &size)。
-func (s *ECStreamer) commitLogicalSize(size uint64) {
-	s.commitFileSize(size)
-	s.invalidateReaderPrefetchBuf()
-}
-
-// truncateV2Locked 调用方已持 s.mu；w 为当前 fWriter。
+// truncateV2Locked caller holds s.mu: Flush → GetObjExtents → grow (meta only) or shrink (Writer.TruncateV2FromExtents + meta).
 func (s *ECStreamer) truncateV2Locked(ctx context.Context, ino uint64, targetSize uint64, fullPath string) error {
 	if s.fWriter == nil {
 		log.LogErrorf("ECStreamer truncateV2: writer nil, ino(%v)", ino)
 		return syscall.EBADF
 	}
-	// 调用streamer的Flush， 只是下刷数据和写道meta // flush完后需要更新size和oeks
 	if err := s.fWriter.Flush(ino, ctx); err != nil {
 		return err
 	}
@@ -530,29 +486,28 @@ func (s *ECStreamer) truncateV2Locked(ctx context.Context, ino uint64, targetSiz
 			if err := s.mw.TruncateV2(ino, targetSize, fullPath, nil, nil); err != nil {
 				return err
 			}
-			return s.updateMetaInfo(false, &targetSize)
+			return s.updateMetaInfo(&targetSize)
 		}
 		return err
 	}
 
 	if targetSize == currentSize {
 		if s.isDirty() {
-			return s.updateMetaInfo(false, &targetSize)
+			return s.updateMetaInfo(&targetSize)
 		}
 		return nil
 	}
 
 	// s.markDirty()
 
-	// TODO next version, 在服务端meta判断这个逻辑是否还符合，size扩大
+	// TODO next version, validate grow path against metanode semantics
 	if targetSize > currentSize {
 		if err := s.mw.TruncateV2(ino, targetSize, fullPath, objExtents, nil); err != nil {
 			return err
 		}
-		return s.updateMetaInfo(false, &targetSize)
+		return s.updateMetaInfo(&targetSize)
 	}
 
-	// 1. 扩大，meta； 2.缩小，writer 覆盖写。最后一个extent，做读改写 3. 不变 4. 新建文件
 	newObjExtents, toDeletes, err := s.fWriter.TruncateV2FromExtents(ctx, targetSize, currentSize, objExtents)
 	if err != nil {
 		return err
@@ -560,5 +515,5 @@ func (s *ECStreamer) truncateV2Locked(ctx context.Context, ino uint64, targetSiz
 	if err := s.mw.TruncateV2(ino, targetSize, fullPath, newObjExtents, toDeletes); err != nil {
 		return err
 	}
-	return s.updateMetaInfo(false, &targetSize)
+	return s.updateMetaInfo(&targetSize)
 }

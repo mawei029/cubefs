@@ -133,6 +133,7 @@ type ListFilesV2Result struct {
 type Volume struct {
 	mw         *meta.MetaWrapper
 	ec         *stream.ExtentClient
+	oec        *blobstore.ECExtentClient
 	mc         *master.MasterClient
 	store      Store // Storage for ACP management
 	name       string
@@ -716,22 +717,34 @@ func (v *Volume) PutObject(path string, reader io.Reader, opt *PutFileOption) (f
 
 	md5Hash := md5.New()
 	isCache := false
-	if proto.IsCold(v.volType) || proto.IsStorageClassBlobStore(invisibleTempDataInode.StorageClass) {
-		isCache = true
-	}
-	if err = v.ec.OpenStream(invisibleTempDataInode.Inode, true, isCache, path); err != nil {
-		log.LogErrorf("PutObject: open stream fail: volume(%v) path(%v) inode(%v) err(%v)",
-			v.name, path, invisibleTempDataInode.Inode, err)
-		return
-	}
-	defer func() {
-		if closeErr := v.ec.CloseStream(invisibleTempDataInode.Inode); closeErr != nil {
-			log.LogErrorf("PutObject: close stream fail: volume(%v) inode(%v) err(%v)",
-				v.name, invisibleTempDataInode.Inode, closeErr)
+	useOEC := proto.DataPlaneUsesBlobEC(v.volType, invisibleTempDataInode.StorageClass)
+	if useOEC {
+		if err = v.openOECStream(invisibleTempDataInode.Inode, invisibleTempDataInode.PoolId); err != nil {
+			log.LogErrorf("PutObject: open oec stream fail: volume(%v) path(%v) inode(%v) err(%v)",
+				v.name, path, invisibleTempDataInode.Inode, err)
+			return
 		}
-	}()
+		defer func() {
+			if closeErr := v.oec.CloseStream(invisibleTempDataInode.Inode); closeErr != nil {
+				log.LogErrorf("PutObject: close oec stream fail: volume(%v) inode(%v) err(%v)",
+					v.name, invisibleTempDataInode.Inode, closeErr)
+			}
+		}()
+	} else {
+		if err = v.ec.OpenStream(invisibleTempDataInode.Inode, true, isCache, path); err != nil {
+			log.LogErrorf("PutObject: open stream fail: volume(%v) path(%v) inode(%v) err(%v)",
+				v.name, path, invisibleTempDataInode.Inode, err)
+			return
+		}
+		defer func() {
+			if closeErr := v.ec.CloseStream(invisibleTempDataInode.Inode); closeErr != nil {
+				log.LogErrorf("PutObject: close stream fail: volume(%v) inode(%v) err(%v)",
+					v.name, invisibleTempDataInode.Inode, closeErr)
+			}
+		}()
+	}
 
-	if proto.IsCold(v.volType) || proto.IsStorageClassBlobStore(invisibleTempDataInode.StorageClass) {
+	if useOEC {
 		if _, err = v.ebsWrite(invisibleTempDataInode.Inode, reader, md5Hash, invisibleTempDataInode.PoolId); err != nil {
 			log.LogErrorf("PutObject: ebs write fail: volume(%v) path(%v) inode(%v) err(%v)",
 				v.name, path, invisibleTempDataInode.Inode, err)
@@ -932,7 +945,10 @@ func (v *Volume) DeletePath(path string) (err error) {
 	}
 
 	if err = v.ec.EvictStream(ino); err != nil {
-		log.LogWarnf("DeletePath EvictStream: path(%v) inode(%v)", path, ino)
+		log.LogWarnf("DeletePath ec EvictStream: path(%v) inode(%v)", path, ino)
+	}
+	if err = v.oec.EvictStream(ino); err != nil {
+		log.LogWarnf("DeletePath oec EvictStream: path(%v) inode(%v)", path, ino)
 	}
 
 	// delete objectnode meta cache
@@ -1070,21 +1086,34 @@ func (v *Volume) WritePart(path string, multipartId string, partId uint16, reade
 		md5Hash = md5.New()
 	)
 	isCache := false
-	if proto.IsCold(v.volType) || proto.IsStorageClassBlobStore(tempInodeInfo.StorageClass) {
-		isCache = true
-	}
-	if err = v.ec.OpenStream(tempInodeInfo.Inode, true, isCache, path); err != nil {
-		log.LogErrorf("WritePart: data open stream fail: volume(%v) path(%v) multipartID(%v) partID(%v) inode(%v) err(%v)",
-			v.name, path, multipartId, partId, tempInodeInfo.Inode, err)
-		return nil, err
-	}
-	defer func() {
-		if closeErr := v.ec.CloseStream(tempInodeInfo.Inode); closeErr != nil {
-			log.LogErrorf("WritePart: data close stream fail: volume(%v) path(%v) multipartID(%v) partID(%v) inode(%v) err(%v)",
-				v.name, path, multipartId, partId, tempInodeInfo.Inode, closeErr)
+	useOEC := proto.DataPlaneUsesBlobEC(v.volType, tempInodeInfo.StorageClass)
+	if useOEC {
+		if err = v.openOECStream(tempInodeInfo.Inode, tempInodeInfo.PoolId); err != nil {
+			log.LogErrorf("WritePart: open oec stream fail: volume(%v) path(%v) multipartID(%v) partID(%v) inode(%v) err(%v)",
+				v.name, path, multipartId, partId, tempInodeInfo.Inode, err)
+			return nil, err
 		}
-	}()
-	if proto.IsCold(v.volType) || proto.IsStorageClassBlobStore(tempInodeInfo.StorageClass) {
+		defer func() {
+			if closeErr := v.oec.CloseStream(tempInodeInfo.Inode); closeErr != nil {
+				log.LogErrorf("WritePart: close oec stream fail: volume(%v) path(%v) multipartID(%v) partID(%v) inode(%v) err(%v)",
+					v.name, path, multipartId, partId, tempInodeInfo.Inode, closeErr)
+			}
+		}()
+	} else {
+		if err = v.ec.OpenStream(tempInodeInfo.Inode, true, isCache, path); err != nil {
+			log.LogErrorf("WritePart: data open stream fail: volume(%v) path(%v) multipartID(%v) partID(%v) inode(%v) err(%v)",
+				v.name, path, multipartId, partId, tempInodeInfo.Inode, err)
+			return nil, err
+		}
+		defer func() {
+			if closeErr := v.ec.CloseStream(tempInodeInfo.Inode); closeErr != nil {
+				log.LogErrorf("WritePart: data close stream fail: volume(%v) path(%v) multipartID(%v) partID(%v) inode(%v) err(%v)",
+					v.name, path, multipartId, partId, tempInodeInfo.Inode, closeErr)
+			}
+		}()
+	}
+
+	if useOEC {
 		if size, err = v.ebsWrite(tempInodeInfo.Inode, reader, md5Hash, tempInodeInfo.PoolId); err != nil {
 			log.LogErrorf("WritePart: ebs write fail: volume(%v) inode(%v) multipartID(%v) partID(%v) err(%v)",
 				v.name, tempInodeInfo.Inode, multipartId, partId, err)
@@ -1387,8 +1416,10 @@ func (v *Volume) CompleteMultipart(path, multipartID string, multipartInfo *prot
 
 func (v *Volume) ebsWrite(inode uint64, reader io.Reader, h hash.Hash, poolId uint8) (size uint64, err error) {
 	ctx := context.Background()
-	size, err = v.getEbsWriter(inode, poolId).WriteFromReader(ctx, reader, h)
-	return
+	if !v.oec.HasWriter(inode) {
+		return 0, fmt.Errorf("ebsWrite: no writer for inode(%v)", inode)
+	}
+	return v.oec.WriteFromReader(ctx, inode, reader, h)
 }
 
 func (v *Volume) streamWrite(inode uint64, reader io.Reader, h hash.Hash, poolId uint8, storageClass uint32) (size uint64, err error) {
@@ -1536,6 +1567,12 @@ func (v *Volume) applyInodeToExistDentry(parentID uint64, name string, inode uin
 		log.LogWarnf("applyInodeToExistDentry: evict inode fail: volume(%v) inode(%v) err(%v)",
 			v.name, oldInode, err)
 	}
+	if evictErr := v.ec.EvictStream(oldInode); evictErr != nil {
+		log.LogWarnf("applyInodeToExistDentry: ec EvictStream oldInode(%v) err(%v)", oldInode, evictErr)
+	}
+	if evictErr := v.oec.EvictStream(oldInode); evictErr != nil {
+		log.LogWarnf("applyInodeToExistDentry: oec EvictStream oldInode(%v) err(%v)", oldInode, evictErr)
+	}
 	err = nil
 	return
 }
@@ -1571,23 +1608,32 @@ func (v *Volume) loadUserDefinedMetadata(inode uint64) (metadata map[string]stri
 
 func (v *Volume) readFile(inode, inodeSize uint64, path string, writer io.Writer, offset, size uint64, storageClass uint32, poolId uint8) (err error) {
 	isCache := false
-	if proto.IsCold(v.volType) || proto.IsStorageClassBlobStore(storageClass) {
-		isCache = true
-	}
-	if err = v.ec.OpenStream(inode, false, isCache, path); err != nil {
-		log.LogErrorf("readFile: data open stream fail, Inode(%v) err(%v)", inode, err)
-		return err
-	}
-	defer func() {
-		if closeErr := v.ec.CloseStream(inode); closeErr != nil {
-			log.LogErrorf("readFile: data close stream fail: inode(%v) err(%v)", inode, closeErr)
+	useOEC := proto.DataPlaneUsesBlobEC(v.volType, storageClass)
+	if useOEC {
+		if err = v.openOECStream(inode, poolId); err != nil {
+			log.LogErrorf("readFile: open oec stream fail, inode(%v) err(%v)", inode, err)
+			return err
 		}
-	}()
-	if proto.IsHot(v.volType) || proto.IsStorageClassReplica(storageClass) {
-		return v.read(inode, inodeSize, path, writer, offset, size, poolId)
+		defer func() {
+			if closeErr := v.oec.CloseStream(inode); closeErr != nil {
+				log.LogErrorf("readFile: close oec stream fail: inode(%v) err(%v)", inode, closeErr)
+			}
+		}()
 	} else {
+		if err = v.ec.OpenStream(inode, false, isCache, path); err != nil {
+			log.LogErrorf("readFile: data open stream fail, Inode(%v) err(%v)", inode, err)
+			return err
+		}
+		defer func() {
+			if closeErr := v.ec.CloseStream(inode); closeErr != nil {
+				log.LogErrorf("readFile: data close stream fail: inode(%v) err(%v)", inode, closeErr)
+			}
+		}()
+	}
+	if useOEC {
 		return v.readEbs(inode, inodeSize, path, writer, offset, size, poolId)
 	}
+	return v.read(inode, inodeSize, path, writer, offset, size, poolId)
 }
 
 func (v *Volume) readEbs(inode, inodeSize uint64, path string, writer io.Writer, offset, size uint64, poolId uint8) error {
@@ -1598,9 +1644,14 @@ func (v *Volume) readEbs(inode, inodeSize uint64, path string, writer io.Writer,
 
 	ctx := context.Background()
 	_ = context.WithValue(ctx, "objectnode", 1) // nolint: staticcheck
-	reader := v.getEbsReader(inode, poolId)
+
+	ecStreamer := v.oec.GetStreamer(inode)
+	if ecStreamer == nil || !v.oec.HasReader(inode) {
+		return fmt.Errorf("readEbs: no reader for inode(%v)", inode)
+	}
 	var n int
 	var rest uint64
+	var err error
 	tmp := buf.ClodVolReaderBufPool.Get().([]byte)
 	defer buf.ClodVolReaderBufPool.Put(tmp) // nolint: staticcheck
 
@@ -1613,11 +1664,11 @@ func (v *Volume) readEbs(inode, inodeSize uint64, path string, writer io.Writer,
 			readSize = int(rest)
 		}
 		tmp = tmp[:readSize]
-		off, err := safeConvertUint64ToInt(offset)
-		if err != nil {
-			return err
+		off, convErr := safeConvertUint64ToInt(offset)
+		if convErr != nil {
+			return convErr
 		}
-		n, err = reader.Read(ctx, tmp, off, readSize)
+		n, err = ecStreamer.Read(ctx, tmp, off, readSize)
 		if err != nil && err != io.EOF {
 			log.LogErrorf("ReadFile: data read fail: volume(%v) path(%v) inode(%v) offset(%v) size(%v) err(%v)",
 				v.name, path, inode, offset, size, err)
@@ -1838,6 +1889,9 @@ func (v *Volume) Close() error {
 		close(v.closeCh)
 		_ = v.mw.Close()
 		_ = v.ec.Close()
+		if v.oec != nil {
+			_ = v.oec.Close()
+		}
 	})
 	return nil
 }
@@ -2647,20 +2701,32 @@ func (v *Volume) CopyFile(sv *Volume, sourcePath, targetPath, metaDirective stri
 		return nil, syscall.EFBIG
 	}
 	isCache := false
-	if proto.IsCold(sv.volType) || proto.IsStorageClassBlobStore(sInodeInfo.StorageClass) {
-		isCache = true
-	}
-	if err = sv.ec.OpenStream(sInode, false, isCache, sourcePath); err != nil {
-		log.LogErrorf("CopyFile: open source path stream fail, source path(%v) source path inode(%v) err(%v)",
-			sourcePath, sInode, err)
-		return
-	}
-	defer func() {
-		if closeErr := sv.ec.CloseStream(sInode); closeErr != nil {
-			log.LogErrorf("CopyFile: close source path stream fail: source path(%v) source path inode(%v) err(%v)",
-				sourcePath, sInode, closeErr)
+	srcUseOEC := proto.DataPlaneUsesBlobEC(sv.volType, sInodeInfo.StorageClass)
+	if srcUseOEC {
+		if err = sv.openOECStream(sInode, sInodeInfo.PoolId); err != nil {
+			log.LogErrorf("CopyFile: open source oec stream fail: volume(%v) path(%v) inode(%v) err(%v)",
+				sv.name, sourcePath, sInode, err)
+			return
 		}
-	}()
+		defer func() {
+			if closeErr := sv.oec.CloseStream(sInode); closeErr != nil {
+				log.LogWarnf("CopyFile: close source oec stream fail: volume(%v) path(%v) inode(%v) err(%v)",
+					sv.name, sourcePath, sInode, closeErr)
+			}
+		}()
+	} else {
+		if err = sv.ec.OpenStream(sInode, false, isCache, sourcePath); err != nil {
+			log.LogErrorf("CopyFile: open source path stream fail, source path(%v) source path inode(%v) err(%v)",
+				sourcePath, sInode, err)
+			return
+		}
+		defer func() {
+			if closeErr := sv.ec.CloseStream(sInode); closeErr != nil {
+				log.LogErrorf("CopyFile: close source path stream fail: source path(%v) source path inode(%v) err(%v)",
+					sourcePath, sInode, closeErr)
+			}
+		}()
+	}
 
 	var xattr *proto.XAttrInfo
 	// if source path is same with target path, just reset file metadata
@@ -2815,18 +2881,30 @@ func (v *Volume) CopyFile(sv *Volume, sourcePath, targetPath, metaDirective stri
 	}()
 
 	isCache = false
-	if proto.IsCold(v.volType) || proto.IsStorageClassBlobStore(tInodeInfo.StorageClass) {
-		isCache = true
-	}
-	if err = v.ec.OpenStream(tInodeInfo.Inode, true, isCache, targetPath); err != nil {
-		return
-	}
-	defer func() {
-		if closeErr := v.ec.CloseStream(tInodeInfo.Inode); closeErr != nil {
-			log.LogErrorf("CopyFile: close target path stream fail: volume(%v) path(%v) inode(%v) err(%v)",
-				v.name, targetPath, tInodeInfo.Inode, closeErr)
+	tgtUseOEC := proto.DataPlaneUsesBlobEC(v.volType, tInodeInfo.StorageClass)
+	if tgtUseOEC {
+		if err = v.openOECStream(tInodeInfo.Inode, tInodeInfo.PoolId); err != nil {
+			log.LogErrorf("CopyFile: open target oec stream fail: volume(%v) path(%v) inode(%v) err(%v)",
+				v.name, targetPath, tInodeInfo.Inode, err)
+			return
 		}
-	}()
+		defer func() {
+			if closeErr := v.oec.CloseStream(tInodeInfo.Inode); closeErr != nil {
+				log.LogWarnf("CopyFile: close target oec stream fail: volume(%v) path(%v) inode(%v) err(%v)",
+					v.name, targetPath, tInodeInfo.Inode, closeErr)
+			}
+		}()
+	} else {
+		if err = v.ec.OpenStream(tInodeInfo.Inode, true, isCache, targetPath); err != nil {
+			return
+		}
+		defer func() {
+			if closeErr := v.ec.CloseStream(tInodeInfo.Inode); closeErr != nil {
+				log.LogErrorf("CopyFile: close target path stream fail: volume(%v) path(%v) inode(%v) err(%v)",
+					v.name, targetPath, tInodeInfo.Inode, closeErr)
+			}
+		}()
+	}
 
 	// write data to invisibleTempDataInode from source object
 	var (
@@ -2845,14 +2923,22 @@ func (v *Volume) CopyFile(sv *Volume, sourcePath, targetPath, metaDirective stri
 	var sctx context.Context
 	var ebsReader *blobstore.Reader
 	var tctx context.Context
-	var ebsWriter *blobstore.Writer
-	if proto.IsCold(sv.volType) || proto.IsStorageClassBlobStore(sInodeInfo.StorageClass) {
+	var ecStreamer *blobstore.ECStreamer
+	if srcUseOEC {
 		sctx = context.Background()
-		ebsReader = sv.getEbsReader(sInode, sInodeInfo.PoolId)
+		ebsReader = sv.oec.Reader(sInode)
+		if ebsReader == nil {
+			err = fmt.Errorf("CopyFile: no source oec reader for inode(%v)", sInode)
+			return
+		}
 	}
-	if proto.IsCold(v.volType) || proto.IsStorageClassBlobStore(tInodeInfo.StorageClass) {
+	if tgtUseOEC {
 		tctx = context.Background()
-		ebsWriter = v.getEbsWriter(tInodeInfo.Inode, tInodeInfo.PoolId)
+		ecStreamer = v.oec.GetStreamer(tInodeInfo.Inode)
+		if ecStreamer == nil || !v.oec.HasWriter(tInodeInfo.Inode) {
+			err = fmt.Errorf("CopyFile: no target oec writer for inode(%v)", tInodeInfo.Inode)
+			return
+		}
 	}
 
 	for {
@@ -2864,7 +2950,7 @@ func (v *Volume) CopyFile(sv *Volume, sourcePath, targetPath, metaDirective stri
 			readSize = rest
 		}
 		buf = buf[:readSize]
-		if proto.IsCold(sv.volType) || proto.IsStorageClassBlobStore(sInodeInfo.StorageClass) {
+		if srcUseOEC {
 			readN, err = ebsReader.Read(sctx, buf, readOffset, readSize)
 		} else {
 			readN, err = sv.ec.Read(sInode, buf, readOffset, readSize, sInodeInfo.PoolId, false)
@@ -2873,8 +2959,8 @@ func (v *Volume) CopyFile(sv *Volume, sourcePath, targetPath, metaDirective stri
 			return
 		}
 		if readN > 0 {
-			if proto.IsCold(v.volType) || proto.IsStorageClassBlobStore(tInodeInfo.StorageClass) {
-				writeN, err = ebsWriter.WriteWithoutPool(tctx, writeOffset, buf[:readN])
+			if tgtUseOEC {
+				writeN, err = ecStreamer.WriteWithoutPool(tctx, writeOffset, buf[:readN])
 			} else {
 				writeN, err = v.ec.Write(tInodeInfo.Inode, writeOffset, buf[:readN], 0, nil,
 					tInodeInfo.PoolId, tInodeInfo.StorageClass, false, false)
@@ -2894,8 +2980,8 @@ func (v *Volume) CopyFile(sv *Volume, sourcePath, targetPath, metaDirective stri
 		}
 	}
 	// flush
-	if proto.IsCold(v.volType) || proto.IsStorageClassBlobStore(tInodeInfo.StorageClass) {
-		err = ebsWriter.FlushWithoutPool(tInodeInfo.Inode, tctx)
+	if tgtUseOEC {
+		err = ecStreamer.FlushWithoutPool(tInodeInfo.Inode, tctx)
 	} else {
 		v.ec.Flush(tInodeInfo.Inode)
 	}
@@ -3100,8 +3186,11 @@ func NewVolume(config *VolumeConfig) (*Volume, error) {
 	}
 
 	v := &Volume{
-		mw:           metaWrapper,
-		ec:           extentClient,
+		mw: metaWrapper,
+		ec: extentClient,
+		oec: blobstore.NewObjExtentClient(blobstore.ObjExtentConfig{
+			LimitManager: extentClient.LimitManager,
+		}),
 		mc:           mc,
 		name:         config.Volume,
 		owner:        volumeInfo.Owner,
@@ -3130,52 +3219,33 @@ func NewVolume(config *VolumeConfig) (*Volume, error) {
 	return v, nil
 }
 
-func (v *Volume) getEbsWriter(ino uint64, poolId uint8) (writer *blobstore.Writer) {
-	clientConf := blobstore.ClientConfig{
+// buildECStreamOpenArgs 组装 EC 流打开参数（对齐 client/fs openOECStream → OpenStreamWithArgs）。
+func (v *Volume) buildECStreamOpenArgs(ino uint64, poolId uint8, fileSize, inoGen uint64) blobstore.ECStreamOpenArgs {
+	return blobstore.ECStreamOpenArgs{
+		Ino:             ino,
+		PoolId:          poolId,
+		FileSize:        fileSize,
+		InodeGeneration: inoGen,
 		VolName:         v.name,
 		VolType:         v.volType,
-		Ino:             ino,
 		BlockSize:       v.ebsBlockSize,
+		Ebsc:            ebsClient,
 		Bc:              blockCache,
 		Mw:              v.mw,
-		LimitManager:    v.ec.LimitManager,
-		Ebsc:            ebsClient,
 		EnableBcache:    enableBlockcache,
 		WConcurrency:    writeThreads,
 		ReadConcurrency: readThreads,
-		FileCache:       false,
-		FileSize:        0,
-		PoolId:          poolId,
+		LimitManager:    v.oec.LimitManager,
 	}
-	clientConf.ECStreamer = blobstore.NewECStreamer(ino, nil, nil)
-
-	writer = blobstore.NewWriter(clientConf)
-	log.LogDebugf("getEbsWriter: writer(%v) ", writer)
-	return
 }
 
-func (v *Volume) getEbsReader(ino uint64, poolId uint8) (reader *blobstore.Reader) {
-	clientConf := blobstore.ClientConfig{
-		VolName:         v.name,
-		VolType:         v.volType,
-		Ino:             ino,
-		BlockSize:       v.ebsBlockSize,
-		Bc:              blockCache,
-		Mw:              v.mw,
-		LimitManager:    v.ec.LimitManager,
-		Ebsc:            ebsClient,
-		EnableBcache:    enableBlockcache,
-		WConcurrency:    writeThreads,
-		ReadConcurrency: readThreads,
-		FileCache:       false,
-		FileSize:        0,
-		PoolId:          poolId,
+func (v *Volume) openOECStream(ino uint64, poolId uint8) error {
+	fileSize, inoGen := uint64(0), uint64(0)
+	if info, err := v.mw.InodeGet_ll(ino, false); err == nil && info != nil {
+		fileSize, inoGen = info.Size, info.Generation
 	}
-	clientConf.ECStreamer = blobstore.NewECStreamer(ino, nil, nil)
-
-	reader = blobstore.NewReader(clientConf)
-	log.LogDebugf("getEbsReader: reader(%v) ", reader)
-	return
+	args := v.buildECStreamOpenArgs(ino, poolId, fileSize, inoGen)
+	return v.oec.OpenStreamWithArgs(args)
 }
 
 func safeConvertUint64ToInt(num uint64) (int, error) {

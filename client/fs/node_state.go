@@ -22,7 +22,7 @@ type DirExtendInfo struct {
 type FileExtendInfo struct {
 	sync.RWMutex
 	idle int32
-	// coldBlobReader/coldBlobWriter：仅用于冷卷且非 EC（未走 ObjExtentClient）时挂接的独立 Blob 客户端；EC/BlobStore 一律用 Super.oec。
+	// coldBlobReader/coldBlobWriter: legacy cold path without ObjExtentClient; EC/BlobStore always uses Super.oec.
 	coldBlobReader *blobstore.Reader
 	coldBlobWriter *blobstore.Writer
 	flag           uint32
@@ -389,9 +389,9 @@ func (f *File) removeParentDcacheEntry() {
 	parent.deleteDcacheEntry(f.name)
 }
 
-// storageClass 返回 inode 存储类；icache 命中则只读本地，未命中则 getInfo→InodeGet。
-// 注意：InodeGet 在更新 nodeCache 相关路径时会申请 s.fslock。禁止在**当前 goroutine 已持有 s.fslock** 时调用本方法，
-// 否则与 InodeGet 内再次 Lock(fslock) 形成自死锁（历史上 scheduleFlush 曾踩坑）。
+// storageClass returns inode storage class from icache or InodeGet via getInfo.
+// Do not call while holding s.fslock (InodeGet may lock fslock again — scheduleFlush deadlock).
+// Otherwise self-deadlock with InodeGet (historical scheduleFlush issue).
 func (f *File) storageClass() uint32 {
 	if info := f.super.ic.Get(f.ino); info != nil {
 		return info.StorageClass

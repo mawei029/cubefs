@@ -1189,8 +1189,7 @@ func (s *Streamer) evict() error {
 	s.client.streamerLock.Lock()
 	if atomic.LoadInt32(&s.refcnt) > 0 || len(s.request) != 0 {
 		s.client.streamerLock.Unlock()
-		return errors.New(fmt.Sprintf("evict: streamer(%v) refcnt(%v) requestQLen(%v)",
-			s, atomic.LoadInt32(&s.refcnt), len(s.request)))
+		return errors.New(fmt.Sprintf("evict: streamer(%v) refcnt(%v)", s, atomic.LoadInt32(&s.refcnt)))
 	}
 	if s.client.disableMetaCache || !s.needBCache {
 		delete(s.client.streamers, s.inode)

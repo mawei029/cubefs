@@ -37,7 +37,6 @@ import (
 	"github.com/cubefs/cubefs/depends/bazil.org/fuse/fs"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/blobstore"
-	"github.com/cubefs/cubefs/sdk/data/manager"
 	"github.com/cubefs/cubefs/sdk/data/stream"
 	"github.com/cubefs/cubefs/sdk/meta"
 	"github.com/cubefs/cubefs/util"
@@ -60,7 +59,7 @@ type Super struct {
 	dc         *Dcache
 	mw         *meta.MetaWrapper
 	ec         *stream.ExtentClient
-	// oec 在 NewSuper 中于 NewExtentClient 成功后必定构造，与 ec 共享 LimitManager；业务路径勿判 nil。
+	// oec is always created after NewExtentClient; shares LimitManager with ec; do not nil-check on hot paths.
 	oec         *blobstore.ECExtentClient
 	orphan      *OrphanInodeList
 	enSyncWrite bool
@@ -136,7 +135,7 @@ type Super struct {
 // BlobStoreAheadReadForReader returns mount ahead-read flags for blobstore.Reader.
 // Replica path: ExtentClient uses AheadReadWindow (pooled blocks + background prefetch).
 // Blob/EC path: Reader uses a sequential buffer to merge FUSE-sized reads into one EBS read up to EbsBlockSize.
-// Same knobs: aheadReadEnable and minReadAheadSize（与 MountOptions / ExtentConfig 一致，见 NewSuper 回填）；PrefetchTotalMem 同源 AheadReadTotalMem。
+// Same knobs: aheadReadEnable, minReadAheadSize (from MountOptions/ExtentConfig in NewSuper), PrefetchTotalMem from AheadReadTotalMem.
 func (s *Super) BlobStoreAheadReadForReader() (enable bool, minReadAhead int, totalMem int64) {
 	return s.aheadReadEnable, int(s.minReadAheadSize), s.aheadReadTotalMem
 }
@@ -378,7 +377,7 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 	if err != nil {
 		return nil, errors.Trace(err, "NewExtentClient failed!")
 	}
-	// 与 ExtentConfig 注入的预读开关一致，供 BlobStoreAheadReadForReader → buildECStreamOpenArgs / InodeGet 冷路径构造 Reader。
+	// Matches ExtentConfig prefetch flags for BlobStoreAheadReadForReader and cold InodeGet reader setup.
 	s.aheadReadEnable = opt.AheadReadEnable
 	s.aheadReadTotalMem = opt.AheadReadTotalMem
 	if opt.MinReadAheadSize > 0 {
@@ -429,11 +428,6 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 	go s.loopUpdatePoolCache()
 
 	return s, nil
-}
-
-// blobClientLimitManager 供 blobstore.ClientConfig；与 ec.LimitManager 同源（见 NewObjExtentClient）。
-func (s *Super) blobClientLimitManager() *manager.LimitManager {
-	return s.oec.LimitManager
 }
 
 func (s *Super) AddDirtyDir(ino uint64) {
@@ -549,7 +543,9 @@ func (s *Super) scheduleFlush() {
 				ei.RUnlock()
 				if idle >= BlobWriterIdleTimeoutPeriod {
 					atomic.StoreInt32(&ei.idle, 0)
-					go s.oec.Flush(ino)
+					if strm := s.oec.GetStreamer(ino); strm != nil && s.oec.RefCnt(ino) > 0 {
+						go s.oec.Flush(ino)
+					}
 				} else {
 					atomic.AddInt32(&ei.idle, 1)
 				}

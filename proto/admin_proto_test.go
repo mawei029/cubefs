@@ -62,3 +62,22 @@ func TestValidateFollowerReadLeaseTime(t *testing.T) {
 	err := ValidateFollowerReadLeaseTime(0)
 	require.True(t, errors.Is(err, ErrFollowerReadLeaseTimeRange))
 }
+
+func TestDataPlaneUsesBlobEC(t *testing.T) {
+	cases := []struct {
+		volType int
+		sc      uint32
+		want    bool
+	}{
+		{VolumeTypeHot, StorageClass_BlobStore, true},
+		{VolumeTypeHot, StorageClass_Replica_SSD, false},
+		{VolumeTypeCold, StorageClass_BlobStore, true},
+		{VolumeTypeCold, StorageClass_Replica_SSD, false},
+		{VolumeTypeCold, StorageClass_Replica_HDD, false},
+	}
+	for _, c := range cases {
+		if got := DataPlaneUsesBlobEC(c.volType, c.sc); got != c.want {
+			t.Fatalf("DataPlaneUsesBlobEC(vol=%d sc=%d)=%v want %v", c.volType, c.sc, got, c.want)
+		}
+	}
+}
