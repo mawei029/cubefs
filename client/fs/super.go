@@ -534,7 +534,6 @@ func (s *Super) scheduleFlush() {
 	defer t.Stop()
 	for range t.C {
 		{
-			ctx := context.Background()
 			s.fslock.Lock()
 			for ino, node := range s.nodeCache {
 				if _, ok := node.(*File); !ok {
@@ -546,20 +545,11 @@ func (s *Super) scheduleFlush() {
 					continue
 				}
 				ei.RLock()
-				writer := ei.coldBlobWriter
 				idle := atomic.LoadInt32(&ei.idle)
 				ei.RUnlock()
-				if writer == nil {
-					// 禁止持 fslock 调用 file.storageClass()：其 miss 路径会 getInfo→InodeGet→再次抢 fslock，自死锁后全挂载点 FUSE 卡在 InodeGet（与 pprof 一致）。
-					if info := s.ic.Get(ino); info != nil && proto.IsStorageClassBlobStore(info.StorageClass) {
-						writer = s.oec.Writer(ino)
-					}
-				}
 				if idle >= BlobWriterIdleTimeoutPeriod {
-					if writer != nil {
-						atomic.StoreInt32(&ei.idle, 0)
-						go writer.Flush(ino, ctx)
-					}
+					atomic.StoreInt32(&ei.idle, 0)
+					go s.oec.Flush(ino)
 				} else {
 					atomic.AddInt32(&ei.idle, 1)
 				}

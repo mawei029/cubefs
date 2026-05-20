@@ -193,19 +193,6 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 		log.LogErrorf("Attr: ino(%v) err(%v)", ino, err)
 		return ParseError(err)
 	}
-	pool := f.getStorageClassByPoolId(info.PoolId)
-	storageClass := uint32(pool.StorageClass)
-	// Blob/EC：与 Read 一致，避免 icache 命中「未过期但已落后」的 inode，导致 fstat 与数据面/读上界不一致（LTP ftest）。
-	// TODO：删掉
-	if !proto.IsSymlink(info.Mode) {
-		if !proto.IsStorageClassReplica(storageClass) {
-			f.super.ic.Delete(ino)
-			if info, err = f.super.InodeGet(ino); err != nil {
-				log.LogErrorf("Attr: ino(%v) err(%v)", ino, err)
-				return ParseError(err)
-			}
-		}
-	}
 
 	fillAttr(info, a)
 	a.ParentIno = f.parentIno
@@ -239,7 +226,6 @@ func (f *File) Forget() {
 
 	// TODO:why cannot close fwriter
 	// log.LogErrorf("TRACE Forget: ino(%v)", ino)
-	// if f.fWriter != nil {
 	//	f.fWriter.Close()
 	// }
 
@@ -321,27 +307,25 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 			f.super.ec.OpenStream(ino, openForWrite, isCache, path.Join(f.getParentPath(), f.name))
 		}
 	}
-	// 后续任一步失败须配对 ec.CloseStream，避免副本流 ref 泄漏（oec 未 OpenStream 成功时无对应 oec ref）。
-	defer func() {
-		if err != nil { // todo: 删除
-			_ = f.super.ec.CloseStream(ino)
-			_ = f.super.oec.CloseStream(ino)
-		}
-	}()
-
 	log.LogDebugf("TRACE open ino(%v) f.super.bcacheDir(%v) needBCache(%v)", ino, f.super.bcacheDir, needBCache)
 
-	if f.super.metaCacheAcceleration {
-		inodeInfo, err1 := f.super.InodeGet(ino)
-		if err1 == nil && inodeInfo != nil && inodeInfo.Extents != nil {
-			f.super.ec.RefreshExtentsWithCache(inodeInfo)
+	if proto.IsStorageClassReplica(info.StorageClass) {
+		if f.super.metaCacheAcceleration {
+			inodeInfo, err1 := f.super.InodeGet(ino)
+			if err1 == nil && inodeInfo != nil && inodeInfo.Extents != nil {
+				f.super.ec.RefreshExtentsWithCache(inodeInfo)
+			} else {
+				f.super.ec.RefreshExtentsCache(ino)
+			}
 		} else {
 			f.super.ec.RefreshExtentsCache(ino)
 		}
-	} else {
-		f.super.ec.RefreshExtentsCache(ino)
 	}
-	// todo : ec stream oeks ； f.super.ec.RefreshExtentsCache(ino)
+
+	// ec stream oeks
+	if proto.IsStorageClassBlobStore(info.StorageClass) {
+		f.super.oec.RefreshExtentsCache(ino)
+	}
 
 	if f.super.keepCache && resp != nil {
 		resp.Flags |= fuse.OpenKeepCache
@@ -350,7 +334,7 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 		log.LogDebugf("TRANCE open ino(%v) info(%v), poolId(%v)", ino, info, info.PoolId)
 
 		if s := f.super.oec.GetStreamer(ino); s != nil {
-			if flushErr := s.FlushAndFreeCache(context.Background()); flushErr != nil {
+			if flushErr := s.Flush(context.Background()); flushErr != nil {
 				log.LogErrorf("Open: oec flush before replace stream ino(%v) err(%v)", ino, flushErr)
 				return nil, ParseError(flushErr)
 			}
@@ -361,7 +345,8 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 			log.LogErrorf("Open: openOECStream ino(%v) err: %v", ino, err)
 			return nil, err
 		}
-		log.LogDebugf("TRACE file open (oec), ino(%v) req.Flags(%v) streamer(%v) writer(%v)", ino, req.Flags, f.super.oec.GetStreamer(ino) != nil, f.super.oec.Writer(ino) != nil)
+		log.LogDebugf("TRACE file open (oec), ino(%v) req.Flags(%v) streamer(%v) writer(%v)",
+			ino, req.Flags, f.super.oec.GetStreamer(ino) != nil, f.super.oec.Writer(ino) != nil)
 	}
 
 	elapsed := time.Since(start)
@@ -447,23 +432,10 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 	// Get storage class from poolId if available, otherwise use existing StorageClass
 	pool := f.getStorageClassByPoolId(info.PoolId)
 	storageClass := uint32(pool.StorageClass)
-	// 与 Attr 一致：Blob/EC 上 icache 可能仍保留截断前的 Size/Generation；若不刷新，readSize 会与过期 lz 合并，
-	// readAfterFlush 内 ensureAlignedForRead → syncInodeView 会把 stream.fileSize 重新抬大，洞区读到旧数据（LTP ftest01/05）。
-	if !proto.IsSymlink(info.Mode) && !proto.IsStorageClassReplica(storageClass) {
-		// TODO：删掉
-		f.super.ic.Delete(f.ino)
-		if info, err = f.super.InodeGet(f.ino); err != nil {
-			return ParseError(err)
-		}
-		pool = f.getStorageClassByPoolId(info.PoolId)
-		storageClass = uint32(pool.StorageClass)
-	}
-
 	log.LogDebugf("TRACE Read enter: ino(%v) poolId(%v) storageClass(%v) offset(%v) filesize(%v) reqsize(%v) req(%v)",
 		f.ino, info.PoolId, storageClass, req.Offset, info.Size, req.Size, req)
 
 	start := time.Now()
-
 	metric := exporter.NewTPCnt("fileread")
 	defer func() {
 		metric.SetWithLabels(err, map[string]string{exporter.Vol: f.super.volname})
@@ -477,7 +449,7 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 			req.Size, info.PoolId, false)
 	} else {
 		// Blob/EC：读上界与 fstat 均以 oec/ECStreamer.FileSizeView 为准（含未下刷写缓冲）；对齐在 readAfterFlush 内完成。
-		size, err = f.super.oec.ReadWithInodeView(ctx, f.ino, resp.Data[fuse.OutHeaderSize:], int(req.Offset), req.Size, info.PoolId, false, 0, 0)
+		size, err = f.super.oec.Read(f.ino, resp.Data[fuse.OutHeaderSize:], int(req.Offset), req.Size, info.PoolId, false)
 	}
 	if err != nil && err != io.EOF {
 		msg := fmt.Sprintf("Read: ino(%v) req(%v) err(%v) size(%v)", f.ino, req, err, size)
@@ -557,7 +529,7 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 	} else {
 		filesize, _ := f.fileSizeVersion2(ino)
 		if req.Offset > int64(filesize) && reqlen == 1 && req.Data[0] == 0 {
-			// posix_fallocate may degrade to writing one trailing zero byte when fallocate is unsupported; keep behavior aligned with Hot/Replica branch.
+			// Special case:posix_fallocate may degrade to writing one trailing zero byte when fallocate is unsupported; keep behavior aligned with Hot/Replica branch.
 			fullPath := path.Join(f.getParentPath(), f.name)
 			target := uint64(req.Offset) + uint64(reqlen)
 			if err = f.doECTruncateV2(ino, target, fullPath); err != nil {
@@ -626,15 +598,17 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 		}
 	} else {
 		f.storeIdle(0)
-		// TODO 不要waitForFlush
 		size, err = f.super.oec.Write(ino, int(req.Offset), req.Data, flags, checkFunc,
-			pool.Id, info.StorageClass, false, waitForFlush)
+			pool.Id, info.StorageClass, false)
 	}
 
 	if err != nil {
 		msg := fmt.Sprintf("Write: ino(%v) offset(%v) len(%v) err(%v)", ino, req.Offset, reqlen, err)
 		f.super.handleError("Write", msg)
 		errMetric := exporter.NewCounter("fileWriteFailed")
+
+		log.LogErrorf("Write: ino(%v) offset(%v) len(%v) err(%v)", ino, req.Offset, reqlen, err)
+
 		if !isWriteEio(err) {
 			errMetric.AddWithLabels(1, map[string]string{exporter.Vol: f.super.volname, exporter.Err: "NOTSUP"})
 		} else {
@@ -658,8 +632,7 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 		if proto.IsHot(f.super.volType) || proto.IsStorageClassReplica(storageClass) {
 			err = f.super.ec.Flush(ino)
 		} else {
-			// TODO：err = f.flushNonReplicaWriter(ino, storageClass)
-			f.super.oec.Writer(ino).Flush(ino, context.Background())
+			f.super.oec.Flush(ino)
 		}
 		if err != nil {
 			msg := fmt.Sprintf("Write: failed to wait for flush, ino(%v) offset(%v) len(%v) err(%v) req(%v)", ino, req.Offset, reqlen, err, req)
@@ -679,17 +652,6 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 	log.LogDebugf("TRACE Write: ino(%v) offset(%v) len(%v) flags(%v) fileflags(%v) req(%v) (%v) ",
 		ino, req.Offset, reqlen, req.Flags, req.FileFlags, req, elapsed.String())
 	return nil
-}
-
-// flushNonReplicaWriter 刷非副本路径的 Blob Writer：EC/BlobStore 使用 oec；冷卷非 EC 使用 coldBlobWriter。只读且无 Writer 时 O_RDONLY 视为成功。
-func (f *File) flushNonReplicaWriter(ino uint64, storageClass uint32) error {
-	if f.super.oec.Writer(ino) == nil {
-		if f.getFlag()&0x0f == syscall.O_RDONLY {
-			return nil
-		}
-		return syscall.EBADF
-	}
-	return f.super.oec.Flush(ino)
 }
 
 // Flush only when fsyncOnClose is enabled.
@@ -722,8 +684,7 @@ func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) (err error) {
 	if proto.IsHot(f.super.volType) || proto.IsStorageClassReplica(storageClass) {
 		err = f.super.ec.Flush(f.ino)
 	} else {
-		// TODO: 更新元数据，writer.flush
-		err = f.flushNonReplicaWriter(f.ino, storageClass)
+		err = f.super.oec.Flush(f.ino)
 	}
 	log.LogDebugf("TRACE Flush: ino(%v) err(%v)", f.ino, err)
 	if err != nil {
@@ -782,7 +743,7 @@ func (f *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) (err error) {
 	if proto.IsHot(f.super.volType) || proto.IsStorageClassReplica(storageClass) {
 		err = f.super.ec.Flush(f.ino)
 	} else {
-		err = f.flushNonReplicaWriter(f.ino, storageClass)
+		err = f.super.oec.Flush(f.ino)
 	}
 	if err != nil {
 		msg := fmt.Sprintf("Fsync: ino(%v) err(%v)", f.ino, err)
@@ -849,23 +810,7 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 	log.LogDebugf("Setattr: ino(%v) openForWrite(%v) isCache(%v) targetSize(%v) isHot(%v) storageClass(%v)",
 		ino, openForWrite, isCache, req.Valid.Size(), proto.IsHot(f.super.volType), storageClass)
 
-	// 已在 meta 上的逻辑长度与 req.Size 一致时跳过 Truncate：Linux FUSE 常在带 FATTR_LOCKOWNER 的 setattr 里仍置 FATTR_SIZE，
-	// Size 为当前长度或 0（空文件），误走 doECTruncateV2/ec.Truncate 会空刷 GetObjExtents/Reader 并与并发 Read 交织（LTP ftest Create 后立即 Read）。
-	needTrunc := false
 	if req.Valid.Size() {
-		targetSize := uint64(req.Size)
-		needTrunc = targetSize != info.Size // TODO:Streamer的size
-		// EC/Blob：meta 已等于 target 但流上 logical 尾仍滞后时须补截断（expand-truncate 后 fstat 差 1 csize）。
-		if !needTrunc && proto.IsStorageClassBlobStore(storageClass) {
-			if streamSz, streamGen, ok := f.super.oec.FileSize(ino); ok && streamGen >= info.Generation &&
-				uint64(streamSz) != targetSize {
-				needTrunc = true
-			}
-		}
-	}
-	// todo：保持一样，看req.valid.size()，
-
-	if needTrunc {
 		fullPath := path.Join(f.getParentPath(), f.name)
 		switch {
 		case proto.IsHot(f.super.volType) || proto.IsStorageClassReplica(storageClass):
@@ -935,34 +880,7 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 // doECTruncateV2 handles truncate for EC/BlobStore volumes.
 // Call chain: ensureBlobStoreWriter -> oec.Truncate -> ECStreamer.truncateV2 -> Writer.Flush / mw.GetObjExtents / (shrink: BeforeEBSShrinkHook+Writer.TruncateV2) -> mw.TruncateV2。
 func (f *File) doECTruncateV2(ino uint64, targetSize uint64, fullPath string) error {
-	_, cleanup, err := f.ensureBlobStoreWriter(ino) // todo: 删除
-	if err != nil {
-		return err
-	}
-	if cleanup != nil {
-		defer cleanup()
-	}
-	return f.super.oec.Truncate(f.parentIno, ino, int(targetSize), fullPath)
-}
-
-// ensureBlobStoreWriter 保证 BlobStore（EC）卷通过 ECExtentClient 能拿到 Writer（与 Open 共享同一 oec 流）。
-// 若本函数内部调用了 OpenStream，则返回 cleanup，调用方须在适当时机执行以配对 CloseStream（例如 doECTruncateV2）。
-func (f *File) ensureBlobStoreWriter(ino uint64) (w *blobstore.Writer, cleanup func(), err error) {
-	if w := f.super.oec.Writer(ino); w != nil {
-		return w, nil, nil
-	}
-	info, err := f.getInfo()
-	if err != nil {
-		return nil, nil, err
-	}
-	fileSize, _ := f.fileSizeVersion2(ino)
-	if err := f.openOECStream(info, syscall.O_RDWR, uint64(fileSize)); err != nil {
-		return nil, nil, err
-	}
-	cleanup = func() {
-		_ = f.super.oec.CloseStream(ino)
-	}
-	return f.super.oec.Writer(ino), cleanup, nil
+	return f.super.oec.Truncate(f.parentIno, ino, targetSize, fullPath)
 }
 
 // Readlink handles the readlink request.
@@ -1143,12 +1061,6 @@ func (f *File) fileSizeVersion2(ino uint64) (size int, gen uint64) {
 			if info, err := f.super.InodeGet(ino); err == nil {
 				size = int(info.Size)
 				gen = info.Generation
-				// todo: 删掉
-				// if w := f.coldBlobWriter(); w != nil {
-				// 	if cacheSize := w.CacheFileSize(); cacheSize > size {
-				// 		size = cacheSize
-				// 	}
-				// }
 			}
 		}
 	}
