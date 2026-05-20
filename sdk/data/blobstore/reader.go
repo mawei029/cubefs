@@ -47,6 +47,7 @@ func init() {
 	prometheus.MustRegister(readerMetric)
 }
 
+// rwSlice is one logical read span：ObjExtent ranges use EBS; uncovered spans use hole=true with zero-filled Data and no EBS.
 type rwSlice struct {
 	index        int
 	fileOffset   uint64
@@ -56,8 +57,7 @@ type rwSlice struct {
 	read         int
 	Data         []byte
 	objExtentKey proto.ObjExtentKey
-	// hole marks [start,end) ranges that are not covered by any ObjExtent; Data is pre-filled with zeros and readSliceRange skips EBS.
-	hole bool
+	hole         bool
 }
 
 func (s rwSlice) String() string {
@@ -69,39 +69,37 @@ func (reader *Reader) String() string {
 		&reader, reader.ecStreamer.Volume(), reader.ecStreamer.Inode(), reader.enableBcache, reader.readConcurrency)
 }
 
+// Reader is bound to one inode ECStreamer: split reads by oeks, sparse zero-fill, optional prefetch and async L1 refill.
 type Reader struct {
 	bc              *bcache.BcacheClient
 	readConcurrency int
 	enableBcache    bool
-	inflightCache   sync.Map // TODO: 先不管，保留起来，看怎么用
+	inflightCache   sync.Map // TODO: keep for now; dedupe asyncCache L1 refill per extent key
 	limitManager    *manager.LimitManager
 
-	// blockSize + readBuf: when aheadRead is enabled and file size is larger than minReadAheadSize in EC/BlobStore reads,
-	// merge multiple small FUSE reads (for example max_read=128KiB) into at most one EBS fetch of up to prefetchBufCap() (2×blockSize, e.g. 2×8MiB), cached in readBuf.
-	// Semantics are similar to replica-stream AheadReadWindow, but implementation is Reader-side buffering instead of stream module logic.
+	// Prefetch: when aheadRead is on and fileSize > minReadAheadSize, merge small reads into one readEbsRange (<= prefetchBufCap = 2*blockSize) cached in readBuf.
+	// Semantics match replica AheadReadWindow; buffering lives in Reader, not stream.
 	aheadReadEnable  bool
 	minReadAheadSize uint64
 	readBuf          []byte
-	bufBaseOff       int   // file offset of readBuf[bufOff]
-	bufValidLen      int   // valid bytes in readBuf[bufOff:bufOff+bufValidLen]
-	prefetchReserved int64 // bytes reserved from global blob prefetch budget for this reader
+	bufBaseOff       int   // file offset of valid data at readBuf[0]
+	bufValidLen      int   // valid bytes in readBuf[0:bufValidLen]
+	prefetchReserved int64 // bytes reserved from global blobPreReadLimiter
 	preReadLimiter   *blobPreReadLimiter
 
-	// oec / 冷卷 Blob：与所属 ECStreamer 绑定；须非 nil（见 NewReader）。dirty / inoVersion / fileSize 与流协同。
-	ecStreamer *ECStreamer
+	ecStreamer *ECStreamer // required; logical tail/gen/oeks from stream (see NewReader)
 }
 
+// ClientConfig builds Reader/Writer; production fills via ECStreamOpenArgs.toClientConfig.
 type ClientConfig struct {
-	VolName   string
-	VolType   int
-	BlockSize int
-	Ino       uint64
-	Bc        *bcache.BcacheClient
-	Mw        *meta.MetaWrapper
-	// LimitManager 与副本 ExtentClient / ECExtentClient 侧共享（例如 ec.LimitManager 或 oec.LimitManager）。
-	LimitManager *manager.LimitManager
-	// ECStreamer 必填：须与 OpenStreamWithArgs / inode 冷路径构造的 ClientConfig 一致传入非 nil，否则 NewReader/NewWriter 会 panic。
-	ECStreamer      *ECStreamer
+	VolName         string
+	VolType         int
+	BlockSize       int
+	Ino             uint64
+	Bc              *bcache.BcacheClient
+	Mw              *meta.MetaWrapper
+	LimitManager    *manager.LimitManager // may share replica ec / oec limiter
+	ECStreamer      *ECStreamer           // required; nil panics in NewReader/NewWriter
 	Ebsc            *BlobStoreClient
 	EnableBcache    bool
 	WConcurrency    int
@@ -111,8 +109,8 @@ type ClientConfig struct {
 	PoolId          uint8
 
 	AheadReadEnable  bool
-	MinReadAheadSize int   // bytes; file must be larger than this to use prefetch (same semantics as stream)
-	PrefetchTotalMem int64 // Blob prefetch global memory budget in bytes; shares the same knob source as stream AheadReadTotalMem.
+	MinReadAheadSize int   // prefetch only if logical file size exceeds this (mount/stream policy)
+	PrefetchTotalMem int64 // global prefetch memory budget (same knob as AheadReadTotalMem)
 }
 
 type blobPreReadLimiter struct {
@@ -197,7 +195,7 @@ func (reader *Reader) prefetchBufCap() int {
 	return reader.ecStreamer.BlockSize() * 2
 }
 
-// ensurePrefetchBuf ensures readBuf capacity is at least prefetchBufCap (2×blockSize) and reserves global prefetch budget; on budget shortage it returns false and Read falls back to per-call readEbsRange.
+// ensurePrefetchBuf reserves readBuf and global budget; on failure Read falls back to per-call readEbsRange.
 func (reader *Reader) ensurePrefetchBuf() bool {
 	capW := reader.prefetchBufCap()
 	if capW <= 0 {
@@ -241,23 +239,20 @@ func (reader *Reader) Read(ctx context.Context, buf []byte, offset int, size int
 	}
 	fuseReqSize := size
 
-	// // 每次读前先看是否有脏数据，有writer里的脏数据，需要先flush
-	// if err := reader.ecStreamer.updateMetaInfo(false); err != nil {
-	// 	return 0, err
-	// }
+	// Logical read bound (includes unflushed writer tail); dirty sync is done in ECStreamer.Read before this call.
 	fileSize := reader.ecStreamer.fileSizeView()
 
-	// 与副本 Streamer.read 一致：起点已在文件逻辑尾之后时返回 0 字节、err=nil（POSIX：EOF 以 n==0 表示，不要求 io.EOF）。
+	// Same as replica Streamer.read: offset >= logical tail returns n=0, err=nil (POSIX EOF); caller buf unchanged.
 	if uint64(offset) >= fileSize {
-		// TODD：next version, 把buf重新填充一下，zero填充
+		// TODD: next version, optionally zero caller buf at entry (not required for correctness)
 		return 0, nil
 	}
-	// TODO：空洞填充zero，重新填buf
+	// TODO: next version, optionally zero-fill caller buf for holes at entry
 	if uint64(offset)+uint64(size) > fileSize {
 		size = int(fileSize - uint64(offset))
 	}
 
-	// 两个 oek1 , oek2,空洞
+	// No prefetch: holes are zero-filled in readEbsRange/prepareEbsSlice, then copied into buf.
 	normalReadFunc := func() (int, error) {
 		data, err := reader.readEbsRange(ctx, offset, uint32(size), fileSize)
 		if err != nil {
@@ -275,19 +270,17 @@ func (reader *Reader) Read(ctx context.Context, buf []byte, offset int, size int
 	if !usePrefetch {
 		return normalReadFunc()
 	}
-
 	// case 2: prefetch budget reservation failed and global prefetch pool is exhausted: still read correctly but without readBuf, fallback as above;
 	if !reader.ensurePrefetchBuf() {
 		return normalReadFunc()
 	}
-
 	// case 3: single request >= blockSize: cannot fit prefetch window, read EBS range directly and invalidate buffer to avoid half-block logic.
 	if size >= reader.ecStreamer.BlockSize() {
 		reader.invalidateReadBuf()
 		return normalReadFunc()
 	}
 
-	// case 4: aggregate small reads with prefetch window: one readEbsRange fetches at most [offset, offset+fetch), fetch<=prefetchBufCap; repeated FUSE reads in same window copy from readBuf without extra EBS calls.
+	// case 4: Prefetch: on miss fetch [offset,offset+fetch) with fetch<=prefetchBufCap; later reads in window copy from readBuf.
 	ebsFetchSize := 0
 	if reader.bufValidLen == 0 || offset < reader.bufBaseOff || offset >= reader.bufBaseOff+reader.bufValidLen {
 		// rem: bytes from offset to logical file end (meta / ObjExtent tail / stream fileSize). fetch is capped by prefetchBufCap and rem,
@@ -347,9 +340,7 @@ func (reader *Reader) Read(ctx context.Context, buf []byte, offset int, size int
 	return size, nil
 }
 
-// readEbsRange splits ranges by ObjExtent and runs readSliceRange in parallel; each slice eventually calls BlobStoreClient.Read (access.Get + ReadFull).
-// Caller must hold reader.Mutex for prepareEbsSlice; the mutex is released for the duration of EBS/network I/O so refreshExtents / ensureAlignedForRead
-// can update extent metadata (avoids FUSE hangs under concurrent read + write + getattr).
+// readEbsRange splits [offset,offset+size) into rwSlices, reads EBS in parallel, returns merged buffer (holes zeroed in prepareEbsSlice).
 func (reader *Reader) readEbsRange(ctx context.Context, offset int, size uint32, fileSize uint64) ([]byte, error) {
 	rSlices, err := reader.prepareEbsSlice(offset, size, fileSize)
 	log.LogDebugf("TRACE reader readEbsRange. ino(%v)  rSlices-length(%v) ", reader.ecStreamer.Inode(), len(rSlices))
@@ -386,6 +377,7 @@ func (reader *Reader) readEbsRange(ctx context.Context, offset int, size uint32,
 	return out, nil
 }
 
+// logicalReadBound returns max(meta size, oek logical tails) for writer/updateMetaInfo.
 func logicalReadBound(metaReportedSize uint64, objKeys []proto.ObjExtentKey) uint64 {
 	logical := metaReportedSize
 	for i := range objKeys {
@@ -397,14 +389,30 @@ func logicalReadBound(metaReportedSize uint64, objKeys []proto.ObjExtentKey) uin
 	return logical
 }
 
-// invalidateReadBuf clears prefetch window (without freeing underlying slice); next Read will run readEbsRange again.
+// invalidateReadBuf clears prefetch window metadata; next Read refetches via readEbsRange.
 func (reader *Reader) invalidateReadBuf() {
 	reader.bufValidLen = 0
 	reader.bufBaseOff = 0
 }
 
-// prepareEbsSlice splits [offset, offset+size) into rwSlices: hole ranges are marked hole=true and zero-filled; overlapping ObjExtent ranges use
-// rOffset/rSize to describe read region inside that extent object (must satisfy rOffset+rSize<=oek.Size, otherwise access.Get returns ErrIllegalArguments).
+// releasePrefetchCache frees readBuf and releases global budget; call under ECStreamer.mu, not concurrent with Read.
+func (reader *Reader) releasePrefetchCache() {
+	if reader == nil {
+		return
+	}
+	if reader.prefetchReserved > 0 && reader.preReadLimiter != nil {
+		reader.preReadLimiter.release(reader.prefetchReserved)
+		reader.prefetchReserved = 0
+	}
+	reader.readBuf = nil
+	reader.bufValidLen = 0
+	reader.bufBaseOff = 0
+}
+
+// prepareEbsSlice splits [offset,offset+size) by sorted oeks into hole and data slices.
+// Sparse layout: |--hole--|==oek1==|--hole--|==oek2==|--hole--|; holes use zero Data, readSliceRange skips EBS.
+// Data slice rOffset/rSize is within oek; require rOffset+rSize <= oek.Size.
+// No oeks: whole range is one hole; offset>=fileSize returns nil,nil (same as replica hole read).
 func (reader *Reader) prepareEbsSlice(offset int, size uint32, fileSize uint64) ([]*rwSlice, error) {
 	if offset < 0 {
 		return nil, syscall.EIO
@@ -413,7 +421,6 @@ func (reader *Reader) prepareEbsSlice(offset int, size uint32, fileSize uint64) 
 	log.LogDebugf("TRACE blobStore prepareEbsSlice Enter. ino(%v) fileSize(%v) offset(%v) size(%v)",
 		reader.ecStreamer.Inode(), fileSize, offset, size)
 
-	// 与副本 Streamer.read 对「空洞请求且 FileOffset > filesize」一致：无切片、无错误，readEbsRange 得到空结果。
 	if uint64(offset) >= fileSize {
 		return nil, nil
 	}
@@ -487,8 +494,7 @@ func (reader *Reader) prepareEbsSlice(offset int, size uint32, fileSize uint64) 
 	return chunks, nil
 }
 
-// readSliceRange handles one rwSlice in worker pool: try block-cache hit first, otherwise throttle and call ebs.Read for the single ObjExtent slice.
-// errCh must be buffered with capacity >= 1; sends exactly one result per invocation.
+// readSliceRange handles one rwSlice: holes succeed immediately; data tries L1 then Ebsc.Read into rs.Data. errCh cap >= 1.
 func (reader *Reader) readSliceRange(ctx context.Context, rs *rwSlice, errCh chan error) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -522,7 +528,6 @@ func (reader *Reader) readSliceRange(ctx context.Context, rs *rwSlice, errCh cha
 		readN, err = reader.bc.Get(volume, cacheKey, buf, rs.rOffset, rs.rSize)
 		if err == nil {
 			if readN == int(rs.rSize) {
-
 				// L1 cache hit.
 				metric := exporter.NewTPCnt("L1CacheGetHit")
 				stat.EndStat("CacheHit-L1", nil, bgTime, 1)
@@ -555,7 +560,7 @@ func (reader *Reader) readSliceRange(ctx context.Context, rs *rwSlice, errCh cha
 	read := copy(rs.Data, buf)
 	errCh <- nil
 
-	// When block cache is enabled and client exists: asynchronously read full ObjExtent and Put into L1; otherwise return directly (this path no longer triggers asyncCache by mistake).
+	// With L1 enabled, async full-extent read into cache (inflightCache dedupes by cacheKey).
 	if !reader.needCacheL1() || reader.bc == nil {
 		log.LogDebugf("TRACE blobStore readSliceRange exit without cache. read counter=%v", read)
 		return nil
@@ -568,6 +573,7 @@ func (reader *Reader) readSliceRange(ctx context.Context, rs *rwSlice, errCh cha
 	return nil
 }
 
+// asyncCache reads full ObjExtent in background and Puts to L1; one inflight task per cacheKey.
 func (reader *Reader) asyncCache(ctx context.Context, cacheKey string, objExtentKey proto.ObjExtentKey) {
 	var err error
 	bgTime := stat.BeginStat()

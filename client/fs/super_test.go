@@ -2,16 +2,20 @@ package fs
 
 import (
 	"reflect"
+	"sync/atomic"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/agiledragon/gomonkey/v2"
+	"github.com/stretchr/testify/require"
+
 	"github.com/cubefs/cubefs/proto"
+	"github.com/cubefs/cubefs/sdk/data/blobstore"
 	"github.com/cubefs/cubefs/sdk/data/stream"
 	datawrapper "github.com/cubefs/cubefs/sdk/data/wrapper"
 	masterSDK "github.com/cubefs/cubefs/sdk/master"
 	"github.com/cubefs/cubefs/sdk/meta"
-	"github.com/stretchr/testify/require"
 )
 
 func TestSuperBlobStoreAheadReadForReader(t *testing.T) {
@@ -171,4 +175,35 @@ func TestNewSuper_CoversInitBranches(t *testing.T) {
 	require.NotNil(t, s.runningMonitor)
 	close(s.closeC)
 	s.runningMonitor.Stop()
+}
+
+func TestSuper_scheduleFlush_idleWriterTriggersOecFlush(t *testing.T) {
+	s := newTestSuperForFile()
+	s.oec = blobstore.NewObjExtentClient(blobstore.ObjExtentConfig{})
+	f := &File{super: s, ino: 60, parentIno: 1, name: "idle.dat"}
+	ei := f.getOrCreateExtendInfo()
+	atomic.StoreInt32(&ei.idle, BlobWriterIdleTimeoutPeriod)
+	s.fslock.Lock()
+	s.nodeCache[f.ino] = f
+	s.fslock.Unlock()
+	// scheduleFlush 仅在 oec 流存在且 refCnt>0 时刷盘（与 File.storeIdle / oec 数据面一致）。
+	registerOecTestStreamerWithLogicalView(s, f.ino, nil, &blobstore.Writer{}, 0, 1)
+	require.NoError(t, s.oec.OpenStreamWithArgs(blobstore.ECStreamOpenArgs{Ino: f.ino}))
+
+	flushed := make(chan uint64, 1)
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(s.oec), "Flush",
+		func(_ *blobstore.ECExtentClient, ino uint64) error {
+			flushed <- ino
+			return nil
+		})
+
+	go s.scheduleFlush()
+	select {
+	case got := <-flushed:
+		require.Equal(t, f.ino, got)
+	case <-time.After(6 * time.Second):
+		t.Fatal("scheduleFlush did not trigger oec.Flush in time")
+	}
 }

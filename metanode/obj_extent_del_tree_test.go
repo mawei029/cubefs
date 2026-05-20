@@ -175,3 +175,74 @@ func TestObjExtentDelTreeApplyPunishPayloadV2MultiOek(t *testing.T) {
 	require.True(t, items[0].Oeks[0].IsEquals(&a))
 	require.True(t, items[0].Oeks[1].IsEquals(&b))
 }
+
+func TestApplyPunishPayloadV2_tooManyItems(t *testing.T) {
+	ot := newObjExtentDelTree()
+	var buf bytes.Buffer
+	require.NoError(t, binary.Write(&buf, binary.BigEndian, uint32(maxObjExtentDelBatch+1)))
+	require.Error(t, ot.ApplyPunishPayload(buf.Bytes(), 1))
+}
+
+func TestApplyPunishPayloadV2_invalidOekCount(t *testing.T) {
+	ot := newObjExtentDelTree()
+	var buf bytes.Buffer
+	require.NoError(t, binary.Write(&buf, binary.BigEndian, uint32(1)))
+	require.NoError(t, binary.Write(&buf, binary.BigEndian, int64(1)))  // oldTs
+	require.NoError(t, binary.Write(&buf, binary.BigEndian, uint64(2))) // inode
+	require.NoError(t, binary.Write(&buf, binary.BigEndian, uint64(3))) // oldUniq
+	require.NoError(t, binary.Write(&buf, binary.BigEndian, int64(4)))  // newTs
+	require.NoError(t, binary.Write(&buf, binary.BigEndian, uint32(0))) // nOeks=0 invalid
+	require.Error(t, ot.ApplyPunishPayload(buf.Bytes(), 1))
+}
+
+func TestApplyPunishPayloadV2_truncatedOekBody(t *testing.T) {
+	ot := newObjExtentDelTree()
+	oek := createTestObjExtentKey(0, 64, 1)
+	ob, err := oek.MarshalBinary()
+	require.NoError(t, err)
+
+	var buf bytes.Buffer
+	require.NoError(t, binary.Write(&buf, binary.BigEndian, uint32(1)))
+	require.NoError(t, binary.Write(&buf, binary.BigEndian, int64(10)))
+	require.NoError(t, binary.Write(&buf, binary.BigEndian, uint64(11)))
+	require.NoError(t, binary.Write(&buf, binary.BigEndian, uint64(12)))
+	require.NoError(t, binary.Write(&buf, binary.BigEndian, int64(13)))
+	require.NoError(t, binary.Write(&buf, binary.BigEndian, uint32(1)))
+	require.NoError(t, binary.Write(&buf, binary.BigEndian, uint32(len(ob)+1))) // wrong len
+	require.Error(t, ot.ApplyPunishPayload(buf.Bytes(), 2))
+}
+
+func TestApplyPunishPayloadV2_singleItem_roundTrip(t *testing.T) {
+	ot := newObjExtentDelTree()
+	oek := createTestObjExtentKey(0, 50, 1)
+	ot.EnqueueFromApply(3, 1000, 7, []proto.ObjExtentKey{oek})
+	items := ot.PeekFirstN(1)
+	payload, err := encodeObjExtentGcPunish(items, 2000)
+	require.NoError(t, err)
+	require.NoError(t, ot.ApplyPunishPayload(payload, 8))
+	out := ot.PeekFirstN(1)
+	require.Len(t, out, 1)
+	require.Equal(t, int64(2000), out[0].TsMs)
+}
+
+func TestEncodeObjExtentGcPunish_v2_multiOek(t *testing.T) {
+	a := createTestObjExtentKey(0, 10, 1)
+	b := createTestObjExtentKey(10, 20, 2)
+	it := &objExtentDelItem{TsMs: 1, Inode: 2, Uniq: 3, Oeks: []proto.ObjExtentKey{a, b}}
+	payload, err := encodeObjExtentGcPunish([]*objExtentDelItem{it}, 99)
+	require.NoError(t, err)
+	require.NotEmpty(t, payload)
+	ot := newObjExtentDelTree()
+	require.NoError(t, ot.ApplyPunishPayload(payload, 5))
+}
+
+func TestObjExtentDelPunishReplace_requeues(t *testing.T) {
+	ot := newObjExtentDelTree()
+	oek := createTestObjExtentKey(0, 32, 1)
+	ot.EnqueueFromApply(7, 100, 1, []proto.ObjExtentKey{oek})
+	ot.objExtentDelPunishReplace(100, 7, 1, 200, 99, []proto.ObjExtentKey{oek})
+	items := ot.PeekFirstN(1)
+	require.Len(t, items, 1)
+	require.Equal(t, int64(200), items[0].TsMs)
+	require.Equal(t, uint64(99), items[0].Uniq)
+}

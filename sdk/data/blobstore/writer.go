@@ -35,22 +35,20 @@ import (
 
 const (
 	MaxBufferSize = 512 * util.MB
-	// slowOpInfoThreshold 仅当单次操作超过该时长时打一条 LogInfof（LTP/rwtest 排障，正常路径无输出）。
+	// slowOpInfoThreshold logs one LogInfof when an op exceeds this duration (LTP/rwtest diagnostics).
 	slowOpInfoThreshold = 10 * time.Second
 )
 
 var errPutNoKeys = errors.New("ebs put returned no extent keys")
 
-// overwriteReq represents an overwrite request that contains both the new extent and the old extent
-// Same structure used by computeOverwriteReqs/flushOverwriteReqs; TruncateV2 reuses this type.
-// overwriteReq describes one overwrite request: new written range NewExtent and old range to discard DiscardExtent (optional).
-// Shared by writer flushExt/computeOverwriteReqs; in TruncateV2 reuse there is at most one partially-overlapped request.
+// overwriteReq is one overwrite: NewExtent to write, DiscardExtent old oek to drop (optional).
+// Used by flushExt/computeOverwriteReqs and TruncateV2; at most one partial overlap req.
 type overwriteReq struct {
-	NewExtent     proto.ObjExtentKey // Newly written range (trimmed range when partial overlap happens).
-	DiscardExtent proto.ObjExtentKey // Old extent to discard (optional).
+	NewExtent     proto.ObjExtentKey
+	DiscardExtent proto.ObjExtentKey
 }
 
-// truncateReq is TruncateV2 planning result: kept extents, at most one partially-overlapped OverwriteReq, and delete-only extents.
+// truncateReq is TruncateV2 plan: keep, optional partial overwriteReq, discard-only.
 type truncateReq struct {
 	KeepExtents   []proto.ObjExtentKey
 	OverwriteReqs []overwriteReq
@@ -72,7 +70,7 @@ type Writer struct {
 	fileOffset    int
 	blockPosition int
 	limitManager  *manager.LimitManager
-	ecStreamer    *ECStreamer // 与所属 ECStreamer 绑定；须非 nil（见 NewWriter）。
+	ecStreamer    *ECStreamer // required (see NewWriter)
 }
 
 func NewWriter(config ClientConfig) (writer *Writer) {
@@ -93,20 +91,19 @@ func NewWriter(config ClientConfig) (writer *Writer) {
 }
 
 func (writer *Writer) notifyAfterWrite() {
-	// 顺序写缓冲：抬高 fileSize（max）+ dirty；oeks 在 flush 后由 updateMetaInfo 刷新。
-	// writer.ecStreamer.noteWriteFinished(uint64(writer.fileOffset))
+	// Buffered write ok: raise logical tail and markDirty; oeks refreshed after flush via updateMetaInfo.
 	writer.ecStreamer.raiseFileSize(uint64(writer.fileOffset))
 	writer.ecStreamer.markDirty()
 	writer.ecStreamer.invalidateReaderPrefetchBuf()
 }
 
-// notifyCompleteFlushMeta 在 EBS/meta 已提交后调用：resetBuffer → updateMetaInfo → cleanDirty（统一 flush 收尾，只维护 dirty 即可）。
+// notifyCompleteFlushMeta after EBS/meta commit: resetBuffer → updateMetaInfo → cleanDirty.
 func (writer *Writer) notifyCompleteFlushMeta() error {
 	writer.resetBuffer()
 	if len(writer.buf) > 0 {
 		writer.resetBufferWithoutPool()
 	}
-	if err := writer.ecStreamer.updateMetaInfo(false, nil); err != nil {
+	if err := writer.ecStreamer.updateMetaInfo(nil); err != nil {
 		return err
 	}
 	writer.ecStreamer.raiseFileSize(uint64(writer.fileOffset))
@@ -168,10 +165,8 @@ func (writer *Writer) Write(ctx context.Context, offset int, data []byte, flags 
 		return 0, syscall.EOPNOTSUPP
 	}
 
-	// Case 2: pwrite - offset < current size (overwrite) or > current size (sparse / hole-then-write) both go through tryOverWrite to merge with extents or create new range after hole.
-	// Only offset == CacheFileSize() is sequential append, which goes through buffered/direct-write path.
+	// Case 2: Non-tail writes (overwrite or sparse) use tryOverWrite; flushExt refreshes meta inside.
 	if offset != writer.CacheFileSize() {
-		// tryOverWrite 内 flushExt/notifyCompleteFlushMeta 已刷新 meta；勿在 Write 外层重复 updateMetaInfo。
 		return writer.tryOverWrite(ctx, offset, data, flags)
 	}
 
@@ -179,14 +174,13 @@ func (writer *Writer) Write(ctx context.Context, offset int, data []byte, flags 
 	// Case 3.1: with buffer: Use buffered write for better performance (data stays in buffer until flush)
 	if flags&proto.FlagsSyncWrite == 0 {
 		size, err = writer.doBufferWrite(ctx, data, offset)
-		// 这里不做flush，所以只标记dirty为true，更新版本号，fileSize。不更新oeks 。 为了fileVersion2拿到gen和size
 		if err == nil {
 			writer.notifyAfterWrite()
 		}
 		return
 	}
 
-	// Case 3.2: Synchronous write: write directly to EBS without buffering
+	// Case 3.2: Synchronous write: write directly to EBS without buffering (direct EBS + notifyCompleteFlushMeta).
 	// This ensures data is immediately persisted but has lower throughput
 	size, err = writer.doParallelWrite(ctx, data, offset)
 	if err == nil {
@@ -197,7 +191,7 @@ func (writer *Writer) Write(ctx context.Context, offset int, data []byte, flags 
 	return
 }
 
-// tryOverWrite handles overwrite by buffering data and flushing with extent merge logic
+// tryOverWrite handles non-tail writes: flushExt before offset change, block buffer, merge with oeks.
 func (writer *Writer) tryOverWrite(ctx context.Context, offset int, data []byte, flags int) (size int, err error) {
 	if writer == nil {
 		log.LogErrorf("Writer tryOverWrite: writer is nil")
@@ -246,7 +240,7 @@ func (writer *Writer) tryOverWrite(ctx context.Context, offset int, data []byte,
 		writer.blockPosition += freeSize // Move forward in buffer
 		remainSize -= freeSize           // Decrease remaining data to process
 		writer.fileOffset += freeSize
-		writer.ecStreamer.markDirty()
+		// writer.ecStreamer.markDirty()
 		writer.ecStreamer.raiseFileSize(uint64(writer.fileOffset))
 
 		log.LogDebugf("TRACE blobStore tryOverWrite: ino(%v) cacheFileSize(%v) writer.fileOffset(%v) writer.blockPosition(%v) position(%v) freeSize(%v)",
@@ -278,7 +272,7 @@ func (writer *Writer) tryOverWrite(ctx context.Context, offset int, data []byte,
 		}
 	}
 
-	// 循环内 flushExt 已在 notifyCompleteFlushMeta 中 updateMetaInfo + 清 dirty。
+	// flushExt in loop already updateMetaInfo + cleanDirty via notifyCompleteFlushMeta.
 	if writer.ecStreamer.isDirty() {
 		if err = writer.notifyCompleteFlushMeta(); err != nil {
 			return 0, err
@@ -293,9 +287,8 @@ func (writer *Writer) tryOverWrite(ctx context.Context, offset int, data []byte,
 func (writer *Writer) doParallelWrite(ctx context.Context, data []byte, offset int) (size int, err error) {
 	log.LogDebugf("TRACE blobStore doDirectWrite: ino(%v) offset(%v) len(%v)", writer.ecStreamer.Inode(), offset, len(data))
 
-	// O_SYNC 与其它 fd 的缓冲写共享同一 Writer：必须先落盘缓冲尾，再追加本次直写 extent，否则 meta/EBS 顺序错乱会导致 Append 失败或 EIO（LTP rwtest O_SYNC）。
-	// 注意：此处已持 Lock，禁止调用 flush()（其内部会再 Lock 死锁）；flushExt 不加锁，且覆盖纯追加与覆盖写缓冲。
-	// flushFlag 与 Writer.Flush 一致用 true，保证失败回滚 fileSize 与显式 Flush 路径一致。
+	// Before O_SYNC direct write, flushExt shared writer buffer to avoid meta/EBS reorder across fds (LTP rwtest).
+	// Do not call flush() here (re-locks); flushExt has no nested lock.
 	if writer.ecStreamer.isDirty() {
 		if err = writer.flushExt(writer.ecStreamer.Inode(), ctx, true); err != nil {
 			log.LogErrorf("doParallelWrite: flush buffered data before sync write fail ino(%v) offset(%v) err(%v)", writer.ecStreamer.Inode(), offset, err)
@@ -520,7 +513,7 @@ func (writer *Writer) doBufferWrite(ctx context.Context, data []byte, offset int
 		writer.allocateCache()
 	}
 
-	// 需要区分新写buffer，跨block的，generate需要变化. 每一次进来，都判writer.blockPosition是否为0，为0，则需要更新streamer里的version
+	// New buffer block may bump inode generation when blockPosition resets to 0.
 	if writer.blockPosition == 0 {
 		writer.ecStreamer.raiseInodeVersion()
 	}
@@ -565,7 +558,7 @@ func (writer *Writer) doBufferWrite(ctx context.Context, data []byte, offset int
 	}
 
 	size = len(data)
-	// logical 尾由 Write 成功返回后 notifyAfterWrite 抬高。
+	// Logical tail raised in notifyAfterWrite after successful Write.
 
 	log.LogDebugf("TRACE blobStore doBufferWrite Exit: ino(%v) writer.fileSize(%v) writer.fileOffset(%v)",
 		writer.ecStreamer.Inode(), writer.CacheFileSize(), writer.fileOffset)
@@ -588,7 +581,7 @@ func (writer *Writer) Flush(ino uint64, ctx context.Context) (err error) {
 	if !writer.ecStreamer.isDirty() {
 		return nil
 	}
-	// dirty=1 时统一走 flushExt：有缓冲落盘，无缓冲则在 flushExt 内仅 updateMetaInfo。
+	// When dirty, flushExt persists buffer or only updateMetaInfo if buffer empty.
 	return writer.flushExt(ino, ctx, true)
 }
 
@@ -624,7 +617,7 @@ func (writer *Writer) prepareWriteSlice(offset int, data []byte) []*rwSlice {
 func (writer *Writer) writeSlice(ctx context.Context, wSlice *rwSlice, wg bool) (err error) {
 	if wg {
 		defer writer.wg.Done()
-		// 子 goroutine panic 或未发送 err 时，主协程会在 wg.Wait 之后永久阻塞在 <-writer.err，且 doParallelWrite 持 Writer 锁导致全文件卡死。
+		// Worker panic or missing err send deadlocks wg.Wait and holds writer lock for the inode.
 		defer func() {
 			if r := recover(); r != nil {
 				if writer.err != nil {
@@ -684,15 +677,15 @@ func (writer *Writer) writeSlice(ctx context.Context, wSlice *rwSlice, wg bool) 
 
 func (writer *Writer) resetBufferWithoutPool() {
 	writer.buf = writer.buf[:0]
-	// 必须与 len(buf) 一致：doBufferWriteWithoutPool/flushWithoutPool 走 [:0] 后若不清零 blockPosition，
-	// 后续 tryOverWrite/doBufferWrite 会在 copy(buf[blockPosition:]) 处 panic（LTP rwtest 多 fd 交错写）。
+	// len(buf) must match blockSize; after [:0] without clearing blockPosition,
+	// tryOverWrite/doBufferWrite may panic on copy(buf[blockPosition:]) (LTP rwtest multi-fd).
 	writer.blockPosition = 0
 }
 
-// reshapeBufForCopyPath doBufferWrite/tryOverWrite 依赖 len(buf)==blockSize 的池化块；flushWithoutPool 等
-// 仅 [:0] 保留 cap 时，在进入 copy 前恢复长度，避免 copy 写 0 字节却推进 blockPosition。
-// 从 len==0 扩回整块时逻辑上为空，必须清零 blockPosition；否则 stale blockPosition 会使 freeSize 为负或
-// copy 不写数据却累加 position，最终在 data[position:position+freeSize] 处 panic（LTP append 多 fd）。
+// reshapeBufForCopyPath: doBufferWrite/tryOverWrite need len(buf)==blockSize pooled block; flushWithoutPool
+// after [:0] only, restore len before copy to avoid zero copy advancing blockPosition.
+// growing from len==0 must zero blockPosition; stale value breaks freeSize or
+// panics at data[position:position+freeSize] (LTP append multi-fd).
 func (writer *Writer) reshapeBufForCopyPath() {
 	if writer == nil || writer.ecStreamer.BlockSize() <= 0 {
 		log.LogErrorf("Writer reshapeBufForCopyPath: writer is nil or blockSize is 0")
@@ -712,15 +705,9 @@ func (writer *Writer) resetBuffer() {
 	writer.blockPosition = 0
 }
 
-// 脏语义：对外仅使用 ECStreamer.isDirty()。
-//
-//   - dirty=1：读/Flush 前须同步；写缓冲后 notifyAfterWrite → markDirty。
-//   - dirty=0：completeFlushMeta / updateMetaInfo 已在 resetBuffer 后清 dirty。
-//
-// 不变式：未落盘字节存在 ⇒ dirty=1；cleanDirty 仅出现在 notifyCompleteFlushMeta 或 updateMetaInfo（无缓冲）路径。
-// bufferDirtyLen 仅用于 flushExt/flush/flushWithoutPool 计算落盘字节数，不表示“是否要同步”。
+// Dirty state: ECStreamer.isDirty(); bufferDirtyLen counts bytes pending flush only.
 
-// bufferDirtyLen 返回待落盘字节数（仅 flush 路径使用；是否同步看 isDirty）。
+// bufferDirtyLen returns bytes in writer buffer pending flush.
 func (writer *Writer) bufferDirtyLen() int {
 	if writer == nil {
 		log.LogErrorf("Writer bufferDirtyLen: writer is nil")
@@ -732,7 +719,7 @@ func (writer *Writer) bufferDirtyLen() int {
 	if len(writer.buf) == 0 {
 		return 0
 	}
-	// flushWithoutPool / [:0] 追加路径无 blockPosition，以 len(buf) 为准。
+	// flushWithoutPool / [:0] append path uses len(buf), not blockPosition.
 	if cap(writer.buf) >= writer.ecStreamer.BlockSize() && len(writer.buf) >= writer.ecStreamer.BlockSize() {
 		return 0
 	}
@@ -951,11 +938,11 @@ func (writer *Writer) flushExt(inode uint64, ctx context.Context, flushFlag bool
 
 	bufferSize := writer.bufferDirtyLen()
 	if bufferSize == 0 {
-		// 无缓冲：仅刷新 meta（Flush 入口已分流；tryOverWrite 切换 offset 前空 buf 也可能进入）。
-		// 与 flush() 不同：flush() 仅由下方 len(reqs)==0 且 bufferSize>0 时调用，空 buf 不在此处理。
+		// No buffer: refresh meta only (Flush entry split; empty buf before tryOverWrite offset switch).
+		// Unlike flush(): flush() only when len(reqs)==0 and bufferSize>0 below.
 		if writer.ecStreamer.isDirty() {
 			writer.blockPosition = 0
-			return writer.ecStreamer.updateMetaInfo(false, nil)
+			return writer.ecStreamer.updateMetaInfo(nil)
 		}
 		return nil
 	}
@@ -974,7 +961,7 @@ func (writer *Writer) flushExt(inode uint64, ctx context.Context, flushFlag bool
 	end := uint64(writer.fileOffset)
 	if start >= end {
 		writer.blockPosition = 0
-		return writer.ecStreamer.updateMetaInfo(false, nil)
+		return writer.ecStreamer.updateMetaInfo(nil)
 	}
 
 	// Compute overwrite requests: determine which parts of buffer overlap with existing extents
@@ -1003,8 +990,8 @@ func (writer *Writer) flush(inode uint64, ctx context.Context, flushFlag bool) (
 	log.LogDebugf("flush: TRACE blobStore flush: ino(%v) buf-len(%v) flushFlag(%v) fileOffset(%v) blockPosition(%v)",
 		inode, len(writer.buf), flushFlag, writer.fileOffset, writer.blockPosition)
 
-	// 仅由 flushExt 在 bufferSize>0 且 computeOverwriteReqs 得 reqs==0 时调用（纯尾部追加落盘）。
-	// 空 buf 的 meta 刷新在 flushExt 开头或 Flush 入口处理；此处 bufferSize==0 为契约违反的防御早退。
+	// flush() only from flushExt when bufferSize>0 and reqs empty (pure tail append).
+	// Empty buf meta refresh at flushExt start or Flush entry; bufferSize==0 here is defensive.
 	bufferSize := writer.bufferDirtyLen()
 	if bufferSize == 0 {
 		return nil
@@ -1061,7 +1048,7 @@ func (writer *Writer) TruncateV2(ctx context.Context, targetSize uint64,
 	return writer.TruncateV2FromExtents(ctx, targetSize, currentSize, objExtents)
 }
 
-// TruncateV2FromExtents 在已持有 currentSize 与 objExtents 时使用，避免重复 GetObjExtents（例如 ECStreamer.truncateV2 缩容路径）。
+// TruncateV2FromExtents uses provided currentSize/objExtents to avoid duplicate GetObjExtents.
 func (writer *Writer) TruncateV2FromExtents(ctx context.Context, targetSize uint64, currentSize uint64, objExtents []proto.ObjExtentKey,
 ) (newObjExtents []proto.ObjExtentKey, toDelete []proto.ObjExtentKey, err error) {
 	if writer == nil || writer.ecStreamer.Ebsc() == nil {

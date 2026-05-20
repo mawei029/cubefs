@@ -54,15 +54,19 @@ func (s *Super) InodeGet(ino uint64) (info *proto.InodeInfo, err error) {
 	s.fslock.Unlock()
 	if isFind {
 		if f, ok := node.(*File); ok && proto.IsStorageClassBlobStore(info.StorageClass) {
-			if s.oec.Reader(ino) != nil || s.oec.Writer(ino) != nil {
+			if s.oec.RefCnt(ino) > 0 {
+				_ = s.oec.RefreshExtentsCache(ino)
 				return info, nil
 			}
-			// inode cache miss：与 File.Open 一致，经 openOECStream → oec.OpenStreamWithArgs 建立/恢复数据面。
+			if s.oec.HasReader(ino) || s.oec.HasWriter(ino) {
+				return info, nil
+			}
+			// inode cache miss: same as File.Open, openOECStream → OpenStreamWithArgs restores data plane.
 			openFlags := uint32(syscall.O_RDONLY)
 			if ei, found := f.getExtendInfo(); found && ei != nil {
 				ei.RLock()
 				openFlags = uint32(ei.flag & 0x0f)
-				// 冷卷遗留 coldBlobWriter（非 oec）须先刷盘，避免未落盘字节丢失。
+				// Legacy coldBlobWriter (non-oec) must flush first to avoid losing buffered bytes.
 				if err := s.oec.Flush(ino); err != nil {
 					ei.RUnlock()
 					log.LogErrorf("InodeGet: flush legacy cold blob writer ino(%v) err(%v)", ino, err)
@@ -70,7 +74,7 @@ func (s *Super) InodeGet(ino uint64) (info *proto.InodeInfo, err error) {
 				}
 				ei.RUnlock()
 			}
-			// CloseStream 后 streamer 可能仍在 map 内但 RW 已释放；ref==0 时驱逐以便 OpenStreamWithArgs 重建。
+			// After CloseStream streamer may remain in map with released RW; Evict when ref==0 before rebuild.
 			if strm := s.oec.GetStreamer(ino); strm != nil && s.oec.RefCnt(ino) == 0 {
 				_ = s.oec.EvictStream(ino)
 			}

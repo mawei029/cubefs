@@ -44,6 +44,7 @@ const (
 	SendTimeLimit      = 20 * 1000 // ms
 )
 
+// BlobStoreClient wraps blobstore access API for Reader/Writer EBS I/O.
 type BlobStoreClient struct {
 	client access.API
 }
@@ -371,7 +372,6 @@ func (ebs *BlobStoreClient) Get(ctx context.Context, volName string, offset uint
 		SliceSize: oek.BlobSize,
 		Slices:    sliceInfos,
 	}
-	// func get has retry
 	log.LogDebugf("TRACE Ebs Read, oek(%v) loc(%v)", oek, loc)
 	defer func() {
 		if body != nil {
@@ -451,7 +451,7 @@ func (ebs *BlobStoreClient) ApplyTruncateReqs(ctx context.Context, volName strin
 	toDelete = make([]proto.ObjExtentKey, 0, len(req.DiscardOnly)+len(req.OverwriteReqs))
 	toDelete = append(toDelete, req.DiscardOnly...)
 
-	// TODO: next version, OverwriteReqs只有1个
+	// TODO: next version, at most one OverwriteReqs entry
 	for _, r := range req.OverwriteReqs {
 		discard := r.DiscardExtent
 		if discard.Size == 0 {

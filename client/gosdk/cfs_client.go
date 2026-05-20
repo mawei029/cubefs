@@ -88,6 +88,7 @@ type (
 		// server info
 		mw   *meta.MetaWrapper
 		ec   *stream.ExtentClient
+		oec  *blobstore.ECExtentClient
 		ic   *fs.InodeCache
 		dc   *fs.DentryCache
 		bc   *bcache.BcacheClient
@@ -286,10 +287,16 @@ func (c *Client) Start() (err error) {
 	c.mw = mw
 	c.ec = ec
 	c.ebsc = ebsc
+	c.oec = blobstore.NewObjExtentClient(blobstore.ObjExtentConfig{
+		LimitManager: ec.LimitManager,
+	})
 	return nil
 }
 
 func (c *Client) Close() {
+	if c.oec != nil {
+		_ = c.oec.Close()
+	}
 	if c.ec != nil {
 		_ = c.ec.Close()
 	}
@@ -984,15 +991,77 @@ func (c *Client) mkdir(pino uint64, name string, mode uint32, fullPath string) (
 	return c.mw.Create_ll(pino, name, fuseMode, 0, 0, nil, fullPath, false, false)
 }
 
-func (c *Client) openStream(f *File, openForWrite bool, fullPath string) {
-	isCache := false
-	if proto.IsCold(c.volType) || proto.IsStorageClassBlobStore(f.storageClass) {
-		isCache = true
+func (c *Client) buildECStreamOpenArgs(ino uint64, info *proto.InodeInfo, openFlags uint32, fileSize uint64) (blobstore.ECStreamOpenArgs, error) {
+	if c.ebsc == nil {
+		return blobstore.ECStreamOpenArgs{}, fmt.Errorf("blobstore client not configured")
 	}
+	return blobstore.ECStreamOpenArgs{
+		Ino:             ino,
+		PoolId:          info.PoolId,
+		FileSize:        fileSize,
+		InodeGeneration: info.Generation,
+		OpenFlags:       openFlags,
+		VolName:         c.cfg.VolName,
+		VolType:         c.volType,
+		BlockSize:       c.ebsBlockSize,
+		Ebsc:            c.ebsc,
+		Bc:              c.bc,
+		Mw:              c.mw,
+		EnableBcache:    c.cfg.EnableBcache,
+		WConcurrency:    c.cfg.WriteBlockThread,
+		ReadConcurrency: c.cfg.ReadBlockThread,
+		LimitManager:    c.oec.LimitManager,
+	}, nil
+}
+
+func (c *Client) openOECStream(f *File, info *proto.InodeInfo, openFlags uint32, logicalSize uint64) error {
+	args, err := c.buildECStreamOpenArgs(f.ino, info, openFlags, logicalSize)
+	if err != nil {
+		return err
+	}
+	return c.oec.OpenStreamWithArgs(args)
+}
+
+func (c *Client) openStream(f *File, openForWrite bool, fullPath string) {
+	if proto.IsCold(c.volType) || proto.IsStorageClassBlobStore(f.storageClass) {
+		info := c.ic.Get(f.ino)
+		if info == nil {
+			var err error
+			info, err = c.mw.InodeGet_ll(f.ino, false)
+			if err != nil {
+				log.LogErrorf("openStream: InodeGet ino(%v) err(%v)", f.ino, err)
+				return
+			}
+		}
+		openFlags := uint32(f.flags & 0xff)
+		if err := c.openOECStream(f, info, openFlags, info.Size); err != nil {
+			log.LogErrorf("openStream: openOECStream ino(%v) path(%v) err(%v)", f.ino, fullPath, err)
+			return
+		}
+		f.fileReader = c.oec.Reader(f.ino)
+		f.fileWriter = c.oec.Writer(f.ino)
+		switch f.flags & 0xff {
+		case syscall.O_RDONLY:
+			f.fileWriter = nil
+		case syscall.O_WRONLY:
+			f.fileReader = nil
+		}
+		return
+	}
+	isCache := false
 	_ = c.ec.OpenStream(f.ino, openForWrite, isCache, fullPath)
 }
 
 func (c *Client) closeStream(f *File) error {
+	if proto.IsCold(c.volType) || proto.IsStorageClassBlobStore(f.storageClass) {
+		if err := c.oec.CloseStream(f.ino); err != nil {
+			return err
+		}
+		_ = c.oec.EvictStream(f.ino)
+		f.fileReader = nil
+		f.fileWriter = nil
+		return nil
+	}
 	err := c.ec.CloseStream(f.ino)
 	if err != nil {
 		return err
@@ -1001,7 +1070,9 @@ func (c *Client) closeStream(f *File) error {
 	if err != nil {
 		return err
 	}
-	f.fileWriter.FreeCache()
+	if f.fileWriter != nil {
+		f.fileWriter.FreeCache()
+	}
 	f.fileWriter = nil
 	f.fileReader = nil
 	return nil
@@ -1127,39 +1198,7 @@ func (c *Client) allocFD(ino uint64, flags int, mode uint32, fileCache bool, fil
 	}
 	c.fdset.Set(fd)
 	f := &File{client: c, fd: fd, ino: ino, flags: flags, mode: mode, pino: parentInode, path: path, storageClass: storageClass, poolId: poolId}
-	if proto.IsCold(c.volType) || proto.IsStorageClassBlobStore(c.volStorageClass) {
-		clientConf := blobstore.ClientConfig{
-			VolName:         c.cfg.VolName,
-			VolType:         c.volType,
-			BlockSize:       c.ebsBlockSize,
-			Ino:             ino,
-			Bc:              c.bc,
-			Mw:              c.mw,
-			LimitManager:    c.ec.LimitManager,
-			Ebsc:            c.ebsc,
-			EnableBcache:    c.cfg.EnableBcache,
-			WConcurrency:    c.cfg.WriteBlockThread,
-			ReadConcurrency: c.cfg.ReadBlockThread,
-			FileCache:       fileCache,
-			FileSize:        fileSize,
-		}
-		clientConf.ECStreamer = blobstore.NewECStreamer(ino, nil, nil)
-		f.fileWriter.FreeCache()
-		switch flags & 0xff {
-		case syscall.O_RDONLY:
-			f.fileReader = blobstore.NewReader(clientConf)
-			f.fileWriter = nil
-		case syscall.O_WRONLY:
-			f.fileWriter = blobstore.NewWriter(clientConf)
-			f.fileReader = nil
-		case syscall.O_RDWR:
-			f.fileReader = blobstore.NewReader(clientConf)
-			f.fileWriter = blobstore.NewWriter(clientConf)
-		default:
-			f.fileWriter = blobstore.NewWriter(clientConf)
-			f.fileReader = nil
-		}
-	}
+	_ = fileCache // Blob/EC Reader/Writer 在 openStream 经 oec 挂载
 	c.fdmap[fd] = f
 	return f
 }

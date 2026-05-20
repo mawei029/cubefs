@@ -202,7 +202,7 @@ func (d *Dir) Release(ctx context.Context, req *fuse.ReleaseRequest) (err error)
 	if req != nil && ei.dctx != nil {
 		ei.dctx.Remove(req.Handle)
 	}
-	// 并发 Release 或 FUSE 边界情况下可能对同一 DirExtendInfo 多投递一次 Release 吗？需要用 CAS 避免 openCnt 被打成负数？
+	// May duplicate Release hit same DirExtendInfo under races? Consider CAS to avoid negative openCnt.
 	ref := atomic.AddInt64(&ei.openCnt, -1)
 	if ref < 0 {
 		log.LogWarnf("DirRelease: negative openCnt detected, ino(%v) name(%v) openCnt(%v)", d.ino, d.name, ref)
@@ -263,8 +263,7 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 		openForWrite = true
 	}
 	isCache := false
-	if proto.IsCold(d.super.volType) || proto.IsStorageClassBlobStore(info.StorageClass) {
-		isCache = true
+	if proto.DataPlaneUsesBlobEC(d.super.volType, info.StorageClass) {
 		if err := child.(*File).openOECStream(info, uint32(req.Flags&0x0f), info.Size); err != nil {
 			log.LogErrorf("Create: openOECStream ino(%v) err(%v)", info.Inode, err)
 			return nil, nil, ParseError(err)
@@ -313,8 +312,8 @@ func (d *Dir) Forget() {
 		}
 	}
 	if !d.super.metaCacheAcceleration {
-		// Forget 可能在目录仍有 fd（Dir.Open 已 openCnt++）时先于 Release 到达；若此时 deleteExtendInfo，
-		// 后续 Lookup 会 getOrCreate 出 openCnt=0 的新 DirExtendInfo，再 Release 会 -- 打成 -1（见 WARN DirRelease negative openCnt）。
+		// Forget may arrive before Release while dir still open (openCnt>0); deleteExtendInfo then
+		// causes fresh DirExtendInfo with openCnt=0 and Release decrements to -1 (see DirRelease negative openCnt WARN).
 		if ei, ok := d.getExtendInfo(); ok && ei != nil && atomic.LoadInt64(&ei.openCnt) > 0 {
 			log.LogDebugf("Forget:dir skip deleteExtendInfo while openCnt>0 ino(%v) name(%v) openCnt(%v)", ino, d.name, atomic.LoadInt64(&ei.openCnt))
 		} else {
