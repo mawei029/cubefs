@@ -79,6 +79,7 @@ func testFlashTopologyLoadHeartbeatConfigDefaults(t *testing.T) {
 	require.Equal(t, server.cluster.cfg.flashReadFlowLimit, cfg.FlashReadFlowLimit)
 	require.Equal(t, server.cluster.cfg.flashWriteFlowLimit, cfg.FlashWriteFlowLimit)
 	require.Equal(t, server.cluster.cfg.flashKeyFlowLimit, cfg.FlashKeyFlowLimit)
+	require.Equal(t, server.cluster.cfg.flashNodeConnectionLimit, cfg.FlashNodeConnectionLimit)
 }
 
 // testFlashTopologyRemoveRemoteCacheFlowLimits checks that Cluster.removeRemoteCacheFlowLimitsForVol
@@ -144,9 +145,11 @@ func TestUpdateFlashTopoHandler(t *testing.T) {
 		values.Set(flashNodeHandleReadTimeout, "11")
 		values.Set(flashNodeReadDataNodeTimeout, "12")
 		values.Set(flashHotKeyMissCount, "13")
+		values.Set(flashNodeReadRps, "18")
 		values.Set(flashReadFlowLimit, "14")
 		values.Set(flashWriteFlowLimit, "15")
 		values.Set(flashKeyFlowLimit, "16")
+		values.Set(flashNodeConnectionLimit, "17")
 
 		req := httptest.NewRequest(http.MethodGet, "/?"+values.Encode(), nil)
 		reply := decodeReply(t, callHandler(s.updateFlashTopo, req))
@@ -155,9 +158,11 @@ func TestUpdateFlashTopoHandler(t *testing.T) {
 		require.Equal(t, 11, cfg.FlashNodeHandleReadTimeout)
 		require.Equal(t, 12, cfg.FlashNodeReadDataNodeTimeout)
 		require.Equal(t, 13, cfg.FlashHotKeyMissCount)
+		require.Equal(t, int64(18), cfg.FlashNodeReadRps)
 		require.Equal(t, int64(14), cfg.FlashReadFlowLimit)
 		require.Equal(t, int64(15), cfg.FlashWriteFlowLimit)
 		require.Equal(t, int64(16), cfg.FlashKeyFlowLimit)
+		require.Equal(t, int64(17), cfg.FlashNodeConnectionLimit)
 	})
 
 	t.Run("param_error", func(t *testing.T) {

@@ -60,10 +60,12 @@ func (m *FlashGroupManager) getCluster(w http.ResponseWriter, r *http.Request) {
 		FlashNodeHandleReadTimeout:   m.cluster.cfg.FlashNodeHandleReadTimeout,
 		FlashNodeReadDataNodeTimeout: m.cluster.cfg.FlashNodeReadDataNodeTimeout,
 		FlashHotKeyMissCount:         m.cluster.cfg.FlashHotKeyMissCount,
+		FlashNodeReadRps:             m.cluster.cfg.FlashNodeReadRps,
 		MaxDisableFlashGroupPercent:  m.cluster.cfg.MaxDisableFlashGroupPercent,
 		FlashReadFlowLimit:           m.cluster.cfg.FlashReadFlowLimit,
 		FlashWriteFlowLimit:          m.cluster.cfg.FlashWriteFlowLimit,
 		FlashKeyFlowLimit:            m.cluster.cfg.FlashKeyFlowLimit,
+		FlashNodeConnectionLimit:     m.cluster.cfg.FlashNodeConnectionLimit,
 		RemoteClientFlowLimit:        m.cluster.cfg.RemoteClientFlowLimit,
 		RemoteCacheTTL:               m.config.RemoteCacheTTL,
 		RemoteCacheReadTimeout:       m.config.RemoteCacheReadTimeout,
@@ -121,6 +123,7 @@ func (m *FlashGroupManager) getRemoteCacheConfig(w http.ResponseWriter, r *http.
 		RemoteCacheSameZoneTimeout:   m.config.RemoteCacheSameZoneTimeout,
 		RemoteCacheSameRegionTimeout: m.config.RemoteCacheSameRegionTimeout,
 		FlashHotKeyMissCount:         m.config.FlashHotKeyMissCount,
+		FlashNodeReadRps:             m.config.FlashNodeReadRps,
 		FlashReadFlowLimit:           m.config.FlashReadFlowLimit,
 		FlashWriteFlowLimit:          m.config.FlashWriteFlowLimit,
 		RemoteClientFlowLimit:        m.config.RemoteClientFlowLimit,
@@ -938,6 +941,9 @@ func (m *FlashGroupManager) updateFlashTopo(w http.ResponseWriter, r *http.Reque
 	if args.FlashHotKeyMissCount != nil {
 		cfg.FlashHotKeyMissCount = *args.FlashHotKeyMissCount
 	}
+	if args.FlashNodeReadRps != nil {
+		cfg.FlashNodeReadRps = *args.FlashNodeReadRps
+	}
 	if args.FlashReadFlowLimit != nil {
 		cfg.FlashReadFlowLimit = *args.FlashReadFlowLimit
 	}
@@ -946,6 +952,9 @@ func (m *FlashGroupManager) updateFlashTopo(w http.ResponseWriter, r *http.Reque
 	}
 	if args.FlashKeyFlowLimit != nil {
 		cfg.FlashKeyFlowLimit = *args.FlashKeyFlowLimit
+	}
+	if args.FlashNodeConnectionLimit != nil {
+		cfg.FlashNodeConnectionLimit = *args.FlashNodeConnectionLimit
 	}
 	topo.SetHeartbeatConfig(cfg)
 
@@ -1346,6 +1355,8 @@ func (m *FlashGroupManager) setConfig(key string, value string) (err error) {
 			m.config.FlashReadFlowLimit = oldInt64Value
 		case cfgFlashWriteFlowLimit:
 			m.config.FlashWriteFlowLimit = oldInt64Value
+		case cfgFlashKeyFlowLimit:
+			m.config.FlashKeyFlowLimit = oldInt64Value
 		case cfgRemoteClientFlowLimit:
 			m.config.RemoteClientFlowLimit = oldInt64Value
 		}

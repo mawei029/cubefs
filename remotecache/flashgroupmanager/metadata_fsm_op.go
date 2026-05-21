@@ -42,10 +42,12 @@ type clusterValue struct {
 	RemoteCacheSameZoneTimeout   int64
 	RemoteCacheSameRegionTimeout int64
 	FlashHotKeyMissCount         int
+	FlashNodeReadRps             int64
 	MaxDisableFlashGroupPercent  int
 	FlashReadFlowLimit           int64
 	FlashWriteFlowLimit          int64
 	FlashKeyFlowLimit            int64
+	FlashNodeConnectionLimit     int64
 	RemoteClientFlowLimit        int64
 }
 
@@ -61,10 +63,12 @@ func newClusterValue(c *Cluster) (cv *clusterValue) {
 		RemoteCacheSameZoneTimeout:   c.cfg.RemoteCacheSameZoneTimeout,
 		RemoteCacheSameRegionTimeout: c.cfg.RemoteCacheSameRegionTimeout,
 		FlashHotKeyMissCount:         c.cfg.FlashHotKeyMissCount,
+		FlashNodeReadRps:             c.cfg.FlashNodeReadRps,
 		MaxDisableFlashGroupPercent:  c.cfg.MaxDisableFlashGroupPercent,
 		FlashReadFlowLimit:           c.cfg.FlashReadFlowLimit,
 		FlashWriteFlowLimit:          c.cfg.FlashWriteFlowLimit,
 		FlashKeyFlowLimit:            c.cfg.FlashKeyFlowLimit,
+		FlashNodeConnectionLimit:     c.cfg.FlashNodeConnectionLimit,
 		RemoteClientFlowLimit:        c.cfg.RemoteClientFlowLimit,
 	}
 	return cv
@@ -101,21 +105,29 @@ func (c *Cluster) loadClusterValue() (err error) {
 		if cv.FlashHotKeyMissCount == 0 {
 			cv.FlashHotKeyMissCount = defaultFlashHotKeyMissCount
 		}
+		if cv.FlashNodeReadRps == 0 {
+			cv.FlashNodeReadRps = defaultFlashNodeReadRps
+		}
 		if cv.MaxDisableFlashGroupPercent == 0 {
 			cv.MaxDisableFlashGroupPercent = defaultMaxDisableFlashGroupPercent
 		}
 		c.cfg.FlashHotKeyMissCount = cv.FlashHotKeyMissCount
+		c.cfg.FlashNodeReadRps = cv.FlashNodeReadRps
 		c.cfg.MaxDisableFlashGroupPercent = cv.MaxDisableFlashGroupPercent
 
 		c.cfg.FlashReadFlowLimit = cv.FlashReadFlowLimit
 		c.cfg.FlashWriteFlowLimit = cv.FlashWriteFlowLimit
 		c.cfg.RemoteClientFlowLimit = cv.RemoteClientFlowLimit
 		c.cfg.FlashKeyFlowLimit = cv.FlashKeyFlowLimit
+		if cv.FlashNodeConnectionLimit == 0 {
+			cv.FlashNodeConnectionLimit = defaultFlashNodeConnectionLimit
+		}
+		c.cfg.FlashNodeConnectionLimit = cv.FlashNodeConnectionLimit
 		c.syncMaxDisableFlashGroupPercentToFlashTopos()
 
 		c.cfg.FlashNodeReadDataNodeTimeout = cv.FlashNodeReadDataNodeTimeout
-		log.LogInfof("action[loadClusterValue] flashNodeHandleReadTimeout %v(ms), flashNodeReadDataNodeTimeout%v(ms), flashHotKeyMissCount(%v), maxDisableFlashGroupPercent(%v), flashReadFlowLimit(%v), flashWriteFlowLimit(%v), remoteClientFlowLimit(%v), flashKeyFlowLimit(%v)",
-			cv.FlashNodeHandleReadTimeout, cv.FlashNodeReadDataNodeTimeout, cv.FlashHotKeyMissCount, cv.MaxDisableFlashGroupPercent, cv.FlashReadFlowLimit, cv.FlashWriteFlowLimit, cv.RemoteClientFlowLimit, cv.FlashKeyFlowLimit)
+		log.LogInfof("action[loadClusterValue] flashNodeHandleReadTimeout %v(ms), flashNodeReadDataNodeTimeout%v(ms), flashHotKeyMissCount(%v), flashNodeReadRps(%v), maxDisableFlashGroupPercent(%v), flashReadFlowLimit(%v), flashWriteFlowLimit(%v), remoteClientFlowLimit(%v), flashKeyFlowLimit(%v), flashNodeConnectionLimit(%v)",
+			cv.FlashNodeHandleReadTimeout, cv.FlashNodeReadDataNodeTimeout, cv.FlashHotKeyMissCount, cv.FlashNodeReadRps, cv.MaxDisableFlashGroupPercent, cv.FlashReadFlowLimit, cv.FlashWriteFlowLimit, cv.RemoteClientFlowLimit, cv.FlashKeyFlowLimit, cv.FlashNodeConnectionLimit)
 
 		if cv.RemoteCacheTTL == 0 {
 			cv.RemoteCacheTTL = proto.DefaultRemoteCacheTTL
@@ -165,9 +177,11 @@ func (c *Cluster) defaultFlashNodeHeartbeatConfig() FlashNodeHeartbeatConfig {
 		FlashNodeHandleReadTimeout:   c.cfg.FlashNodeHandleReadTimeout,
 		FlashNodeReadDataNodeTimeout: c.cfg.FlashNodeReadDataNodeTimeout,
 		FlashHotKeyMissCount:         c.cfg.FlashHotKeyMissCount,
+		FlashNodeReadRps:             c.cfg.FlashNodeReadRps,
 		FlashReadFlowLimit:           c.cfg.FlashReadFlowLimit,
 		FlashWriteFlowLimit:          c.cfg.FlashWriteFlowLimit,
 		FlashKeyFlowLimit:            c.cfg.FlashKeyFlowLimit,
+		FlashNodeConnectionLimit:     c.cfg.FlashNodeConnectionLimit,
 	}
 }
 
@@ -207,9 +221,11 @@ func (c *Cluster) loadFlashTopos() (err error) {
 		topo.FlashNodeHandleReadTimeout = ftv.FlashNodeHandleReadTimeout
 		topo.FlashNodeReadDataNodeTimeout = ftv.FlashNodeReadDataNodeTimeout
 		topo.FlashHotKeyMissCount = ftv.FlashHotKeyMissCount
+		topo.FlashNodeReadRps = ftv.FlashNodeReadRps
 		topo.FlashReadFlowLimit = ftv.FlashReadFlowLimit
 		topo.FlashWriteFlowLimit = ftv.FlashWriteFlowLimit
 		topo.FlashKeyFlowLimit = ftv.FlashKeyFlowLimit
+		topo.FlashNodeConnectionLimit = ftv.FlashNodeConnectionLimit
 		topo.FillHeartbeatConfigDefaults(c.defaultFlashNodeHeartbeatConfig())
 		topo.SyncFlashGroupFunc = c.syncUpdateFlashGroup
 		topo.SetMaxDisableFlashGroupPercent(c.cfg.MaxDisableFlashGroupPercent)

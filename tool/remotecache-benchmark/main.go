@@ -105,8 +105,15 @@ func NewBenchmarkTester(dataDir, hddBase, nvmeBase string, verify bool, master s
 }
 
 // TODO:Place 10,000 files in each folder.
-func (t *BenchmarkTester) GenerateTestData(totalSizeGB, concurrency int) error {
-	fmt.Printf("Concurrently generating %dGB of random files (0-4MB) in directory (%v)...\n", totalSizeGB, t.dataDir)
+func (t *BenchmarkTester) GenerateTestData(totalSizeGB, concurrency int, minFileSize, maxFileSize int64) error {
+	if minFileSize <= 0 {
+		return fmt.Errorf("min file size must be greater than 0")
+	}
+	if maxFileSize < minFileSize {
+		return fmt.Errorf("max file size must be greater than or equal to min file size")
+	}
+	fmt.Printf("Concurrently generating %dGB of random files (%d-%d bytes) in directory (%v)...\n",
+		totalSizeGB, minFileSize, maxFileSize, t.dataDir)
 	var (
 		generatedSize  int64  = 0
 		fileCount      uint32 = 0
@@ -117,7 +124,7 @@ func (t *BenchmarkTester) GenerateTestData(totalSizeGB, concurrency int) error {
 
 	bufferPool := sync.Pool{
 		New: func() interface{} {
-			return make([]byte, 4*1024*1024) // Maximum 4MB
+			return make([]byte, maxFileSize)
 		},
 	}
 
@@ -138,17 +145,15 @@ func (t *BenchmarkTester) GenerateTestData(totalSizeGB, concurrency int) error {
 				return
 			}
 
-			if maxPossibleSize > 4*1024*1024 {
-				maxPossibleSize = 4 * 1024 * 1024
+			if maxPossibleSize > maxFileSize {
+				maxPossibleSize = maxFileSize
 			}
 
-			baseSize := int64(1 * 1024 * 1024)
-			maxRandom := maxPossibleSize - baseSize
-			if maxRandom <= 0 {
-				maxRandom = 1 // parameter for Int63n should always > 0
+			fileSize := maxPossibleSize
+			if maxPossibleSize > minFileSize {
+				// Generate random file sizes in [minFileSize, maxPossibleSize].
+				fileSize = rand.Int63n(maxPossibleSize-minFileSize+1) + minFileSize
 			}
-			// Generate random file sizes
-			fileSize := rand.Int63n(maxRandom) + baseSize
 
 			if !atomic.CompareAndSwapInt64(&generatedSize, currentSize, currentSize+fileSize) {
 				continue
@@ -206,6 +211,8 @@ func main() {
 	dataDir := flag.String("data", "./test_data", "Test data directory")
 	totalSizeGB := flag.Int("size", 100, "Total size of test data (GB)")
 	genConcurrency := flag.Int("gen-concurrency", util.Max(2, int(float64(runtime.NumCPU())*0.6)), "Number of concurrent data generation processes")
+	minFileSize := flag.Int64("min-file-size", 1*1024*1024, "Minimum generated file size in bytes")
+	maxFileSize := flag.Int64("max-file-size", 4*1024*1024, "Maximum generated file size in bytes")
 	concurrency := flag.Int("concurrency", util.Max(2, int(float64(runtime.NumCPU())*0.6)), "Number of concurrent requests")
 	needGenerate := flag.Bool("need-generate", false, "Generate test data")
 	hddBase := flag.String("hdd", "", "HDD storage directory")
@@ -225,12 +232,16 @@ func main() {
 	flashConnWorkers := flag.Int("flash-conn-workers", 64, "Number of flash connection workers")
 	flowLimit := flag.Int64("flow-limit", 0, "Flow limit in bytes per second (default: 0 limiter is disable)")
 	writeChunkSize := flag.Int("write-chunk-size", 64*1024, "Write chunk size in bytes (default: 64K)")
+	requestTimeoutMs := flag.Int("request-timeout-ms", 0, "Per-request GET timeout in milliseconds (default: 0 means no per-request timeout)")
+	sameFileConcurrency := flag.Bool("same-file-concurrency", false, "Run GET test by having all concurrency workers read the same file before moving to the next file")
 	flag.Parse()
 
 	fmt.Printf("Parsed command-line arguments:\n")
 	fmt.Printf("  -data: %s\n", *dataDir)
 	fmt.Printf("  -size: %d\n", *totalSizeGB)
 	fmt.Printf("  -gen-concurrency: %d\n", *genConcurrency)
+	fmt.Printf("  -min-file-size: %d\n", *minFileSize)
+	fmt.Printf("  -max-file-size: %d\n", *maxFileSize)
 	fmt.Printf("  -need-generate: %v\n", *needGenerate)
 	fmt.Printf("  -hdd: %v\n", *hddBase)
 	fmt.Printf("  -nvme: %v\n", *nvmeBase)
@@ -250,9 +261,11 @@ func main() {
 	fmt.Printf("  -flash-conn-workers: %v\n", *flashConnWorkers)
 	fmt.Printf("  -flow-limit: %v\n", *flowLimit)
 	fmt.Printf("  -write-chunk-size: %v\n", *writeChunkSize)
+	fmt.Printf("  -request-timeout-ms: %v\n", *requestTimeoutMs)
+	fmt.Printf("  -same-file-concurrency: %v\n", *sameFileConcurrency)
 	tester := NewBenchmarkTester(ensureAbsolutePath(*dataDir), *hddBase, *nvmeBase, *verify, *master, *topoName, *clear, *logLevel, *disableBatch, *activateTime, *flashConnWorkers, *flowLimit, *writeChunkSize)
 	if *needGenerate {
-		if err := tester.GenerateTestData(*totalSizeGB, *genConcurrency); err != nil {
+		if err := tester.GenerateTestData(*totalSizeGB, *genConcurrency, *minFileSize, *maxFileSize); err != nil {
 			fmt.Printf("generate test files failed: %v\n", err)
 			return
 		}
@@ -274,7 +287,7 @@ func main() {
 
 	if *runGetTest {
 		// Ensure all data has been preheated into the storage system.
-		tester.RunGetBenchmark(ctx, *concurrency, *readRepeat)
+		tester.RunGetBenchmark(ctx, *concurrency, *readRepeat, *requestTimeoutMs, *sameFileConcurrency)
 	}
 
 	if *removeKey && *blockKey != "" {
@@ -524,23 +537,26 @@ func (fh *FileHandler) Close() error {
 	return nil
 }
 
-func (t *BenchmarkTester) RunGetBenchmark(ctx context.Context, concurrency int, repeats int) {
+func (t *BenchmarkTester) RunGetBenchmark(ctx context.Context, concurrency int, repeats int, requestTimeoutMs int, sameFileConcurrency bool) {
 	fmt.Printf("\n=== Starting Get performance test (concurrency: %d) ===\n", concurrency)
 	if t.hddStorage != nil {
-		hddResult := t.runStorageGetBenchmark(ctx, t.hddStorage, concurrency, repeats)
+		hddResult := t.runStorageGetBenchmark(ctx, t.hddStorage, concurrency, repeats, requestTimeoutMs, sameFileConcurrency)
 		t.printBenchmarkResult(hddResult)
 	}
 	if t.nvmeStorage != nil {
-		nvmeResult := t.runStorageGetBenchmark(ctx, t.nvmeStorage, concurrency, repeats)
+		nvmeResult := t.runStorageGetBenchmark(ctx, t.nvmeStorage, concurrency, repeats, requestTimeoutMs, sameFileConcurrency)
 		t.printBenchmarkResult(nvmeResult)
 	}
 	if t.cacheStorage != nil {
-		remoteResult := t.runStorageGetBenchmark(ctx, t.cacheStorage, concurrency, repeats)
+		remoteResult := t.runStorageGetBenchmark(ctx, t.cacheStorage, concurrency, repeats, requestTimeoutMs, sameFileConcurrency)
 		t.printBenchmarkResult(remoteResult)
 	}
 }
 
-func (t *BenchmarkTester) runStorageGetBenchmark(ctx context.Context, storage storage.Storage, concurrency int, repeats int) *BenchmarkResult {
+func (t *BenchmarkTester) runStorageGetBenchmark(ctx context.Context, storage storage.Storage, concurrency int, repeats int, requestTimeoutMs int, sameFileConcurrency bool) *BenchmarkResult {
+	if sameFileConcurrency {
+		return t.runStorageSameFileGetBenchmark(ctx, storage, concurrency, repeats, requestTimeoutMs)
+	}
 	fmt.Printf("Testing %s Get performance...\n", storage.Name())
 	// if t.clearPageCache {
 	//	clearPageCache()
@@ -558,6 +574,7 @@ func (t *BenchmarkTester) runStorageGetBenchmark(ctx context.Context, storage st
 		totalBytes   int64
 		lastProgress = 0
 		index        = 0
+		latencyMu    sync.Mutex
 	)
 
 	taskCh := make(chan string, 4*concurrency)
@@ -583,7 +600,12 @@ func (t *BenchmarkTester) runStorageGetBenchmark(ctx context.Context, storage st
 				for i := 0; i < repeats; i++ {
 					startTime := time.Now()
 					reqId := uuid.New().String()
-					r, len1, _, err := storage.Get(ctx, reqId, fh.FileName, from, to)
+					reqCtx := ctx
+					cancel := func() {}
+					if requestTimeoutMs > 0 {
+						reqCtx, cancel = context.WithTimeout(ctx, time.Duration(requestTimeoutMs)*time.Millisecond)
+					}
+					r, len1, _, err := storage.Get(reqCtx, reqId, fh.FileName, from, to)
 					var latency time.Duration
 					if err == nil && r != nil {
 						reads := 0
@@ -619,11 +641,14 @@ func (t *BenchmarkTester) runStorageGetBenchmark(ctx context.Context, storage st
 					} else {
 						atomic.AddInt64(&successCount, 1)
 						atomic.AddInt64(&totalBytes, len1)
+						latencyMu.Lock()
 						result.Latencies = append(result.Latencies, latency)
+						latencyMu.Unlock()
 					}
 					if r != nil {
 						r.Close()
 					}
+					cancel()
 				}
 				bytespool.Free(dataBuf)
 				bytespool.Free(tmpBuf)
@@ -635,7 +660,7 @@ func (t *BenchmarkTester) runStorageGetBenchmark(ctx context.Context, storage st
 	t.fileCache.Range(func(key, value interface{}) bool {
 		select {
 		case <-ctx.Done():
-			fmt.Printf("context cancel storage %v put \n", storage.Name())
+			fmt.Printf("context cancel storage %v get \n", storage.Name())
 			return false
 		case taskCh <- key.(string):
 			index++
@@ -650,7 +675,148 @@ func (t *BenchmarkTester) runStorageGetBenchmark(ctx context.Context, storage st
 	close(taskCh)
 	wg.Wait()
 	totalTime := time.Since(begin)
-	result.TotalRequests = atomic.LoadInt64(&t.fileCounts)
+	result.TotalRequests = atomic.LoadInt64(&t.fileCounts) * int64(repeats)
+	result.SuccessCount = successCount
+	result.ErrorCount = errorCount
+	result.TotalBytes = totalBytes
+	if len(result.Latencies) > 0 {
+		sort.Slice(result.Latencies, func(i, j int) bool {
+			return result.Latencies[i] < result.Latencies[j]
+		})
+
+		var totalLatency time.Duration
+		for _, l := range result.Latencies {
+			totalLatency += l
+		}
+		result.AvgLatency = totalLatency / time.Duration(len(result.Latencies))
+
+		p95Idx := int(math.Min(float64(len(result.Latencies)-1), float64(len(result.Latencies))*0.95))
+		p99Idx := int(math.Min(float64(len(result.Latencies)-1), float64(len(result.Latencies))*0.99))
+		result.P95Latency = result.Latencies[p95Idx]
+		result.P99Latency = result.Latencies[p99Idx]
+
+		result.TotalTime = totalTime
+
+		result.Throughput = float64(totalBytes) / (1024 * 1024) / result.TotalTime.Seconds()
+
+		result.IOPS = float64(successCount) / result.TotalTime.Seconds()
+	}
+	return result
+}
+
+func (t *BenchmarkTester) runStorageSameFileGetBenchmark(ctx context.Context, storage storage.Storage, concurrency int, repeats int, requestTimeoutMs int) *BenchmarkResult {
+	fmt.Printf("Testing %s Get performance with same-file concurrency...\n", storage.Name())
+	result := &BenchmarkResult{
+		StorageType:   storage.Name(),
+		OperationType: "GetSameFile",
+		Latencies:     make([]time.Duration, 0),
+	}
+	var (
+		successCount int64
+		errorCount   int64
+		totalBytes   int64
+		lastProgress = 0
+		index        = 0
+		latencyMu    sync.Mutex
+	)
+
+	begin := time.Now()
+	t.fileCache.Range(func(key, value interface{}) bool {
+		select {
+		case <-ctx.Done():
+			fmt.Printf("context cancel storage %v get \n", storage.Name())
+			return false
+		default:
+		}
+
+		fh, ok := value.(*FileHandler)
+		if !ok || fh == nil {
+			atomic.AddInt64(&errorCount, int64(concurrency*repeats))
+			fmt.Printf("storage %v: invalid file handler for %v\n", storage.Name(), key)
+			return true
+		}
+
+		var wg sync.WaitGroup
+		for w := 0; w < concurrency; w++ {
+			wg.Add(1)
+			go func(workerID int) {
+				defer wg.Done()
+
+				from := int64(0)
+				to := fh.Size
+				dataBuf := bytespool.Alloc(proto.CACHE_BLOCK_PACKET_SIZE)
+				tmpBuf := bytespool.Alloc(int(to - from))
+				defer bytespool.Free(dataBuf)
+				defer bytespool.Free(tmpBuf)
+
+				for i := 0; i < repeats; i++ {
+					startTime := time.Now()
+					reqId := uuid.New().String()
+					reqCtx := ctx
+					cancel := func() {}
+					if requestTimeoutMs > 0 {
+						reqCtx, cancel = context.WithTimeout(ctx, time.Duration(requestTimeoutMs)*time.Millisecond)
+					}
+					r, len1, _, err := storage.Get(reqCtx, reqId, fh.FileName, from, to)
+					var latency time.Duration
+					if err == nil && r != nil {
+						reads := 0
+						for {
+							readBytes, readErr := r.Read(dataBuf)
+							if readErr != nil && readErr != io.EOF {
+								fmt.Printf("storage %v read data %v failed reqID %v: readErr %v\n", storage.Name(), fh.FileName, reqId, readErr)
+								err = readErr
+								break
+							}
+							copy(tmpBuf[reads:], dataBuf[:readBytes])
+							reads += readBytes
+							if readErr == io.EOF {
+								break
+							}
+						}
+						if err == nil && reads != int(len1) {
+							err = fmt.Errorf("wrong len %v:expected[%v]", reads, len1)
+						} else if err == nil {
+							latency = time.Since(startTime)
+							if t.verify {
+								readCrc := crc32.ChecksumIEEE(tmpBuf[:reads])
+								actualCrc := crc32.ChecksumIEEE(fh.bytes[from:to])
+								if actualCrc != readCrc {
+									err = fmt.Errorf("wrong crc %v:expected[%v]", actualCrc, readCrc)
+								}
+							}
+						}
+					}
+					if err != nil && err != io.EOF {
+						atomic.AddInt64(&errorCount, 1)
+						fmt.Printf("storage %v get %v failed reqID %v worker %v: %v\n", storage.Name(), fh.FileName, reqId, workerID, err)
+					} else {
+						atomic.AddInt64(&successCount, 1)
+						atomic.AddInt64(&totalBytes, len1)
+						latencyMu.Lock()
+						result.Latencies = append(result.Latencies, latency)
+						latencyMu.Unlock()
+					}
+					if r != nil {
+						r.Close()
+					}
+					cancel()
+				}
+			}(w)
+		}
+		wg.Wait()
+		fh.Close()
+
+		index++
+		progress := index * 100 / int(t.fileCounts)
+		if progress >= lastProgress+10 {
+			lastProgress = progress
+			fmt.Printf("\r%s Progress: %d%% \n", storage.Name(), progress)
+		}
+		return true
+	})
+	totalTime := time.Since(begin)
+	result.TotalRequests = atomic.LoadInt64(&t.fileCounts) * int64(concurrency) * int64(repeats)
 	result.SuccessCount = successCount
 	result.ErrorCount = errorCount
 	result.TotalBytes = totalBytes

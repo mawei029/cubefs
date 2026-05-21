@@ -23,6 +23,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,6 +32,7 @@ import (
 	cflog "github.com/cubefs/cubefs/util/log"
 	"github.com/cubefs/cubefs/util/tmpfs"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -60,6 +62,42 @@ func initTestTmpfs() (umount func() error, err error) {
 		return
 	}
 	return func() error { return tmpfs.Umount(testTmpFS) }, nil
+}
+
+func TestCacheBlockCheckRateLimitLazyUpdateKeyLimiterFlow(t *testing.T) {
+	disk := &Disk{
+		Path:   "/tmp/test",
+		Status: proto.ReadWrite,
+	}
+	threshold := int32(1024 * 1024)
+	block := NewCacheBlockV2("/cfs_test/tmpfs", "test", "lazy-update", 2*1024*1024, "127.0.0.1", disk, threshold, 100)
+	engine := &CacheEngine{}
+	engine.SetKeyLimiterFlow(200)
+	block.cacheEngine = engine
+
+	require.EqualValues(t, 100, atomic.LoadInt64(&block.keyLimiterFlow))
+	require.NoError(t, block.CheckRateLimit(context.Background(), 1, uint64(threshold)))
+	require.EqualValues(t, 200, atomic.LoadInt64(&block.keyLimiterFlow))
+	require.NotNil(t, block.keyLimiter)
+	require.Equal(t, rate.Limit(200), block.keyLimiter.Limit())
+	require.Equal(t, 100, block.keyLimiter.Burst())
+}
+
+func TestCacheBlockCheckRateLimitLazyDisableKeyLimiter(t *testing.T) {
+	disk := &Disk{
+		Path:   "/tmp/test",
+		Status: proto.ReadWrite,
+	}
+	threshold := int32(1024 * 1024)
+	block := NewCacheBlockV2("/cfs_test/tmpfs", "test", "lazy-disable", 2*1024*1024, "127.0.0.1", disk, threshold, 100)
+	engine := &CacheEngine{}
+	engine.SetKeyLimiterFlow(0)
+	block.cacheEngine = engine
+
+	require.NotNil(t, block.keyLimiter)
+	require.NoError(t, block.CheckRateLimit(context.Background(), 1, uint64(threshold)))
+	require.EqualValues(t, 0, atomic.LoadInt64(&block.keyLimiterFlow))
+	require.Nil(t, block.keyLimiter)
 }
 
 func TestBlockWriteCache(t *testing.T) {
@@ -599,7 +637,13 @@ func TestCacheBlockV2ReadReloadAndComplete(t *testing.T) {
 func TestCacheBlockV2RateLimit(t *testing.T) {
 	disk := &Disk{Path: t.TempDir(), Status: proto.ReadWrite}
 	block := NewCacheBlockV2(disk.Path, "volume", "limited-key", 2*1024, "127.0.0.1", disk, 1024, 100)
+	engine := &CacheEngine{}
+	engine.SetKeyLimiterFlow(100)
+	block.cacheEngine = engine
 
-	require.Equal(t, util.LimitedFlowError, block.CheckRateLimit(60, 1024))
-	require.NoError(t, block.CheckRateLimit(1, 4*1024))
+	require.NoError(t, block.CheckRateLimit(context.Background(), 50, 1024))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	require.Equal(t, util.LimitedFlowError, block.CheckRateLimit(ctx, 1, 1024))
+	require.NoError(t, block.CheckRateLimit(context.Background(), 1, 4*1024))
 }

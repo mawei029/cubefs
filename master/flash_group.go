@@ -791,6 +791,9 @@ func (m *Server) updateFlashTopo(w http.ResponseWriter, r *http.Request) {
 	if args.FlashHotKeyMissCount != nil {
 		cfg.FlashHotKeyMissCount = *args.FlashHotKeyMissCount
 	}
+	if args.FlashNodeReadRps != nil {
+		cfg.FlashNodeReadRps = *args.FlashNodeReadRps
+	}
 	if args.FlashReadFlowLimit != nil {
 		cfg.FlashReadFlowLimit = *args.FlashReadFlowLimit
 	}
@@ -799,6 +802,9 @@ func (m *Server) updateFlashTopo(w http.ResponseWriter, r *http.Request) {
 	}
 	if args.FlashKeyFlowLimit != nil {
 		cfg.FlashKeyFlowLimit = *args.FlashKeyFlowLimit
+	}
+	if args.FlashNodeConnectionLimit != nil {
+		cfg.FlashNodeConnectionLimit = *args.FlashNodeConnectionLimit
 	}
 	topo.SetHeartbeatConfig(cfg)
 

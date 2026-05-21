@@ -88,6 +88,7 @@ const (
 	_defaultPreheatReadDataNodeLimitFlow   = 1 * 1024 * 1024 * 1024 // 1GB
 	_defaultPreheatWorkerNum               = 20
 	_defaultPreheatReplyBatchSize          = 100
+	_defaultFlashNodeConnectionLimit       = 100000
 )
 
 // Configuration keys
@@ -129,6 +130,7 @@ const (
 	cfgPreheatReadDataNodeLimitFlow = "preheatReadDataNodeLimitFlow"
 	cfgPreheatWorkerNum             = "preheatWorkerNum"
 	cfgPreheatReplyBatchSize        = "preheatReplyBatchSize"
+	cfgFlashNodeConnectionLimit     = "flashNodeConnectionLimit"
 	paramIocc                       = "iocc"
 	paramFlow                       = "flow"
 	paramFactor                     = "factor"
@@ -178,6 +180,9 @@ type FlashNode struct {
 	readLimiter  *rate.Limiter
 	lowerHitRate float64
 	enableTmpfs  bool
+
+	connectionLimit   int64
+	activeConnections int64
 
 	handleReadTimeout     int
 	diskWriteIocc         int
@@ -377,6 +382,10 @@ func (f *FlashNode) parseConfig(cfg *config.Config) (err error) {
 	if f.readRps <= 0 {
 		f.readRps = _defaultReadBurst
 	}
+	f.connectionLimit = cfg.GetInt64(cfgFlashNodeConnectionLimit)
+	if f.connectionLimit <= 0 {
+		f.connectionLimit = _defaultFlashNodeConnectionLimit
+	}
 	f.hotKeyMissCount = _defaultMissCountThresholdInterval
 	f.enableTmpfs = !cfg.GetBool(cfgDisableTmpfs)
 	percent := cfg.GetFloat(cfgCachePercent)
@@ -546,6 +555,7 @@ func (f *FlashNode) parseConfig(cfg *config.Config) (err error) {
 	log.LogInfof("[parseConfig] load cacheLoadWorkerNum[%d]", f.cacheLoadWorkerNum)
 	log.LogInfof("[parseConfig] load cacheEvictWorkerNum[%d]", f.cacheEvictWorkerNum)
 	log.LogInfof("[parseConfig] load  readRps[%d].", f.readRps)
+	log.LogInfof("[parseConfig] load  flashNodeConnectionLimit[%d].", f.connectionLimit)
 	log.LogInfof("[parseConfig] load  lowerHitRate[%.2f].", f.lowerHitRate)
 	log.LogInfof("[parseConfig] load  enableTmpfs[%v].", f.enableTmpfs)
 	log.LogInfof("[parseConfig] load  enableWarmUpPaths[%v].", f.enableWarmUpPaths)
@@ -728,6 +738,30 @@ func (f *FlashNode) resizePreheatWorkers(workerNum int) {
 
 func (f *FlashNode) initLimiter() {
 	f.readLimiter = rate.NewLimiter(rate.Limit(f.readRps), 2*f.readRps)
+}
+
+func (f *FlashNode) setReadRps(readRps int64) {
+	if readRps <= 0 {
+		return
+	}
+	newReadRps := int(readRps)
+	if f.readRps == newReadRps {
+		return
+	}
+	log.LogInfof("FlashNode set readRps from %d to %d", f.readRps, newReadRps)
+	f.readRps = newReadRps
+	f.readLimiter.SetLimit(rate.Limit(newReadRps))
+	f.readLimiter.SetBurst(2 * newReadRps)
+}
+
+func (f *FlashNode) setConnectionLimit(limit int64) {
+	if limit <= 0 {
+		return
+	}
+	old := atomic.SwapInt64(&f.connectionLimit, limit)
+	if old != limit {
+		log.LogInfof("FlashNode set connectionLimit from %d to %d", old, limit)
+	}
 }
 
 func (f *FlashNode) GetBatchReadPoolStatus() *util.PoolStatus {

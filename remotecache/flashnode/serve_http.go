@@ -59,6 +59,9 @@ func (f *FlashNode) registerAPIHandler() {
 func (f *FlashNode) handleStat(w http.ResponseWriter, r *http.Request) {
 	replyOK(w, r, proto.FlashNodeStat{
 		NodeLimit:         uint64(f.readLimiter.Limit()),
+		ReadRps:           f.readRps,
+		ConnectionLimit:   atomic.LoadInt64(&f.connectionLimit),
+		ActiveConnections: atomic.LoadInt64(&f.activeConnections),
 		CacheStatus:       f.cacheEngine.Status(),
 		WaitForCacheBlock: f.waitForCacheBlock,
 	})
@@ -151,8 +154,11 @@ func (f *FlashNode) handleSubmitTask(w http.ResponseWriter, r *http.Request) {
 
 func (f *FlashNode) handleStatAll(w http.ResponseWriter, r *http.Request) {
 	replyOK(w, r, proto.FlashNodeStat{
-		NodeLimit:   uint64(f.readLimiter.Limit()),
-		CacheStatus: f.cacheEngine.StatusAll(),
+		NodeLimit:         uint64(f.readLimiter.Limit()),
+		ReadRps:           f.readRps,
+		ConnectionLimit:   atomic.LoadInt64(&f.connectionLimit),
+		ActiveConnections: atomic.LoadInt64(&f.activeConnections),
+		CacheStatus:       f.cacheEngine.StatusAll(),
 	})
 }
 
@@ -163,6 +169,9 @@ func (f *FlashNode) handleSampleStat(w http.ResponseWriter, r *http.Request) {
 	}
 	replyOK(w, r, proto.FlashNodeStat{
 		NodeLimit:         uint64(f.readLimiter.Limit()),
+		ReadRps:           f.readRps,
+		ConnectionLimit:   atomic.LoadInt64(&f.connectionLimit),
+		ActiveConnections: atomic.LoadInt64(&f.activeConnections),
 		CacheStatus:       cacheStatus,
 		WaitForCacheBlock: f.waitForCacheBlock,
 	})

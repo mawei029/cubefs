@@ -120,6 +120,7 @@ func TestLoadFlashToposPersistsDefaultAndIdleTopos(t *testing.T) {
 	cluster.cfg.FlashReadFlowLimit = 444
 	cluster.cfg.FlashWriteFlowLimit = 555
 	cluster.cfg.FlashKeyFlowLimit = 0
+	cluster.cfg.FlashNodeConnectionLimit = 666
 
 	require.NoError(t, cluster.loadFlashTopos())
 
@@ -134,9 +135,11 @@ func TestLoadFlashToposPersistsDefaultAndIdleTopos(t *testing.T) {
 		FlashNodeHandleReadTimeout:   111,
 		FlashNodeReadDataNodeTimeout: 222,
 		FlashHotKeyMissCount:         333,
+		FlashNodeReadRps:             defaultFlashNodeReadRps,
 		FlashReadFlowLimit:           444,
 		FlashWriteFlowLimit:          555,
 		FlashKeyFlowLimit:            0,
+		FlashNodeConnectionLimit:     666,
 	}, defaultTopo.GetHeartbeatConfig())
 
 	result, err := cluster.fsm.store.SeekForPrefix([]byte(flashTopoPrefix))
@@ -194,9 +197,11 @@ func TestClusterLoadFlashToposRestoresPersistedTopoAndCreatesIdle(t *testing.T) 
 		FlashNodeHandleReadTimeout:   111,
 		FlashNodeReadDataNodeTimeout: 222,
 		FlashHotKeyMissCount:         333,
+		FlashNodeReadRps:             88888,
 		FlashReadFlowLimit:           444,
 		FlashWriteFlowLimit:          555,
 		FlashKeyFlowLimit:            666,
+		FlashNodeConnectionLimit:     777,
 	})
 	require.NoError(t, cluster.syncAddFlashTopo(topo))
 
@@ -210,7 +215,9 @@ func TestClusterLoadFlashToposRestoresPersistedTopoAndCreatesIdle(t *testing.T) 
 	require.True(t, restored.DeleteGradualFlag)
 	require.Equal(t, int64(11), restored.GetRemoteCacheReadFlowMap()["vol-a"])
 	require.Equal(t, int64(22), restored.GetRemoteCacheWriteFlowMap()["vol-a"])
+	require.Equal(t, int64(88888), restored.GetHeartbeatConfig().FlashNodeReadRps)
 	require.Equal(t, int64(666), restored.GetHeartbeatConfig().FlashKeyFlowLimit)
+	require.Equal(t, int64(777), restored.GetHeartbeatConfig().FlashNodeConnectionLimit)
 
 	_, err = cluster.PeekFlashTopo(proto.IdleTopoName)
 	require.NoError(t, err)

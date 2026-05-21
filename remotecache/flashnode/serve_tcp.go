@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/cubefs/cubefs/proto"
@@ -39,6 +40,7 @@ func (f *FlashNode) startTcpServer() (err error) {
 	go func() {
 		defer f.tcpListener.Close()
 		var latestAlarm time.Time
+		var latestConnectionLimitAlarm time.Time
 		for {
 			conn, err1 := f.tcpListener.Accept()
 
@@ -62,6 +64,22 @@ func (f *FlashNode) startTcpServer() (err error) {
 				time.Sleep(time.Second)
 				continue
 			}
+			activeConnections := atomic.AddInt64(&f.activeConnections, 1)
+			connectionLimit := atomic.LoadInt64(&f.connectionLimit)
+			if connectionLimit > 0 && activeConnections > connectionLimit {
+				atomic.AddInt64(&f.activeConnections, -1)
+				p := proto.NewPacket()
+				p.PacketErrorWithBody(proto.OpErr, []byte(proto.ErrFlashNodeConnectionLimited.Error()))
+				if err := p.WriteToConn(conn); err != nil {
+					log.LogWarnf("flashnode write connection limit error failed, active:%d limit:%d err:%v", activeConnections, connectionLimit, err)
+				}
+				conn.Close()
+				if time.Since(latestConnectionLimitAlarm) > time.Minute {
+					log.LogWarnf("flashnode active connection limit exceeded, active:%d limit:%d", activeConnections, connectionLimit)
+					latestConnectionLimitAlarm = time.Now()
+				}
+				continue
+			}
 			go f.serveConn(conn)
 		}
 	}()
@@ -74,7 +92,10 @@ func (f *FlashNode) stopServer() {
 }
 
 func (f *FlashNode) serveConn(conn net.Conn) {
-	defer conn.Close()
+	defer func() {
+		atomic.AddInt64(&f.activeConnections, -1)
+		conn.Close()
+	}()
 	c := conn.(*net.TCPConn)
 	c.SetKeepAlive(true)
 	c.SetNoDelay(true)
@@ -99,6 +120,11 @@ func (f *FlashNode) serveConn(conn net.Conn) {
 			log.LogWarn("preHandle", p.LogMessage(p.GetOpMsg(), remoteAddr, p.StartT, err))
 			p.PacketErrorWithBody(proto.OpErr, ([]byte)(err.Error()))
 			p.WriteToConn(conn)
+			// Keep the connection open after readLimiter rejects a request. The
+			// SDK treats flashnode limit errors as reusable-connection errors and
+			// may put this TCP connection back into its pool. Closing here would
+			// leave a server-closed connection in the client pool and cause the
+			// next reuse to fail before reconnecting.
 			continue
 		}
 		f.handlePacket(conn, p)

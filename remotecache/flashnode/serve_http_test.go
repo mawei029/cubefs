@@ -15,8 +15,11 @@
 package flashnode
 
 import (
+	"encoding/json"
+	"net/http"
 	"testing"
 
+	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/remotecache/flashnode/cachengine"
 	"github.com/cubefs/cubefs/sdk/httpclient"
 	"github.com/stretchr/testify/require"
@@ -26,6 +29,8 @@ var httpCli = httpclient.New()
 
 func testHTTP(t *testing.T) {
 	t.Run("Stat", testHTTPStat)
+	t.Run("StatAll", testHTTPStatAll)
+	t.Run("SampleStat", testHTTPSampleStat)
 	t.Run("EvictVol", testHTTPEvictVol)
 	t.Run("EvictAll", testHTTPEvictAll)
 }
@@ -33,9 +38,35 @@ func testHTTP(t *testing.T) {
 func testHTTPStat(t *testing.T) {
 	st, err := httpCli.Addr(httpServer.Addr).FlashNode().Stat()
 	require.NoError(t, err)
+	require.Equal(t, flashServer.readRps, st.ReadRps)
 	t.Logf("node  status %+v", st)
 	for _, s := range st.CacheStatus {
 		t.Logf("cache status %+v", *s)
+	}
+}
+
+func testHTTPStatAll(t *testing.T) {
+	st, err := httpCli.Addr(httpServer.Addr).FlashNode().StatAll()
+	require.NoError(t, err)
+	require.Equal(t, flashServer.readRps, st.ReadRps)
+	require.Greater(t, st.NodeLimit, uint64(0))
+}
+
+func testHTTPSampleStat(t *testing.T) {
+	resp, err := http.Get("http://" + httpServer.Addr + "/sampleStat")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var reply proto.HTTPReplyRaw
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&reply))
+	require.EqualValues(t, proto.ErrCodeSuccess, reply.Code)
+
+	var st proto.FlashNodeStat
+	require.NoError(t, json.Unmarshal(reply.Data, &st))
+	require.Equal(t, flashServer.readRps, st.ReadRps)
+	for _, s := range st.CacheStatus {
+		require.Empty(t, s.Keys)
 	}
 }
 

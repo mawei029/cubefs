@@ -84,9 +84,11 @@ type FlashNodeTopologyValue struct {
 	FlashNodeHandleReadTimeout   *int
 	FlashNodeReadDataNodeTimeout *int
 	FlashHotKeyMissCount         *int
+	FlashNodeReadRps             *int64
 	FlashReadFlowLimit           *int64
 	FlashWriteFlowLimit          *int64
 	FlashKeyFlowLimit            *int64
+	FlashNodeConnectionLimit     *int64
 	RemoteCacheReadFlowMap       map[string]int64
 	RemoteCacheWriteFlowMap      map[string]int64
 }
@@ -95,9 +97,11 @@ type FlashNodeHeartbeatConfig struct {
 	FlashNodeHandleReadTimeout   int
 	FlashNodeReadDataNodeTimeout int
 	FlashHotKeyMissCount         int
+	FlashNodeReadRps             int64
 	FlashReadFlowLimit           int64
 	FlashWriteFlowLimit          int64
 	FlashKeyFlowLimit            int64
+	FlashNodeConnectionLimit     int64
 }
 
 type FlashNodeTopology struct {
@@ -157,9 +161,11 @@ func (t *FlashNodeTopology) SetHeartbeatConfig(cfg FlashNodeHeartbeatConfig) {
 	t.FlashNodeHandleReadTimeout = intPtr(cfg.FlashNodeHandleReadTimeout)
 	t.FlashNodeReadDataNodeTimeout = intPtr(cfg.FlashNodeReadDataNodeTimeout)
 	t.FlashHotKeyMissCount = intPtr(cfg.FlashHotKeyMissCount)
+	t.FlashNodeReadRps = int64Ptr(cfg.FlashNodeReadRps)
 	t.FlashReadFlowLimit = int64Ptr(cfg.FlashReadFlowLimit)
 	t.FlashWriteFlowLimit = int64Ptr(cfg.FlashWriteFlowLimit)
 	t.FlashKeyFlowLimit = int64Ptr(cfg.FlashKeyFlowLimit)
+	t.FlashNodeConnectionLimit = int64Ptr(cfg.FlashNodeConnectionLimit)
 }
 
 func (t *FlashNodeTopology) FillHeartbeatConfigDefaults(cfg FlashNodeHeartbeatConfig) {
@@ -175,6 +181,11 @@ func (t *FlashNodeTopology) FillHeartbeatConfigDefaults(cfg FlashNodeHeartbeatCo
 	if t.FlashHotKeyMissCount == nil {
 		t.FlashHotKeyMissCount = intPtr(cfg.FlashHotKeyMissCount)
 	}
+	if t.FlashNodeReadRps == nil || *t.FlashNodeReadRps <= 0 {
+		if cfg.FlashNodeReadRps > 0 {
+			t.FlashNodeReadRps = int64Ptr(cfg.FlashNodeReadRps)
+		}
+	}
 	if t.FlashReadFlowLimit == nil {
 		t.FlashReadFlowLimit = int64Ptr(cfg.FlashReadFlowLimit)
 	}
@@ -183,6 +194,9 @@ func (t *FlashNodeTopology) FillHeartbeatConfigDefaults(cfg FlashNodeHeartbeatCo
 	}
 	if t.FlashKeyFlowLimit == nil {
 		t.FlashKeyFlowLimit = int64Ptr(cfg.FlashKeyFlowLimit)
+	}
+	if t.FlashNodeConnectionLimit == nil {
+		t.FlashNodeConnectionLimit = int64Ptr(cfg.FlashNodeConnectionLimit)
 	}
 }
 
@@ -200,6 +214,9 @@ func (t *FlashNodeTopology) GetHeartbeatConfig() FlashNodeHeartbeatConfig {
 	if t.FlashHotKeyMissCount != nil {
 		cfg.FlashHotKeyMissCount = *t.FlashHotKeyMissCount
 	}
+	if t.FlashNodeReadRps != nil {
+		cfg.FlashNodeReadRps = *t.FlashNodeReadRps
+	}
 	if t.FlashReadFlowLimit != nil {
 		cfg.FlashReadFlowLimit = *t.FlashReadFlowLimit
 	}
@@ -208,6 +225,9 @@ func (t *FlashNodeTopology) GetHeartbeatConfig() FlashNodeHeartbeatConfig {
 	}
 	if t.FlashKeyFlowLimit != nil {
 		cfg.FlashKeyFlowLimit = *t.FlashKeyFlowLimit
+	}
+	if t.FlashNodeConnectionLimit != nil {
+		cfg.FlashNodeConnectionLimit = *t.FlashNodeConnectionLimit
 	}
 	return cfg
 }
@@ -1305,8 +1325,8 @@ func (t *FlashNodeTopology) CreateFlashNodeHeartBeatTasks(leader string, remoteC
 			}
 		}
 		task := node.createHeartbeatTask(leader, cfg.FlashNodeHandleReadTimeout, cfg.FlashNodeReadDataNodeTimeout,
-			cfg.FlashHotKeyMissCount, cfg.FlashReadFlowLimit, cfg.FlashWriteFlowLimit, cfg.FlashKeyFlowLimit,
-			slots, remoteCacheDisableTTLMap, remoteCacheReadFlowMap, remoteCacheWriteFlowMap)
+			cfg.FlashHotKeyMissCount, cfg.FlashNodeReadRps, cfg.FlashReadFlowLimit, cfg.FlashWriteFlowLimit, cfg.FlashKeyFlowLimit,
+			cfg.FlashNodeConnectionLimit, slots, remoteCacheDisableTTLMap, remoteCacheReadFlowMap, remoteCacheWriteFlowMap)
 		tasks = append(tasks, task)
 		return true
 	})
@@ -1511,9 +1531,11 @@ func (t *FlashNodeTopology) GetFlashTopoAdminView() (ftv *proto.FlashTopologyAdm
 		FlashNodeHandleReadTimeout:   cfg.FlashNodeHandleReadTimeout,
 		FlashNodeReadDataNodeTimeout: cfg.FlashNodeReadDataNodeTimeout,
 		FlashHotKeyMissCount:         cfg.FlashHotKeyMissCount,
+		FlashNodeReadRps:             cfg.FlashNodeReadRps,
 		FlashReadFlowLimit:           cfg.FlashReadFlowLimit,
 		FlashWriteFlowLimit:          cfg.FlashWriteFlowLimit,
 		FlashKeyFlowLimit:            cfg.FlashKeyFlowLimit,
+		FlashNodeConnectionLimit:     cfg.FlashNodeConnectionLimit,
 	}
 	return ftv
 }

@@ -22,10 +22,12 @@ const (
 	defaultHttpReversePoolSize          = 1024
 	defaultRetainLogs                   = 20000
 	defaultFlashHotKeyMissCount         = 5
+	defaultFlashNodeReadRps             = 200000
 	defaultMaxDisableFlashGroupPercent  = DefaultMaxDisableFlashGroupPercent
 	defaultFlashReadFlowLimit           = 2147483648
 	defaultFlashWriteFlowLimit          = 2147483648
 	defaultFlashKeyFlowLimit            = 0
+	defaultFlashNodeConnectionLimit     = 100000
 	defaultRemoteClientFlowLimit        = 0
 )
 
@@ -39,10 +41,12 @@ const (
 	cfgRemoteCacheSameZoneTimeout   = "remoteCacheSameZoneTimeout"
 	cfgRemoteCacheSameRegionTimeout = "remoteCacheSameRegionTimeout"
 	cfgFlashHotKeyMissCount         = "flashHotKeyMissCount"
+	cfgFlashNodeReadRps             = "flashNodeReadRps"
 	cfgMaxDisableFlashGroupPercent  = "maxDisableFlashGroupPercent"
 	cfgFlashReadFlowLimit           = "flashReadFlowLimit"
 	cfgFlashWriteFlowLimit          = "flashWriteFlowLimit"
 	cfgFlashKeyFlowLimit            = "flashKeyFlowLimit"
+	cfgFlashNodeConnectionLimit     = "flashNodeConnectionLimit"
 	cfgRemoteClientFlowLimit        = "remoteClientFlowLimit"
 )
 
@@ -70,10 +74,12 @@ func newClusterConfig() (cfg *clusterConfig) {
 	cfg.RemoteCacheSameZoneTimeout = cfsProto.DefaultRemoteCacheSameZoneTimeout
 	cfg.RemoteCacheSameRegionTimeout = cfsProto.DefaultRemoteCacheSameRegionTimeout
 	cfg.FlashHotKeyMissCount = defaultFlashHotKeyMissCount
+	cfg.FlashNodeReadRps = defaultFlashNodeReadRps
 	cfg.MaxDisableFlashGroupPercent = defaultMaxDisableFlashGroupPercent
 	cfg.FlashReadFlowLimit = defaultFlashReadFlowLimit
 	cfg.FlashWriteFlowLimit = defaultFlashWriteFlowLimit
 	cfg.FlashKeyFlowLimit = defaultFlashKeyFlowLimit
+	cfg.FlashNodeConnectionLimit = defaultFlashNodeConnectionLimit
 	cfg.RemoteClientFlowLimit = defaultRemoteClientFlowLimit
 
 	return
