@@ -251,7 +251,7 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 	// Delete from negative cache if file is being created
 	d.deleteNegativeDcache(req.Name)
 	info, err := d.super.mw.Create_ll(d.ino, req.Name, proto.Mode(req.Mode.Perm()), req.Uid, req.Gid, nil,
-		fullPath, false, false)
+		fullPath, false)
 	if err != nil {
 		log.LogErrorf("Create: parent(%v) req(%v) err(%v)", d.ino, req, err)
 		return nil, nil, ParseError(err)
@@ -350,7 +350,7 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 	// Delete from negative cache if directory is being created
 	d.deleteNegativeDcache(req.Name)
 	info, err := d.super.mw.Create_ll(d.ino, req.Name, proto.Mode(os.ModeDir|req.Mode.Perm()), req.Uid,
-		req.Gid, nil, fullPath, false, false)
+		req.Gid, nil, fullPath, false)
 	if err != nil {
 		log.LogErrorf("Mkdir: parent(%v) req(%v) err(%v)", d.ino, req, err)
 		return nil, ParseError(err)
@@ -994,7 +994,7 @@ func (d *Dir) Mknod(ctx context.Context, req *fuse.MknodRequest) (fs.Node, error
 	// Delete from negative cache if file is being created
 	d.deleteNegativeDcache(req.Name)
 	info, err := d.super.mw.Create_ll(d.ino, req.Name, proto.Mode(req.Mode), req.Uid, req.Gid,
-		nil, fullPath, false, false)
+		nil, fullPath, false)
 	if err != nil {
 		log.LogErrorf("Mknod: parent(%v) req(%v) err(%v)", d.ino, req, err)
 		return nil, ParseError(err)
@@ -1032,7 +1032,7 @@ func (d *Dir) Symlink(ctx context.Context, req *fuse.SymlinkRequest) (fs.Node, e
 	// Delete from negative cache if symlink is being created
 	d.deleteNegativeDcache(req.NewName)
 	info, err := d.super.mw.Create_ll(parentIno, req.NewName, proto.Mode(os.ModeSymlink|os.ModePerm), req.Uid,
-		req.Gid, []byte(req.Target), fullPath, false, false)
+		req.Gid, []byte(req.Target), fullPath, false)
 	if err != nil {
 		log.LogErrorf("Symlink: parent(%v) NewName(%v) err(%v)", parentIno, req.NewName, err)
 		return nil, ParseError(err)
