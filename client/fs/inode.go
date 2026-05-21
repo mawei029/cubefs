@@ -29,23 +29,21 @@ const (
 
 func (s *Super) InodeGet(ino uint64) (info *proto.InodeInfo, err error) {
 	info = s.ic.Get(ino)
-
 	if info != nil {
 		return info, nil
 	}
+	return s.LoadInodeInfo(ino)
+}
 
-	if s.metaCacheAcceleration {
-		info, err = s.mw.InodeGet_ll(ino, false)
-	} else {
-		info, err = s.mw.InodeGet_ll(ino, false)
-	}
+// LoadInodeInfo fetches inode metadata on cache miss, updates node caches, and refreshes extent cache when needed.
+func (s *Super) LoadInodeInfo(ino uint64) (info *proto.InodeInfo, err error) {
+	info, err = s.mw.InodeGet_ll(ino, false)
 	if err != nil || info == nil {
 		log.LogErrorf("InodeGet: ino(%v) err(%v) info(%v)", ino, err, info)
 		if err != nil {
 			return nil, ParseError(err)
-		} else {
-			return nil, fuse.ENOENT
 		}
+		return nil, fuse.ENOENT
 	}
 	s.ic.Put(info)
 
@@ -63,11 +61,11 @@ func (s *Super) InodeGet(ino uint64) (info *proto.InodeInfo, err error) {
 	if !info.HasExtents() {
 		if err = s.ec.RefreshExtentsCache(ino); err != nil {
 			log.LogErrorf("[InodeGet] get ino(%v) inode(%v) err: %v", ino, info, err)
-			// TODO:tangjingyu return ParseError(err)?
 			return info, err
 		}
 	}
-	log.LogInfof("[InodeGet] get ino(%v) inode(%v)", ino, info)
+
+	log.LogInfof("[InodeGet] get ino(%v) inode(%v), migrated(%v)", ino, info, migrated)
 	return info, nil
 }
 
