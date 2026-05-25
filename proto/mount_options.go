@@ -92,6 +92,7 @@ const (
 	ForceRemoteCache
 	DebugCluster
 	EnableAsyncFlush
+	UpdateInodeMetaOnOverwrite
 	RemoteCacheName
 
 	// warm up
@@ -210,6 +211,7 @@ func InitMountOptions(opts []MountOption) {
 	opts[ForceRemoteCache] = MountOption{"forceRemoteCache", "All read requests are handled by the remote cache.", "", false}
 	opts[DebugCluster] = MountOption{"debugCluster", "display cluster name", "", ""}
 	opts[EnableAsyncFlush] = MountOption{"enableAsyncFlush", "async flush extent handler", "", true}
+	opts[UpdateInodeMetaOnOverwrite] = MountOption{"updateInodeMetaOnOverwrite", "update inode meta during overwrite path", "", true}
 	opts[ReadDirLimit] = MountOption{"readDirLimit", "The limit for reading directory entries in warm up", "", int64(500)}
 	opts[MaxWarmUpConcurrency] = MountOption{"maxWarmUpConcurrency", "The maximum number of concurrent goroutines for warm up", "", int64(2)}
 	opts[StopWarmMeta] = MountOption{"stopWarmMeta", "Stop warm up meta", "", true}
@@ -419,9 +421,10 @@ type MountOptions struct {
 	AheadReadWindowCnt    int
 
 	// remote cache
-	ForceRemoteCache bool
-	EnableAsyncFlush bool
-	RemoteCacheName  string
+	ForceRemoteCache           bool
+	EnableAsyncFlush           bool
+	UpdateInodeMetaOnOverwrite bool
+	RemoteCacheName            string
 
 	// warm up
 	ReadDirLimit          int64

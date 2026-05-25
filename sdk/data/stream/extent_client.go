@@ -166,11 +166,12 @@ type ExtentConfig struct {
 	AheadReadWindowCnt    int
 	MinReadAheadSize      uint64
 	// remoteCache
-	NeedRemoteCache  bool
-	ForceRemoteCache bool
-	HeartBeatPing    bool
-	EnableAsyncFlush bool
-	MetaAcceleration bool
+	NeedRemoteCache            bool
+	ForceRemoteCache           bool
+	HeartBeatPing              bool
+	EnableAsyncFlush           bool
+	UpdateInodeMetaOnOverwrite bool
+	MetaAcceleration           bool
 
 	RemoteCacheName string
 }
@@ -225,9 +226,10 @@ type ExtentClient struct {
 	stopCh       chan struct{}
 	wg           sync.WaitGroup
 
-	forceRemoteCache bool
-	enableAsyncFlush bool
-	metaAcceleration bool
+	forceRemoteCache           bool
+	enableAsyncFlush           bool
+	updateInodeMetaOnOverwrite bool
+	metaAcceleration           bool
 }
 
 func (client *ExtentClient) UidIsLimited(uid uint32) bool {
@@ -363,6 +365,7 @@ retry:
 	client.getInodeInfo = config.OnGetInodeInfo
 	client.forceRemoteCache = config.ForceRemoteCache
 	client.enableAsyncFlush = config.EnableAsyncFlush
+	client.updateInodeMetaOnOverwrite = config.UpdateInodeMetaOnOverwrite
 	client.metaAcceleration = config.MetaAcceleration
 
 	if config.StreamRetryTimeout <= 0 || config.StreamRetryTimeout >= 600 {

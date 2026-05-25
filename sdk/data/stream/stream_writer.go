@@ -664,7 +664,7 @@ func (s *Streamer) doOverwrite(req *ExtentRequest, direct bool, poolId uint8) (t
 	// update generation first, if fails, there is no need to update
 	// remote cache.Even if the random write fails, it won't cause the
 	// remote cache to fail to cache the latest data.
-	if s.enableRemoteCache() {
+	if s.enableRemoteCache() || s.client.updateInodeMetaOnOverwrite {
 		// During LTP testing, it was observed that when performing overwrite writes,
 		// the local file size is altered by metaNode from concurrent client reads,
 		// causing the user-visible metadata to become inconsistent with the expected
