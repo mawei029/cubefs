@@ -25,7 +25,9 @@ description: 检查并改进 Go 增量测试覆盖率（针对当前未提交改
    - `target_threshold` 视为**最终验收阈值**，**不要**作为每轮的硬门槛
    - 基于初始覆盖率 + 改动复杂度计算每轮里程碑目标 `round_target[i]`，仅最终验收时使用 `target_threshold`
 3. 优先使用**最小变更包范围**生成 coverprofile，而不是默认整仓 `testcover`，除非范围确实不清晰。
+   - 只关注这些业务包目录：`client`、`client/common`、`client/fdstore`、`client/fs`、`client/gosdk`、`client/libsdk`、`datanode`、`datanode/repl`、`datanode/storage`、`lcnode`、`master`、`metanode`、`objectnode`、`remotecache/flashgroupmanager`、`remotecache/flashnode`、`remotecache/flashnode/cachengine`、`sdk/data/blobstore`、`sdk/data/manager`、`sdk/data/stream`、`sdk/data/wrapper`、`sdk/httpclient`、`sdk/master`、`sdk/meta`、`sdk/remotecache`；其他目录（如 `depends/`）不纳入 `pkgs`、`coverpkg` 或增量覆盖率分母。
 4. 调用增量覆盖率检查脚本。
+   - 除整体增量覆盖率外，每个有可执行增量行的关注目录都必须达到 `target_threshold`；单目录不达标时继续针对该目录补测。
 5. 若低于阈值，按未覆盖 changed lines 补齐 focused 测试，并在有界循环中重跑。
 6. 自动补测最多 5 轮（`round1..round5`，不含初始基线）：
    - 每轮：补测 → 重跑定向覆盖率 → 重跑校验脚本
@@ -244,11 +246,21 @@ description: 检查并改进 Go 增量测试覆盖率（针对当前未提交改
 base=<commit>
 threshold=80
 . build/cgo_env.sh
+filter_focus_go_files() {
+  while read -r f; do
+    [ -n "$f" ] || continue
+    case "$(dirname "$f")" in
+      client|client/common|client/fdstore|client/fs|client/gosdk|client/libsdk|datanode|datanode/repl|datanode/storage|lcnode|master|metanode|objectnode|remotecache/flashgroupmanager|remotecache/flashnode|remotecache/flashnode/cachengine|sdk/data/blobstore|sdk/data/manager|sdk/data/stream|sdk/data/wrapper|sdk/httpclient|sdk/master|sdk/meta|sdk/remotecache)
+        printf '%s\n' "$f"
+        ;;
+    esac
+  done
+}
 pkgs=$(
   {
     git diff --name-only "$base" -- '*.go'
     git ls-files --others --exclude-standard -- '*.go'
-  } | while read -r f; do
+  } | filter_focus_go_files | while read -r f; do
         [ -n "$f" ] || continue
         d=$(dirname "$f")
         [ "$d" = "." ] && echo "./" || echo "./$d"

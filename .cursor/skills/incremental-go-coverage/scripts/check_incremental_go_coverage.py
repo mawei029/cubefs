@@ -10,6 +10,35 @@ from pathlib import Path
 from typing import DefaultDict, Dict, List, Optional, Set, Tuple
 
 
+FOCUS_PACKAGE_DIRS = (
+    "client",
+    "client/common",
+    "client/fdstore",
+    "client/fs",
+    "client/gosdk",
+    "client/libsdk",
+    "datanode",
+    "datanode/repl",
+    "datanode/storage",
+    "lcnode",
+    "master",
+    "metanode",
+    "objectnode",
+    "remotecache/flashgroupmanager",
+    "remotecache/flashnode",
+    "remotecache/flashnode/cachengine",
+    "sdk/data/blobstore",
+    "sdk/data/manager",
+    "sdk/data/stream",
+    "sdk/data/wrapper",
+    "sdk/httpclient",
+    "sdk/master",
+    "sdk/meta",
+    "sdk/remotecache",
+)
+FOCUS_PACKAGE_DIR_SET = set(FOCUS_PACKAGE_DIRS)
+
+
 @dataclass(frozen=True)
 class CoverBlock:
     start_line: int
@@ -56,6 +85,20 @@ def normalize_path(raw: str, repo: Path, module_path: Optional[str]) -> str:
     return value
 
 
+def in_focus_package_dirs(path: str) -> bool:
+    return focus_package_dir_for_path(path) is not None
+
+
+def focus_package_dir_for_path(path: str) -> Optional[str]:
+    normalized = path.strip().lstrip("./")
+    parent = Path(normalized).parent.as_posix()
+    if parent == ".":
+        parent = ""
+    if parent in FOCUS_PACKAGE_DIR_SET:
+        return parent
+    return None
+
+
 def parse_hunk_new_lines(header: str) -> List[int]:
     plus_index = header.find("+")
     if plus_index == -1:
@@ -91,6 +134,8 @@ def collect_changed_lines_from_diff(repo: Path, base: Optional[str]) -> Dict[str
                 current_file = path
             if current_file and current_file.endswith("_test.go"):
                 current_file = None
+            if current_file and not in_focus_package_dirs(current_file):
+                current_file = None
             continue
         if line.startswith("@@") and current_file:
             changed[current_file].update(parse_hunk_new_lines(line))
@@ -104,6 +149,8 @@ def collect_untracked_go_files(repo: Path) -> Dict[str, Set[int]]:
         if not rel:
             continue
         if rel.endswith("_test.go"):
+            continue
+        if not in_focus_package_dirs(rel):
             continue
         path = repo / rel
         if not path.exists():
@@ -209,13 +256,19 @@ def main() -> int:
     uncovered_by_file: Dict[str, List[int]] = {}
     ignored_by_file: Dict[str, List[int]] = {}
     missing_profile_files: Dict[str, List[int]] = {}
+    package_relevant: DefaultDict[str, int] = defaultdict(int)
+    package_covered: DefaultDict[str, int] = defaultdict(int)
 
     for path in sorted(changed_lines):
         lines = set(changed_lines[path])
+        package_dir = focus_package_dir_for_path(path)
+        if package_dir is None:
+            continue
         blocks = cover_blocks.get(path)
         if not blocks:
             missing_profile_files[path] = sorted(lines)
             total_relevant += len(lines)
+            package_relevant[package_dir] += len(lines)
             continue
 
         relevant, covered = lines_covered_by_blocks(lines, blocks)
@@ -224,6 +277,8 @@ def main() -> int:
 
         total_relevant += len(relevant)
         total_covered += len(covered)
+        package_relevant[package_dir] += len(relevant)
+        package_covered[package_dir] += len(covered)
 
         if uncovered:
             uncovered_by_file[path] = uncovered
@@ -240,6 +295,24 @@ def main() -> int:
     if module_path:
         print(f"Module path: {module_path}")
 
+    if package_relevant:
+        print("\nIncremental Go coverage by focus package:")
+        failed_packages: List[Tuple[str, float, int, int]] = []
+        for package_dir in sorted(package_relevant):
+            relevant = package_relevant[package_dir]
+            covered = package_covered[package_dir]
+            package_coverage = 100.0 if relevant == 0 else (covered / relevant) * 100.0
+            print(f"- {package_dir}: {package_coverage:.2f}% ({covered}/{relevant})")
+            if relevant > 0 and package_coverage + 1e-9 < args.threshold:
+                failed_packages.append((package_dir, package_coverage, covered, relevant))
+    else:
+        failed_packages = []
+
+    if failed_packages:
+        print("\nFocus packages below threshold:")
+        for package_dir, package_coverage, covered, relevant in failed_packages:
+            print(f"- {package_dir}: {package_coverage:.2f}% ({covered}/{relevant}) < {args.threshold:.2f}%")
+
     if missing_profile_files:
         print("\nFiles missing from the coverprofile (counted as uncovered):")
         for path, lines in missing_profile_files.items():
@@ -255,7 +328,7 @@ def main() -> int:
         for path, lines in ignored_by_file.items():
             print(f"- {path}: {compress_lines(lines)}")
 
-    if coverage + 1e-9 < args.threshold:
+    if coverage + 1e-9 < args.threshold or failed_packages:
         return 1
     return 0
 

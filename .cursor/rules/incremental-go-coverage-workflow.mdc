@@ -21,6 +21,8 @@ alwaysApply: true
   - `incremental-coverage-autofix <valid_commit> [target_coverage]`
   - `incremental-coverage-autofix [target_coverage]`（不带 commit 时只检查未提交改动）
 - 优先走**最小变更包范围**的 `go test -coverprofile`，不要默认整仓 `bash build/build.sh testcover`。
+- `icover` 只关注这些业务包目录：`client`、`client/common`、`client/fdstore`、`client/fs`、`client/gosdk`、`client/libsdk`、`datanode`、`datanode/repl`、`datanode/storage`、`lcnode`、`master`、`metanode`、`objectnode`、`remotecache/flashgroupmanager`、`remotecache/flashnode`、`remotecache/flashnode/cachengine`、`sdk/data/blobstore`、`sdk/data/manager`、`sdk/data/stream`、`sdk/data/wrapper`、`sdk/httpclient`、`sdk/master`、`sdk/meta`、`sdk/remotecache`；其他目录不纳入测试包、coverpkg 或增量覆盖率分母。
+- 每个有可执行增量行的关注目录都必须达到 `target_coverage`；整体达标但单个关注目录不达标时，仍继续补测该目录。
 - 用 `.cursor/skills/incremental-go-coverage/scripts/check_incremental_go_coverage.py` 做 changed-line 覆盖率计算。
 - 低于阈值时，优先补已有 `_test.go` 中的 focused tests，再重新执行覆盖率校验。
 - 自动补测分两阶段：

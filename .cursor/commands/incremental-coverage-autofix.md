@@ -51,8 +51,10 @@ description: 自动补齐测试用例并校验 Go 增量覆盖率（别名 /icov
    - 达标判断以 `target_coverage` 为准（默认 `80`）
    - 不再将固定 `target+20` 作为最终硬门槛
 3. 优先按**最小变更包范围**生成 `coverage.txt`，不要默认整仓 `bash build/build.sh testcover`
+   - 只关注以下业务目录，其他 Go 改动忽略：`client`、`client/common`、`client/fdstore`、`client/fs`、`client/gosdk`、`client/libsdk`、`datanode`、`datanode/repl`、`datanode/storage`、`lcnode`、`master`、`metanode`、`objectnode`、`remotecache/flashgroupmanager`、`remotecache/flashnode`、`remotecache/flashnode/cachengine`、`sdk/data/blobstore`、`sdk/data/manager`、`sdk/data/stream`、`sdk/data/wrapper`、`sdk/httpclient`、`sdk/master`、`sdk/meta`、`sdk/remotecache`
 4. 用现有脚本检查增量覆盖率：
    - `python3 .cursor/skills/incremental-go-coverage/scripts/check_incremental_go_coverage.py ...`
+   - 除整体增量覆盖率外，每个有可执行增量行的关注目录也必须达到 `target_coverage`，否则继续补测该目录
 5. 如果低于目标阈值：
    - 根据未覆盖 changed lines 补测试
    - 优先追加到已有 `_test.go`，不要无意义拆很多新测试文件
@@ -137,6 +139,17 @@ if ! [[ "$threshold" =~ ^([0-9]|[1-9][0-9]|100)(\.[0-9]+)?$ ]]; then
   exit 2
 fi
 
+filter_focus_go_files() {
+  while read -r f; do
+    [ -n "$f" ] || continue
+    case "$(dirname "$f")" in
+      client|client/common|client/fdstore|client/fs|client/gosdk|client/libsdk|datanode|datanode/repl|datanode/storage|lcnode|master|metanode|objectnode|remotecache/flashgroupmanager|remotecache/flashnode|remotecache/flashnode/cachengine|sdk/data/blobstore|sdk/data/manager|sdk/data/stream|sdk/data/wrapper|sdk/httpclient|sdk/master|sdk/meta|sdk/remotecache)
+        printf '%s\n' "$f"
+        ;;
+    esac
+  done
+}
+
 if [ -n "$base" ]; then
   if ! git rev-parse --verify "$base" >/dev/null 2>&1; then
     echo "ERROR: invalid base commit: $base"
@@ -145,13 +158,13 @@ if [ -n "$base" ]; then
     echo "  incremental-coverage-autofix [target_coverage]"
     exit 2
   fi
-  changed_go_files=$(git diff --name-only "$base" -- '*.go')
+  changed_go_files=$(git diff --name-only "$base" -- '*.go' | filter_focus_go_files)
 else
   changed_go_files=$(
     {
       git diff --name-only HEAD -- '*.go'
       git ls-files --others --exclude-standard -- '*.go'
-    }
+    } | filter_focus_go_files
   )
 fi
 
