@@ -788,9 +788,10 @@ func (s *Server) LoadFuseContext(fs FS, sockaddr string) error {
 
 		if cnVersion == ContextNodeVersionV1 {
 			cn := ContextNodeFromBytes(data)
-			sn := &serveNode{inode: cn.Inode, generation: cn.Generation, refs: cn.Refs}
+			sn := newServeNode(cn.Inode, cn.Generation, nil, cn.Refs)
 			if sn.node, err = fs.Node(cn.Inode, cn.ParentIno, cn.Mode); err != nil {
-				err = fmt.Errorf("LoadFuseContext: failed to get fs.Node of %v: %v\n", sn.inode, err)
+				releaseServeNode(sn)
+				err = fmt.Errorf("LoadFuseContext: failed to get fs.Node of %v: %v\n", cn.Inode, err)
 				return err
 			}
 
@@ -914,12 +915,7 @@ func (s *Server) Serve(fs FS, opt *proto.MountOptions) error {
 	// Recognize the root node if it's ever returned from Lookup,
 	// passed to Invalidate, etc.
 	s.nodeRef[root] = 1
-	s.node = append(s.node, nil, &serveNode{
-		inode:      1,
-		generation: s.nodeGen,
-		node:       root,
-		refs:       1,
-	})
+	s.node = append(s.node, nil, newServeNode(1, s.nodeGen, root, 1))
 	s.handle = append(s.handle, nil)
 
 	if err = s.TryRestore(fs); err != nil {
@@ -1037,6 +1033,51 @@ type serveNode struct {
 	wg sync.WaitGroup
 }
 
+var serveNodePool = sync.Pool{
+	New: func() interface{} {
+		return new(serveNode)
+	},
+}
+
+func newServeNode(inode, generation uint64, node Node, refs uint64) *serveNode {
+	sn := serveNodePool.Get().(*serveNode)
+	sn.inode = inode
+	sn.generation = generation
+	sn.node = node
+	sn.refs = refs
+	return sn
+}
+
+func releaseServeNode(sn *serveNode) {
+	if sn == nil {
+		return
+	}
+	if sn.refs != 0 {
+		return
+	}
+	// Keep the WaitGroup object itself; dropNode has already waited for it.
+	// Clear only reusable metadata and user node references before pooling.
+	sn.inode = 0
+	sn.generation = 0
+	sn.node = nil
+	sn.refs = 0
+	serveNodePool.Put(sn)
+}
+
+func (c *Server) pinNode(id fuse.NodeID) (Node, *serveNode, bool) {
+	c.meta.RLock()
+	defer c.meta.RUnlock()
+	if id >= fuse.NodeID(len(c.node)) {
+		return nil, nil, false
+	}
+	sn := c.node[uint(id)]
+	if sn == nil {
+		return nil, nil, false
+	}
+	sn.wg.Add(1)
+	return sn.node, sn, true
+}
+
 func (sn *serveNode) attr(ctx context.Context, attr *fuse.Attr) error {
 	err := nodeAttr(ctx, sn.node, attr)
 	if attr.Inode == 0 {
@@ -1067,7 +1108,7 @@ func (c *Server) saveNode(inode uint64, node Node) (id fuse.NodeID, gen uint64) 
 		return id, sn.generation
 	}
 
-	sn := &serveNode{inode: inode, node: node, refs: 1}
+	sn := newServeNode(inode, 0, node, 1)
 	if n := len(c.freeNode); n > 0 {
 		id = c.freeNode[n-1]
 		c.freeNode = c.freeNode[:n-1]
@@ -1109,7 +1150,11 @@ func (n *nodeRefcountDropBug) String() string {
 
 func (c *Server) dropNode(id fuse.NodeID, n uint64) (forget bool) {
 	c.meta.Lock()
-	defer c.meta.Unlock()
+	if id >= fuse.NodeID(len(c.node)) {
+		c.meta.Unlock()
+		c.debug(nodeRefcountDropBug{N: n, Node: id})
+		return true
+	}
 	snode := c.node[id]
 
 	if snode == nil {
@@ -1120,6 +1165,7 @@ func (c *Server) dropNode(id fuse.NodeID, n uint64) (forget bool) {
 
 		// we may end up triggering Forget twice, but that's better
 		// than not even once, and that's the best we can do
+		c.meta.Unlock()
 		return true
 	}
 
@@ -1130,12 +1176,15 @@ func (c *Server) dropNode(id fuse.NodeID, n uint64) (forget bool) {
 
 	snode.refs -= n
 	if snode.refs == 0 {
-		snode.wg.Wait()
 		c.node[id] = nil
 		delete(c.nodeRef, snode.node)
 		c.freeNode = append(c.freeNode, id)
+		c.meta.Unlock()
+		snode.wg.Wait()
+		releaseServeNode(snode)
 		return true
 	}
+	c.meta.Unlock()
 	return false
 }
 
@@ -1368,6 +1417,9 @@ func (c *Server) serve(r fuse.Request) {
 	if ok {
 		return
 	}
+	if snode != nil {
+		defer snode.wg.Done()
+	}
 	done := c.done(req, hdr)
 
 	var responded bool
@@ -1476,12 +1528,24 @@ func (c *Server) checkNode(r fuse.Request, req *serveRequest) (Node, *serveNode,
 
 	hdr := r.Hdr()
 	if id := hdr.Node; id != 0 {
-		c.meta.RLock()
-		if id < fuse.NodeID(len(c.node)) {
-			snode = c.node[uint(id)]
+		if _, isForget := r.(*fuse.ForgetRequest); isForget {
+			c.meta.RLock()
+			if id < fuse.NodeID(len(c.node)) {
+				snode = c.node[uint(id)]
+			}
+			if snode != nil {
+				node = snode.node
+			}
+			c.meta.RUnlock()
+			snode = nil
+		} else {
+			var ok bool
+			node, snode, ok = c.pinNode(id)
+			if !ok {
+				snode = nil
+			}
 		}
-		c.meta.RUnlock()
-		if snode == nil {
+		if node == nil {
 			c.debug(response{
 				Op:      opName(r),
 				Request: logResponseHeader{ID: hdr.ID},
@@ -1496,7 +1560,6 @@ func (c *Server) checkNode(r fuse.Request, req *serveRequest) (Node, *serveNode,
 			r.RespondError(fuse.ESTALE)
 			return nil, nil, nil, true
 		}
-		node = snode.node
 	}
 
 	// c.meta.Lock()
@@ -1548,6 +1611,9 @@ func (c *Server) serveWithTimeOut(r fuse.Request, requestTimeout int64) {
 	done := c.done(req, hdr)
 
 	go func() {
+		if snode != nil {
+			defer snode.wg.Done()
+		}
 		defer func() {
 			if rec := recover(); rec != nil {
 				const size = 1 << 16
@@ -1686,20 +1752,16 @@ func (c *Server) handleRequest(ctx context.Context, node Node, snode *serveNode,
 		if !ok {
 			return fuse.EIO /// XXX or EPERM?
 		}
-		c.meta.Lock()
-		var oldNode *serveNode
-		if int(r.OldNode) < len(c.node) {
-			oldNode = c.node[r.OldNode]
-		}
-		c.meta.Unlock()
-		if oldNode == nil {
+		oldNode, oldSNode, ok := c.pinNode(r.OldNode)
+		if !ok {
 			c.debug(logLinkRequestOldNodeNotFound{
 				Request: r.Hdr(),
 				In:      r,
 			})
 			return fuse.EIO
 		}
-		n2, err := n.Link(ctx, r, oldNode.node)
+		defer oldSNode.wg.Done()
+		n2, err := n.Link(ctx, r, oldNode)
 		if err != nil {
 			return err
 		}
@@ -2037,24 +2099,20 @@ func (c *Server) handleRequest(ctx context.Context, node Node, snode *serveNode,
 		return nil
 
 	case *fuse.RenameRequest:
-		c.meta.Lock()
-		var newDirNode *serveNode
-		if int(r.NewDir) < len(c.node) {
-			newDirNode = c.node[r.NewDir]
-		}
-		c.meta.Unlock()
-		if newDirNode == nil {
+		newDirNode, newDirSNode, ok := c.pinNode(r.NewDir)
+		if !ok {
 			c.debug(renameNewDirNodeNotFound{
 				Request: r.Hdr(),
 				In:      r,
 			})
 			return fuse.EIO
 		}
+		defer newDirSNode.wg.Done()
 		n, ok := node.(NodeRenamer)
 		if !ok {
 			return fuse.EIO // XXX or EPERM like Mkdir?
 		}
-		err := n.Rename(ctx, r, newDirNode.node)
+		err := n.Rename(ctx, r, newDirNode)
 		if err != nil {
 			return err
 		}
