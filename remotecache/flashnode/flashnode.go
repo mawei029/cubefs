@@ -181,6 +181,8 @@ type FlashNode struct {
 	lowerHitRate float64
 	enableTmpfs  bool
 
+	Hits              uint64
+	Misses            uint64
 	connectionLimit   int64
 	activeConnections int64
 

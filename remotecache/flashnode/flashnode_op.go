@@ -285,6 +285,7 @@ func (f *FlashNode) opCacheRead(conn net.Conn, p *proto.Packet) (err error) {
 
 	defer func() {
 		if err != nil {
+			atomic.AddUint64(&f.Misses, 1)
 			if !proto.IsFlashNodeLimitError(err) {
 				log.LogWarnf("action[opCacheRead] volume:[%s], logMsg:%s", volume,
 					p.LogMessage(p.GetOpMsg(), conn.RemoteAddr().String(), p.StartT, err))
@@ -293,6 +294,8 @@ func (f *FlashNode) opCacheRead(conn net.Conn, p *proto.Packet) (err error) {
 			if e := p.WriteToConn(conn); e != nil {
 				log.LogErrorf("action[opCacheRead] write to conn %v", e)
 			}
+		} else {
+			atomic.AddUint64(&f.Hits, 1)
 		}
 	}()
 
@@ -669,6 +672,7 @@ func (f *FlashNode) smallObjectGet(req *proto.BatchReadItem, connAddr string, de
 	}
 	defer func() {
 		if err != nil {
+			atomic.AddUint64(&f.Misses, 1)
 			if proto.IsFlashNodeLimitError(err) || proto.IsCacheMissError(err) {
 				if log.EnableDebug() {
 					log.LogDebugf("action[smallObjectGet] req(%s) remoteAddr(%s) deadLine(%d) err:%v", req.String(), connAddr, deadLine, err)
@@ -678,6 +682,8 @@ func (f *FlashNode) smallObjectGet(req *proto.BatchReadItem, connAddr string, de
 			}
 			result.ResultCode = uint32(proto.OpErr)
 			result.Data = ([]byte)(err.Error())
+		} else {
+			atomic.AddUint64(&f.Hits, 1)
 		}
 		stat.EndStat("FlashNode:smallObjectGet", err, bgTime, 1)
 	}()
@@ -760,6 +766,7 @@ func (f *FlashNode) opCacheObjectGet(conn net.Conn, p *proto.Packet) (err error)
 	reqID := string(p.Arg)
 	defer func() {
 		if err != nil {
+			atomic.AddUint64(&f.Misses, 1)
 			if proto.IsFlashNodeLimitError(err) || proto.IsCacheMissError(err) {
 				if log.EnableDebug() {
 					log.LogDebugf("action[opCacheObjectGet]reqID[%v] key:[%s], logMsg:%s", reqID, uniKey,
@@ -773,6 +780,8 @@ func (f *FlashNode) opCacheObjectGet(conn net.Conn, p *proto.Packet) (err error)
 			if e := p.WriteToConn(conn); e != nil {
 				log.LogWarnf("action[opCacheObjectGet] reqID[%v] key:[%s] write to conn %v", reqID, uniKey, e)
 			}
+		} else {
+			atomic.AddUint64(&f.Hits, 1)
 		}
 	}()
 	req := new(proto.CacheReadRequestBase)

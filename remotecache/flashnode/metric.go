@@ -22,6 +22,7 @@ const (
 	MetricFlashNodeWriteBytes          = "flashNodeWriteBytes"
 	MetricFlashNodeWriteCount          = "flashNodeWriteCount"
 	MetricFlashNodeHitRate             = "flashNodeHitRate"
+	MetricFlashNodeDataHitRate         = "flashNodeDataHitRate"
 	MetricFlashNodeEvictCount          = "flashNodeEvictCount"
 	MetricFlashNodeCacheErrorCount     = "flashNodeCacheErrorCount"
 	MetricFlashNodeCacheBytes          = "flashNodeCacheBytes"
@@ -55,6 +56,7 @@ type FlashNodeMetrics struct {
 	MetricEvictCount          *exporter.Gauge
 	MetricCacheErrorCount     *exporter.Gauge
 	MetricHitRate             *exporter.Gauge
+	MetricDataHitRate         *exporter.Gauge
 	MetricCacheBytes          *exporter.Gauge
 	MetricHandleReadLatency   *exporter.Gauge
 	MetricSourceDataLatency   *exporter.Gauge
@@ -88,6 +90,7 @@ func (f *FlashNode) registerMetrics(disks []*cachengine.Disk) {
 	f.metrics.MetricEvictCount = exporter.NewGauge(MetricFlashNodeEvictCount)
 	f.metrics.MetricCacheErrorCount = exporter.NewGauge(MetricFlashNodeCacheErrorCount)
 	f.metrics.MetricHitRate = exporter.NewGauge(MetricFlashNodeHitRate)
+	f.metrics.MetricDataHitRate = exporter.NewGauge(MetricFlashNodeDataHitRate)
 	f.metrics.MetricCacheBytes = exporter.NewGauge(MetricFlashNodeCacheBytes)
 	f.metrics.MetricHandleReadLatency = exporter.NewGauge(MetricFlashNodeHandleReadLatency)
 	f.metrics.MetricSourceDataLatency = exporter.NewGauge(MetricFlashNodeSourceDataLatency)
@@ -141,6 +144,7 @@ func (fm *FlashNodeMetrics) doStat() {
 	fm.setEvictCountMetric()
 	fm.setCacheErrorCountMetric()
 	fm.setHitRateMetric()
+	fm.setDataHitRateMetric()
 	fm.setCacheBytesMetric()
 	fm.setLatencyMetric()
 	fm.setLimitedCountMetric()
@@ -217,6 +221,16 @@ func (fm *FlashNodeMetrics) setHitRateMetric() {
 	for dataPath, hitRate := range hitRateMap {
 		fm.MetricHitRate.SetWithLabels(hitRate, fm.labelsWithDisk(dataPath))
 	}
+}
+
+func (fm *FlashNodeMetrics) setDataHitRateMetric() {
+	hits := atomic.SwapUint64(&fm.flashNode.Hits, 1)
+	misses := atomic.SwapUint64(&fm.flashNode.Misses, 0)
+	if hits == 0 && misses == 0 {
+		hits = 1
+	}
+	hitRate := float64(hits) / float64(hits+misses)
+	fm.MetricDataHitRate.SetWithLabels(math.Trunc(hitRate*1e4+0.5)*1e-4, fm.baseLabels())
 }
 
 func (fm *FlashNodeMetrics) setCacheBytesMetric() {
