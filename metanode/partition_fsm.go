@@ -359,13 +359,9 @@ func (mp *metaPartition) Apply(command []byte, index uint64) (resp interface{}, 
 	case opFSMInternalDelExtentCursor:
 		err = mp.setExtentDeleteFileCursor(msg.V)
 	case opFSMObjExtentGcDequeue:
-		if mp.objExtentDelTree != nil {
-			err = mp.objExtentDelTree.ApplyDequeuePayload(msg.V)
-		}
+		err = mp.objExtentDelTree.ApplyDequeuePayload(msg.V)
 	case opFSMObjExtentGcPunishRequeue:
-		if mp.objExtentDelTree != nil {
-			err = mp.objExtentDelTree.ApplyPunishPayload(msg.V, index)
-		}
+		err = mp.objExtentDelTree.ApplyPunishPayload(msg.V, index)
 	case opFSMSetXAttr:
 		var extend *Extend
 		if extend, err = NewExtendFromBytes(msg.V); err != nil {

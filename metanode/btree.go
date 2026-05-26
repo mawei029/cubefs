@@ -132,7 +132,7 @@ type Tree interface {
 type ObjExtentDelTree interface {
 	Len() int
 	EnqueueFromApply(inode uint64, modifyTimeSec int64, raftApplyIndex uint64, oeks []proto.ObjExtentKey)
-	PeekFirstN(n int) []*objExtentDelItem
+	PeekFirstN(n int) batchObjExtentDelItems
 	ApplyDequeuePayload(val []byte) error
 	ApplyPunishPayload(val []byte, applyIndex uint64) error
 }

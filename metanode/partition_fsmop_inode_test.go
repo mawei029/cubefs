@@ -957,11 +957,11 @@ func TestFsmExtentsTruncateV2(t *testing.T) {
 	require.NotNil(t, mp.objExtentDelTree)
 	require.Equal(t, 1, mp.objExtentDelTree.Len())
 	items := mp.objExtentDelTree.PeekFirstN(1)
-	require.Len(t, items, 1)
-	require.Equal(t, int64(mp.fsmRaftApplyIndex), items[0].TsMs)
-	require.Equal(t, mp.fsmRaftApplyIndex<<20, items[0].Uniq)
-	require.Len(t, items[0].Oeks, 1)
-	require.True(t, items[0].Oeks[0].IsEquals(&toDeletes[0]))
+	require.Len(t, items.Items, 1)
+	require.Equal(t, int64(mp.fsmRaftApplyIndex), items.Items[0].TsMs)
+	require.Equal(t, mp.fsmRaftApplyIndex, items.Items[0].RaftIdx)
+	require.Len(t, items.Items[0].Oeks, 1)
+	require.True(t, items.Items[0].Oeks[0].IsEquals(&toDeletes[0]))
 }
 
 func TestFsmExtentsTruncateV2_Errors(t *testing.T) {

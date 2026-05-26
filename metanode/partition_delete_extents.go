@@ -489,7 +489,7 @@ const (
 	objExtentDelGcPenaltyMs = int64(60_000)
 )
 
-// startObjExtentDelTreeGC runs periodic leader-side EBS deletes for discard ObjExtentKeys held in objExtentDelTree.
+// startObjExtentDelTreeGC runs a background worker (like deleteWorker) that drains objExtentDelTree on the leader.
 func (mp *metaPartition) startObjExtentDelTreeGC() {
 	go func() {
 		defer func() {
@@ -497,64 +497,112 @@ func (mp *metaPartition) startObjExtentDelTreeGC() {
 				log.LogErrorf("[startObjExtentDelTreeGC] mp(%v) panic: %v", mp.config.PartitionId, r)
 			}
 		}()
-		ticker := time.NewTicker(time.Minute)
-		defer ticker.Stop()
+
 		for {
 			select {
 			case <-mp.stopC:
 				return
-			case <-ticker.C:
-				mp.runObjExtentDelTreeGCOnce()
+			default:
 			}
+			mp.runObjExtentDelTreeGCWorker()
 		}
 	}()
 }
 
-func (mp *metaPartition) runObjExtentDelTreeGCOnce() {
+// runObjExtentDelTreeGCWorker loops runObjExtentDelTreeGCOnce until the pending tree is empty, then sleeps when idle.
+func (mp *metaPartition) runObjExtentDelTreeGCWorker() {
+	if mp.objExtentDelTree == nil || mp.raftPartition == nil {
+		time.Sleep(AsyncDeleteInterval)
+		return
+	}
+	if _, ok := mp.IsLeader(); !ok {
+		time.Sleep(AsyncDeleteInterval)
+		return
+	}
+	if mp.raftPartition.Status().RestoringSnapshot {
+		time.Sleep(AsyncDeleteInterval)
+		return
+	}
+	if mp.objExtentDelTree.Len() == 0 {
+		time.Sleep(time.Minute)
+		return
+	}
+
+	for mp.objExtentDelTree.Len() > 0 {
+		select {
+		case <-mp.stopC:
+			return
+		default:
+		}
+		if _, ok := mp.IsLeader(); !ok {
+			return
+		}
+		// Prevent busy-waiting/spin-waiting/busy-looping
+		// No dequeue progress (EBS/punish failure, encode/submit error): backoff to avoid a tight loop.
+		if err := mp.runObjExtentDelTreeGCOnce(); err != nil {
+			time.Sleep(AsyncDeleteInterval)
+		}
+	}
+}
+
+func (mp *metaPartition) runObjExtentDelTreeGCOnce() (err error) {
 	if mp.objExtentDelTree == nil || mp.raftPartition == nil {
 		return
 	}
+
 	status := mp.raftPartition.Status()
 	if status.RestoringSnapshot {
 		return
 	}
+
 	if _, ok := mp.IsLeader(); !ok {
 		return
 	}
+
 	if mp.objExtentDelTree.Len() == 0 {
 		return
 	}
+
 	items := mp.objExtentDelTree.PeekFirstN(objExtentDelTreeGcBatch)
-	if len(items) == 0 {
+	if len(items.Items) == 0 {
 		return
 	}
+
 	nKeys := 0
-	for _, it := range items {
+	for _, it := range items.Items {
 		nKeys += len(it.Oeks)
 	}
+
 	oeks := make([]proto.ObjExtentKey, 0, nKeys)
-	for _, it := range items {
+	for _, it := range items.Items {
 		oeks = append(oeks, it.Oeks...)
 	}
-	if err := mp.deleteObjExtents(oeks); err != nil {
+
+	if err = mp.deleteObjExtents(oeks); err != nil {
 		log.LogWarnf("[runObjExtentDelTreeGCOnce] mp(%v) delete ebs failed cnt(%v): %v", mp.config.PartitionId, len(oeks), err)
 		newTs := time.Now().UnixMilli() + objExtentDelGcPenaltyMs
-		payload, encErr := encodeObjExtentGcPunish(items, newTs)
+		payload, encErr := items.MarshalPunish(newTs)
 		if encErr != nil {
 			log.LogErrorf("[runObjExtentDelTreeGCOnce] mp(%v) encode punish: %v", mp.config.PartitionId, encErr)
-			return
+			return encErr
 		}
-		if _, submitErr := mp.submit(opFSMObjExtentGcPunishRequeue, payload); submitErr != nil {
-			log.LogErrorf("[runObjExtentDelTreeGCOnce] mp(%v) submit punish: %v", mp.config.PartitionId, submitErr)
+
+		if _, err = mp.submit(opFSMObjExtentGcPunishRequeue, payload); err != nil {
+			log.LogErrorf("[runObjExtentDelTreeGCOnce] mp(%v) submit punish: %v", mp.config.PartitionId, err)
 		}
-		return
+		return err
 	}
-	payload, err := encodeObjExtentGcDequeueKeys(items)
-	if err != nil {
-		log.LogErrorf("[runObjExtentDelTreeGCOnce] mp(%v) encode dequeue: %v", mp.config.PartitionId, err)
-		return
+
+	payload, encErr := items.MarshalDequeue()
+	if encErr != nil {
+		log.LogErrorf("[runObjExtentDelTreeGCOnce] mp(%v) encode dequeue: %v", mp.config.PartitionId, encErr)
+		return encErr
 	}
+
 	if _, err = mp.submit(opFSMObjExtentGcDequeue, payload); err != nil {
 		log.LogErrorf("[runObjExtentDelTreeGCOnce] mp(%v) submit dequeue: %v", mp.config.PartitionId, err)
+		return err
 	}
+
+	return nil
 }
