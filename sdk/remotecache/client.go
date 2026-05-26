@@ -774,6 +774,10 @@ func (rc *RemoteCacheClient) Delete(ctx context.Context, key string) (err error)
 }
 
 func (rc *RemoteCacheClient) Put(ctx context.Context, reqId, key string, r io.Reader, length int64) (err error) {
+	return rc.WarmUp(ctx, reqId, key, r, length, rc.TTL)
+}
+
+func (rc *RemoteCacheClient) WarmUp(ctx context.Context, reqId, key string, r io.Reader, length, ttl int64) (err error) {
 	if length <= 0 || length > proto.CACHE_OBJECT_BLOCK_SIZE {
 		log.LogWarnf("put data length %v is leq 0 or gt 4M", length)
 		return fmt.Errorf(proto.ErrorPutDataLengthInvalidTpl, length)
@@ -809,7 +813,7 @@ func (rc *RemoteCacheClient) Put(ctx context.Context, reqId, key string, r io.Re
 	req := &proto.PutBlockHead{
 		UniKey:   key,
 		BlockLen: length,
-		TTL:      uint64(rc.TTL),
+		TTL:      uint64(ttl),
 	}
 	reqPacket := proto.NewPacketReqID()
 	if len(reqId) == 0 {
