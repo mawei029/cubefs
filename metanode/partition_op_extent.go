@@ -660,7 +660,7 @@ func (mp *metaPartition) ExtentsTruncate(req *ExtentsTruncateReq, p *Packet, rem
 	return
 }
 
-// extentsTruncateV2 handles EC TruncateV2: only update inode.Size and ObjExtents, and do not push to objExtDelCh (client already removed EBS data).
+// extentsTruncateV2 handles EC TruncateV2: submit FSM to merge extent deltas and enqueue discarded oeks to objExtentDelTree (client already updated EBS).
 func (mp *metaPartition) extentsTruncateV2(req *ExtentsTruncateReq, p *Packet) (err error) {
 	ino := NewInode(req.Inode, proto.Mode(os.ModePerm))
 	i, err := mp.inodeTree.CopyGet(ino)
@@ -685,6 +685,7 @@ func (mp *metaPartition) extentsTruncateV2(req *ExtentsTruncateReq, p *Packet) (
 		p.PacketErrorWithBody(status, []byte(err.Error()))
 		return
 	}
+
 	reqData, err := json.Marshal(req)
 	if err != nil {
 		log.LogErrorf("extentsTruncateV2: marshal req err(%v)", err)
@@ -812,20 +813,20 @@ func (mp *metaPartition) BatchObjExtentAppendWithCheck(req *proto.AppendObjExten
 	// can only be called when write into ebs
 	inoParm.StorageClass = proto.StorageClass_BlobStore
 	objExtents := req.Extents
-	discards := req.DiscardExtents
+	discard := req.DiscardExtent
 
-	if len(objExtents) == 0 || len(objExtents) != len(discards) {
+	if len(objExtents) != 1 {
 		err = errors.New("BatchObjExtentAppendWithCheck: extents is empty, or not match")
-		log.LogErrorf("BatchObjExtentAppendWithCheck fail, ino(%v) extents(%v) discards(%v) err [%v]", req.Inode, len(objExtents), len(discards), err)
+		log.LogErrorf("BatchObjExtentAppendWithCheck fail, ino(%v) extents(%v) discards(%v) err [%v]", req.Inode, objExtents, discard, err)
 		p.PacketErrorWithBody(proto.OpArgMismatchErr, []byte(err.Error()))
 		return
 	}
 
 	// Prepare FSM input: [new1, discard1, new2, discard2, ...] for batch apply
-	extents := make([]proto.ObjExtentKey, 0, len(objExtents)*2)
-	for i := range objExtents {
-		extents = append(extents, objExtents[i])
-		extents = append(extents, discards[i])
+	extents := make([]proto.ObjExtentKey, 0, 2)
+	extents = append(extents, objExtents[0])
+	if !discard.IsEmpty() {
+		extents = append(extents, discard)
 	}
 
 	inoParm.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks(extents)
@@ -842,8 +843,8 @@ func (mp *metaPartition) BatchObjExtentAppendWithCheck(req *proto.AppendObjExten
 		return
 	}
 
-	log.LogDebugf("BatchObjExtentAppendWithCheck: ino(%v) mp[%v] extentsCount(%v) discardsCount(%v) rspcode(%v)",
-		req.Inode, req.PartitionID, len(objExtents), len(discards), resp.(uint8))
+	log.LogDebugf("BatchObjExtentAppendWithCheck: ino(%v) mp[%v] extents(%v) discard(%v) rspcode(%v)",
+		req.Inode, req.PartitionID, objExtents, discard, resp.(uint8))
 	p.PacketErrorWithBody(resp.(uint8), nil)
 	return
 }

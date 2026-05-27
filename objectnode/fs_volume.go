@@ -3219,7 +3219,7 @@ func NewVolume(config *VolumeConfig) (*Volume, error) {
 	return v, nil
 }
 
-// buildECStreamOpenArgs 组装 EC 流打开参数（对齐 client/fs openOECStream → OpenStreamWithArgs）。
+// buildECStreamOpenArgs builds EC stream open args (aligned with client/fs openOECStream → OpenStreamWithArgs).
 func (v *Volume) buildECStreamOpenArgs(ino uint64, poolId uint8, fileSize, inoGen uint64) blobstore.ECStreamOpenArgs {
 	return blobstore.ECStreamOpenArgs{
 		Ino:             ino,

@@ -218,6 +218,7 @@ func (ebs *BlobStoreClient) Delete(oeks []proto.ObjExtentKey) (err error) {
 	elapsed := time.Since(start)
 	_, err = ebs.client.Delete(ctx, &access.DeleteArgs{Locations: locs})
 	if err != nil {
+		// call ebs-access delete, just send delete msg to kafka, so we don't need to check the error code(CodeBidNotFound/CodeShardMarkDeleted)
 		log.LogErrorf("[EbsDelete] Ebs delete error, id(%v), consume(%v)ns, err(%v)", requestId, elapsed.Nanoseconds(), err.Error())
 		return err
 	}
@@ -400,12 +401,12 @@ func (ebs *BlobStoreClient) Get(ctx context.Context, volName string, offset uint
 
 // TruncateV2Extents truncates ObjExtentKey list by target size, reusing overwrite flow ComputeTruncateReqs + ApplyTruncateReqs:
 // keep extents fully before targetSize, delete-only extents fully after it, and for partial overlap do read -> trim -> write new -> delete old.
-// Return the truncated ObjExtentKey list for meta TruncateV2.
+// Returns deltas for meta TruncateV2: at most one NewObjExtent and one ToDelete anchor (first tail extent).
 func (ebs *BlobStoreClient) TruncateV2Extents(ctx context.Context, volName string, objExtentKeys []proto.ObjExtentKey, targetSize uint64,
-) (newObjExtents []proto.ObjExtentKey, toDelete []proto.ObjExtentKey, err error) {
+) (newObjExtent proto.ObjExtentKey, toDeleteFrom proto.ObjExtentKey, err error) {
 	log.LogDebugf("TruncateV2Extents: volName(%v) objExtentKeys(%v) targetSize(%v)", volName, objExtentKeys, targetSize)
 	if len(objExtentKeys) == 0 {
-		return nil, nil, nil
+		return proto.ObjExtentKey{}, proto.ObjExtentKey{}, nil
 	}
 
 	req := ComputeTruncateReqs(targetSize, objExtentKeys)
@@ -419,69 +420,64 @@ func ComputeTruncateReqs(targetSize uint64, objExtents []proto.ObjExtentKey) tru
 	copy(eks, objExtents)
 	sort.Slice(eks, func(i, j int) bool { return eks[i].FileOffset < eks[j].FileOffset })
 
-	var keep []proto.ObjExtentKey
-	var overwriteReqs []overwriteReq
-	var discardOnly []proto.ObjExtentKey
+	var partialKeep, discardFrom proto.ObjExtentKey
 	for _, oek := range eks {
 		end := oek.FileOffset + oek.Size
+		// all keep extents
 		if end <= targetSize {
-			keep = append(keep, oek)
 			continue
 		}
+		// all delete extents
 		if oek.FileOffset >= targetSize {
-			discardOnly = append(discardOnly, oek)
-			continue
+			if discardFrom.IsEmpty() {
+				discardFrom = oek
+			}
+			break
 		}
+		// partial keep extent, keep some part and new write it, discard all old extent
 		keepSize := targetSize - oek.FileOffset
-		overwriteReqs = append(overwriteReqs, overwriteReq{
-			NewExtent:     proto.ObjExtentKey{FileOffset: oek.FileOffset, Size: keepSize},
-			DiscardExtent: oek,
-		})
+		partialKeep = proto.ObjExtentKey{FileOffset: oek.FileOffset, Size: keepSize}
+		discardFrom = oek
+		break
 	}
-	return truncateReq{KeepExtents: keep, OverwriteReqs: overwriteReqs, DiscardOnly: discardOnly}
+	return truncateReq{KeepExtent: partialKeep, DiscardFrom: discardFrom}
 }
 
-// ApplyTruncateReqs executes TruncateReq: for each overwriteReq, read old extent, trim, write new blob, and collect new keys;
-// then delete all discarded extents (DiscardExtent in OverwriteReq plus DiscardOnly).
-// Return kept extents plus newly written extents for meta TruncateV2.
+// ApplyTruncateReqs executes TruncateReq: optional single overwriteReq (read old -> trim -> write new),
+// then returns meta deltas (NewObjExtent, ToDelete anchor). EBS discard of tail extents is handled by the caller hook.
 func (ebs *BlobStoreClient) ApplyTruncateReqs(ctx context.Context, volName string, req truncateReq,
-) (newObjExtents []proto.ObjExtentKey, toDelete []proto.ObjExtentKey, err error) {
-	newObjExtents = make([]proto.ObjExtentKey, 0, len(req.KeepExtents)+len(req.OverwriteReqs))
-	newObjExtents = append(newObjExtents, req.KeepExtents...)
-	toDelete = make([]proto.ObjExtentKey, 0, len(req.DiscardOnly)+len(req.OverwriteReqs))
-	toDelete = append(toDelete, req.DiscardOnly...)
-
-	// TODO: next version, at most one OverwriteReqs entry
-	for _, r := range req.OverwriteReqs {
-		discard := r.DiscardExtent
-		if discard.Size == 0 {
-			continue
-		}
-		toDelete = append(toDelete, discard)
-
-		buf := make([]byte, discard.Size)
-		readN, err := ebs.Read(ctx, volName, buf, 0, discard.Size, discard)
-		if err != nil {
-			log.LogErrorf("ApplyTruncateReqs: read extent (%v) err(%v)", discard, err)
-			return nil, nil, err
-		}
-		if uint64(readN) != discard.Size {
-			log.LogWarnf("ApplyTruncateReqs: read short extent(%v) readN(%v)", discard, readN)
-		}
-		truncated := buf[:r.NewExtent.Size]
-		newOeks, _, err := ebs.Put(ctx, volName, bytes.NewReader(truncated), uint64(len(truncated)))
-		if err != nil {
-			log.LogErrorf("ApplyTruncateReqs: put truncated err(%v)", err)
-			return nil, nil, err
-		}
-		if len(newOeks) == 0 {
-			log.LogErrorf("ApplyTruncateReqs: put returned no keys")
-			return nil, nil, errPutNoKeys //nolint:wrapcheck
-		}
-		newKey := newOeks[0]
-		newKey.FileOffset = r.NewExtent.FileOffset
-		newObjExtents = append(newObjExtents, newKey)
+) (newObjExtent proto.ObjExtentKey, toDeleteFrom proto.ObjExtentKey, err error) {
+	toDeleteFrom = req.DiscardFrom
+	keepSome := req.KeepExtent
+	if toDeleteFrom.Size == 0 || keepSome.Size == 0 {
+		return keepSome, toDeleteFrom, nil
+	}
+	keepSize := keepSome.Size
+	if keepSize > toDeleteFrom.Size {
+		err = fmt.Errorf("ApplyTruncateReqs: keepSize(%v) > discard.Size(%v)", keepSize, toDeleteFrom.Size)
+		log.LogErrorf("%v", err)
+		return proto.ObjExtentKey{}, proto.ObjExtentKey{}, err
 	}
 
-	return newObjExtents, toDelete, nil
+	buf := make([]byte, keepSize)
+	readN, err := ebs.Read(ctx, volName, buf, 0, keepSize, toDeleteFrom)
+	if err != nil {
+		log.LogErrorf("ApplyTruncateReqs: read extent (%v) keepSize(%v) err(%v)", toDeleteFrom, keepSize, err)
+		return proto.ObjExtentKey{}, proto.ObjExtentKey{}, err
+	}
+	if uint64(readN) != keepSize {
+		log.LogWarnf("ApplyTruncateReqs: read short extent(%v) want(%v) readN(%v)", toDeleteFrom, keepSize, readN)
+	}
+	newOeks, _, err := ebs.Put(ctx, volName, bytes.NewReader(buf), uint64(len(buf)))
+	if err != nil {
+		log.LogErrorf("ApplyTruncateReqs: put truncated err(%v)", err)
+		return proto.ObjExtentKey{}, proto.ObjExtentKey{}, err
+	}
+	if len(newOeks) == 0 {
+		log.LogErrorf("ApplyTruncateReqs: put returned no keys")
+		return proto.ObjExtentKey{}, proto.ObjExtentKey{}, errPutNoKeys //nolint:wrapcheck
+	}
+	newObjExtent = newOeks[0]
+	newObjExtent.FileOffset = keepSome.FileOffset
+	return newObjExtent, toDeleteFrom, nil
 }

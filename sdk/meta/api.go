@@ -1649,12 +1649,8 @@ func (mw *MetaWrapper) AppendExtentKeys(inode uint64, eks []proto.ExtentKey, sto
 	return nil
 }
 
-// AppendObjExtentKeysWithCheck atomically applies multiple (newExtent, discardExtent) pairs with conflict checking.
-// len(newExtents) must equal len(discardExtents); each pair is applied in order, then all discards are sent for async deletion in one batch.
-func (mw *MetaWrapper) AppendObjExtentKeysWithCheck(inode uint64, newExtents, discardExtents []proto.ObjExtentKey) error {
-	if len(newExtents) != len(discardExtents) {
-		return syscall.EINVAL
-	}
+// AppendObjExtentKeysWithCheck atomically applies one new ObjExtentKey with optional discard for conflict checking.
+func (mw *MetaWrapper) AppendObjExtentKeysWithCheck(inode uint64, newExtents, discardExtents proto.ObjExtentKey) error {
 	mp := mw.getPartitionByInode(inode)
 	if mp == nil {
 		return syscall.ENOENT
@@ -1662,10 +1658,10 @@ func (mw *MetaWrapper) AppendObjExtentKeysWithCheck(inode uint64, newExtents, di
 
 	status, err := mw.appendObjExtentKeysWithCheck(mp, inode, newExtents, discardExtents)
 	if err != nil || status != statusOK {
-		log.LogErrorf("AppendObjExtentKeysWithCheckBatch: inode(%v) count(%v) err(%v) status(%v)", inode, len(newExtents), err, status)
+		log.LogErrorf("AppendObjExtentKeysWithCheckBatch: inode(%v) newExtents(%v) discardExtents(%v) err(%v) status(%v)", inode, newExtents, discardExtents, err, status)
 		return statusToErrno(status)
 	}
-	log.LogDebugf("AppendObjExtentKeysWithCheckBatch: ino(%v) count(%v)", inode, len(newExtents))
+	log.LogDebugf("AppendObjExtentKeysWithCheckBatch: ino(%v) newExtents(%v)", inode, newExtents)
 	return nil
 }
 
@@ -1749,15 +1745,17 @@ func (mw *MetaWrapper) Truncate(inode, size uint64, fullPath string) error {
 	return nil
 }
 
-// TruncateV2 submits inode logical size and ObjExtents for EC/BlobStore volumes to metanode; the list must match target size (including pure expand cases where no EBS shrink happens and current object list is reused).
-func (mw *MetaWrapper) TruncateV2(inode, size uint64, fullPath string, newObjExtents []proto.ObjExtentKey, toDeletes []proto.ObjExtentKey) error {
+// TruncateV2 submits inode logical size and optional extent deltas for EC/BlobStore volumes.
+// Shrink passes at most one NewObjExtent (partial overlap) and one ToDelete anchor (first tail extent).
+// Grow or unchanged size passes empty extents; metanode only updates inode.Size.
+func (mw *MetaWrapper) TruncateV2(inode, size uint64, fullPath string, newObjExtent, toDeleteFrom proto.ObjExtentKey) error {
 	mp := mw.getPartitionByInode(inode)
 	if mp == nil {
 		log.LogErrorf("TruncateV2: No inode partition, ino(%v)", inode)
 		return syscall.ENOENT
 	}
 
-	status, err := mw.truncateV2(mp, inode, size, fullPath, newObjExtents, toDeletes)
+	status, err := mw.truncateV2(mp, inode, size, fullPath, newObjExtent, toDeleteFrom)
 	if err != nil || status != statusOK {
 		return statusToErrno(status)
 	}

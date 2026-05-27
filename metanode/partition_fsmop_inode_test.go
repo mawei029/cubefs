@@ -15,13 +15,18 @@
 package metanode
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"reflect"
+	"sort"
 	"testing"
 	"time"
 
+	"github.com/agiledragon/gomonkey/v2"
 	raftstoremock "github.com/cubefs/cubefs/metanode/mocktest/raftstore"
 	"github.com/cubefs/cubefs/proto"
+	"github.com/cubefs/cubefs/sdk/data/blobstore"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 )
@@ -879,11 +884,434 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 	})
 }
 
-// TestFsmExtentsTruncateV2 verifies EC TruncateV2 FSM: update inode.Size and ObjExtents,
-// and enqueue ToDeletes into objExtentDelTree.
-func TestFsmExtentsTruncateV2(t *testing.T) {
+// --- TruncateV2 test helpers (contract = blobstore plan + Example comment in fsmExtentsTruncateV2) ---
+
+func sparseTruncateV2ExampleExtents() []proto.ObjExtentKey {
+	return []proto.ObjExtentKey{
+		{FileOffset: 10, Size: 20}, // [10,30)
+		{FileOffset: 35, Size: 10}, // [35,45)
+		{FileOffset: 60, Size: 10}, // [60,70)
+	}
+}
+
+// applyTruncateV2Contract is the intended metanode merge: partial replace + sweep FileOffset >= target.
+func applyTruncateV2Contract(eks []proto.ObjExtentKey, target uint64, newObj, toDelete proto.ObjExtentKey) (final, enqueue []proto.ObjExtentKey) {
+	final = append([]proto.ObjExtentKey(nil), eks...)
+	if !newObj.IsEmpty() {
+		for j, ek := range final {
+			if ek.FileOffset == newObj.FileOffset {
+				if !ek.IsEquals(&newObj) {
+					enqueue = append(enqueue, ek)
+				}
+				final[j] = newObj
+				break
+			}
+		}
+	}
+	if tailIdx := sort.Search(len(final), func(i int) bool { return final[i].FileOffset >= target }); tailIdx < len(final) {
+		enqueue = append(enqueue, final[tailIdx:]...)
+		final = final[:tailIdx]
+	}
+	return final, enqueue
+}
+
+func inodeOekAtOffset(eks []proto.ObjExtentKey, fileOffset uint64) proto.ObjExtentKey {
+	for _, ek := range eks {
+		if ek.FileOffset == fileOffset {
+			return ek
+		}
+	}
+	return proto.ObjExtentKey{}
+}
+
+// buildTruncateV2ReqFromCompute builds a TruncateRequest from blobstore.ComputeTruncateReqs on inode snapshot.
+// newObj uses keep offset/size with synthetic Cid (EBS object identity is not compared on partial path).
+func buildTruncateV2ReqFromCompute(ino, target uint64, eks []proto.ObjExtentKey) *proto.TruncateRequest {
+	plan := blobstore.ComputeTruncateReqs(target, eks)
+	req := &proto.TruncateRequest{Inode: ino, Size: target}
+	if !plan.KeepExtent.IsEmpty() {
+		req.NewObjExtent = plan.KeepExtent
+		req.NewObjExtent.Cid = testTruncateV2SyntheticCid
+		req.ToDelete = inodeOekAtOffset(eks, plan.DiscardFrom.FileOffset)
+		if req.ToDelete.IsEmpty() {
+			req.ToDelete = plan.DiscardFrom
+		}
+	} else if !plan.DiscardFrom.IsEmpty() {
+		req.ToDelete = inodeOekAtOffset(eks, plan.DiscardFrom.FileOffset)
+		if req.ToDelete.IsEmpty() {
+			req.ToDelete = plan.DiscardFrom
+		}
+	}
+	return req
+}
+
+const testTruncateV2SyntheticCid = 424242
+
+func assertObjExtentsEqual(t *testing.T, want, got []proto.ObjExtentKey) {
+	t.Helper()
+	require.Len(t, got, len(want))
+	for i := range want {
+		require.Equal(t, want[i].FileOffset, got[i].FileOffset, "idx %d FileOffset", i)
+		require.Equal(t, want[i].Size, got[i].Size, "idx %d Size", i)
+	}
+}
+
+// TestCheckTruncateV2Conflict_ExampleSparse exercises checkTruncateV2Conflict against fsmExtentsTruncateV2 Example rows.
+func TestCheckTruncateV2Conflict_ExampleSparse(t *testing.T) {
+	mp := newTestMetaPartitionForTruncateV2(t, 10010)
+	const ino = 9010
+	base := sparseTruncateV2ExampleExtents()
+
+	cases := []struct {
+		name       string
+		target     uint64
+		newObj     proto.ObjExtentKey
+		toDelete   proto.ObjExtentKey
+		wantStatus uint8
+	}{
+		{
+			name:       "target=0 tail anchor first oek",
+			target:     0,
+			toDelete:   base[0],
+			wantStatus: proto.OpOk,
+		},
+		{
+			name:       "target=15 partial plus tail sweep",
+			target:     15,
+			newObj:     proto.ObjExtentKey{FileOffset: 10, Size: 5, Cid: testTruncateV2SyntheticCid},
+			toDelete:   base[0],
+			wantStatus: proto.OpOk,
+		},
+		{
+			name:       "target=50 tail only",
+			target:     50,
+			toDelete:   base[2],
+			wantStatus: proto.OpOk,
+		},
+		{
+			name:       "target=65 partial only",
+			target:     65,
+			newObj:     proto.ObjExtentKey{FileOffset: 60, Size: 5, Cid: testTruncateV2SyntheticCid},
+			toDelete:   base[2],
+			wantStatus: proto.OpOk,
+		},
+		{
+			name:       "target=100 logical hole",
+			target:     100,
+			wantStatus: proto.OpOk,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := &proto.TruncateRequest{Inode: ino, Size: tc.target, NewObjExtent: tc.newObj, ToDelete: tc.toDelete}
+			st, final, enqueue := mp.checkTruncateV2Conflict(req, append([]proto.ObjExtentKey(nil), base...))
+			require.Equal(t, tc.wantStatus, st)
+			if st != proto.OpOk {
+				return
+			}
+			wantFinal, wantEnqueue := applyTruncateV2Contract(base, tc.target, tc.newObj, tc.toDelete)
+			assertObjExtentsEqual(t, wantFinal, final)
+			require.Len(t, enqueue, len(wantEnqueue))
+		})
+	}
+}
+
+// TestFsmExtentsTruncateV2_ExampleSparse runs full FSM for each row in fsmExtentsTruncateV2 Example comment.
+func TestFsmExtentsTruncateV2_ExampleSparse(t *testing.T) {
+	mp := newTestMetaPartitionForTruncateV2(t, 10011)
+	const ino = 9011
+	base := sparseTruncateV2ExampleExtents()
+
+	cases := []struct {
+		name     string
+		target   uint64
+		newObj   proto.ObjExtentKey
+		toDelete proto.ObjExtentKey
+	}{
+		{name: "target=0", target: 0, toDelete: base[0]},
+		{
+			name:     "target=15",
+			target:   15,
+			newObj:   proto.ObjExtentKey{FileOffset: 10, Size: 5, Cid: testTruncateV2SyntheticCid},
+			toDelete: base[0],
+		},
+		{name: "target=50", target: 50, toDelete: base[2]},
+		{
+			name:     "target=65",
+			target:   65,
+			newObj:   proto.ObjExtentKey{FileOffset: 60, Size: 5, Cid: testTruncateV2SyntheticCid},
+			toDelete: base[2],
+		},
+		{name: "target=100", target: 100},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setupInodeWithObjExtents(t, mp, ino, base, 200)
+			resp := runFsmExtentsTruncateV2(t, mp, &proto.TruncateRequest{
+				Inode: ino, Size: tc.target, NewObjExtent: tc.newObj, ToDelete: tc.toDelete,
+			})
+			require.Equal(t, proto.OpOk, resp.Status)
+			updated := getInodeOrFail(t, mp, ino)
+			require.Equal(t, tc.target, updated.Size)
+			wantFinal, _ := applyTruncateV2Contract(base, tc.target, tc.newObj, tc.toDelete)
+			assertObjExtentsEqual(t, wantFinal, updated.HybridCloudExtents.sortedEks.(*SortedObjExtents).CopyExtents())
+		})
+	}
+}
+
+// TestCheckTruncateV2Conflict_BlobstoreComputeTruncateReqs aligns check with ComputeTruncateReqs plans.
+func TestCheckTruncateV2Conflict_BlobstoreComputeTruncateReqs(t *testing.T) {
+	mp := newTestMetaPartitionForTruncateV2(t, 10012)
+	const ino = 9012
+
+	t.Run("empty extents", func(t *testing.T) {
+		req := buildTruncateV2ReqFromCompute(ino, 100, nil)
+		st, final, _ := mp.checkTruncateV2Conflict(req, nil)
+		require.Equal(t, proto.OpOk, st)
+		require.Nil(t, final)
+	})
+
+	t.Run("logical hole past last end", func(t *testing.T) {
+		eks := []proto.ObjExtentKey{{FileOffset: 0, Size: 50}, {FileOffset: 50, Size: 50}}
+		req := buildTruncateV2ReqFromCompute(ino, 100, eks)
+		plan := blobstore.ComputeTruncateReqs(100, eks)
+		require.True(t, plan.KeepExtent.IsEmpty())
+		require.True(t, plan.DiscardFrom.IsEmpty())
+		st, final, _ := mp.checkTruncateV2Conflict(req, eks)
+		require.Equal(t, proto.OpOk, st)
+		assertObjExtentsEqual(t, eks, final)
+	})
+
+	t.Run("partial span target 150", func(t *testing.T) {
+		eks := []proto.ObjExtentKey{
+			{FileOffset: 0, Size: 100},
+			{FileOffset: 100, Size: 100},
+			{FileOffset: 200, Size: 50},
+		}
+		target := uint64(150)
+		req := buildTruncateV2ReqFromCompute(ino, target, eks)
+		plan := blobstore.ComputeTruncateReqs(target, eks)
+		require.Equal(t, uint64(100), plan.KeepExtent.FileOffset)
+		require.Equal(t, uint64(50), plan.KeepExtent.Size)
+		require.Equal(t, uint64(100), plan.DiscardFrom.FileOffset)
+		require.Equal(t, uint64(100), plan.DiscardFrom.Size)
+
+		st, final, enqueue := mp.checkTruncateV2Conflict(req, eks)
+		require.Equal(t, proto.OpOk, st)
+		wantFinal, wantEnqueue := applyTruncateV2Contract(eks, target, req.NewObjExtent, req.ToDelete)
+		assertObjExtentsEqual(t, wantFinal, final)
+		require.Len(t, enqueue, len(wantEnqueue))
+	})
+
+	t.Run("integer boundary target equals oek end", func(t *testing.T) {
+		eks := []proto.ObjExtentKey{{FileOffset: 0, Size: 100}, {FileOffset: 100, Size: 100}}
+		target := uint64(100)
+		req := buildTruncateV2ReqFromCompute(ino, target, eks)
+		plan := blobstore.ComputeTruncateReqs(target, eks)
+		require.True(t, plan.KeepExtent.IsEmpty())
+		require.Equal(t, uint64(100), plan.DiscardFrom.FileOffset)
+
+		st, final, _ := mp.checkTruncateV2Conflict(req, eks)
+		require.Equal(t, proto.OpOk, st)
+		wantFinal, _ := applyTruncateV2Contract(eks, target, req.NewObjExtent, req.ToDelete)
+		assertObjExtentsEqual(t, wantFinal, final)
+	})
+
+	t.Run("unsorted input sorted by compute", func(t *testing.T) {
+		eks := []proto.ObjExtentKey{
+			{FileOffset: 10, Size: 10},
+			{FileOffset: 0, Size: 10},
+			{FileOffset: 20, Size: 10},
+		}
+		target := uint64(15)
+		req := buildTruncateV2ReqFromCompute(ino, target, eks)
+		sorted := append([]proto.ObjExtentKey(nil), eks...)
+		sort.Slice(sorted, func(i, j int) bool { return sorted[i].FileOffset < sorted[j].FileOffset })
+		st, final, _ := mp.checkTruncateV2Conflict(req, sorted)
+		require.Equal(t, proto.OpOk, st)
+		wantFinal, _ := applyTruncateV2Contract(sorted, target, req.NewObjExtent, req.ToDelete)
+		assertObjExtentsEqual(t, wantFinal, final)
+	})
+
+	t.Run("reject New without ToDelete when plan has partial", func(t *testing.T) {
+		eks := []proto.ObjExtentKey{{FileOffset: 0, Size: 100}}
+		req := &proto.TruncateRequest{Inode: ino, Size: 50, NewObjExtent: proto.ObjExtentKey{FileOffset: 0, Size: 50, Cid: 1}}
+		st, _, _ := mp.checkTruncateV2Conflict(req, eks)
+		require.Equal(t, proto.OpConflictExtentsErr, st)
+	})
+
+	t.Run("reject ToDelete size mismatch", func(t *testing.T) {
+		eks := []proto.ObjExtentKey{{FileOffset: 0, Size: 100}, {FileOffset: 100, Size: 100}}
+		req := &proto.TruncateRequest{Inode: ino, Size: 100, ToDelete: proto.ObjExtentKey{FileOffset: 100, Size: 99}}
+		st, _, _ := mp.checkTruncateV2Conflict(req, eks)
+		require.Equal(t, proto.OpConflictExtentsErr, st)
+	})
+
+	t.Run("reject target beyond ToDelete end", func(t *testing.T) {
+		eks := []proto.ObjExtentKey{{FileOffset: 60, Size: 10}}
+		req := &proto.TruncateRequest{Inode: ino, Size: 80, ToDelete: eks[0]}
+		st, _, _ := mp.checkTruncateV2Conflict(req, eks)
+		require.Equal(t, proto.OpConflictExtentsErr, st)
+	})
+
+	t.Run("idempotent last end le target", func(t *testing.T) {
+		eks := []proto.ObjExtentKey{{FileOffset: 0, Size: 50}}
+		req := &proto.TruncateRequest{Inode: ino, Size: 100, ToDelete: proto.ObjExtentKey{FileOffset: 999, Size: 1}}
+		st, final, _ := mp.checkTruncateV2Conflict(req, eks)
+		require.Equal(t, proto.OpOk, st)
+		assertObjExtentsEqual(t, eks, final)
+	})
+}
+
+// TestFsmExtentsTruncateV2_BlobstoreComputeTruncateReqs runs FSM with requests derived from ComputeTruncateReqs.
+func TestFsmExtentsTruncateV2_BlobstoreComputeTruncateReqs(t *testing.T) {
+	mp := newTestMetaPartitionForTruncateV2(t, 10013)
+	const ino = 9013
+
+	t.Run("partial span 150", func(t *testing.T) {
+		eks := []proto.ObjExtentKey{
+			{FileOffset: 0, Size: 100},
+			{FileOffset: 100, Size: 100},
+			{FileOffset: 200, Size: 50},
+		}
+		target := uint64(150)
+		setupInodeWithObjExtents(t, mp, ino, eks, 250)
+		req := buildTruncateV2ReqFromCompute(ino, target, eks)
+		resp := runFsmExtentsTruncateV2(t, mp, req)
+		require.Equal(t, proto.OpOk, resp.Status)
+		wantFinal, _ := applyTruncateV2Contract(eks, target, req.NewObjExtent, req.ToDelete)
+		got := getInodeOrFail(t, mp, ino).HybridCloudExtents.sortedEks.(*SortedObjExtents).CopyExtents()
+		assertObjExtentsEqual(t, wantFinal, got)
+	})
+
+	t.Run("integer boundary 100", func(t *testing.T) {
+		eks := []proto.ObjExtentKey{{FileOffset: 0, Size: 100}, {FileOffset: 100, Size: 100}}
+		target := uint64(100)
+		setupInodeWithObjExtents(t, mp, ino, eks, 200)
+		req := buildTruncateV2ReqFromCompute(ino, target, eks)
+		resp := runFsmExtentsTruncateV2(t, mp, req)
+		require.Equal(t, proto.OpOk, resp.Status)
+		wantFinal, _ := applyTruncateV2Contract(eks, target, req.NewObjExtent, req.ToDelete)
+		assertObjExtentsEqual(t, wantFinal, getInodeOrFail(t, mp, ino).HybridCloudExtents.sortedEks.(*SortedObjExtents).CopyExtents())
+	})
+}
+
+func TestFsmExtentsTruncateV2_FsmValidationAndApplyErrors(t *testing.T) {
+	mp := newTestMetaPartitionForTruncateV2(t, 10007)
+	const inoId = 9004
+	setupInodeWithObjExtents(t, mp, inoId, []proto.ObjExtentKey{{FileOffset: 0, Size: 100}}, 100)
+
+	t.Run("missing ToDelete when partial New set", func(t *testing.T) {
+		resp := runFsmExtentsTruncateV2(t, mp, &proto.TruncateRequest{
+			Inode:        inoId,
+			Size:         50,
+			NewObjExtent: proto.ObjExtentKey{FileOffset: 0, Size: 50, Cid: 1},
+		})
+		require.Equal(t, proto.OpConflictExtentsErr, resp.Status)
+	})
+
+	t.Run("NewObjExtent without ToDelete", func(t *testing.T) {
+		resp := runFsmExtentsTruncateV2(t, mp, &proto.TruncateRequest{
+			Inode:        inoId,
+			Size:         50,
+			NewObjExtent: proto.ObjExtentKey{FileOffset: 0, Size: 50, Cid: 1},
+		})
+		require.Equal(t, proto.OpConflictExtentsErr, resp.Status)
+	})
+
+	t.Run("ToDelete size mismatch", func(t *testing.T) {
+		setupInodeWithObjExtents(t, mp, inoId, []proto.ObjExtentKey{
+			{FileOffset: 0, Size: 100},
+			{FileOffset: 100, Size: 100},
+		}, 200)
+		resp := runFsmExtentsTruncateV2(t, mp, &proto.TruncateRequest{
+			Inode:    inoId,
+			Size:     100,
+			ToDelete: proto.ObjExtentKey{FileOffset: 100, Size: 99},
+		})
+		require.Equal(t, proto.OpConflictExtentsErr, resp.Status)
+	})
+
+	t.Run("inodeTree Put error", func(t *testing.T) {
+		setupInodeWithObjExtents(t, mp, inoId, []proto.ObjExtentKey{
+			{FileOffset: 0, Size: 50},
+			{FileOffset: 50, Size: 50},
+		}, 100)
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyMethod(reflect.TypeOf(mp.inodeTree), "Put",
+			func(_ *InodeBTree, _ interface{}, _ *Inode) error {
+				return errors.New("put failed")
+			})
+		handle, err := mp.inodeTree.CreateBatchWriteHandle()
+		require.NoError(t, err)
+		resp, err := mp.fsmExtentsTruncateV2(handle, &proto.TruncateRequest{
+			Inode:    inoId,
+			Size:     50,
+			ToDelete: proto.ObjExtentKey{FileOffset: 50, Size: 50},
+		})
+		require.Equal(t, proto.OpErr, resp.Status)
+		require.Error(t, err)
+		_ = mp.inodeTree.CommitAndReleaseBatchWriteHandle(handle, false)
+	})
+
+	t.Run("NewObjExtent offset missing in inode", func(t *testing.T) {
+		resp := runFsmExtentsTruncateV2(t, mp, &proto.TruncateRequest{
+			Inode:        inoId,
+			Size:         50,
+			NewObjExtent: proto.ObjExtentKey{FileOffset: 999, Size: 1},
+		})
+		require.Equal(t, proto.OpConflictExtentsErr, resp.Status)
+	})
+
+	t.Run("ToDelete anchor not found", func(t *testing.T) {
+		setupInodeWithObjExtents(t, mp, inoId, []proto.ObjExtentKey{
+			{FileOffset: 0, Size: 100},
+		}, 100)
+		resp := runFsmExtentsTruncateV2(t, mp, &proto.TruncateRequest{
+			Inode:    inoId,
+			Size:     50,
+			ToDelete: proto.ObjExtentKey{FileOffset: 999, Size: 1},
+		})
+		require.Equal(t, proto.OpConflictExtentsErr, resp.Status)
+	})
+
+	t.Run("already deleted returns ok", func(t *testing.T) {
+		setupInodeWithObjExtents(t, mp, inoId, []proto.ObjExtentKey{
+			{FileOffset: 0, Size: 50},
+		}, 50)
+		resp := runFsmExtentsTruncateV2(t, mp, &proto.TruncateRequest{
+			Inode:    inoId,
+			Size:     50,
+			ToDelete: proto.ObjExtentKey{FileOffset: 999, Size: 1},
+		})
+		require.Equal(t, proto.OpOk, resp.Status)
+	})
+
+	t.Run("dir inode rejected", func(t *testing.T) {
+		const dirIno = 9005
+		handle, err := mp.inodeTree.CreateBatchWriteHandle()
+		require.NoError(t, err)
+		dir := NewInode(dirIno, DirModeType)
+		dir.StorageClass = proto.StorageClass_BlobStore
+		mp.inodeTree.ReplaceOrInsert(handle, dir, true)
+		require.NoError(t, mp.inodeTree.CommitAndReleaseBatchWriteHandle(handle, false))
+
+		h2, err := mp.inodeTree.CreateBatchWriteHandle()
+		require.NoError(t, err)
+		resp, err := mp.fsmExtentsTruncateV2(h2, &proto.TruncateRequest{Inode: dirIno, Size: 0})
+		require.NoError(t, err)
+		require.Equal(t, proto.OpArgMismatchErr, resp.Status)
+		require.NoError(t, mp.inodeTree.CommitAndReleaseBatchWriteHandle(h2, false))
+	})
+}
+
+func newTestMetaPartitionForTruncateV2(t *testing.T, partID uint64) *metaPartition {
+	t.Helper()
 	mpC := &MetaPartitionConfig{
-		PartitionId:   10001,
+		PartitionId:   partID,
 		VolName:       VolNameForTest,
 		PartitionType: proto.VolumeTypeHot,
 		StoreMode:     proto.StoreModeMem,
@@ -891,77 +1319,89 @@ func TestFsmExtentsTruncateV2(t *testing.T) {
 	metaM := &metadataManager{
 		nodeId:          1,
 		zoneName:        "test",
-		raftStore:       nil,
 		partitions:      make(map[uint64]MetaPartition),
 		metaNode:        &MetaNode{},
 		fileStatsConfig: &fileStatsConfig{},
 	}
 	partition := NewMetaPartition(mpC, metaM)
 	mp := partition.(*metaPartition)
-	err := mp.initObjects(true)
-	require.NoError(t, err)
+	require.NoError(t, mp.initObjects(true))
 	mp.uidManager = NewUidMgr(mpC.VolName, mpC.PartitionId)
 	mp.mqMgr = NewQuotaManager(mpC.VolName, mpC.PartitionId)
 	mp.uniqChecker = newUniqChecker()
 	mp.vol = NewVol()
 	mp.fsmRaftApplyIndex = 12345
+	return mp
+}
 
-	const inoId = 9001
+func setupInodeWithObjExtents(t *testing.T, mp *metaPartition, inoId uint64, eks []proto.ObjExtentKey, size uint64) {
+	t.Helper()
 	handle, err := mp.inodeTree.CreateBatchWriteHandle()
 	require.NoError(t, err)
 	fsmIno := NewInode(inoId, 0)
 	fsmIno.StorageClass = proto.StorageClass_BlobStore
-	fsmIno.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks([]proto.ObjExtentKey{
-		{FileOffset: 0, Size: 100},
-		{FileOffset: 100, Size: 100},
-	})
-	fsmIno.Size = 200
+	fsmIno.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks(eks)
+	fsmIno.Size = size
 	mp.inodeTree.ReplaceOrInsert(handle, fsmIno, true)
-	err = mp.inodeTree.CommitAndReleaseBatchWriteHandle(handle, false)
-	require.NoError(t, err)
+	require.NoError(t, mp.inodeTree.CommitAndReleaseBatchWriteHandle(handle, false))
+}
 
-	// TruncateV2: truncate to 150, new extents become [0,100) + [100,150) (the latter comes from client-side EBS truncation).
-	newObjExtents := []proto.ObjExtentKey{
-		{FileOffset: 0, Size: 100},
-		{FileOffset: 100, Size: 50},
-	}
-	toDeletes := []proto.ObjExtentKey{
-		{FileOffset: 100, Size: 100},
-	}
-	truncReq := &proto.TruncateRequest{
-		Inode:         inoId,
-		Size:          150,
-		NewObjExtents: newObjExtents,
-		ToDeletes:     toDeletes,
-	}
-	handle2, err := mp.inodeTree.CreateBatchWriteHandle()
+func runFsmExtentsTruncateV2(t *testing.T, mp *metaPartition, truncReq *proto.TruncateRequest) *InodeResponse {
+	t.Helper()
+	handle, err := mp.inodeTree.CreateBatchWriteHandle()
 	require.NoError(t, err)
-	resp, err := mp.fsmExtentsTruncateV2(handle2, truncReq)
+	resp, err := mp.fsmExtentsTruncateV2(handle, truncReq)
 	require.NoError(t, err)
+	require.NoError(t, mp.inodeTree.CommitAndReleaseBatchWriteHandle(handle, false))
+	return resp
+}
+
+func getInodeOrFail(t *testing.T, mp *metaPartition, inoId uint64) *Inode {
+	t.Helper()
+	ino, err := mp.inodeTree.CopyGet(&Inode{Inode: inoId})
+	require.NoError(t, err)
+	require.NotNil(t, ino)
+	return ino
+}
+
+func TestCheckTruncateV2Conflict_EmptyEks(t *testing.T) {
+	mp := newTestMetaPartitionForTruncateV2(t, 10014)
+
+	st, final, del := mp.checkTruncateV2Conflict(&proto.TruncateRequest{Inode: 1, Size: 100}, nil)
+	require.Equal(t, proto.OpOk, st)
+	require.Nil(t, final)
+	require.Nil(t, del)
+
+	st, final, del = mp.checkTruncateV2Conflict(&proto.TruncateRequest{
+		Inode:    1,
+		Size:     100,
+		ToDelete: proto.ObjExtentKey{FileOffset: 0, Size: 1},
+	}, nil)
+	require.Equal(t, proto.OpConflictExtentsErr, st)
+	require.Nil(t, final)
+	require.Nil(t, del)
+}
+
+func TestFsmExtentsTruncateV2_EmptyObjExtents(t *testing.T) {
+	mp := newTestMetaPartitionForTruncateV2(t, 10015)
+	const inoId = 9100
+
+	setupInodeWithObjExtents(t, mp, inoId, nil, 0)
+	resp := runFsmExtentsTruncateV2(t, mp, &proto.TruncateRequest{Inode: inoId, Size: 128})
 	require.Equal(t, proto.OpOk, resp.Status)
-	err = mp.inodeTree.CommitAndReleaseBatchWriteHandle(handle2, false)
-	require.NoError(t, err)
+	ino := getInodeOrFail(t, mp, inoId)
+	require.Equal(t, uint64(128), ino.Size)
+	require.Equal(t, uint64(2), ino.Generation)
+	require.Len(t, ino.HybridCloudExtents.sortedEks.(*SortedObjExtents).CopyExtents(), 0)
 
-	updatedIno, err := mp.inodeTree.CopyGet(&Inode{Inode: inoId})
-	require.NoError(t, err)
-	require.NotNil(t, updatedIno)
-	require.Equal(t, uint64(150), updatedIno.Size)
-	require.Equal(t, uint64(2), updatedIno.Generation)
-	sortedEks := updatedIno.HybridCloudExtents.sortedEks.(*SortedObjExtents)
-	extents := sortedEks.CopyExtents()
-	require.Len(t, extents, 2)
-	require.Equal(t, uint64(0), extents[0].FileOffset)
-	require.Equal(t, uint64(100), extents[0].Size)
-	require.Equal(t, uint64(100), extents[1].FileOffset)
-	require.Equal(t, uint64(50), extents[1].Size)
-	require.NotNil(t, mp.objExtentDelTree)
-	require.Equal(t, 1, mp.objExtentDelTree.Len())
-	items := mp.objExtentDelTree.PeekFirstN(1)
-	require.Len(t, items.Items, 1)
-	require.Equal(t, int64(mp.fsmRaftApplyIndex), items.Items[0].TsMs)
-	require.Equal(t, mp.fsmRaftApplyIndex, items.Items[0].RaftIdx)
-	require.Len(t, items.Items[0].Oeks, 1)
-	require.True(t, items.Items[0].Oeks[0].IsEquals(&toDeletes[0]))
+	resp = runFsmExtentsTruncateV2(t, mp, &proto.TruncateRequest{
+		Inode:    inoId,
+		Size:     64,
+		ToDelete: proto.ObjExtentKey{FileOffset: 0, Size: 1},
+	})
+	require.Equal(t, proto.OpConflictExtentsErr, resp.Status)
+	ino = getInodeOrFail(t, mp, inoId)
+	require.Equal(t, uint64(128), ino.Size)
 }
 
 func TestFsmExtentsTruncateV2_Errors(t *testing.T) {
@@ -992,9 +1432,9 @@ func TestFsmExtentsTruncateV2_Errors(t *testing.T) {
 		handle, err := mp.inodeTree.CreateBatchWriteHandle()
 		require.NoError(t, err)
 		resp, err := mp.fsmExtentsTruncateV2(handle, &proto.TruncateRequest{
-			Inode:         7777,
-			Size:          10,
-			NewObjExtents: []proto.ObjExtentKey{{FileOffset: 0, Size: 10}},
+			Inode:        7777,
+			Size:         10,
+			NewObjExtent: proto.ObjExtentKey{FileOffset: 0, Size: 10},
 		})
 		require.NoError(t, err)
 		require.Equal(t, proto.OpNotExistErr, resp.Status)
@@ -1012,9 +1452,9 @@ func TestFsmExtentsTruncateV2_Errors(t *testing.T) {
 		handle2, err := mp.inodeTree.CreateBatchWriteHandle()
 		require.NoError(t, err)
 		resp, err := mp.fsmExtentsTruncateV2(handle2, &proto.TruncateRequest{
-			Inode:         8888,
-			Size:          10,
-			NewObjExtents: []proto.ObjExtentKey{{FileOffset: 0, Size: 10}},
+			Inode:        8888,
+			Size:         10,
+			NewObjExtent: proto.ObjExtentKey{FileOffset: 0, Size: 10},
 		})
 		require.NoError(t, err)
 		require.Equal(t, proto.OpArgMismatchErr, resp.Status)

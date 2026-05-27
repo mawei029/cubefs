@@ -277,31 +277,121 @@ func TestComputeTruncateReqs_PartialSpan(t *testing.T) {
 		{FileOffset: 200, Size: 50},
 	}
 	req := ComputeTruncateReqs(150, objExtents)
-	require.Len(t, req.KeepExtents, 1)
-	require.Equal(t, uint64(0), req.KeepExtents[0].FileOffset)
-	require.Equal(t, uint64(100), req.KeepExtents[0].Size)
-	require.Len(t, req.OverwriteReqs, 1)
-	require.Equal(t, uint64(100), req.OverwriteReqs[0].NewExtent.FileOffset)
-	require.Equal(t, uint64(50), req.OverwriteReqs[0].NewExtent.Size)
-	require.Equal(t, uint64(100), req.OverwriteReqs[0].DiscardExtent.FileOffset)
-	require.Equal(t, uint64(100), req.OverwriteReqs[0].DiscardExtent.Size)
-	require.Len(t, req.DiscardOnly, 1)
-	require.Equal(t, uint64(200), req.DiscardOnly[0].FileOffset)
+	require.False(t, req.KeepExtent.IsEmpty())
+	require.Equal(t, uint64(100), req.KeepExtent.FileOffset)
+	require.Equal(t, uint64(50), req.KeepExtent.Size)
+	require.False(t, req.DiscardFrom.IsEmpty())
+	require.Equal(t, uint64(100), req.DiscardFrom.FileOffset)
+	require.Equal(t, uint64(100), req.DiscardFrom.Size)
 }
 
 func TestComputeTruncateReqs_EmptyInput(t *testing.T) {
 	req := ComputeTruncateReqs(100, nil)
-	require.Empty(t, req.KeepExtents)
-	require.Empty(t, req.OverwriteReqs)
-	require.Empty(t, req.DiscardOnly)
+	require.True(t, req.KeepExtent.IsEmpty())
+	require.True(t, req.DiscardFrom.IsEmpty())
+}
+
+func TestComputeTruncateReqs_tail_only_discard(t *testing.T) {
+	eks := []cproto.ObjExtentKey{
+		{FileOffset: 0, Size: 50},
+		{FileOffset: 50, Size: 50},
+	}
+	req := ComputeTruncateReqs(50, eks)
+	require.True(t, req.KeepExtent.IsEmpty())
+	require.False(t, req.DiscardFrom.IsEmpty())
+	require.Equal(t, uint64(50), req.DiscardFrom.FileOffset)
+	require.Equal(t, uint64(50), req.DiscardFrom.Size)
+}
+
+func TestComputeTruncateReqs_unsorted_input(t *testing.T) {
+	eks := []cproto.ObjExtentKey{
+		{FileOffset: 100, Size: 50},
+		{FileOffset: 0, Size: 50},
+	}
+	req := ComputeTruncateReqs(75, eks)
+	require.True(t, req.KeepExtent.IsEmpty())
+	require.Equal(t, uint64(100), req.DiscardFrom.FileOffset)
+	require.Equal(t, uint64(50), req.DiscardFrom.Size)
+}
+
+func TestComputeTruncateReqs_all_keep_no_discard(t *testing.T) {
+	eks := []cproto.ObjExtentKey{{FileOffset: 0, Size: 100}}
+	req := ComputeTruncateReqs(100, eks)
+	require.True(t, req.KeepExtent.IsEmpty())
+	require.True(t, req.DiscardFrom.IsEmpty())
+}
+
+func TestCreateOPMetric_and_createOPMetricBySize(t *testing.T) {
+	require.Equal(t, "tag0K_4K", createOPMetric(make([]byte, 1), "tag"))
+	require.Equal(t, "tag4K_128K", createOPMetric(make([]byte, 8*1024), "tag"))
+	require.Equal(t, "tag128K_1M", createOPMetric(make([]byte, 200*1024), "tag"))
+	require.Equal(t, "tag1M_4M", createOPMetric(make([]byte, 2*1024*1024), "tag"))
+	require.Equal(t, "tag4M_8M", createOPMetric(make([]byte, 5*1024*1024), "tag"))
+
+	require.Equal(t, "sz0K_4K", createOPMetricBySize(1024, "sz"))
+	require.Equal(t, "sz4K_128K", createOPMetricBySize(64*1024, "sz"))
+	require.Equal(t, "sz128K_1M", createOPMetricBySize(512*1024, "sz"))
+	require.Equal(t, "sz1M_4M", createOPMetricBySize(2*1024*1024, "sz"))
+	require.Equal(t, "sz4M_16M", createOPMetricBySize(8*1024*1024, "sz"))
+	require.Equal(t, "sz16M_64M", createOPMetricBySize(32*1024*1024, "sz"))
+	require.Equal(t, "sz64M_256M", createOPMetricBySize(128*1024*1024, "sz"))
+	require.Equal(t, "sz256M_1G", createOPMetricBySize(512*1024*1024, "sz"))
+	require.Equal(t, "sz1G_", createOPMetricBySize(2*1024*1024*1024, "sz"))
+}
+
+func TestLocationToObjExtentKey(t *testing.T) {
+	loc := proto.Location{
+		ClusterID: 7,
+		Size_:     99,
+		Crc:       12345,
+		CodeMode:  2,
+		SliceSize: 4096,
+		Slices: []proto.Slice{
+			{MinSliceID: 10, Vid: 20, Count: 3},
+		},
+	}
+	oek := locationToObjExtentKey(loc, 1000)
+	require.Equal(t, uint64(7), oek.Cid)
+	require.Equal(t, uint64(99), oek.Size)
+	require.Equal(t, uint64(1000), oek.FileOffset)
+	require.Equal(t, uint32(12345), oek.Crc)
+	require.Equal(t, uint8(2), oek.CodeMode)
+	require.Equal(t, uint32(4096), oek.BlobSize)
+	require.Len(t, oek.Blobs, 1)
+	require.Equal(t, uint64(10), oek.Blobs[0].MinBid)
+}
+
+func TestApplyTruncateReqs_discard_only_no_ebs(t *testing.T) {
+	req := truncateReq{
+		DiscardFrom: cproto.ObjExtentKey{FileOffset: 100, Size: 50},
+	}
+	ebs := &BlobStoreClient{}
+	out, del, err := ebs.ApplyTruncateReqs(context.Background(), "vol", req)
+	require.NoError(t, err)
+	require.True(t, out.IsEmpty())
+	require.Equal(t, req.DiscardFrom, del)
+}
+
+func TestApplyTruncateReqs_keepSize_gt_discard(t *testing.T) {
+	req := truncateReq{
+		KeepExtent:  cproto.ObjExtentKey{FileOffset: 0, Size: 100},
+		DiscardFrom: cproto.ObjExtentKey{FileOffset: 0, Size: 50},
+	}
+	ebs := &BlobStoreClient{}
+	out, del, err := ebs.ApplyTruncateReqs(context.Background(), "vol", req)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "keepSize")
+	require.True(t, out.IsEmpty())
+	require.True(t, del.IsEmpty())
 }
 
 func TestTruncateV2Extents_EmptyInput(t *testing.T) {
 	ebs := &BlobStoreClient{}
 	ctx := context.Background()
-	out, _, err := ebs.TruncateV2Extents(ctx, "vol", nil, 100)
+	out, toDel, err := ebs.TruncateV2Extents(ctx, "vol", nil, 100)
 	require.NoError(t, err)
-	require.Nil(t, out)
+	require.True(t, out.IsEmpty())
+	require.True(t, toDel.IsEmpty())
 }
 
 func TestTruncateV2Extents_OnlyKeepNoEBS(t *testing.T) {
@@ -311,31 +401,22 @@ func TestTruncateV2Extents_OnlyKeepNoEBS(t *testing.T) {
 		{FileOffset: 50, Size: 50},
 	}
 	req := ComputeTruncateReqs(100, objExtents)
-	require.Len(t, req.KeepExtents, 2)
-	require.Empty(t, req.OverwriteReqs)
-	require.Empty(t, req.DiscardOnly)
+	require.True(t, req.KeepExtent.IsEmpty())
+	require.True(t, req.DiscardFrom.IsEmpty())
 
 	ebs := &BlobStoreClient{}
 	ctx := context.Background()
 	out, toDel, err := ebs.ApplyTruncateReqs(ctx, "vol", req)
 	require.NoError(t, err)
-	require.Len(t, out, 2)
-	require.Len(t, toDel, 0)
-	require.Equal(t, uint64(0), out[0].FileOffset)
-	require.Equal(t, uint64(50), out[0].Size)
-	require.Equal(t, uint64(50), out[1].FileOffset)
-	require.Equal(t, uint64(50), out[1].Size)
+	require.True(t, out.IsEmpty())
+	require.True(t, toDel.IsEmpty())
 }
 
 func TestApplyTruncateReqs_ReadError(t *testing.T) {
 	ebs := &BlobStoreClient{}
 	req := truncateReq{
-		OverwriteReqs: []overwriteReq{
-			{
-				NewExtent:     cproto.ObjExtentKey{FileOffset: 0, Size: 10},
-				DiscardExtent: cproto.ObjExtentKey{FileOffset: 0, Size: 20},
-			},
-		},
+		KeepExtent:  cproto.ObjExtentKey{FileOffset: 0, Size: 10},
+		DiscardFrom: cproto.ObjExtentKey{FileOffset: 0, Size: 20},
 	}
 
 	patches := gomonkey.NewPatches()
@@ -346,19 +427,15 @@ func TestApplyTruncateReqs_ReadError(t *testing.T) {
 		})
 	out, toDel, err := ebs.ApplyTruncateReqs(context.Background(), "vol", req)
 	require.Error(t, err)
-	require.Nil(t, out)
-	require.Len(t, toDel, 0)
+	require.True(t, out.IsEmpty())
+	require.True(t, toDel.IsEmpty())
 }
 
 func TestApplyTruncateReqs_PutNoKeys(t *testing.T) {
 	ebs := &BlobStoreClient{}
 	req := truncateReq{
-		OverwriteReqs: []overwriteReq{
-			{
-				NewExtent:     cproto.ObjExtentKey{FileOffset: 0, Size: 10},
-				DiscardExtent: cproto.ObjExtentKey{FileOffset: 0, Size: 20},
-			},
-		},
+		KeepExtent:  cproto.ObjExtentKey{FileOffset: 0, Size: 10},
+		DiscardFrom: cproto.ObjExtentKey{FileOffset: 0, Size: 20},
 	}
 
 	patches := gomonkey.NewPatches()
@@ -373,21 +450,21 @@ func TestApplyTruncateReqs_PutNoKeys(t *testing.T) {
 		})
 	out, toDel, err := ebs.ApplyTruncateReqs(context.Background(), "vol", req)
 	require.ErrorIs(t, err, errPutNoKeys)
-	require.Nil(t, out)
-	require.Len(t, toDel, 0)
+	require.True(t, out.IsEmpty())
+	require.True(t, toDel.IsEmpty())
 }
 
 func TestApplyTruncateReqs_DeleteError(t *testing.T) {
 	ebs := &BlobStoreClient{}
 	req := truncateReq{
-		DiscardOnly: []cproto.ObjExtentKey{{FileOffset: 0, Size: 20}},
+		DiscardFrom: cproto.ObjExtentKey{FileOffset: 0, Size: 20},
 	}
 
 	out, toDel, err := ebs.ApplyTruncateReqs(context.Background(), "vol", req)
 	require.NoError(t, err)
-	require.NotNil(t, out)
-	require.Len(t, out, 0)
-	require.Len(t, toDel, 1)
+	require.True(t, out.IsEmpty())
+	require.False(t, toDel.IsEmpty())
+	require.Equal(t, uint64(0), toDel.FileOffset)
 }
 
 func TestBlobStoreClientReadRetryBranches(t *testing.T) {
@@ -486,25 +563,18 @@ func TestBlobStoreClientWriteAndGetRetryBranches(t *testing.T) {
 func TestApplyTruncateReqs_MoreBranches(t *testing.T) {
 	t.Run("discard zero size skipped", func(t *testing.T) {
 		ebs := &BlobStoreClient{}
-		req := truncateReq{
-			OverwriteReqs: []overwriteReq{{
-				NewExtent:     cproto.ObjExtentKey{FileOffset: 10, Size: 0},
-				DiscardExtent: cproto.ObjExtentKey{FileOffset: 10, Size: 0},
-			}},
-		}
+		req := truncateReq{}
 		out, del, err := ebs.ApplyTruncateReqs(context.Background(), "v", req)
 		require.NoError(t, err)
-		require.Empty(t, out)
-		require.Empty(t, del)
+		require.True(t, out.IsEmpty())
+		require.True(t, del.IsEmpty())
 	})
 
 	t.Run("read short and put error", func(t *testing.T) {
 		ebs := &BlobStoreClient{}
 		req := truncateReq{
-			OverwriteReqs: []overwriteReq{{
-				NewExtent:     cproto.ObjExtentKey{FileOffset: 100, Size: 2},
-				DiscardExtent: cproto.ObjExtentKey{FileOffset: 100, Size: 4},
-			}},
+			KeepExtent:  cproto.ObjExtentKey{FileOffset: 100, Size: 2},
+			DiscardFrom: cproto.ObjExtentKey{FileOffset: 100, Size: 4},
 		}
 		patches := gomonkey.NewPatches()
 		defer patches.Reset()
@@ -518,22 +588,23 @@ func TestApplyTruncateReqs_MoreBranches(t *testing.T) {
 			})
 		out, del, err := ebs.ApplyTruncateReqs(context.Background(), "v", req)
 		require.Error(t, err)
-		require.Nil(t, out)
-		require.Empty(t, del)
+		require.True(t, out.IsEmpty())
+		require.True(t, del.IsEmpty())
 	})
 
 	t.Run("new key fileoffset rewritten", func(t *testing.T) {
 		ebs := &BlobStoreClient{}
 		req := truncateReq{
-			OverwriteReqs: []overwriteReq{{
-				NewExtent:     cproto.ObjExtentKey{FileOffset: 200, Size: 2},
-				DiscardExtent: cproto.ObjExtentKey{FileOffset: 200, Size: 4},
-			}},
+			KeepExtent:  cproto.ObjExtentKey{FileOffset: 200, Size: 2},
+			DiscardFrom: cproto.ObjExtentKey{FileOffset: 200, Size: 4},
 		}
 		patches := gomonkey.NewPatches()
 		defer patches.Reset()
 		patches.ApplyMethod(reflect.TypeOf(ebs), "Read",
-			func(_ *BlobStoreClient, _ context.Context, _ string, _ []byte, _ uint64, size uint64, _ cproto.ObjExtentKey) (int, error) {
+			func(_ *BlobStoreClient, _ context.Context, _ string, buf []byte, offset, size uint64, _ cproto.ObjExtentKey) (int, error) {
+				require.Equal(t, uint64(0), offset)
+				require.Equal(t, uint64(2), size)
+				require.Len(t, buf, 2)
 				return int(size), nil
 			})
 		patches.ApplyMethod(reflect.TypeOf(ebs), "Put",
@@ -542,9 +613,9 @@ func TestApplyTruncateReqs_MoreBranches(t *testing.T) {
 			})
 		out, del, err := ebs.ApplyTruncateReqs(context.Background(), "v", req)
 		require.NoError(t, err)
-		require.Len(t, out, 1)
-		require.Equal(t, uint64(200), out[0].FileOffset)
-		require.Len(t, del, 1)
+		require.Equal(t, uint64(200), out.FileOffset)
+		require.Equal(t, uint64(200), del.FileOffset)
+		require.Equal(t, uint64(4), del.Size)
 	})
 }
 
@@ -555,23 +626,27 @@ func TestComputeTruncateReqsAndTruncateV2Extents(t *testing.T) {
 		{FileOffset: 20, Size: 10},
 	}
 	req := ComputeTruncateReqs(15, exts)
-	require.Len(t, req.KeepExtents, 1)
-	require.Len(t, req.OverwriteReqs, 1)
-	require.Len(t, req.DiscardOnly, 1)
+	require.False(t, req.KeepExtent.IsEmpty())
+	require.Equal(t, uint64(10), req.KeepExtent.FileOffset)
+	require.Equal(t, uint64(5), req.KeepExtent.Size)
+	require.False(t, req.DiscardFrom.IsEmpty())
+	require.Equal(t, uint64(10), req.DiscardFrom.FileOffset)
 
 	t.Run("truncatev2 calls apply", func(t *testing.T) {
 		ebs := &BlobStoreClient{}
 		patches := gomonkey.NewPatches()
 		defer patches.Reset()
 		patches.ApplyMethod(reflect.TypeOf(ebs), "ApplyTruncateReqs",
-			func(_ *BlobStoreClient, _ context.Context, _ string, in truncateReq) ([]cproto.ObjExtentKey, []cproto.ObjExtentKey, error) {
-				require.NotEmpty(t, in.OverwriteReqs)
-				return []cproto.ObjExtentKey{{FileOffset: 0, Size: 1}}, nil, nil
+			func(_ *BlobStoreClient, _ context.Context, _ string, in truncateReq) (cproto.ObjExtentKey, cproto.ObjExtentKey, error) {
+				require.False(t, in.DiscardFrom.IsEmpty())
+				require.Equal(t, uint64(5), in.KeepExtent.Size)
+				return cproto.ObjExtentKey{FileOffset: 10, Size: 5}, in.DiscardFrom, nil
 			})
 		out, del, err := ebs.TruncateV2Extents(context.Background(), "v", exts, 15)
 		require.NoError(t, err)
-		require.Len(t, out, 1)
-		require.Empty(t, del)
+		require.False(t, out.IsEmpty())
+		require.False(t, del.IsEmpty())
+		require.Equal(t, uint64(10), del.FileOffset)
 	})
 }
 
@@ -611,6 +686,36 @@ func assertObjExtentsWithinInodeSize(t *testing.T, oeks []cproto.ObjExtentKey, i
 
 func discardDedupKey(o cproto.ObjExtentKey) string {
 	return fmt.Sprintf("%d:%d:%d", o.FileOffset, o.Size, o.Cid)
+}
+
+// mergeTruncateV2Deltas mirrors metanode checkTruncateV2Conflict apply: prefix before ToDelete anchor + optional New.
+func mergeTruncateV2Deltas(eksInInode []cproto.ObjExtentKey, newObj, toDelete cproto.ObjExtentKey) []cproto.ObjExtentKey {
+	if toDelete.IsEmpty() {
+		return append([]cproto.ObjExtentKey(nil), eksInInode...)
+	}
+	for j, ek := range eksInInode {
+		if ek.FileOffset == toDelete.FileOffset {
+			final := append([]cproto.ObjExtentKey(nil), eksInInode[:j]...)
+			if !newObj.IsEmpty() {
+				final = append(final, newObj)
+			}
+			return final
+		}
+	}
+	return append([]cproto.ObjExtentKey(nil), eksInInode...)
+}
+
+// truncateV2DroppedKeys returns extents enqueued for GC (suffix from ToDelete anchor).
+func truncateV2DroppedKeys(before []cproto.ObjExtentKey, _, toDelete cproto.ObjExtentKey) []cproto.ObjExtentKey {
+	if toDelete.IsEmpty() {
+		return nil
+	}
+	for j, ek := range before {
+		if ek.FileOffset == toDelete.FileOffset {
+			return append([]cproto.ObjExtentKey(nil), before[j:]...)
+		}
+	}
+	return nil
 }
 
 // TestTruncateV2Extents_MultiRoundConsistency 覆盖多轮 shrink/expand 交替下 ComputeTruncateReqs + ApplyTruncateReqs 链路与 discard 累积。
@@ -656,16 +761,17 @@ func TestTruncateV2Extents_MultiRoundConsistency(t *testing.T) {
 
 		round := func(name string, target uint64) {
 			t.Helper()
-			nex, del, err := ebs.TruncateV2Extents(ctx, vol, exts, target)
+			newObj, delFrom, err := ebs.TruncateV2Extents(ctx, vol, exts, target)
 			require.NoError(t, err, name)
-			for _, d := range del {
+			dropped := truncateV2DroppedKeys(exts, newObj, delFrom)
+			for _, d := range dropped {
 				k := discardDedupKey(d)
 				_, dup := seenDel[k]
 				require.False(t, dup, "%s duplicate discard key %v", name, d)
 				seenDel[k] = struct{}{}
 			}
-			allDel = append(allDel, del...)
-			exts = nex
+			allDel = append(allDel, dropped...)
+			exts = mergeTruncateV2Deltas(exts, newObj, delFrom)
 			inodeSize = target
 			assertObjExtentsWithinInodeSize(t, exts, inodeSize)
 		}
@@ -692,15 +798,15 @@ func TestTruncateV2Extents_MultiRoundConsistency(t *testing.T) {
 		seenDel := make(map[string]struct{})
 
 		round := func(target uint64) {
-			nex, del, err := ebs.TruncateV2Extents(ctx, vol, exts, target)
+			newObj, delFrom, err := ebs.TruncateV2Extents(ctx, vol, exts, target)
 			require.NoError(t, err)
-			for _, d := range del {
+			for _, d := range truncateV2DroppedKeys(exts, newObj, delFrom) {
 				k := discardDedupKey(d)
 				_, dup := seenDel[k]
 				require.False(t, dup, "duplicate discard %v", d)
 				seenDel[k] = struct{}{}
 			}
-			exts = nex
+			exts = mergeTruncateV2Deltas(exts, newObj, delFrom)
 			inodeSize = target
 			assertObjExtentsWithinInodeSize(t, exts, inodeSize)
 		}

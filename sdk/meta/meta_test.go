@@ -126,12 +126,13 @@ func TestMetaWrapper_getMetaHostsMap_errorFromMaster(t *testing.T) {
 // TestTruncateV2Request 校验 TruncateV2 请求可正确序列化（SDK 发往 metanode 的 OpMetaTruncate 载荷）。
 func TestTruncateV2Request(t *testing.T) {
 	req := &proto.TruncateRequest{
-		VolName:       "vol",
-		PartitionID:   1,
-		Inode:         100,
-		Size:          150,
-		TruncateV2:    true,
-		NewObjExtents: []proto.ObjExtentKey{{FileOffset: 0, Size: 100}, {FileOffset: 100, Size: 50}},
+		VolName:      "vol",
+		PartitionID:  1,
+		Inode:        100,
+		Size:         150,
+		TruncateV2:   true,
+		NewObjExtent: proto.ObjExtentKey{FileOffset: 100, Size: 50},
+		ToDelete:     proto.ObjExtentKey{FileOffset: 200, Size: 50},
 	}
 	req.FullPaths = []string{"/path"}
 	data, err := json.Marshal(req)
@@ -142,7 +143,8 @@ func TestTruncateV2Request(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, decoded.TruncateV2)
 	require.Equal(t, uint64(150), decoded.Size)
-	require.Len(t, decoded.NewObjExtents, 2)
+	require.Equal(t, uint64(100), decoded.NewObjExtent.FileOffset)
+	require.Equal(t, uint64(200), decoded.ToDelete.FileOffset)
 }
 
 func TestCoverageMetaWrapperTruncateV2_NoPartition(t *testing.T) {
@@ -151,7 +153,7 @@ func TestCoverageMetaWrapperTruncateV2_NoPartition(t *testing.T) {
 		ranges:     btree.New(8),
 		conns:      util.NewConnectPool(),
 	}
-	err := mw.TruncateV2(100, 64, "/x", nil, nil)
+	err := mw.TruncateV2(100, 64, "/x", proto.ObjExtentKey{}, proto.ObjExtentKey{})
 	require.ErrorIs(t, err, syscall.ENOENT)
 }
 
@@ -164,16 +166,11 @@ func TestCoverageMetaWrapperAppendObjExtentKeysWithCheck(t *testing.T) {
 	mp := &MetaPartition{PartitionID: 1, Start: 1, End: 1 << 62, Members: []string{"127.0.0.1:1"}, LeaderAddr: "127.0.0.1:1"}
 	mw.ranges.ReplaceOrInsert(mp)
 
-	newExts := []proto.ObjExtentKey{{FileOffset: 0, Size: 10}}
-	discards := []proto.ObjExtentKey{{FileOffset: 0, Size: 10}}
+	newExt := proto.ObjExtentKey{FileOffset: 0, Size: 10}
+	discard := proto.ObjExtentKey{FileOffset: 0, Size: 10}
 
-	t.Run("len mismatch", func(t *testing.T) {
-		err := mw.AppendObjExtentKeysWithCheck(1, newExts, nil)
-		require.ErrorIs(t, err, syscall.EINVAL)
-	})
-
-	t.Run("inner success", func(t *testing.T) {
-		err := mw.AppendObjExtentKeysWithCheck(1, newExts, discards)
+	t.Run("send error without live metanode", func(t *testing.T) {
+		err := mw.AppendObjExtentKeysWithCheck(1, newExt, discard)
 		require.Error(t, err)
 	})
 }
@@ -186,10 +183,10 @@ func TestCoverageMetaWrapperTruncateV2_StatusBranch(t *testing.T) {
 	}
 	mp := &MetaPartition{PartitionID: 1, Start: 1, End: 1 << 62, Members: []string{"127.0.0.1:1"}, LeaderAddr: "127.0.0.1:1"}
 	mw.ranges.ReplaceOrInsert(mp)
-	exts := []proto.ObjExtentKey{{FileOffset: 0, Size: 10}}
+	newExt := proto.ObjExtentKey{FileOffset: 0, Size: 10}
 
 	t.Run("network/send error path", func(t *testing.T) {
-		err := mw.TruncateV2(1, 10, "/x", exts, nil)
+		err := mw.TruncateV2(1, 10, "/x", newExt, proto.ObjExtentKey{})
 		require.Error(t, err)
 	})
 }
@@ -199,6 +196,6 @@ func TestCoverageMetaWrapperAppendObjExtentKeysWithCheck_NoPartition(t *testing.
 		partitions: make(map[uint64]*MetaPartition),
 		ranges:     btree.New(8),
 	}
-	err := mw.AppendObjExtentKeysWithCheck(999, []proto.ObjExtentKey{{FileOffset: 0, Size: 1}}, []proto.ObjExtentKey{{}})
+	err := mw.AppendObjExtentKeysWithCheck(999, proto.ObjExtentKey{FileOffset: 0, Size: 1}, proto.ObjExtentKey{})
 	require.ErrorIs(t, err, syscall.ENOENT)
 }

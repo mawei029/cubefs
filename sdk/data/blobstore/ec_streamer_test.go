@@ -177,6 +177,26 @@ func TestECStreamer_updateMetaInfo_dirty_with_buffer_keeps_dirty(t *testing.T) {
 	require.Equal(t, uint64(100), atomic.LoadUint64(&s.fileSize))
 }
 
+func TestECStreamer_updateMetaInfo_with_commitSize(t *testing.T) {
+	w := &Writer{fileOffset: 500, blockPosition: 20}
+	s := mustTestECStreamer(50, nil, w)
+	seedDirtyForTest(s)
+	s.mw = &meta.MetaWrapper{}
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "GetObjExtents",
+		func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
+			return 3, 200, nil, nil, nil
+		})
+
+	commit := uint64(60)
+	require.NoError(t, s.updateMetaInfo(&commit))
+	require.False(t, s.isDirty())
+	require.Equal(t, uint64(60), atomic.LoadUint64(&s.fileSize))
+	require.Equal(t, 60, w.fileOffset)
+}
+
 func TestECStreamer_updateMetaInfo_dirty_no_buffer_cleans(t *testing.T) {
 	s := mustTestECStreamer(16, nil, nil)
 	seedDirtyForTest(s)
@@ -244,7 +264,7 @@ func TestECStreamer_truncateV2_ENOENT_new_file(t *testing.T) {
 			return 1, 128, nil, nil, nil
 		})
 	patches.ApplyMethod(reflect.TypeOf(s.mw), "TruncateV2",
-		func(_ *meta.MetaWrapper, _ uint64, _ uint64, _ string, _ []proto.ObjExtentKey, _ []proto.ObjExtentKey) error {
+		func(_ *meta.MetaWrapper, _ uint64, _ uint64, _ string, _ proto.ObjExtentKey, _ proto.ObjExtentKey) error {
 			return nil
 		})
 
@@ -382,6 +402,11 @@ func TestECStreamer_raiseFileSize_zero_lb_skipped(t *testing.T) {
 	require.Equal(t, uint64(0), atomic.LoadUint64(&s.fileSize))
 }
 
+func TestECStreamer_raiseFileSize_nil_streamer(t *testing.T) {
+	var s *ECStreamer
+	s.raiseFileSize(100)
+}
+
 func TestECStreamer_updateMetaInfo_under_mu(t *testing.T) {
 	s := mustTestECStreamer(33, nil, nil)
 	s.mw = &meta.MetaWrapper{}
@@ -404,6 +429,24 @@ func TestECStreamer_mergeInodeGen_zero_noop(t *testing.T) {
 	require.Equal(t, uint64(0), atomic.LoadUint64(&s.inoVersion))
 }
 
+func TestECStreamer_updateMetaInfo_dirty_without_buffer(t *testing.T) {
+	w := &Writer{}
+	s := mustTestECStreamer(37, nil, w)
+	seedDirtyForTest(s)
+	s.mw = &meta.MetaWrapper{}
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "GetObjExtents",
+		func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
+			return 3, 80, nil, []proto.ObjExtentKey{{FileOffset: 0, Size: 80}}, nil
+		})
+	patches.ApplyPrivateMethod(reflect.TypeOf(w), "bufferDirtyLen", func(_ *Writer) int { return 0 })
+
+	require.NoError(t, s.updateMetaInfo(nil))
+	require.False(t, s.isDirty())
+	require.Equal(t, uint64(80), atomic.LoadUint64(&s.fileSize))
+}
+
 func TestECStreamer_raiseFileSize_and_mergeInodeGen(t *testing.T) {
 	s := mustTestECStreamer(24, nil, nil)
 	s.raiseFileSize(100)
@@ -412,6 +455,30 @@ func TestECStreamer_raiseFileSize_and_mergeInodeGen(t *testing.T) {
 	s.mergeInodeGen(5)
 	s.mergeInodeGen(9)
 	require.Equal(t, uint64(9), atomic.LoadUint64(&s.inoVersion))
+}
+
+func TestECStreamer_truncateV2_grow_truncateV2_error(t *testing.T) {
+	w := &Writer{}
+	s := mustTestECStreamer(267, nil, w)
+	s.mw = &meta.MetaWrapper{}
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(w), "Flush", func(_ *Writer, _ uint64, _ context.Context) error { return nil })
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "GetObjExtents",
+		func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
+			return 1, 50, nil, nil, nil
+		})
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "TruncateV2",
+		func(_ *meta.MetaWrapper, _ uint64, _ uint64, _ string, _, _ proto.ObjExtentKey) error {
+			return errors.New("grow truncate failed")
+		})
+
+	s.mu.Lock()
+	err := s.truncateV2Locked(context.Background(), 267, 100, "/grow-err")
+	s.mu.Unlock()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "grow truncate failed")
 }
 
 func TestECStreamer_truncateV2_grow_meta_only(t *testing.T) {
@@ -427,7 +494,7 @@ func TestECStreamer_truncateV2_grow_meta_only(t *testing.T) {
 			return 1, 100, nil, []proto.ObjExtentKey{{FileOffset: 0, Size: 100}}, nil
 		})
 	patches.ApplyMethod(reflect.TypeOf(s.mw), "TruncateV2",
-		func(_ *meta.MetaWrapper, _ uint64, size uint64, _ string, _ []proto.ObjExtentKey, _ []proto.ObjExtentKey) error {
+		func(_ *meta.MetaWrapper, _ uint64, size uint64, _ string, _ proto.ObjExtentKey, _ proto.ObjExtentKey) error {
 			require.Equal(t, uint64(200), size)
 			return nil
 		})
@@ -438,9 +505,223 @@ func TestECStreamer_truncateV2_grow_meta_only(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestECStreamer_truncateV2_shrink_calls_writer(t *testing.T) {
+func TestECStreamer_truncateV2_shrink_with_meta_deltas(t *testing.T) {
+	w := &Writer{}
+	s := mustTestECStreamer(261, nil, w)
+	s.mw = &meta.MetaWrapper{}
+	newDelta := proto.ObjExtentKey{FileOffset: 100, Size: 50}
+	delAnchor := proto.ObjExtentKey{FileOffset: 200, Size: 30}
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(w), "Flush", func(_ *Writer, _ uint64, _ context.Context) error { return nil })
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "GetObjExtents",
+		func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
+			return 1, 250, nil, []proto.ObjExtentKey{
+				{FileOffset: 0, Size: 100},
+				{FileOffset: 100, Size: 100},
+				{FileOffset: 200, Size: 50},
+			}, nil
+		})
+	patches.ApplyMethod(reflect.TypeOf(w), "TruncateV2FromExtents",
+		func(_ *Writer, _ context.Context, target, current uint64, _ []proto.ObjExtentKey) (proto.ObjExtentKey, proto.ObjExtentKey, error) {
+			require.Equal(t, uint64(150), target)
+			require.Equal(t, uint64(250), current)
+			return newDelta, delAnchor, nil
+		})
+	var gotNew, gotDel proto.ObjExtentKey
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "TruncateV2",
+		func(_ *meta.MetaWrapper, _ uint64, size uint64, _ string, ne, td proto.ObjExtentKey) error {
+			require.Equal(t, uint64(150), size)
+			gotNew, gotDel = ne, td
+			return nil
+		})
+	patches.ApplyPrivateMethod(reflect.TypeOf(s), "updateMetaInfo",
+		func(_ *ECStreamer, _ *uint64) error { return nil })
+
+	s.mu.Lock()
+	err := s.truncateV2Locked(context.Background(), 261, 150, "/shrink-delta")
+	s.mu.Unlock()
+	require.NoError(t, err)
+	require.Equal(t, newDelta, gotNew)
+	require.Equal(t, delAnchor, gotDel)
+}
+
+func TestECStreamer_truncateV2_shrink_calls_writer_with_deltas(t *testing.T) {
 	w := &Writer{}
 	s := mustTestECStreamer(26, nil, w)
+	s.mw = &meta.MetaWrapper{}
+	delAnchor := proto.ObjExtentKey{FileOffset: 0, Size: 200}
+	newDelta := proto.ObjExtentKey{FileOffset: 0, Size: 100, Cid: 9}
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(w), "Flush", func(_ *Writer, _ uint64, _ context.Context) error { return nil })
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "GetObjExtents",
+		func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
+			return 1, 200, nil, []proto.ObjExtentKey{delAnchor}, nil
+		})
+	var shrinkCalled bool
+	patches.ApplyMethod(reflect.TypeOf(w), "TruncateV2FromExtents",
+		func(_ *Writer, _ context.Context, target, current uint64, _ []proto.ObjExtentKey) (proto.ObjExtentKey, proto.ObjExtentKey, error) {
+			shrinkCalled = true
+			require.Equal(t, uint64(100), target)
+			require.Equal(t, uint64(200), current)
+			return newDelta, delAnchor, nil
+		})
+	var gotNew, gotDel proto.ObjExtentKey
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "TruncateV2",
+		func(_ *meta.MetaWrapper, _ uint64, size uint64, _ string, ne, td proto.ObjExtentKey) error {
+			require.Equal(t, uint64(100), size)
+			gotNew, gotDel = ne, td
+			return nil
+		})
+	patches.ApplyPrivateMethod(reflect.TypeOf(s), "updateMetaInfo",
+		func(_ *ECStreamer, _ *uint64) error { return nil })
+
+	s.mu.Lock()
+	err := s.truncateV2Locked(context.Background(), 26, 100, "/shrink")
+	s.mu.Unlock()
+	require.NoError(t, err)
+	require.True(t, shrinkCalled)
+	require.Equal(t, newDelta, gotNew)
+	require.Equal(t, delAnchor, gotDel)
+}
+
+func TestECStreamer_truncateV2_shrink_no_oeks(t *testing.T) {
+	w := &Writer{}
+	s := mustTestECStreamer(262, nil, w)
+	s.mw = &meta.MetaWrapper{}
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(w), "Flush", func(_ *Writer, _ uint64, _ context.Context) error { return nil })
+	var writerShrink bool
+	patches.ApplyMethod(reflect.TypeOf(w), "TruncateV2FromExtents",
+		func(_ *Writer, _ context.Context, _, _ uint64, _ []proto.ObjExtentKey) (proto.ObjExtentKey, proto.ObjExtentKey, error) {
+			writerShrink = true
+			return proto.ObjExtentKey{}, proto.ObjExtentKey{}, nil
+		})
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "GetObjExtents",
+		func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
+			return 1, 80, nil, nil, nil
+		})
+	var truncSize uint64
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "TruncateV2",
+		func(_ *meta.MetaWrapper, _ uint64, size uint64, _ string, ne, td proto.ObjExtentKey) error {
+			truncSize = size
+			require.True(t, ne.IsEmpty())
+			require.True(t, td.IsEmpty())
+			return nil
+		})
+	patches.ApplyPrivateMethod(reflect.TypeOf(s), "updateMetaInfo",
+		func(_ *ECStreamer, _ *uint64) error { return nil })
+
+	s.mu.Lock()
+	err := s.truncateV2Locked(context.Background(), 262, 50, "/shrink-empty-oeks")
+	s.mu.Unlock()
+	require.NoError(t, err)
+	require.False(t, writerShrink)
+	require.Equal(t, uint64(50), truncSize)
+}
+
+func TestECStreamer_truncateV2_shrink_size_only_past_last_extent_end(t *testing.T) {
+	w := &Writer{}
+	s := mustTestECStreamer(263, nil, w)
+	s.mw = &meta.MetaWrapper{}
+	lastEk := proto.ObjExtentKey{FileOffset: 0, Size: 100}
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(w), "Flush", func(_ *Writer, _ uint64, _ context.Context) error { return nil })
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "GetObjExtents",
+		func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
+			return 1, 200, nil, []proto.ObjExtentKey{lastEk}, nil
+		})
+	patches.ApplyMethod(reflect.TypeOf(w), "TruncateV2FromExtents",
+		func(_ *Writer, _ context.Context, target, current uint64, _ []proto.ObjExtentKey) (proto.ObjExtentKey, proto.ObjExtentKey, error) {
+			require.Equal(t, uint64(150), target)
+			require.Equal(t, uint64(200), current)
+			return proto.ObjExtentKey{}, proto.ObjExtentKey{}, nil
+		})
+	var truncSize uint64
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "TruncateV2",
+		func(_ *meta.MetaWrapper, _ uint64, size uint64, _ string, ne, td proto.ObjExtentKey) error {
+			truncSize = size
+			require.True(t, ne.IsEmpty())
+			require.True(t, td.IsEmpty())
+			return nil
+		})
+	patches.ApplyPrivateMethod(reflect.TypeOf(s), "updateMetaInfo",
+		func(_ *ECStreamer, _ *uint64) error { return nil })
+
+	s.mu.Lock()
+	err := s.truncateV2Locked(context.Background(), 263, 150, "/shrink-size-only")
+	s.mu.Unlock()
+	require.NoError(t, err)
+	require.Equal(t, uint64(150), truncSize)
+}
+
+func TestECStreamer_truncateV2_same_size_not_dirty(t *testing.T) {
+	w := &Writer{}
+	s := mustTestECStreamer(265, nil, w)
+	s.mw = &meta.MetaWrapper{}
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(w), "Flush", func(_ *Writer, _ uint64, _ context.Context) error { return nil })
+	var truncCalls int
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "GetObjExtents",
+		func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
+			return 1, 64, nil, nil, nil
+		})
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "TruncateV2",
+		func(_ *meta.MetaWrapper, _ uint64, _ uint64, _ string, _, _ proto.ObjExtentKey) error {
+			truncCalls++
+			return nil
+		})
+
+	s.mu.Lock()
+	err := s.truncateV2Locked(context.Background(), 265, 64, "/same")
+	s.mu.Unlock()
+	require.NoError(t, err)
+	require.Equal(t, 0, truncCalls)
+}
+
+func TestECStreamer_truncateV2_shrink_truncateV2_error(t *testing.T) {
+	w := &Writer{}
+	s := mustTestECStreamer(266, nil, w)
+	s.mw = &meta.MetaWrapper{}
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(w), "Flush", func(_ *Writer, _ uint64, _ context.Context) error { return nil })
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "GetObjExtents",
+		func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
+			return 1, 80, nil, nil, nil
+		})
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "TruncateV2",
+		func(_ *meta.MetaWrapper, _ uint64, _ uint64, _ string, _, _ proto.ObjExtentKey) error {
+			return errors.New("truncate failed")
+		})
+
+	s.mu.Lock()
+	err := s.truncateV2Locked(context.Background(), 266, 50, "/shrink-err")
+	s.mu.Unlock()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "truncate failed")
+}
+
+func TestECStreamer_FileSizeView_nil(t *testing.T) {
+	var s *ECStreamer
+	sz, gen := s.FileSizeView()
+	require.Equal(t, 0, sz)
+	require.Equal(t, uint64(0), gen)
+}
+
+func TestECStreamer_truncateV2_shrink_invalid_empty_delta(t *testing.T) {
+	w := &Writer{}
+	s := mustTestECStreamer(264, nil, w)
 	s.mw = &meta.MetaWrapper{}
 
 	patches := gomonkey.NewPatches()
@@ -450,23 +731,16 @@ func TestECStreamer_truncateV2_shrink_calls_writer(t *testing.T) {
 		func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
 			return 1, 200, nil, []proto.ObjExtentKey{{FileOffset: 0, Size: 200}}, nil
 		})
-	var shrinkCalled bool
 	patches.ApplyMethod(reflect.TypeOf(w), "TruncateV2FromExtents",
-		func(_ *Writer, _ context.Context, target, current uint64, _ []proto.ObjExtentKey) ([]proto.ObjExtentKey, []proto.ObjExtentKey, error) {
-			shrinkCalled = true
-			require.Equal(t, uint64(100), target)
-			return nil, nil, nil
-		})
-	patches.ApplyMethod(reflect.TypeOf(s.mw), "TruncateV2",
-		func(_ *meta.MetaWrapper, _ uint64, _ uint64, _ string, _ []proto.ObjExtentKey, _ []proto.ObjExtentKey) error {
-			return nil
+		func(_ *Writer, _ context.Context, _, _ uint64, _ []proto.ObjExtentKey) (proto.ObjExtentKey, proto.ObjExtentKey, error) {
+			return proto.ObjExtentKey{}, proto.ObjExtentKey{}, nil
 		})
 
 	s.mu.Lock()
-	err := s.truncateV2Locked(context.Background(), 26, 100, "/shrink")
+	err := s.truncateV2Locked(context.Background(), 264, 100, "/shrink-bad-delta")
 	s.mu.Unlock()
-	require.NoError(t, err)
-	require.True(t, shrinkCalled)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "newObjExtent is not empty or targetSize is wrong")
 }
 
 func TestECStreamer_updateMetaInfo_getExtents_err(t *testing.T) {
@@ -501,7 +775,7 @@ func TestECStreamer_truncateV2_ENOENT_error_string_match(t *testing.T) {
 			return 1, 1, nil, nil, nil
 		})
 	patches.ApplyMethod(reflect.TypeOf(s.mw), "TruncateV2",
-		func(_ *meta.MetaWrapper, _ uint64, _ uint64, _ string, _ []proto.ObjExtentKey, _ []proto.ObjExtentKey) error {
+		func(_ *meta.MetaWrapper, _ uint64, _ uint64, _ string, _ proto.ObjExtentKey, _ proto.ObjExtentKey) error {
 			return nil
 		})
 	s.mu.Lock()

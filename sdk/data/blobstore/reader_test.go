@@ -217,6 +217,18 @@ func TestReader_releasePrefetchCache(t *testing.T) {
 	r.releasePrefetchCache() // idempotent
 }
 
+func TestGetBlobPreReadLimiter_branches(t *testing.T) {
+	require.Nil(t, getBlobPreReadLimiter(0))
+	require.Nil(t, getBlobPreReadLimiter(-1))
+
+	first := getBlobPreReadLimiter(1024)
+	require.NotNil(t, first)
+	require.Equal(t, int64(1024), first.maxBytes)
+
+	second := getBlobPreReadLimiter(2048)
+	require.Same(t, first, second)
+}
+
 func TestBlobPreReadLimiterAndEnsurePrefetchBuf(t *testing.T) {
 	l := &blobPreReadLimiter{maxBytes: 8}
 	assert.True(t, l.tryAcquire(4))

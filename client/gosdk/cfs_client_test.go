@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/agiledragon/gomonkey/v2"
+	"github.com/bits-and-blooms/bitset"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/blobstore"
 	"github.com/cubefs/cubefs/sdk/data/stream"
@@ -132,6 +133,28 @@ func TestClient_openOECStream_and_closeStream_coldBlob(t *testing.T) {
 	require.NoError(t, c.closeStream(f))
 	require.Nil(t, f.fileReader)
 	require.Nil(t, f.fileWriter)
+}
+
+func testClientWithFDSet() *Client {
+	c := &Client{
+		fdmap: make(map[uint]*File),
+		fdset: bitset.New(maxFdNum),
+	}
+	c.fdset.Set(0).Set(1).Set(2)
+	return c
+}
+
+// TestClient_allocFD_coversFileCacheDiscard executes allocFD (incl. _ = fileCache) on the EC/Blob open path.
+func TestClient_allocFD_coversFileCacheDiscard(t *testing.T) {
+	c := testClientWithFDSet()
+	f := c.allocFD(42, syscall.O_RDWR, 0, true, 128, 1, "/f", proto.StorageClass_BlobStore, 1)
+	require.NotNil(t, f)
+	require.Equal(t, uint64(42), f.ino)
+	require.Equal(t, uint(3), f.fd)
+
+	f2 := c.allocFD(43, syscall.O_RDONLY, 0, false, 0, 1, "/g", proto.StorageClass_BlobStore, 1)
+	require.NotNil(t, f2)
+	require.Equal(t, syscall.O_RDONLY, f2.flags&syscall.O_ACCMODE)
 }
 
 func TestClient_Close_closesOec(t *testing.T) {

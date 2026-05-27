@@ -82,8 +82,8 @@ type Reader struct {
 	aheadReadEnable  bool
 	minReadAheadSize uint64
 	readBuf          []byte
-	bufBaseOff       int   // file offset of valid data at readBuf[0]
-	bufValidLen      int   // valid bytes in readBuf[0:bufValidLen]
+	bufBaseOff       int   // file offset of valid data at readBuf[0] (prefetch block start)
+	bufValidLen      int   // valid bytes in readBuf[0:bufValidLen] (prefetch block end)
 	prefetchReserved int64 // bytes reserved from global blobPreReadLimiter
 	preReadLimiter   *blobPreReadLimiter
 

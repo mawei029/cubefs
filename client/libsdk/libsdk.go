@@ -1640,7 +1640,7 @@ func (c *client) allocFD(ino uint64, flags, mode uint32, fileCache bool, fileSiz
 	if flags&0x0f != syscall.O_RDONLY {
 		f.openForWrite = true
 	}
-	_ = fileCache // Blob/EC Reader/Writer 在 openStream 经 oec 挂载
+	_ = fileCache // Blob/EC Reader/Writer attach via oec in openStream
 	c.fdmap[fd] = f
 	return f
 }

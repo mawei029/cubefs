@@ -722,12 +722,12 @@ func (ap *AppendExtentKeyWithCheckRequest) EkString() string {
 // For overwrite: Extents[i] is the new extent, DiscardExtents[i] is the old extent to discard (paired by index).
 // DiscardExtent is legacy single discard; when DiscardExtents is empty, DiscardExtent is used as one pair.
 type AppendObjExtentKeysRequest struct {
-	VolName        string         `json:"vol"`
-	PartitionID    uint64         `json:"pid"`
-	Inode          uint64         `json:"ino"`
-	Extents        []ObjExtentKey `json:"ek"`
-	DiscardExtents []ObjExtentKey `json:"dek"`
-	IsOverwrite    bool           `json:"isOverwrite"`
+	VolName       string         `json:"vol"`
+	PartitionID   uint64         `json:"pid"`
+	Inode         uint64         `json:"ino"`
+	Extents       []ObjExtentKey `json:"ek"`
+	DiscardExtent ObjExtentKey   `json:"dek"`
+	IsOverwrite   bool           `json:"isOverwrite"`
 }
 
 // EkString returns a string representation of extent-related fields.
@@ -750,12 +750,8 @@ func (ap *AppendObjExtentKeysRequest) EkString() string {
 		sb.WriteString(ek.String())
 	}
 	sb.WriteString(",dek:")
-	if len(ap.DiscardExtents) > 0 {
-		for _, d := range ap.DiscardExtents {
-			if !d.IsEmpty() {
-				sb.WriteString(d.String())
-			}
-		}
+	if !ap.DiscardExtent.IsEmpty() {
+		sb.WriteString(ap.DiscardExtent.String())
 	}
 	sb.WriteString(fmt.Sprintf(",isOverwrite:%v]", ap.IsOverwrite))
 
@@ -794,17 +790,18 @@ type GetExtentsResponse struct {
 }
 
 // TruncateRequest defines the request to truncate.
-// When TruncateV2 is true (EC/BlobStore), client has done EBS read/truncate/write/delete and sends
-// the new extent list; metanode only updates inode.Size and inode.ObjExtents, does not send to objExtDelCh.
+// When TruncateV2 is true (EC/BlobStore), client has done EBS read/truncate/write/delete.
+// Metanode merges NewObjExtent into existing ObjExtents (partial overlap replace) and drops ToDelete
+// plus all following sorted extents; both are enqueued to objExtentDelTree for async GC.
 type TruncateRequest struct {
-	VolName       string         `json:"vol"`
-	PartitionID   uint64         `json:"pid"`
-	Inode         uint64         `json:"ino"`
-	Size          uint64         `json:"sz"`
-	Timestamp     int64          `json:"timestamp"`
-	TruncateV2    bool           `json:"truncateV2"`    // true means EC TruncateV2; metanode replaces with NewObjExtents and skips objExtDelCh
-	NewObjExtents []ObjExtentKey `json:"newObjExtents"` // new obj extent list computed by client for TruncateV2
-	ToDeletes     []ObjExtentKey `json:"toDeletes"`     // obj extent list to delete, computed by client for TruncateV2
+	VolName      string       `json:"vol"`
+	PartitionID  uint64       `json:"pid"`
+	Inode        uint64       `json:"ino"`
+	Size         uint64       `json:"sz"`
+	Timestamp    int64        `json:"timestamp"`
+	TruncateV2   bool         `json:"truncateV2"`   // true means EC TruncateV2
+	NewObjExtent ObjExtentKey `json:"newObjExtent"` // partial cut inside one old oek after EBS trim; empty on integer-boundary cut
+	ToDelete     ObjExtentKey `json:"toDelete"`     // ComputeTruncateReqs DiscardFrom on inode snapshot: full old oek for partial cut, or first tail oek (FileOffset>=sz) when tail-only; empty for logical hole/grow
 	RequestExtend
 }
 

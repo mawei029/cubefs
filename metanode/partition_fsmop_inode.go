@@ -846,43 +846,33 @@ func (mp *metaPartition) fsmAppendObjExtentsWithCheck(dbHandle interface{}, inoP
 		return proto.OpMismatchStorageClass, nil
 	}
 
-	// Extract pairs new extent and discard extent from input
-	// Rule: requestEks = [new1, discard1, new2, discard2, ...]; len must be even and >= 2
-	var requestEks []proto.ObjExtentKey
-	if inoParam.HybridCloudExtents.sortedEks != nil {
-		if sortedEks, ok := inoParam.HybridCloudExtents.sortedEks.(*SortedObjExtents); ok && len(sortedEks.eks) > 0 {
-			requestEks = sortedEks.CopyExtents()
-		}
-	}
-	if len(requestEks) < 2 || len(requestEks)%2 != 0 {
+	// requestEks: new (+ optional discard) from Raft apply payload (inoParam), not the inode snapshot.
+	requestEks := copyObjExtentsFromInode(inoParam)
+	if len(requestEks) == 0 || len(requestEks) > 2 {
+		// len must be 1 or 2
 		log.LogErrorf("action[fsmAppendObjExtentsWithCheck] mp[%v] inode[%v] OpArgMismatchErr: extents must be pairs (new,discard), len(requestEks)=%v", mpId, inoId, len(requestEks))
 		return proto.OpArgMismatchErr, nil
 	}
 
-	// Check if the new extent is already exist
-	var eksInInode []proto.ObjExtentKey
-	if fsmIno.HybridCloudExtents.sortedEks != nil {
-		if sortedEks, ok := fsmIno.HybridCloudExtents.sortedEks.(*SortedObjExtents); ok {
-			eksInInode = sortedEks.CopyExtents()
-		}
-	}
+	// eksInInode: current sorted ObjExtents on metanode before merge.
+	eksInInode := copyObjExtentsFromInode(fsmIno)
 
-	toDelete := make([]proto.ObjExtentKey, 0, len(requestEks)/2)
-	for i := 0; i < len(requestEks); i += 2 {
-		newExtent := requestEks[i]
-		discardExtent := requestEks[i+1]
-		log.LogDebugf("action[fsmAppendObjExtentsWithCheck] mp[%v] inode[%v] pair[%d] newExtent[%v] discardExtent[%v]", mpId, inoId, i/2, newExtent, discardExtent)
-
-		// Check conflicts and append/update extent
-		status, finalEks := mp.appendObjExtentsCheck(mpId, inoId, eksInInode, newExtent, discardExtent)
-		if status != proto.OpOk {
-			return status, nil
-		}
-		eksInInode = finalEks
-		if !discardExtent.IsEmpty() {
-			toDelete = append(toDelete, discardExtent)
-		}
+	// One flush/overwrite can span multiple existing ObjExtents (see computeOverwriteReqs), so the FSM
+	// carries several (new, discard) pairs in one batch. Each non-empty discard is collected for async EBS GC.
+	// TruncateV2 is different: at most one partial overlap (NewObjExtent) plus one tail anchor (ToDelete).
+	newExtent := requestEks[0]
+	discardExtent := proto.ObjExtentKey{}
+	if len(requestEks) == 2 {
+		discardExtent = requestEks[1]
 	}
+	log.LogDebugf("action[fsmAppendObjExtentsWithCheck] mp[%v] inode[%v] newExtent[%v] discardExtent[%v]", mpId, inoId, newExtent, discardExtent)
+
+	// Check conflicts and append/update extent
+	status, finalEks := mp.checkObjExtentsConflict(mpId, inoId, eksInInode, newExtent, discardExtent)
+	if status != proto.OpOk {
+		return status, nil
+	}
+	eksInInode = finalEks
 
 	// Update inode extents in memory with final result
 	fsmIno.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks(eksInInode)
@@ -895,8 +885,8 @@ func (mp *metaPartition) fsmAppendObjExtentsWithCheck(dbHandle interface{}, inoP
 	fsmIno.ModifyTime = inoParam.ModifyTime
 
 	// Schedule discard extents for async EBS delete (replicated btree; same apply index for idempotent replay).
-	if len(toDelete) > 0 {
-		mp.objExtentDelTree.EnqueueFromApply(inoId, inoParam.ModifyTime, mp.fsmRaftApplyIndex, toDelete)
+	if !discardExtent.IsEmpty() {
+		mp.objExtentDelTree.EnqueueFromApply(inoId, inoParam.ModifyTime, mp.fsmRaftApplyIndex, []proto.ObjExtentKey{discardExtent})
 	}
 
 	if err = mp.inodeTree.Update(dbHandle, fsmIno); err != nil {
@@ -904,20 +894,19 @@ func (mp *metaPartition) fsmAppendObjExtentsWithCheck(dbHandle interface{}, inoP
 		return proto.OpErr, err
 	}
 
-	log.LogDebugf("fsm update success, mp[%d] inode[%d] success, finalEks count[%d] gen[%d] discardCount[%d]",
-		mpId, inoId, len(eksInInode), fsmIno.Generation, len(toDelete))
+	log.LogDebugf("fsm update success, mp[%d] inode[%d] success, finalEks count[%d] gen[%d] discardExtent[%v]",
+		mpId, inoId, len(eksInInode), fsmIno.Generation, discardExtent)
 	return proto.OpOk, nil
 }
 
-// appendObjExtentsCheck checks conflicts between existing extents and new extent, then appends or updates.
-//   - Idempotent: newExtent already equals an existing extent → OpOk, no change.
-//   - Replace: new [start,end) exactly matches one existing extent → require existing == discard, then replace with newExtent.
-//   - Extend: new has same start as the last extent but larger end → same requirement, replace with newExtent.
-//   - Conflict: any other overlap (e.g. new inside existing, or overlapping multiple) → OpConflictExtentsErr.
-//   - Append: no overlap with any existing → require discard empty, then append newExtent (sorted).
-//
-// Returns (status, finalEks). existingExtents must be sorted by FileOffset.
-func (mp *metaPartition) appendObjExtentsCheck(mpId uint64, inoId uint64, existingExtents []proto.ObjExtentKey, newExtent, discardExtent proto.ObjExtentKey) (status uint8, finalEks []proto.ObjExtentKey) {
+// checkObjExtentsConflict checks conflicts between existing extents and newExtent, then appends or updates.
+// EC blobstore writer only sends exact-replace (same range) or extend-last; same-start shorter overlap is rejected.
+// existingExtents must be sorted by FileOffset. Returns (status, finalEks).
+func (mp *metaPartition) checkObjExtentsConflict(mpId uint64, inoId uint64, existingExtents []proto.ObjExtentKey, newExtent, discardExtent proto.ObjExtentKey) (status uint8, finalEks []proto.ObjExtentKey) {
+	if newExtent.IsEmpty() {
+		return proto.OpConflictExtentsErr, nil
+	}
+
 	newStart := newExtent.FileOffset
 	newEnd := newExtent.FileOffset + newExtent.Size
 
@@ -928,7 +917,7 @@ func (mp *metaPartition) appendObjExtentsCheck(mpId uint64, inoId uint64, existi
 	lastIdx := len(existingExtents) - 1
 	for i, existingEk := range existingExtents {
 		if existingEk.IsEquals(&newExtent) {
-			log.LogWarnf("action[appendObjExtentsCheck] mp[%v] ino[%v] idempotent: existingEk[%v] == newExtent[%v]", mpId, inoId, existingEk, newExtent)
+			log.LogWarnf("action[checkObjExtentsConflict] mp[%v] ino[%v] idempotent: existingEk[%v] == newExtent[%v]", mpId, inoId, existingEk, newExtent)
 			return proto.OpOk, finalEks
 		}
 
@@ -939,38 +928,50 @@ func (mp *metaPartition) appendObjExtentsCheck(mpId uint64, inoId uint64, existi
 			continue
 		}
 
-		// Overlap: allow only full replace or extend-last; discard must match the replaced extent
-		offsetMatch := (newStart == existingStart)
-		exactReplace := offsetMatch && (newEnd == existingEnd)
-		extendLast := (i == lastIdx) && offsetMatch && (newEnd > existingEnd)
+		// Overlap: exact replace or extend-last only (writer merges partial overwrite into full old extent).
+		offsetMatch := newStart == existingStart
+		exactReplace := offsetMatch && newEnd == existingEnd
+		extendLast := i == lastIdx && offsetMatch && newEnd > existingEnd
 
 		if exactReplace || extendLast {
 			if !existingEk.IsEquals(&discardExtent) {
-				log.LogErrorf("action[appendObjExtentsCheck] mp[%v] ino[%v] discard mismatch: existingEk[%v] discardExtent[%v]",
+				log.LogErrorf("action[checkObjExtentsConflict] mp[%v] ino[%v] discard mismatch: existingEk[%v] discardExtent[%v]",
 					mpId, inoId, existingEk, discardExtent)
 				return proto.OpConflictExtentsErr, finalEks
 			}
 			finalEks[i] = newExtent
-			log.LogDebugf("action[appendObjExtentsCheck] mp[%v] ino[%v] replaced: existingEk[%v] -> newExtent[%v]", mpId, inoId, existingEk, newExtent)
+			log.LogDebugf("action[checkObjExtentsConflict] mp[%v] ino[%v] replaced: existingEk[%v] -> newExtent[%v]", mpId, inoId, existingEk, newExtent)
 			return proto.OpOk, finalEks
 		}
 
 		// Other overlap scenarios are conflicts
-		log.LogErrorf("action[appendObjExtentsCheck] mp[%v] ino[%v] invalid overlap: existingEk[%v] newExtent[%v]", mpId, inoId, existingEk, newExtent)
+		log.LogErrorf("action[checkObjExtentsConflict] mp[%v] ino[%v] invalid overlap: existingEk[%v] newExtent[%v]", mpId, inoId, existingEk, newExtent)
 		return proto.OpConflictExtentsErr, finalEks
 	}
 
 	// If discardExtent is not empty, newExtent must be overlap with existing extents, so return conflict error
 	if !discardExtent.IsEmpty() {
-		log.LogErrorf("action[appendObjExtentsCheck] mp[%v] ino[%v] no overlap but discard provided: newExtent[%v] discardExtent[%v]", mpId, inoId, newExtent, discardExtent)
+		log.LogErrorf("action[checkObjExtentsConflict] mp[%v] ino[%v] no overlap but discard provided: newExtent[%v] discardExtent[%v]", mpId, inoId, newExtent, discardExtent)
 		return proto.OpConflictExtentsErr, finalEks
 	}
 
 	// No overlap: append (covers fill-gap case when new range lies between existing extents)
 	finalEks = append(finalEks, newExtent)
 	sort.Slice(finalEks, func(a, b int) bool { return finalEks[a].FileOffset < finalEks[b].FileOffset })
-	log.LogDebugf("action[appendObjExtentsCheck] mp[%v] ino[%v] appended: newExtent[%v]", mpId, inoId, newExtent)
+	log.LogDebugf("action[checkObjExtentsConflict] mp[%v] ino[%v] appended: newExtent[%v]", mpId, inoId, newExtent)
 	return proto.OpOk, finalEks
+}
+
+// copyObjExtentsFromInode returns a sorted copy of ObjExtents stored on the inode (nil if none).
+func copyObjExtentsFromInode(ino *Inode) []proto.ObjExtentKey {
+	if ino == nil || ino.HybridCloudExtents == nil {
+		return nil
+	}
+	sortedEks, ok := ino.HybridCloudExtents.sortedEks.(*SortedObjExtents)
+	if !ok || sortedEks == nil {
+		return nil
+	}
+	return sortedEks.CopyExtents()
 }
 
 func (mp *metaPartition) fsmExtentsTruncate(dbHandle interface{}, ino *Inode) (resp *InodeResponse, err error) {
@@ -1055,13 +1056,26 @@ func (mp *metaPartition) fsmExtentsTruncate(dbHandle interface{}, ino *Inode) (r
 	return
 }
 
-// fsmExtentsTruncateV2 handles EC TruncateV2: updates inode.Size and ObjExtents,
-// and enqueues req.ToDeletes into objExtentDelTree (background GC deletes EBS asynchronously).
+// Contract matches sdk/data/blobstore ComputeTruncateReqs + ApplyTruncateReqs:
+//   - NewObjExtent: optional; EBS-trimmed oek when target falls inside one old oek (same FileOffset, shorter Size).
+//   - ToDelete: optional; equals ComputeTruncateReqs DiscardFrom on the inode snapshot before apply:
+//   - partial cut  -> full old oek at NewObjExtent.FileOffset (EBS overwrite source, not the first tail);
+//   - drop old extent -> drop every remaining oek with FileOffset >= target.
+//
+// Example inode Size=200, sorted oeks {[10,30), [35,45), [60,70)} (FileOffset, end):
+//
+//   - target=0: NewObjExtent empty, ToDelete {10,30}; inode.Size shrinks to 0, and delete all old extents.
+//   - target=15: NewObjExtent {10,15}, ToDelete old {10,30}; keep {10,15}; sweep >=15 removes [35,45) and [60,70).
+//   - target=50: NewObjExtent empty, ToDelete {60,70}; keep prefix; sweep >=50 removes [60,70).
+//   - target=65: NewObjExtent {60,65}, ToDelete old {60,70}; keep {10,30),{35,45),{60,65}; no sweep.
+//   - target=100: both empty; only inode.Size shrinks to 100 (logical hole, extents unchanged).
 func (mp *metaPartition) fsmExtentsTruncateV2(dbHandle interface{}, req *proto.TruncateRequest) (resp *InodeResponse, err error) {
 	resp = NewInodeResponse()
 	resp.Status = proto.OpOk
+
+	// Step 1: Load inode and basic guards (BlobStore file only).
 	ino := NewInode(req.Inode, 0)
-	i, err := mp.inodeTree.Get(ino)
+	i, err := mp.inodeTree.CopyGet(ino)
 	if err != nil {
 		resp.Status = proto.OpErr
 		return
@@ -1082,26 +1096,102 @@ func (mp *metaPartition) fsmExtentsTruncateV2(dbHandle interface{}, req *proto.T
 	if i.HybridCloudExtents == nil {
 		i.HybridCloudExtents = NewSortedHybridCloudExtents()
 	}
-	newEks := req.NewObjExtents
-	if newEks == nil {
-		newEks = []proto.ObjExtentKey{}
+
+	// Step 2: get oeks from inode, and check truncate conflict.
+	eksInInode := copyObjExtentsFromInode(i)
+	status, finalEks, toEnqueue := mp.checkTruncateV2Conflict(req, eksInInode)
+	if status != proto.OpOk {
+		resp.Status = status
+		return
 	}
-	i.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks(newEks)
+
+	// Step 3: Persist truncated extent list and logical size (Raft-replicated). may be eks is empty, so we need to create a new sortedEks.
+	mpId := mp.config.PartitionId
+	inoId := req.Inode
+	i.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks(finalEks)
 	i.Size = req.Size
 	i.Generation++
 	if err = mp.inodeTree.Put(dbHandle, i); err != nil {
-		log.LogErrorf("[fsmExtentsTruncateV2] mpId(%v) ino(%v) Put err: %v", mp.config.PartitionId, req.Inode, err)
+		log.LogErrorf("[fsmExtentsTruncateV2] mpId(%v) ino(%v) Put err: %v", mpId, inoId, err)
 		resp.Status = proto.OpErr
 		return
 	}
 
-	if len(req.ToDeletes) > 0 && mp.objExtentDelTree != nil {
-		// TruncateRequest has ModifyTime field,or Use ts=0 so all replicas derive TsMs from the same apply index.
-		mp.objExtentDelTree.EnqueueFromApply(req.Inode, req.Timestamp, mp.fsmRaftApplyIndex, req.ToDeletes)
+	// Step 4: After inode commit, schedule async EBS GC for every key in toEnqueue (idempotent by apply index).
+	if len(toEnqueue) > 0 {
+		mp.objExtentDelTree.EnqueueFromApply(req.Inode, req.Timestamp, mp.fsmRaftApplyIndex, toEnqueue)
 	}
-	log.LogDebugf("[fsmExtentsTruncateV2] mpId(%v) ino(%v) size(%v) newExtentsLen(%v) toDeletesLen(%v)",
-		mp.config.PartitionId, req.Inode, req.Size, len(newEks), len(req.ToDeletes))
+	log.LogDebugf("[fsmExtentsTruncateV2] mpId(%v) ino(%v) size(%v) finalExtentsLen(%v) enqueueLen(%v)",
+		mpId, inoId, req.Size, len(eksInInode), len(toEnqueue))
 	return
+}
+
+func (mp *metaPartition) checkTruncateV2Conflict(req *proto.TruncateRequest, eksInInode []proto.ObjExtentKey) (status uint8, finalEks, toEnqueue []proto.ObjExtentKey) {
+	if len(eksInInode) == 0 {
+		if !req.NewObjExtent.IsEmpty() || !req.ToDelete.IsEmpty() {
+			return proto.OpConflictExtentsErr, nil, nil
+		}
+		return proto.OpOk, nil, nil
+	}
+
+	target := req.Size
+	lastEk := eksInInode[len(eksInInode)-1]
+
+	if req.ToDelete.IsEmpty() {
+		if !req.NewObjExtent.IsEmpty() {
+			return proto.OpConflictExtentsErr, nil, nil
+		}
+		if target < lastEk.FileOffset+lastEk.Size {
+			return proto.OpConflictExtentsErr, nil, nil
+		}
+		// all empty and target is ok: no conflict, no need to shrink
+		return proto.OpOk, eksInInode, toEnqueue
+	}
+
+	delIdx := -1
+	extent := proto.ObjExtentKey{}
+	for i, ek := range eksInInode {
+		if !req.NewObjExtent.IsEmpty() && ek.IsEquals(&req.NewObjExtent) && i == len(eksInInode)-1 {
+			log.LogWarnf("[checkTruncateV2Conflict] mpId(%v) ino(%v) already deleted, target(%v) req.NewObjExtent(%v)",
+				mp.config.PartitionId, req.Inode, target, req.NewObjExtent)
+			return proto.OpOk, eksInInode[:i+1], toEnqueue
+		}
+
+		if ek.FileOffset == req.ToDelete.FileOffset {
+			extent = ek
+			delIdx = i
+			break
+		}
+	}
+
+	// when not delete, target may be is zero
+	status = proto.OpConflictExtentsErr
+	if extent.FileOffset == req.ToDelete.FileOffset && extent.Size == req.ToDelete.Size && target <= extent.FileOffset+extent.Size {
+		status = proto.OpOk
+	}
+
+	if status != proto.OpOk {
+		// when already deleted
+		if req.NewObjExtent.IsEmpty() {
+			if extent.IsEmpty() && lastEk.FileOffset+lastEk.Size <= target {
+				log.LogWarnf("[checkTruncateV2Conflict] mpId(%v) ino(%v) already deleted, target(%v) lastEk(%v)", mp.config.PartitionId, req.Inode, target, lastEk)
+				return proto.OpOk, eksInInode, toEnqueue
+			}
+		}
+		return status, nil, nil
+	}
+
+	// replace the extent with the new extent, and return will be deleted extents(toEnqueue)
+	finalEks = make([]proto.ObjExtentKey, 0, delIdx+1)
+	if delIdx >= 0 {
+		toEnqueue = append(toEnqueue, eksInInode[delIdx:]...)
+		finalEks = append(finalEks, eksInInode[:delIdx]...)
+		if !req.NewObjExtent.IsEmpty() {
+			finalEks = append(finalEks, req.NewObjExtent)
+		}
+	}
+
+	return status, finalEks, toEnqueue
 }
 
 func (mp *metaPartition) fsmEvictInode(dbHandle interface{}, ino *Inode) (resp *InodeResponse, err error) {

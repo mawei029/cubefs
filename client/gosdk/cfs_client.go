@@ -1198,7 +1198,7 @@ func (c *Client) allocFD(ino uint64, flags int, mode uint32, fileCache bool, fil
 	}
 	c.fdset.Set(fd)
 	f := &File{client: c, fd: fd, ino: ino, flags: flags, mode: mode, pino: parentInode, path: path, storageClass: storageClass, poolId: poolId}
-	_ = fileCache // Blob/EC Reader/Writer 在 openStream 经 oec 挂载
+	_ = fileCache // Blob/EC Reader/Writer attach via oec in openStream
 	c.fdmap[fd] = f
 	return f
 }

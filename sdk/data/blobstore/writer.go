@@ -48,11 +48,10 @@ type overwriteReq struct {
 	DiscardExtent proto.ObjExtentKey
 }
 
-// truncateReq is TruncateV2 plan: keep, optional partial overwriteReq, discard-only.
+// truncateReq is TruncateV2 plan: keep, optional single partial overwriteReq, first tail discard anchor.
 type truncateReq struct {
-	KeepExtents   []proto.ObjExtentKey
-	OverwriteReqs []overwriteReq
-	DiscardOnly   []proto.ObjExtentKey
+	KeepExtent  proto.ObjExtentKey // keep some extent, truncate Reduce capacity
+	DiscardFrom proto.ObjExtentKey // first extent will be discarded; 0->20->10, may be oek size is 0
 }
 
 type wSliceErr struct {
@@ -66,9 +65,9 @@ type Writer struct {
 	wConcurrency  int
 	wg            sync.WaitGroup
 	once          sync.Once
-	buf           []byte
-	fileOffset    int
-	blockPosition int
+	buf           []byte // buffer for write operations, size is blockSize
+	fileOffset    int    // logical file offset of current write position (file end). The logical write pointer of the current buffered session (the exclusive end of the written range); Flush using [fileOffset-bufferSize, fileOffset].
+	blockPosition int    // physical block offset of current write position (buffer end). Current filled length within the 8 MB block; reaching BlockSize triggers flushExt, then reset to zero
 	limitManager  *manager.LimitManager
 	ecStreamer    *ECStreamer // required (see NewWriter)
 }
@@ -198,8 +197,6 @@ func (writer *Writer) tryOverWrite(ctx context.Context, offset int, data []byte,
 		return 0, fmt.Errorf("writer is not opened yet")
 	}
 
-	writer.ecStreamer.markDirty()
-
 	if offset != writer.fileOffset {
 		// Flush existing buffer data before starting new write at different offset
 		if err = writer.flushExt(writer.ecStreamer.Inode(), ctx, false); err != nil {
@@ -207,17 +204,20 @@ func (writer *Writer) tryOverWrite(ctx context.Context, offset int, data []byte,
 				writer.ecStreamer.Inode(), offset, len(data), flags, err)
 			return 0, err
 		}
+		// reset fileOffset to the new write position
 		writer.fileOffset = offset
 	}
+
+	writer.ecStreamer.markDirty()
 	if buf.CachePool != nil && writer.buf == nil {
 		writer.allocateCache()
 	}
 	writer.reshapeBufForCopyPath()
 
-	remainSize, position := len(data), 0
+	remainSize, position, notFlushSize := len(data), 0, 0
 	log.LogDebugf("TRACE blobStore tryOverWrite: ino(%v) writer.buf.len(%v) writer.blocksize(%v)", writer.ecStreamer.Inode(), len(writer.buf), writer.ecStreamer.BlockSize())
 
-	// The loop will write data to buffer in blocks, flushing when buffer is full
+	// Write maybe beyond the BlockSize boundary: The loop will write data to buffer in blocks, flushing when buffer is full
 	// Process data in chunks until all data is written to buffer
 	for remainSize > 0 {
 		freeSize := writer.ecStreamer.BlockSize() - writer.blockPosition
@@ -240,14 +240,14 @@ func (writer *Writer) tryOverWrite(ctx context.Context, offset int, data []byte,
 		writer.blockPosition += freeSize // Move forward in buffer
 		remainSize -= freeSize           // Decrease remaining data to process
 		writer.fileOffset += freeSize
-		// writer.ecStreamer.markDirty()
-		writer.ecStreamer.raiseFileSize(uint64(writer.fileOffset))
+		notFlushSize += freeSize
 
 		log.LogDebugf("TRACE blobStore tryOverWrite: ino(%v) cacheFileSize(%v) writer.fileOffset(%v) writer.blockPosition(%v) position(%v) freeSize(%v)",
 			writer.ecStreamer.Inode(), writer.CacheFileSize(), writer.fileOffset, writer.blockPosition, position, freeSize)
 
 		// Check buffer is full: when position are equal, buffer is completely filled. we flush buffer and continue
 		if writer.blockPosition == writer.ecStreamer.BlockSize() {
+			notFlushSize = 0
 			log.LogDebugf("TRACE blobStore tryOverWrite: ino(%v) writer.buf.len(%v) writer.blocksize(%v)", writer.ecStreamer.Inode(), len(writer.buf), writer.ecStreamer.BlockSize())
 			// Flush buffer with overwrite logic: this will handle extent overlap and discard old data
 			err = writer.flushExt(writer.ecStreamer.Inode(), ctx, false)
@@ -255,7 +255,6 @@ func (writer *Writer) tryOverWrite(ctx context.Context, offset int, data []byte,
 				// Rollback the state to maintain consistency, remove the failed buffer and revert position pointers
 				writer.buf = writer.buf[:writer.blockPosition-freeSize]
 				writer.fileOffset -= freeSize
-				writer.ecStreamer.setFileSize(uint64(writer.fileOffset))
 				writer.blockPosition -= freeSize
 				return 0, err
 			}
@@ -266,6 +265,9 @@ func (writer *Writer) tryOverWrite(ctx context.Context, offset int, data []byte,
 	// Partial block data still in buf must be flushed, otherwise Read (which uses EBS/meta) will not observe this pwrite/sparse write.
 	if writer.blockPosition > 0 {
 		if err = writer.flushExt(writer.ecStreamer.Inode(), ctx, false); err != nil {
+			writer.fileOffset -= notFlushSize
+			writer.blockPosition -= notFlushSize
+			writer.buf = writer.buf[:writer.blockPosition]
 			log.LogErrorf("TRACE blobStore tryOverWrite error, final flush ext fail,ino(%v) offset(%v) len(%v) err(%v)",
 				writer.ecStreamer.Inode(), offset, len(data), err)
 			return 0, err
@@ -790,6 +792,7 @@ func (writer *Writer) flushWithoutPool(inode uint64, ctx context.Context, flushF
 func computeOverwriteReqs(start, end uint64, objExtents []proto.ObjExtentKey) (reqs []overwriteReq) {
 	reqs = make([]overwriteReq, 0)
 	for _, ek := range objExtents {
+		// last extent, append a new extent
 		if end <= ek.FileOffset {
 			reqs = append(reqs, overwriteReq{
 				NewExtent:     proto.ObjExtentKey{FileOffset: start, Size: end - start},
@@ -803,6 +806,7 @@ func computeOverwriteReqs(start, end uint64, objExtents []proto.ObjExtentKey) (r
 		if start >= ek.FileOffset+ek.Size {
 			continue
 		}
+		// hole, new data, no overlap
 		if start < ek.FileOffset {
 			reqs = append(reqs, overwriteReq{
 				NewExtent:     proto.ObjExtentKey{FileOffset: start, Size: ek.FileOffset - start},
@@ -810,6 +814,7 @@ func computeOverwriteReqs(start, end uint64, objExtents []proto.ObjExtentKey) (r
 			})
 			start = ek.FileOffset
 		}
+		// new data, partial overlap
 		reqSize := end - start
 		if end > ek.FileOffset+ek.Size {
 			reqSize = ek.FileOffset + ek.Size - start
@@ -835,19 +840,8 @@ func computeOverwriteReqs(start, end uint64, objExtents []proto.ObjExtentKey) (r
 // flushOverwriteReqs applies the request list: write all slices to EBS, then update metadata in one batch.
 // 1. For each req: build wSlice (read/merge old extent if partial overwrite), writeSlice to EBS, collect newExtent + discardExtent.
 // 2. One AppendObjExtentKeysWithCheck(ino, newExtents, discardExtents); on failure rollback (delete all new extents).
-// Call flow: writer.mw.AppendObjExtentKeysWithCheckBatch -> metanode BatchObjExtentAppendWithCheck -> fsmAppendObjExtentsWithCheck (multi-pair) -> objExtDelCh <- toDelete
-func (writer *Writer) flushOverwriteReqs(ctx context.Context, inode uint64, reqs []overwriteReq, bufOff uint64, bufferSize int, flushFlag bool) (err error) {
-	newExtents := make([]proto.ObjExtentKey, 0, len(reqs))
-	discardExtents := make([]proto.ObjExtentKey, 0, len(reqs))
-
-	rollbackFn := func() {
-		for _, written := range newExtents {
-			if delErr := writer.ecStreamer.Ebsc().Delete([]proto.ObjExtentKey{written}); delErr != nil {
-				log.LogWarnf("flushExt: rollback delete ebs extent fail,ino(%v) fileOffset(%v) err(%v)", writer.ecStreamer.Inode(), written.FileOffset, delErr)
-			}
-		}
-	}
-
+// Call flow: per req mw.AppendObjExtentKeysWithCheck -> metanode BatchObjExtentAppendWithCheck -> fsmAppendObjExtentsWithCheck (one new+optional discard) -> objExtentDelTree
+func (writer *Writer) flushOverwriteReqs(ctx context.Context, inode uint64, reqs []overwriteReq, bufOff uint64, bufferSize int) (err error) {
 	for _, req := range reqs {
 		ek := req.NewExtent
 		if ek.Size == 0 {
@@ -898,27 +892,21 @@ func (writer *Writer) flushOverwriteReqs(ctx context.Context, inode uint64, reqs
 		// Write the slice to EBS (either new data or merged data)
 		log.LogDebugf("flushExt: write slice ino(%v) fileOffset(%v) len(%v) discardExtent(%v)", inode, wSlice.fileOffset, wSlice.size, req.DiscardExtent)
 		if err = writer.writeSlice(ctx, wSlice, false); err != nil {
-			_ = flushFlag
-			// Rollback: delete already-written extents (use newExtents: real EBS location keys, not req.NewExtent)
-			rollbackFn()
-			return
+			// don't rollback, posix overwrite error, and tell upper layer to handle it
+			return err
 		}
 
-		newExtents = append(newExtents, wSlice.objExtentKey)
-		discardExtents = append(discardExtents, req.DiscardExtent)
+		// append obj extent keys with check
+		if err = writer.ecStreamer.Mw().AppendObjExtentKeysWithCheck(writer.ecStreamer.Inode(), wSlice.objExtentKey, req.DiscardExtent); err != nil {
+			log.LogErrorf("flushExt: append obj extent keys with check batch fail,ino(%v) newExtent(%v) discardExtent(%v) offset(%v) size(%v) err(%v)",
+				inode, wSlice.objExtentKey, req.DiscardExtent, wSlice.fileOffset, wSlice.size, err)
+			// Allow some garbage; data succeeded, metadata failed.The probability is very low.
+			return err
+		}
+		log.LogDebugf("flushExt: append obj extent keys with check batch success,ino(%v) offset(%v) size(%v)", inode, wSlice.fileOffset, wSlice.size)
+
 	}
 
-	if len(newExtents) == 0 {
-		return nil
-	}
-
-	// Atomic metadata update: add batch new extent and discard old extent
-	if err = writer.ecStreamer.Mw().AppendObjExtentKeysWithCheck(writer.ecStreamer.Inode(), newExtents, discardExtents); err != nil {
-		log.LogErrorf("flushExt: append obj extent keys with check batch fail,ino(%v) count(%v) err(%v)", inode, len(newExtents), err)
-		rollbackFn()
-		return err
-	}
-	log.LogDebugf("flushExt: append obj extent keys with check batch success,ino(%v) count(%v)", inode, len(newExtents))
 	return nil
 }
 
@@ -936,12 +924,11 @@ func (writer *Writer) flushExt(inode uint64, ctx context.Context, flushFlag bool
 	log.LogDebugf("flushExt: ino(%v) buf-len(%v) flushFlag(%v) fileOffset(%v) blockPosition(%v)",
 		inode, len(writer.buf), flushFlag, writer.fileOffset, writer.blockPosition)
 
-	bufferSize := writer.bufferDirtyLen()
+	bufferSize := writer.bufferDirtyLen() // writer.blockPosition or len(writer.buf)
 	if bufferSize == 0 {
 		// No buffer: refresh meta only (Flush entry split; empty buf before tryOverWrite offset switch).
 		// Unlike flush(): flush() only when len(reqs)==0 and bufferSize>0 below.
 		if writer.ecStreamer.isDirty() {
-			writer.blockPosition = 0
 			return writer.ecStreamer.updateMetaInfo(nil)
 		}
 		return nil
@@ -957,8 +944,8 @@ func (writer *Writer) flushExt(inode uint64, ctx context.Context, flushFlag bool
 		log.LogErrorf(err.Error())
 		return err
 	}
-	start := uint64(writer.fileOffset - bufferSize)
-	end := uint64(writer.fileOffset)
+	start := uint64(writer.fileOffset - bufferSize) // buffer start offset
+	end := uint64(writer.fileOffset)                // buffer end offset
 	if start >= end {
 		writer.blockPosition = 0
 		return writer.ecStreamer.updateMetaInfo(nil)
@@ -969,12 +956,15 @@ func (writer *Writer) flushExt(inode uint64, ctx context.Context, flushFlag bool
 	reqs := computeOverwriteReqs(start, end, objExtents)
 	log.LogDebugf("flushExt: ino(%v) start(%v) end(%v) reqsCount(%v) bufferSize(%v)", inode, start, end, len(reqs), bufferSize)
 
-	if len(reqs) == 0 {
+	if len(reqs) == 1 && reqs[0].DiscardExtent.IsEmpty() {
+		// is hole write/tail append, simple flush
 		err = writer.flush(inode, ctx, flushFlag)
 	} else {
-		err = writer.flushOverwriteReqs(ctx, inode, reqs, start, bufferSize, flushFlag)
+		// is overwrite, flush overwrite reqs
+		err = writer.flushOverwriteReqs(ctx, inode, reqs, start, bufferSize)
 	}
 	if err != nil {
+		log.LogErrorf("flushExt: flush overwrite reqs fail,ino(%v) reqsCount(%v) err(%v)", inode, len(reqs), err)
 		return
 	}
 
@@ -1036,10 +1026,10 @@ func (writer *Writer) CacheFileSize() int {
 // when targetSize >= current size, return existing list directly (upper-layer MetaWrapper.TruncateV2 updates meta only, no EBS write).
 // Call chain: File.doECTruncateV2 -> Writer.TruncateV2 -> (shrink path) BlobStoreClient.TruncateV2Extents -> mw.TruncateV2.
 func (writer *Writer) TruncateV2(ctx context.Context, targetSize uint64,
-) (newObjExtents []proto.ObjExtentKey, toDelete []proto.ObjExtentKey, err error) {
+) (newObjExtent proto.ObjExtentKey, toDeleteFrom proto.ObjExtentKey, err error) {
 	if writer == nil || writer.ecStreamer.Mw() == nil || writer.ecStreamer.Ebsc() == nil {
 		log.LogErrorf("Writer.TruncateV2: writer/mw/ebsc nil")
-		return nil, nil, fmt.Errorf("Writer.TruncateV2: writer/mw/ebsc nil")
+		return proto.ObjExtentKey{}, proto.ObjExtentKey{}, fmt.Errorf("Writer.TruncateV2: writer/mw/ebsc nil")
 	}
 	// don't need to flush here, because the truncate is already done in the file.truncateV2 function
 	objExtents := writer.ecStreamer.OeksLocked()
@@ -1050,13 +1040,13 @@ func (writer *Writer) TruncateV2(ctx context.Context, targetSize uint64,
 
 // TruncateV2FromExtents uses provided currentSize/objExtents to avoid duplicate GetObjExtents.
 func (writer *Writer) TruncateV2FromExtents(ctx context.Context, targetSize uint64, currentSize uint64, objExtents []proto.ObjExtentKey,
-) (newObjExtents []proto.ObjExtentKey, toDelete []proto.ObjExtentKey, err error) {
+) (newObjExtent proto.ObjExtentKey, toDeleteFrom proto.ObjExtentKey, err error) {
 	if writer == nil || writer.ecStreamer.Ebsc() == nil {
 		log.LogErrorf("Writer.TruncateV2FromExtents: writer/ebsc nil")
-		return nil, nil, fmt.Errorf("Writer.TruncateV2FromExtents: writer/ebsc nil")
+		return proto.ObjExtentKey{}, proto.ObjExtentKey{}, fmt.Errorf("Writer.TruncateV2FromExtents: writer/ebsc nil")
 	}
 	if targetSize >= currentSize {
-		return objExtents, nil, nil
+		return proto.ObjExtentKey{}, proto.ObjExtentKey{}, nil
 	}
 	return writer.ecStreamer.Ebsc().TruncateV2Extents(ctx, writer.ecStreamer.Volume(), objExtents, targetSize)
 }

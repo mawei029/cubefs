@@ -157,6 +157,26 @@ func TestClient_openOECStream_closeStream_libsdk(t *testing.T) {
 	require.Nil(t, f.fileReader)
 }
 
+// TestClient_allocFD_coversFileCacheDiscard executes allocFD (incl. _ = fileCache) used before oec openStream.
+func TestClient_allocFD_coversFileCacheDiscard(t *testing.T) {
+	c := newClient()
+	c.fdset.Set(0).Set(1).Set(2)
+	defer func() {
+		gClientManager.mu.Lock()
+		delete(gClientManager.clients, c.id)
+		gClientManager.mu.Unlock()
+	}()
+
+	f := c.allocFD(42, uint32(syscall.O_RDWR), 0, true, 128, 1, "/f", proto.StorageClass_BlobStore, 1)
+	require.NotNil(t, f)
+	require.True(t, f.openForWrite)
+	require.Equal(t, uint64(42), f.ino)
+
+	f2 := c.allocFD(43, uint32(syscall.O_RDONLY), 0, false, 0, 1, "/g", proto.StorageClass_BlobStore, 1)
+	require.NotNil(t, f2)
+	require.False(t, f2.openForWrite)
+}
+
 func TestCfs_close_client_closesOec(t *testing.T) {
 	c := newTestLibsdkClientForOEC()
 	closed := false

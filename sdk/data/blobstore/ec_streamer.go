@@ -2,6 +2,7 @@ package blobstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -326,8 +327,12 @@ func (s *ECStreamer) setFileSize(size uint64) {
 
 // raiseFileSize raises logical tail to max(current, lb); skip lb==0; do not use setFileSize on overwrite paths.
 func (s *ECStreamer) raiseFileSize(lb uint64) {
-	if s == nil || lb == 0 {
-		log.LogErrorf("ECStreamer raiseFileSize: s is nil or lb is 0, ino(%v) lb(%v)", s.ino, lb)
+	if s == nil {
+		log.LogErrorf("ECStreamer raiseFileSize: streamer is nil, lb(%v)", lb)
+		return
+	}
+	if lb == 0 {
+		// skip: may be a zero-length file: use empty file, truncate to zero...
 		return
 	}
 	cur := atomic.LoadUint64(&s.fileSize)
@@ -373,19 +378,19 @@ func (s *ECStreamer) updateMetaInfo(commitSize *uint64) error {
 
 	s.mergeInodeGen(gen)
 	if commitSize != nil {
-		// 截断/Setattr：压低 fileSize 并裁剪 Writer 尾（commitSize 由 truncateV2Locked 传入）
+		// Truncate/Setattr: clamp fileSize and trim writer tail (commitSize from truncateV2Locked).
 		s.commitFileSize(*commitSize)
 	} else {
 		lb := logicalReadBound(size, objExtents)
 		if !s.isDirty() {
 			s.setFileSize(lb)
 		} else if w := s.fWriter; w.bufferDirtyLen() > 0 {
-			// dirty 且仍有物理缓冲：保留 dirty，fileSize 取 max(meta 尾, writer 尾)
+			// Dirty with buffered data: keep dirty; fileSize = max(meta tail, writer tail).
 			s.raiseFileSize(lb)
 			s.raiseFileSize(uint64(w.fileOffset))
 			s.markDirty()
 		} else {
-			// dirty 无物理缓冲（仅 oeks 旧）或 flush 后：与 meta 对齐并清 dirty
+			// Dirty without buffer (stale oeks only) or after flush: align with meta and clear dirty.
 			s.setFileSize(lb)
 			s.cleanDirty()
 		}
@@ -477,13 +482,14 @@ func (s *ECStreamer) truncateV2Locked(ctx context.Context, ino uint64, targetSiz
 		return err
 	}
 
+	empty := proto.ObjExtentKey{}
 	_, currentSize, _, objExtents, err := s.mw.GetObjExtents(ino)
 	if err != nil {
 		// create new file
 		if err == syscall.ENOENT || strings.Contains(err.Error(), syscall.ENOENT.Error()) {
 			log.LogDebugf("ECStreamer truncateV2: ino(%v) not found, new empty size(%v)", ino, targetSize)
 			s.markDirty()
-			if err := s.mw.TruncateV2(ino, targetSize, fullPath, nil, nil); err != nil {
+			if err := s.mw.TruncateV2(ino, targetSize, fullPath, empty, empty); err != nil {
 				return err
 			}
 			return s.updateMetaInfo(&targetSize)
@@ -498,21 +504,42 @@ func (s *ECStreamer) truncateV2Locked(ctx context.Context, ino uint64, targetSiz
 		return nil
 	}
 
-	// s.markDirty()
-
-	// TODO next version, validate grow path against metanode semantics
 	if targetSize > currentSize {
-		if err := s.mw.TruncateV2(ino, targetSize, fullPath, objExtents, nil); err != nil {
+		if err := s.mw.TruncateV2(ino, targetSize, fullPath, empty, empty); err != nil {
 			return err
 		}
 		return s.updateMetaInfo(&targetSize)
 	}
 
-	newObjExtents, toDeletes, err := s.fWriter.TruncateV2FromExtents(ctx, targetSize, currentSize, objExtents)
+	// shrink file, and no oeks
+	if len(objExtents) == 0 {
+		if err := s.mw.TruncateV2(ino, targetSize, fullPath, empty, empty); err != nil {
+			return err
+		}
+		return s.updateMetaInfo(&targetSize)
+	}
+
+	// shrink file, and has oeks
+	newObjExtent, toDeleteFrom, err := s.fWriter.TruncateV2FromExtents(ctx, targetSize, currentSize, objExtents)
 	if err != nil {
 		return err
 	}
-	if err := s.mw.TruncateV2(ino, targetSize, fullPath, newObjExtents, toDeletes); err != nil {
+
+	// delete and new extent is empty, don't need to change meta extent, just update file size
+	if toDeleteFrom.IsEmpty() {
+		lastEk := objExtents[len(objExtents)-1]
+		if !newObjExtent.IsEmpty() || targetSize < lastEk.FileOffset+lastEk.Size {
+			log.LogErrorf("ECStreamer truncateV2: shrink file, newObjExtent wrong or targetSize wrong, ino(%v) targetSize(%v) newObjExtent(%v) toDeleteFrom(%v)", ino, targetSize, newObjExtent, toDeleteFrom)
+			return errors.New("shrink file, and has oeks, but newObjExtent is not empty or targetSize is wrong")
+		}
+		if err := s.mw.TruncateV2(ino, targetSize, fullPath, empty, empty); err != nil {
+			return err
+		}
+		return s.updateMetaInfo(&targetSize)
+	}
+
+	// target < currentSize, and has oeks, and delete extent is not empty.
+	if err := s.mw.TruncateV2(ino, targetSize, fullPath, newObjExtent, toDeleteFrom); err != nil {
 		return err
 	}
 	return s.updateMetaInfo(&targetSize)

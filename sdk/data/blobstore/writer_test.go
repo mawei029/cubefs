@@ -17,6 +17,7 @@ package blobstore
 import (
 	"context"
 	"crypto/md5"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -134,6 +135,20 @@ func TestWriter_TruncateV2FromExtentsNilEbsc(t *testing.T) {
 	_, _, err := s.fWriter.TruncateV2FromExtents(context.Background(), 10, 100, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "ebsc nil")
+}
+
+func TestWriter_TruncateV2FromExtents_no_shrink_when_target_ge_current(t *testing.T) {
+	s := mustTestECStreamerWithEbsc(265, &BlobStoreClient{}, 8<<20)
+	eks := []proto.ObjExtentKey{{FileOffset: 0, Size: 100}}
+	newEk, del, err := s.fWriter.TruncateV2FromExtents(context.Background(), 100, 100, eks)
+	require.NoError(t, err)
+	require.True(t, newEk.IsEmpty())
+	require.True(t, del.IsEmpty())
+
+	newEk, del, err = s.fWriter.TruncateV2FromExtents(context.Background(), 200, 100, eks)
+	require.NoError(t, err)
+	require.True(t, newEk.IsEmpty())
+	require.True(t, del.IsEmpty())
 }
 
 func TestWriter_doBufferWrite_(t *testing.T) {
@@ -371,7 +386,7 @@ func MockGetObjExtentsEmpty(mw *meta.MetaWrapper, inode uint64) (gen uint64, sz 
 }
 
 // MockAppendObjExtentKeysWithCheckTrue mocks successful AppendObjExtentKeysWithCheck
-func MockAppendObjExtentKeysWithCheckTrue(mw *meta.MetaWrapper, inode uint64, newEk []proto.ObjExtentKey, discardEk []proto.ObjExtentKey) error {
+func MockAppendObjExtentKeysWithCheckTrue(mw *meta.MetaWrapper, inode uint64, newEk, discardEk proto.ObjExtentKey) error {
 	return nil
 }
 
@@ -574,10 +589,10 @@ func TestWriterSetFileSizeAndTruncateV2GrowNoShrink(t *testing.T) {
 	s.ebsc = &BlobStoreClient{}
 	seedStreamerExtentsForTest(s, 20, []proto.ObjExtentKey{{FileOffset: 0, Size: 20}})
 
-	newExts, toDel, err := w.TruncateV2(context.Background(), 25)
+	newExt, toDel, err := w.TruncateV2(context.Background(), 25)
 	require.NoError(t, err)
-	require.Len(t, newExts, 1)
-	require.Len(t, toDel, 0)
+	require.True(t, newExt.IsEmpty())
+	require.True(t, toDel.IsEmpty())
 }
 
 func TestWriterCoverageAdditionalBranches(t *testing.T) {
@@ -715,7 +730,7 @@ func TestWriterCoverageMoreLowFunctions(t *testing.T) {
 		}, nil)
 		require.NoError(t, err)
 		defer gohook.UnHookMethod(w.ecStreamer.mw, "GetObjExtents")
-		err = gohook.HookMethod(w.ecStreamer.mw, "AppendObjExtentKeysWithCheck", func(_ *meta.MetaWrapper, _ uint64, _, _ []proto.ObjExtentKey) error {
+		err = gohook.HookMethod(w.ecStreamer.mw, "AppendObjExtentKeysWithCheck", func(_ *meta.MetaWrapper, _ uint64, _, _ proto.ObjExtentKey) error {
 			return nil
 		}, nil)
 		require.NoError(t, err)
@@ -863,4 +878,155 @@ func TestWriter_Write_append_buffered(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 3, n)
 	require.True(t, s.isDirty())
+}
+
+func TestWriter_flushOverwriteReqs_new_and_merge(t *testing.T) {
+	ctx := context.Background()
+	st, w := testWriterWithMwEbsc(270, &BlobStoreClient{})
+	_ = st
+	const bufOff = uint64(50)
+	w.buf = make([]byte, 128)
+	for i := range w.buf {
+		w.buf[i] = byte(i)
+	}
+
+	require.NoError(t, gohook.HookMethod(w.ecStreamer.ebsc, "Write", MockEbscWriteTrue, nil))
+	defer gohook.UnHookMethod(w.ecStreamer.ebsc, "Write")
+	require.NoError(t, gohook.HookMethod(w.ecStreamer.mw, "AppendObjExtentKeysWithCheck", MockAppendObjExtentKeysWithCheckTrue, nil))
+	defer gohook.UnHookMethod(w.ecStreamer.mw, "AppendObjExtentKeysWithCheck")
+
+	t.Run("hole append only", func(t *testing.T) {
+		reqs := []overwriteReq{
+			{NewExtent: proto.ObjExtentKey{FileOffset: 60, Size: 10}, DiscardExtent: proto.ObjExtentKey{}},
+		}
+		require.NoError(t, w.flushOverwriteReqs(ctx, st.ino, reqs, bufOff, 20))
+	})
+
+	t.Run("partial merge with discard", func(t *testing.T) {
+		old := proto.ObjExtentKey{FileOffset: 50, Size: 30}
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyMethod(reflect.TypeOf(w.ecStreamer.ebsc), "Read",
+			func(_ *BlobStoreClient, _ context.Context, _ string, data []byte, _, size uint64, _ proto.ObjExtentKey) (int, error) {
+				for i := range data {
+					data[i] = byte(i)
+				}
+				return int(size), nil
+			})
+		reqs := []overwriteReq{
+			{NewExtent: proto.ObjExtentKey{FileOffset: 55, Size: 5}, DiscardExtent: old},
+		}
+		require.NoError(t, w.flushOverwriteReqs(ctx, st.ino, reqs, bufOff, 10))
+	})
+
+	t.Run("skip zero-size req", func(t *testing.T) {
+		reqs := []overwriteReq{{NewExtent: proto.ObjExtentKey{FileOffset: 70, Size: 0}}}
+		require.NoError(t, w.flushOverwriteReqs(ctx, st.ino, reqs, bufOff, 0))
+	})
+
+	t.Run("read old extent fails", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyMethod(reflect.TypeOf(w.ecStreamer.ebsc), "Read",
+			func(_ *BlobStoreClient, _ context.Context, _ string, _ []byte, _, _ uint64, _ proto.ObjExtentKey) (int, error) {
+				return 0, syscall.EIO
+			})
+		reqs := []overwriteReq{
+			{NewExtent: proto.ObjExtentKey{FileOffset: 55, Size: 5}, DiscardExtent: proto.ObjExtentKey{FileOffset: 50, Size: 20}},
+		}
+		err := w.flushOverwriteReqs(ctx, st.ino, reqs, bufOff, 5)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "read discard extent")
+	})
+}
+
+// TestWriter_flushOverwriteReqs_ebsWritten_metaAppendFails_noRollback：EBS 已写入成功，metanode Append 失败；
+// 不回滚 blobstore 数据，直接向上返回错误（极低概率下允许孤儿 extent / 元数据不一致）。
+func TestWriter_flushOverwriteReqs_ebsWritten_metaAppendFails_noRollback(t *testing.T) {
+	ctx := context.Background()
+	st, w := testWriterWithMwEbsc(273, &BlobStoreClient{})
+	const bufOff uint64 = 0
+	w.buf = []byte("overwrite-payload")
+
+	metaErr := errors.New("metanode append obj extent keys failed")
+	var appendCalls int
+	var appendedNew proto.ObjExtentKey
+	var ebsWriteCalls, deleteCalls int
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(w.ecStreamer.ebsc), "Write",
+		func(ebs *BlobStoreClient, ctx context.Context, vol string, data []byte, l uint32) (proto2.Location, error) {
+			ebsWriteCalls++
+			return MockEbscWriteTrue(ebs, ctx, vol, data, l)
+		})
+	patches.ApplyMethod(reflect.TypeOf(w.ecStreamer.ebsc), "Delete",
+		func(_ *BlobStoreClient, _ []proto.ObjExtentKey) error {
+			deleteCalls++
+			return nil
+		})
+	patches.ApplyMethod(reflect.TypeOf(w.ecStreamer.mw), "AppendObjExtentKeysWithCheck",
+		func(_ *meta.MetaWrapper, ino uint64, newEk, discardEk proto.ObjExtentKey) error {
+			appendCalls++
+			require.Equal(t, st.ino, ino)
+			require.True(t, discardEk.IsEmpty())
+			require.False(t, newEk.IsEmpty())
+			appendedNew = newEk
+			return metaErr
+		})
+
+	reqs := []overwriteReq{
+		{NewExtent: proto.ObjExtentKey{FileOffset: 0, Size: uint64(len(w.buf))}, DiscardExtent: proto.ObjExtentKey{}},
+	}
+	err := w.flushOverwriteReqs(ctx, st.ino, reqs, bufOff, len(w.buf))
+	require.ErrorIs(t, err, metaErr)
+	require.Equal(t, 1, ebsWriteCalls, "data must be written to EBS before meta update")
+	require.Equal(t, 1, appendCalls)
+	require.Equal(t, uint64(0), appendedNew.FileOffset)
+	require.NotZero(t, appendedNew.Cid, "writeSlice should fill objExtentKey from EBS location")
+	require.Zero(t, deleteCalls, "must not rollback EBS when only metanode append fails")
+}
+
+func TestWriter_reshapeBufForCopyPath_branches(t *testing.T) {
+	var nilW *Writer
+	nilW.reshapeBufForCopyPath()
+
+	s := mustTestECStreamer(271, nil, nil)
+	w := s.Writer()
+	w.reshapeBufForCopyPath()
+
+	w.blockPosition = w.ecStreamer.BlockSize() + 1
+	w.buf = make([]byte, 0, w.ecStreamer.BlockSize())
+	w.reshapeBufForCopyPath()
+	require.Equal(t, 0, w.blockPosition)
+	require.Equal(t, w.ecStreamer.BlockSize(), len(w.buf))
+}
+
+func TestRwSlice_String(t *testing.T) {
+	s := rwSlice{fileOffset: 1, size: 2, hole: true}
+	require.Contains(t, s.String(), "rwSlice{")
+}
+
+func TestWriter_flushExt_partial_overlap_path(t *testing.T) {
+	ctx := context.Background()
+	st, w := testWriterWithMwEbsc(272, &BlobStoreClient{})
+	seedStreamerExtentsForTest(st, 200, []proto.ObjExtentKey{{FileOffset: 0, Size: 200}})
+	seedDirtyForTest(st)
+	w.buf = make([]byte, 64)
+	w.fileOffset = 120
+	w.blockPosition = 20
+
+	require.NoError(t, gohook.HookMethod(w.ecStreamer.ebsc, "Write", MockEbscWriteTrue, nil))
+	defer gohook.UnHookMethod(w.ecStreamer.ebsc, "Write")
+	require.NoError(t, gohook.HookMethod(w.ecStreamer.mw, "AppendObjExtentKeysWithCheck", MockAppendObjExtentKeysWithCheckTrue, nil))
+	defer gohook.UnHookMethod(w.ecStreamer.mw, "AppendObjExtentKeysWithCheck")
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(w.ecStreamer.ebsc), "Read",
+		func(_ *BlobStoreClient, _ context.Context, _ string, data []byte, _, size uint64, _ proto.ObjExtentKey) (int, error) {
+			return int(size), nil
+		})
+
+	require.NoError(t, w.flushExt(st.ino, ctx, false))
+	require.False(t, st.isDirty())
 }

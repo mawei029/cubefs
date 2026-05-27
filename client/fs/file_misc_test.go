@@ -245,7 +245,7 @@ func TestFile_Write_BlobFallocatePath(t *testing.T) {
 		})
 	var truncateTo uint64
 	patches.ApplyMethod(reflect.TypeOf(s.mw), "TruncateV2",
-		func(_ *meta.MetaWrapper, _ uint64, size uint64, _ string, _ []proto.ObjExtentKey, _ []proto.ObjExtentKey) error {
+		func(_ *meta.MetaWrapper, _ uint64, size uint64, _ string, _ proto.ObjExtentKey, _ proto.ObjExtentKey) error {
 			truncateTo = size
 			return nil
 		})
@@ -296,7 +296,7 @@ func TestFile_Setattr_BlobTruncateAndSyncReaderWriter(t *testing.T) {
 			return 1, 32, nil, []proto.ObjExtentKey{{FileOffset: 0, Size: 32}}, nil
 		})
 	patches.ApplyMethod(reflect.TypeOf(s.mw), "TruncateV2",
-		func(_ *meta.MetaWrapper, _ uint64, _ uint64, _ string, _ []proto.ObjExtentKey, _ []proto.ObjExtentKey) error {
+		func(_ *meta.MetaWrapper, _ uint64, _ uint64, _ string, _ proto.ObjExtentKey, _ proto.ObjExtentKey) error {
 			return nil
 		})
 	patches.ApplyMethod(reflect.TypeOf(s.ec), "RefreshExtentsCache", func(_ *stream.ExtentClient, _ uint64) error { return nil })

@@ -1579,22 +1579,21 @@ func (mw *MetaWrapper) truncate(mp *MetaPartition, inode, size uint64, fullPath 
 }
 
 // truncateV2 is for EC volumes: client already completed EBS read/truncate/write/delete, so only notify metanode to update inode.Size and ObjExtents.
-func (mw *MetaWrapper) truncateV2(mp *MetaPartition, inode, size uint64, fullPath string, newObjExtents, toDeletes []proto.ObjExtentKey) (status int, err error) {
+func (mw *MetaWrapper) truncateV2(mp *MetaPartition, inode, size uint64, fullPath string, newObjExtent, toDeleteFrom proto.ObjExtentKey) (status int, err error) {
 	bgTime := stat.BeginStat()
 	defer func() {
 		stat.EndStat("truncateV2", err, bgTime, 1)
 	}()
 
-	// TODO：校验newObjExtents东西meta存的相同offset位置的是否一致，一样的不做return ok；不一样的做执行。toDeletes删除的第一个，与meta是否一致。参数不一致；放到状态机 fsm的apply里面
 	req := &proto.TruncateRequest{
-		VolName:       mw.volname,
-		PartitionID:   mp.PartitionID,
-		Inode:         inode,
-		Size:          size,
-		Timestamp:     time.Now().Unix(),
-		TruncateV2:    true,
-		NewObjExtents: newObjExtents, // For a single overlapping section, replace only one part.
-		ToDeletes:     toDeletes,     // Delete only the first one
+		VolName:      mw.volname,
+		PartitionID:  mp.PartitionID,
+		Inode:        inode,
+		Size:         size,
+		Timestamp:    time.Now().Unix(),
+		TruncateV2:   true,
+		NewObjExtent: newObjExtent,
+		ToDelete:     toDeleteFrom,
 	}
 	req.FullPaths = []string{fullPath}
 
@@ -1607,7 +1606,8 @@ func (mw *MetaWrapper) truncateV2(mp *MetaPartition, inode, size uint64, fullPat
 		return
 	}
 
-	log.LogDebugf("truncateV2 enter: packet(%v) mp(%v) ino(%v) size(%v) newExtentsLen(%v)", packet, mp, inode, size, len(newObjExtents))
+	log.LogDebugf("truncateV2 enter: packet(%v) mp(%v) ino(%v) size(%v) hasNewObjExtent(%v) hasToDelete(%v)",
+		packet, mp, inode, size, !newObjExtent.IsEmpty(), !toDeleteFrom.IsEmpty())
 
 	metric := exporter.NewTPCnt(packet.GetOpMsg())
 	defer func() {
@@ -2134,19 +2134,19 @@ func (mw *MetaWrapper) appendExtentKeys(mp *MetaPartition, inode uint64, extents
 }
 
 // appendObjExtentKeysWithCheck sends request to metanode for atomic extent update with conflict checking (batch).
-func (mw *MetaWrapper) appendObjExtentKeysWithCheck(mp *MetaPartition, inode uint64, newExtents, discardExtents []proto.ObjExtentKey) (status int, err error) {
+func (mw *MetaWrapper) appendObjExtentKeysWithCheck(mp *MetaPartition, inode uint64, newExtents, discardExtent proto.ObjExtentKey) (status int, err error) {
 	bgTime := stat.BeginStat()
 	defer func() {
 		stat.EndStat("appendObjExtentKeyWithCheck", err, bgTime, 1)
 	}()
 
 	req := &proto.AppendObjExtentKeysRequest{
-		VolName:        mw.volname,
-		PartitionID:    mp.PartitionID,
-		Inode:          inode,
-		Extents:        newExtents,
-		DiscardExtents: discardExtents,
-		IsOverwrite:    true,
+		VolName:       mw.volname,
+		PartitionID:   mp.PartitionID,
+		Inode:         inode,
+		Extents:       []proto.ObjExtentKey{newExtents},
+		DiscardExtent: discardExtent,
+		IsOverwrite:   true,
 	}
 
 	packet := proto.NewPacketReqID()
@@ -2154,10 +2154,10 @@ func (mw *MetaWrapper) appendObjExtentKeysWithCheck(mp *MetaPartition, inode uin
 	packet.PartitionID = mp.PartitionID
 	err = packet.MarshalData(req)
 	if err != nil {
-		log.LogErrorf("appendObjExtentKeyWithCheck: batch append obj extents: ino(%v) count(%v) err(%v)", inode, len(newExtents), err)
+		log.LogErrorf("appendObjExtentKeyWithCheck: batch append obj extents: ino(%v) newExtents(%v) discardExtent(%v) err(%v)", inode, newExtents, discardExtent, err)
 		return
 	}
-	log.LogDebugf("appendObjExtentKeyWithCheck: batch append obj extents: packet(%v) mp(%v) ino(%v) count(%v)", packet, mp, inode, len(newExtents))
+	log.LogDebugf("appendObjExtentKeyWithCheck: batch append obj extents: packet(%v) mp(%v) ino(%v) newExtents(%v) discardExtent(%v)", packet, mp, inode, newExtents, discardExtent)
 
 	metric := exporter.NewTPCnt(packet.GetOpMsg())
 	defer func() {
