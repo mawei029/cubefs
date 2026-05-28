@@ -2862,6 +2862,8 @@ func (c *Cluster) loadStoragePools() (err error) {
 
 	if !c.HasResourceOfStorageBlobStore() {
 		c.storagePools[proto.DefaultECPoolId].Status = proto.PoolStatusDisabled
+	} else {
+		c.storagePools[proto.DefaultECPoolId].Status = proto.PoolStatusAvailable
 	}
 
 	log.LogInfof("action[loadStoragePools] load pools success, count[%d]", len(c.storagePools))
