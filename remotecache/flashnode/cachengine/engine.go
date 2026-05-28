@@ -211,11 +211,10 @@ func NewCacheEngine(memDataDir string, totalMemSize int64, maxUseRatio float64, 
 		cache := NewCache(LRUCacheBlockCacheType, memCacheConfig.Capacity, memCacheConfig.MaxAlloc, expireTime,
 			func(v interface{}, reason string, removeOuter bool) error {
 				cb := v.(*CacheBlock)
-				de := cb.Delete(reason)
-				if removeOuter {
-					s.deleteCacheItem(cb.blockKey)
-				}
-				return de
+				return cb.Delete(reason)
+			},
+			func(key interface{}) {
+				s.deleteCacheItem(key.(string))
 			},
 			func(v interface{}) error {
 				cb := v.(*CacheBlock)
@@ -229,6 +228,7 @@ func NewCacheEngine(memDataDir string, totalMemSize int64, maxUseRatio float64, 
 				file := v.(*os.File)
 				return file.Close()
 			},
+			nil,
 			func(v interface{}) error {
 				file := v.(*os.File)
 				return file.Close()
@@ -271,11 +271,10 @@ func NewCacheEngine(memDataDir string, totalMemSize int64, maxUseRatio float64, 
 		cache := NewCache(LRUCacheBlockCacheType, diskCacheConfig.Capacity, diskCacheConfig.MaxAlloc, expireTime,
 			func(v interface{}, reason string, removeOuter bool) error {
 				cb := v.(*CacheBlock)
-				de := cb.Delete(reason)
-				if removeOuter {
-					s.deleteCacheItem(cb.blockKey)
-				}
-				return de
+				return cb.Delete(reason)
+			},
+			func(key interface{}) {
+				s.deleteCacheItem(key.(string))
 			},
 			func(v interface{}) error {
 				cb := v.(*CacheBlock)
@@ -308,6 +307,7 @@ func NewCacheEngine(memDataDir string, totalMemSize int64, maxUseRatio float64, 
 			}
 			return file.Close()
 		},
+		nil,
 		func(v interface{}) error {
 			file := v.(*os.File)
 			if log.EnableInfo() {
@@ -947,6 +947,7 @@ func (c *CacheEngine) initTmpfs() (err error) {
 func (c *CacheEngine) DeleteCacheBlock(key string) {
 	if cacheItem, ok := c.getCacheItem(key); ok {
 		cacheItem.lruCache.Evict(key)
+		// Index may exist without an LRU entry; Evict is a no-op then and skips onUnlink.
 		c.deleteCacheItem(key)
 	}
 }
@@ -1341,11 +1342,9 @@ func (c *CacheEngine) EvictCacheByVolume(evictVol string) (failedKeys []interfac
 		for _, k := range stat.Keys {
 			vol := strings.Split(k.(string), "/")[0]
 			if evictVol == vol {
-				if !cacheItem.lruCache.Evict(k) {
-					failedKeys = append(failedKeys, k)
-				} else {
-					c.deleteCacheItem(k.(string))
-				}
+				// Keys come from LRU Status(); Evict unlinks index via onUnlink in deleteElement.
+				// Evict always returns true (see fCache.Evict); failedKeys is kept for API compat.
+				_ = cacheItem.lruCache.Evict(k)
 			}
 		}
 		return true
