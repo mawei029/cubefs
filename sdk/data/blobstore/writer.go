@@ -956,11 +956,19 @@ func (writer *Writer) flushExt(inode uint64, ctx context.Context, flushFlag bool
 	reqs := computeOverwriteReqs(start, end, objExtents)
 	log.LogDebugf("flushExt: ino(%v) start(%v) end(%v) reqsCount(%v) bufferSize(%v)", inode, start, end, len(reqs), bufferSize)
 
-	if len(reqs) == 1 && reqs[0].DiscardExtent.IsEmpty() {
-		// is hole write/tail append, simple flush
+	lastExtentEnd := uint64(0)
+	if len(objExtents) > 0 {
+		last := objExtents[len(objExtents)-1]
+		lastExtentEnd = last.FileOffset + last.Size
+	}
+	isPureTailAppend := len(reqs) == 1 && reqs[0].DiscardExtent.IsEmpty() &&
+		reqs[0].NewExtent.FileOffset == lastExtentEnd
+
+	if isPureTailAppend {
+		// Simple flush: Pure tail append can use append-only metadata path.
 		err = writer.flush(inode, ctx, flushFlag)
 	} else {
-		// is overwrite, flush overwrite reqs
+		// Non-tail writes (including middle holes) must go through overwrite conflict-check path.
 		err = writer.flushOverwriteReqs(ctx, inode, reqs, start, bufferSize)
 	}
 	if err != nil {
@@ -1008,10 +1016,6 @@ func (writer *Writer) flush(inode uint64, ctx context.Context, flushFlag bool) (
 	oeks = append(oeks, wSlice.objExtentKey)
 	if err = writer.ecStreamer.Mw().AppendObjExtentKeys(writer.ecStreamer.Inode(), oeks); err != nil {
 		log.LogErrorf("flush: slice write error,meta append ebsc extent keys fail,ino(%v) fileOffset(%v) len(%v) err(%v)", inode, wSlice.fileOffset, wSlice.size, err)
-		// Rollback: delete orphaned data on EBS to avoid blobstore leak
-		if delErr := writer.ecStreamer.Ebsc().Delete(oeks); delErr != nil {
-			log.LogWarnf("flush: rollback delete ebs extent fail,ino(%v) fileOffset(%v) err(%v)", inode, wSlice.fileOffset, delErr)
-		}
 		return
 	}
 	return writer.notifyCompleteFlushMeta()

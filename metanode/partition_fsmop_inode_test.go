@@ -894,25 +894,64 @@ func sparseTruncateV2ExampleExtents() []proto.ObjExtentKey {
 	}
 }
 
-// applyTruncateV2Contract is the intended metanode merge: partial replace + sweep FileOffset >= target.
+// applyTruncateV2Contract mirrors checkTruncateV2Conflict apply: prefix before ToDelete anchor + optional NewObjExtent; enqueue = eks[delIdx:].
 func applyTruncateV2Contract(eks []proto.ObjExtentKey, target uint64, newObj, toDelete proto.ObjExtentKey) (final, enqueue []proto.ObjExtentKey) {
-	final = append([]proto.ObjExtentKey(nil), eks...)
-	if !newObj.IsEmpty() {
-		for j, ek := range final {
-			if ek.FileOffset == newObj.FileOffset {
-				if !ek.IsEquals(&newObj) {
-					enqueue = append(enqueue, ek)
-				}
-				final[j] = newObj
-				break
-			}
+	if len(eks) == 0 {
+		if !newObj.IsEmpty() || !toDelete.IsEmpty() {
+			return nil, nil
+		}
+		return nil, nil
+	}
+	lastEk := eks[len(eks)-1]
+	if toDelete.IsEmpty() {
+		if !newObj.IsEmpty() {
+			return nil, nil
+		}
+		if target < lastEk.FileOffset+lastEk.Size {
+			return nil, nil
+		}
+		return append([]proto.ObjExtentKey(nil), eks...), nil
+	}
+	delIdx := -1
+	var extent proto.ObjExtentKey
+	for i, ek := range eks {
+		if ek.FileOffset == toDelete.FileOffset {
+			extent = ek
+			delIdx = i
+			break
 		}
 	}
-	if tailIdx := sort.Search(len(final), func(i int) bool { return final[i].FileOffset >= target }); tailIdx < len(final) {
-		enqueue = append(enqueue, final[tailIdx:]...)
-		final = final[:tailIdx]
+	if delIdx < 0 {
+		return nil, nil
+	}
+	if extent.FileOffset != toDelete.FileOffset || extent.Size != toDelete.Size || target > extent.FileOffset+extent.Size {
+		if newObj.IsEmpty() && extent.IsEmpty() && lastEk.FileOffset+lastEk.Size <= target {
+			return append([]proto.ObjExtentKey(nil), eks...), nil
+		}
+		return nil, nil
+	}
+	enqueue = append([]proto.ObjExtentKey(nil), eks[delIdx:]...)
+	final = append([]proto.ObjExtentKey(nil), eks[:delIdx]...)
+	if !newObj.IsEmpty() {
+		final = append(final, newObj)
 	}
 	return final, enqueue
+}
+
+func objExtentDelDedupKey(o proto.ObjExtentKey) string {
+	return fmt.Sprintf("%d:%d:%d", o.FileOffset, o.Size, o.Cid)
+}
+
+func collectAllObjExtentDelOeks(ot ObjExtentDelTree) []proto.ObjExtentKey {
+	if ot == nil || ot.Len() == 0 {
+		return nil
+	}
+	batch := ot.PeekFirstN(ot.Len())
+	out := make([]proto.ObjExtentKey, 0)
+	for _, item := range batch.Items {
+		out = append(out, item.Oeks...)
+	}
+	return out
 }
 
 func inodeOekAtOffset(eks []proto.ObjExtentKey, fileOffset uint64) proto.ObjExtentKey {
@@ -954,6 +993,21 @@ func assertObjExtentsEqual(t *testing.T, want, got []proto.ObjExtentKey) {
 		require.Equal(t, want[i].FileOffset, got[i].FileOffset, "idx %d FileOffset", i)
 		require.Equal(t, want[i].Size, got[i].Size, "idx %d Size", i)
 	}
+}
+
+func assertObjExtentsWithinInodeSize(t *testing.T, oeks []proto.ObjExtentKey, inodeSize uint64) {
+	t.Helper()
+	var maxEnd uint64
+	for _, o := range oeks {
+		if o.Size == 0 {
+			continue
+		}
+		require.LessOrEqual(t, o.FileOffset+o.Size, inodeSize)
+		if e := o.FileOffset + o.Size; e > maxEnd {
+			maxEnd = e
+		}
+	}
+	require.LessOrEqual(t, maxEnd, inodeSize)
 }
 
 // TestCheckTruncateV2Conflict_ExampleSparse exercises checkTruncateV2Conflict against fsmExtentsTruncateV2 Example rows.
@@ -1163,6 +1217,76 @@ func TestCheckTruncateV2Conflict_BlobstoreComputeTruncateReqs(t *testing.T) {
 		require.Equal(t, proto.OpOk, st)
 		assertObjExtentsEqual(t, eks, final)
 	})
+}
+
+// TestFsmExtentsTruncateV2_MultiRound_16KB chains truncate on one inode (two 8KiB stripes): 4K → 12K → 6K.
+// Asserts per-round extents, objExtentDelTree enqueue, and no duplicate (FileOffset, Size, Cid) discard keys.
+func TestFsmExtentsTruncateV2_MultiRound_16KB(t *testing.T) {
+	const KiB = uint64(1024)
+	const ino = uint64(9020)
+	mp := newTestMetaPartitionForTruncateV2(t, 10016)
+
+	initial := []proto.ObjExtentKey{
+		{FileOffset: 0, Size: 8 * KiB, Cid: 1},
+		{FileOffset: 8 * KiB, Size: 8 * KiB, Cid: 2},
+	}
+	setupInodeWithObjExtents(t, mp, ino, initial, 16*KiB)
+
+	eks := append([]proto.ObjExtentKey(nil), initial...)
+	seenDel := make(map[string]struct{})
+	var allEnqueued []proto.ObjExtentKey
+
+	round := func(name string, target uint64) {
+		t.Helper()
+		mp.fsmRaftApplyIndex++
+
+		req := buildTruncateV2ReqFromCompute(ino, target, eks)
+		req.Timestamp = int64(target)
+
+		st, wantFinal, wantEnqueue := mp.checkTruncateV2Conflict(req, eks)
+		require.Equal(t, proto.OpOk, st, "%s checkTruncateV2Conflict", name)
+
+		resp := runFsmExtentsTruncateV2(t, mp, req)
+		require.Equal(t, proto.OpOk, resp.Status, "%s fsmExtentsTruncateV2", name)
+
+		for _, d := range wantEnqueue {
+			k := objExtentDelDedupKey(d)
+			_, dup := seenDel[k]
+			require.False(t, dup, "%s duplicate discard key %v", name, d)
+			seenDel[k] = struct{}{}
+		}
+		allEnqueued = append(allEnqueued, wantEnqueue...)
+
+		updated := getInodeOrFail(t, mp, ino)
+		require.Equal(t, target, updated.Size, name)
+		gotEks := updated.HybridCloudExtents.sortedEks.(*SortedObjExtents).CopyExtents()
+		assertObjExtentsEqual(t, wantFinal, gotEks)
+
+		eks = gotEks
+	}
+
+	round("to_4KiB", 4*KiB)
+	require.NotEmpty(t, eks)
+	round("to_12KiB", 12*KiB)
+	round("to_6KiB", 6*KiB)
+
+	require.Equal(t, uint64(6*KiB), getInodeOrFail(t, mp, ino).Size)
+	assertObjExtentsWithinInodeSize(t, eks, 6*KiB)
+	require.NotEmpty(t, allEnqueued)
+
+	treeOeks := collectAllObjExtentDelOeks(mp.objExtentDelTree)
+	require.NotEmpty(t, treeOeks)
+	seenInTree := make(map[string]struct{})
+	for _, d := range treeOeks {
+		k := objExtentDelDedupKey(d)
+		_, dup := seenInTree[k]
+		require.False(t, dup, "objExtentDelTree duplicate discard key %v", d)
+		seenInTree[k] = struct{}{}
+	}
+	for _, d := range allEnqueued {
+		_, ok := seenInTree[objExtentDelDedupKey(d)]
+		require.True(t, ok, "expected enqueued key in del tree: %v", d)
+	}
 }
 
 // TestFsmExtentsTruncateV2_BlobstoreComputeTruncateReqs runs FSM with requests derived from ComputeTruncateReqs.

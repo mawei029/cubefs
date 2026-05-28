@@ -489,6 +489,8 @@ func TestTryOverWrite_Basic(t *testing.T) {
 
 	err = gohook.HookMethod(mw, "AppendObjExtentKeysWithCheck", MockAppendObjExtentKeysWithCheckTrue, nil)
 	require.NoError(t, err, "Hook AppendObjExtentKeysWithCheckTrue failed")
+	err = gohook.HookMethod(mw, "AppendObjExtentKeys", MockAppendObjExtentKeysTrue, nil)
+	require.NoError(t, err, "Hook AppendObjExtentKeysTrue failed")
 	testWriter.ecStreamer.mw = mw
 
 	// Mock BlobStoreClient for writeSlice
@@ -537,6 +539,8 @@ func TestFlushExt_Basic(t *testing.T) {
 
 	err = gohook.HookMethod(mw, "AppendObjExtentKeysWithCheck", MockAppendObjExtentKeysWithCheckTrue, nil)
 	require.NoError(t, err, "Hook AppendObjExtentKeysWithCheckTrue failed")
+	err = gohook.HookMethod(mw, "AppendObjExtentKeys", MockAppendObjExtentKeysTrue, nil)
+	require.NoError(t, err, "Hook AppendObjExtentKeysTrue failed")
 	testWriter.ecStreamer.mw = mw
 
 	// Mock BlobStoreClient
@@ -941,7 +945,7 @@ func TestWriter_flushOverwriteReqs_new_and_merge(t *testing.T) {
 }
 
 // TestWriter_flushOverwriteReqs_ebsWritten_metaAppendFails_noRollback：EBS 已写入成功，metanode Append 失败；
-// 不回滚 blobstore 数据，直接向上返回错误（极低概率下允许孤儿 extent / 元数据不一致）。
+// 不回滚 blobstore 数据，直接向上返回错误（极低概率下允许孤儿 extent:旧数据和旧元数据都在且匹配，新数据没有元数据 / 元数据不一致 ）。
 func TestWriter_flushOverwriteReqs_ebsWritten_metaAppendFails_noRollback(t *testing.T) {
 	ctx := context.Background()
 	st, w := testWriterWithMwEbsc(273, &BlobStoreClient{})
@@ -1029,4 +1033,102 @@ func TestWriter_flushExt_partial_overlap_path(t *testing.T) {
 
 	require.NoError(t, w.flushExt(st.ino, ctx, false))
 	require.False(t, st.isDirty())
+}
+
+func TestWriter_flushExt_tailAppend_usesFlush(t *testing.T) {
+	ctx := context.Background()
+	st, w := testWriterWithMwEbsc(373, &BlobStoreClient{})
+	seedStreamerExtentsForTest(st, 100, []proto.ObjExtentKey{{FileOffset: 0, Size: 100}})
+	seedDirtyForTest(st)
+
+	w.buf = make([]byte, 64)
+	w.fileOffset = 120
+	w.blockPosition = 20
+
+	var flushCalls, overwriteCalls int
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyPrivateMethod(reflect.TypeOf(w), "flush",
+		func(_ *Writer, _ uint64, _ context.Context, _ bool) error {
+			flushCalls++
+			return nil
+		})
+	patches.ApplyPrivateMethod(reflect.TypeOf(w), "flushOverwriteReqs",
+		func(_ *Writer, _ context.Context, _ uint64, _ []overwriteReq, _ uint64, _ int) error {
+			overwriteCalls++
+			return nil
+		})
+	patches.ApplyPrivateMethod(reflect.TypeOf(st), "updateMetaInfo",
+		func(_ *ECStreamer, _ []proto.ObjExtentKey) error { return nil })
+
+	require.NoError(t, w.flushExt(st.ino, ctx, false))
+	require.Equal(t, 1, flushCalls, "tail append must use flush path")
+	require.Equal(t, 0, overwriteCalls, "tail append should not use overwrite path")
+}
+
+func TestWriter_flushExt_middleHole_usesOverwriteReqs(t *testing.T) {
+	ctx := context.Background()
+	st, w := testWriterWithMwEbsc(374, &BlobStoreClient{})
+	seedStreamerExtentsForTest(st, 300, []proto.ObjExtentKey{
+		{FileOffset: 0, Size: 100},
+		{FileOffset: 200, Size: 100},
+	})
+	seedDirtyForTest(st)
+
+	w.buf = make([]byte, 64)
+	w.fileOffset = 140
+	w.blockPosition = 20
+
+	var flushCalls, overwriteCalls int
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyPrivateMethod(reflect.TypeOf(w), "flush",
+		func(_ *Writer, _ uint64, _ context.Context, _ bool) error {
+			flushCalls++
+			return nil
+		})
+	patches.ApplyPrivateMethod(reflect.TypeOf(w), "flushOverwriteReqs",
+		func(_ *Writer, _ context.Context, _ uint64, _ []overwriteReq, _ uint64, _ int) error {
+			overwriteCalls++
+			return nil
+		})
+	patches.ApplyPrivateMethod(reflect.TypeOf(st), "updateMetaInfo",
+		func(_ *ECStreamer, _ []proto.ObjExtentKey) error { return nil })
+
+	require.NoError(t, w.flushExt(st.ino, ctx, false))
+	require.Equal(t, 0, flushCalls, "middle hole write must not use append-only flush path")
+	require.Equal(t, 1, overwriteCalls, "middle hole write must use overwrite path")
+}
+
+func TestWriter_flushExt_tailHole_usesOverwriteReqs(t *testing.T) {
+	ctx := context.Background()
+	st, w := testWriterWithMwEbsc(375, &BlobStoreClient{})
+	seedStreamerExtentsForTest(st, 100, []proto.ObjExtentKey{{FileOffset: 0, Size: 100}})
+	seedDirtyForTest(st)
+
+	// Write range [120, 140): offset is greater than lastExtentEnd(100),
+	// so this is sparse tail-hole write and must NOT use append-only flush.
+	w.buf = make([]byte, 64)
+	w.fileOffset = 140
+	w.blockPosition = 20
+
+	var flushCalls, overwriteCalls int
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyPrivateMethod(reflect.TypeOf(w), "flush",
+		func(_ *Writer, _ uint64, _ context.Context, _ bool) error {
+			flushCalls++
+			return nil
+		})
+	patches.ApplyPrivateMethod(reflect.TypeOf(w), "flushOverwriteReqs",
+		func(_ *Writer, _ context.Context, _ uint64, _ []overwriteReq, _ uint64, _ int) error {
+			overwriteCalls++
+			return nil
+		})
+	patches.ApplyPrivateMethod(reflect.TypeOf(st), "updateMetaInfo",
+		func(_ *ECStreamer, _ []proto.ObjExtentKey) error { return nil })
+
+	require.NoError(t, w.flushExt(st.ino, ctx, false))
+	require.Equal(t, 0, flushCalls, "tail-hole write must not use append-only flush path")
+	require.Equal(t, 1, overwriteCalls, "tail-hole write must use overwrite path")
 }

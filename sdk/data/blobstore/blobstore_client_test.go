@@ -747,6 +747,46 @@ func TestTruncateV2Extents_MultiRoundConsistency(t *testing.T) {
 		return ebs, func() { p.Reset() }
 	}
 
+	t.Run("16KiB_two_8KiB_stripes_then_4K_12K_6K", func(t *testing.T) {
+		const KiB = uint64(1024)
+		ebs, cleanup := newEbsWithEchoReadPut(t)
+		defer cleanup()
+
+		exts := []cproto.ObjExtentKey{
+			{FileOffset: 0, Size: 8 * KiB, Cid: 1},
+			{FileOffset: 8 * KiB, Size: 8 * KiB, Cid: 2},
+		}
+		var inodeSize uint64
+		var allDel []cproto.ObjExtentKey
+		seenDel := make(map[string]struct{})
+
+		round := func(name string, target uint64) {
+			t.Helper()
+			newObj, delFrom, err := ebs.TruncateV2Extents(ctx, vol, exts, target)
+			require.NoError(t, err, name)
+			dropped := truncateV2DroppedKeys(exts, newObj, delFrom)
+			for _, d := range dropped {
+				k := discardDedupKey(d)
+				_, dup := seenDel[k]
+				require.False(t, dup, "%s duplicate discard key %v", name, d)
+				seenDel[k] = struct{}{}
+			}
+			allDel = append(allDel, dropped...)
+			exts = mergeTruncateV2Deltas(exts, newObj, delFrom)
+			inodeSize = target
+			assertObjExtentsWithinInodeSize(t, exts, inodeSize)
+		}
+
+		round("to_4KiB", 4*KiB)
+		require.NotEmpty(t, exts)
+		round("to_12KiB", 12*KiB)
+		round("to_6KiB", 6*KiB)
+
+		require.Equal(t, uint64(6*KiB), inodeSize)
+		assertObjExtentsWithinInodeSize(t, exts, inodeSize)
+		require.NotEmpty(t, allDel)
+	})
+
 	t.Run("16MiB_two_8MiB_stripes_then_4M_12M_6M", func(t *testing.T) {
 		ebs, cleanup := newEbsWithEchoReadPut(t)
 		defer cleanup()
