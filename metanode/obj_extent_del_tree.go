@@ -8,12 +8,11 @@ package metanode
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
-	"fmt"
 	"io"
 	"sync"
 
 	"github.com/cubefs/cubefs/proto"
+	"github.com/cubefs/cubefs/util/errors"
 	"github.com/cubefs/cubefs/util/log"
 )
 
@@ -24,6 +23,7 @@ const (
 )
 
 var (
+	// ErrDelTreeItemsFull: queue at cap; new oek not enqueued by design (see enqueueObjExtentDelWrap).
 	ErrDelTreeItemsFull   = errors.New("delete tree items full")
 	ErrDelTreeUnsupported = errors.New("delete tree payload unsupported")
 	ErrDelPayloadTooShort = errors.New("delete payload too short")
@@ -165,6 +165,7 @@ func (ot *objExtentDelTree) ApplyDequeuePayload(val []byte) error {
 
 	var items batchObjExtentDelItems
 	if err := items.UnmarshalDequeue(val); err != nil {
+		log.LogErrorf("action[ApplyDequeuePayload] dequeue: %v", err)
 		return err
 	}
 
@@ -184,6 +185,7 @@ func (ot *objExtentDelTree) ApplyPunishPayload(val []byte, applyIndex uint64) er
 
 	var batch batchObjExtentDelItems
 	if err := batch.UnmarshalPunish(val); err != nil {
+		log.LogErrorf("action[ApplyPunishPayload] punish: %v", err)
 		return err
 	}
 
@@ -371,13 +373,13 @@ func (b *batchObjExtentDelItems) MarshalDequeue(buf *bytes.Buffer) error {
 
 func (b *batchObjExtentDelItems) UnmarshalDequeue(data []byte) error {
 	if len(data) < minObjExtentDelPayload {
-		return errors.New("dequeue: short buf")
+		return ErrDelPayloadTooShort
 	}
 
 	br := bytes.NewReader(data)
 	ver, cnt, err := b.readBatchItemsHeader(br)
 	if err != nil {
-		return fmt.Errorf("dequeue: %w", err)
+		return err
 	}
 
 	switch ver {
@@ -398,7 +400,8 @@ func (b *batchObjExtentDelItems) UnmarshalDequeue(data []byte) error {
 		}
 		return nil
 	default:
-		return fmt.Errorf("dequeue: unsupported version %d", ver)
+		log.LogErrorf("dequeue: unsupported version %d", ver)
+		return ErrDelTreeUnsupported
 	}
 }
 
@@ -443,13 +446,13 @@ func (b *batchObjExtentDelItems) MarshalPunish(buf *bytes.Buffer, newTsMs int64)
 // UnmarshalPunish decodes punish payload produced by MarshalPunish.
 func (b *batchObjExtentDelItems) UnmarshalPunish(data []byte) error {
 	if len(data) < minObjExtentDelPayload {
-		return errors.New("punish: short buf")
+		return ErrDelPayloadTooShort
 	}
 
 	br := bytes.NewReader(data)
 	ver, cnt, err := b.readBatchItemsPunishHeader(br)
 	if err != nil {
-		return fmt.Errorf("punish: %w", err)
+		return err
 	}
 
 	switch ver {
@@ -470,10 +473,12 @@ func (b *batchObjExtentDelItems) UnmarshalPunish(data []byte) error {
 			if err := binary.Read(br, binary.BigEndian, &nOeks); err != nil {
 				return err
 			}
+
 			if nOeks == 0 {
 				log.LogErrorf("umarshal punish item, invalid oek count: %d", nOeks)
 				return ErrDelTreeUnsupported
 			}
+
 			oeks := make([]proto.ObjExtentKey, 0, nOeks)
 			for j := uint32(0); j < nOeks; j++ {
 				var oekLen uint32
@@ -499,7 +504,8 @@ func (b *batchObjExtentDelItems) UnmarshalPunish(data []byte) error {
 		}
 		return nil
 	default:
-		return fmt.Errorf("punish: unsupported version %d", ver)
+		log.LogErrorf("action[UnmarshalPunish] punish decode: unsupported version %d", ver)
+		return ErrDelTreeUnsupported
 	}
 }
 

@@ -1506,6 +1506,17 @@ func parseAndExtractSetNodeInfoParams(r *http.Request) (params map[string]interf
 		params[nodeDeleteWorkerSleepMs] = val
 	}
 
+	if value = r.FormValue(nodeDelTreeMaxItemLimit); value != "" {
+		noParams = false
+		val := uint64(0)
+		val, err = strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			err = unmatchedKey(nodeDelTreeMaxItemLimit)
+			return
+		}
+		params[nodeDelTreeMaxItemLimit] = val
+	}
+
 	if value = r.FormValue(clusterLoadFactorKey); value != "" {
 		noParams = false
 		valF, err := strconv.ParseFloat(value, 64)

@@ -9,6 +9,7 @@
 package metanode
 
 import (
+	"os"
 	"sync/atomic"
 	"testing"
 
@@ -43,4 +44,61 @@ func TestUpdateFollowerReadLeaseTime(t *testing.T) {
 
 	updateFollowerReadLeaseTime(1)
 	require.EqualValues(t, proto.MinFollowerReadLeaseTimeSec, FollowerReadLeaseTime())
+}
+
+func swapDelTreeMaxItemLimit(maxLimit uint64) func() {
+	prev := atomic.LoadUint64(&delTreeMaxItemLimit)
+	updateDelTreeMaxItemLimit(maxLimit)
+	return func() {
+		atomic.StoreUint64(&delTreeMaxItemLimit, prev)
+	}
+}
+
+// swapDelTreeMaxItemLimitRaw stores cap without normalize (UT only, e.g. cap=1 queue-full).
+func swapDelTreeMaxItemLimitRaw(maxLimit uint64) func() {
+	prev := atomic.LoadUint64(&delTreeMaxItemLimit)
+	atomic.StoreUint64(&delTreeMaxItemLimit, maxLimit)
+	return func() {
+		atomic.StoreUint64(&delTreeMaxItemLimit, prev)
+	}
+}
+
+func TestDelTreeMaxItemLimitPolicy(t *testing.T) {
+	defer swapDelTreeMaxItemLimit(0)()
+
+	updateDelTreeMaxItemLimit(200_000)
+	require.True(t, DelTreeEnqueueLimitEnabled())
+	require.Equal(t, int64(200_000), DelTreeMaxItemLimit())
+
+	updateDelTreeMaxItemLimit(10)
+	require.True(t, DelTreeEnqueueLimitEnabled())
+	require.Equal(t, int64(proto.MinDelTreeMaxItemLimit), DelTreeMaxItemLimit())
+
+	updateDelTreeMaxItemLimit(0)
+	require.False(t, DelTreeEnqueueLimitEnabled())
+	require.Equal(t, int64(0), DelTreeMaxItemLimit())
+
+	updateDelTreeMaxItemLimit(50)
+	require.True(t, DelTreeEnqueueLimitEnabled())
+	require.Equal(t, int64(proto.MinDelTreeMaxItemLimit), DelTreeMaxItemLimit())
+}
+
+func TestDelTreeEnqueueLimitDisabledWhenMaxIsZero(t *testing.T) {
+	defer swapDelTreeMaxItemLimit(0)()
+	updateDelTreeMaxItemLimit(0)
+	require.False(t, DelTreeEnqueueLimitEnabled())
+	require.Equal(t, int64(0), DelTreeMaxItemLimit())
+}
+
+func TestDelTreeMaxItemLimitZeroIgnoresEnqueueCap(t *testing.T) {
+	defer swapDelTreeMaxItemLimit(0)()
+	rootDir, err := os.MkdirTemp("", "del_tree_limit_off")
+	require.NoError(t, err)
+	defer os.RemoveAll(rootDir)
+	mp := newTestMetaPartition(rootDir, nil)
+	mp.manager = newMetaPartitionTestManager()
+	for i := 0; i < 3; i++ {
+		mp.enqueueObjExtentDelWrap(uint64(100+i), 0, uint64(i), []proto.ObjExtentKey{createTestObjExtentKey(0, 1, uint64(i+1))})
+	}
+	require.Equal(t, 3, mp.objExtentDelTree.Len())
 }

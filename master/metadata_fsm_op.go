@@ -120,6 +120,7 @@ type clusterValue struct {
 	AutoFixTag                             atomicutil.Bool
 	DefaultPoolId                          uint8
 	DefaultMetaRegion                      string // Default meta region for new volumes
+	MetaNodeDelTreeMaxItemLimit            uint64
 }
 
 func newClusterValue(c *Cluster) (cv *clusterValue) {
@@ -131,6 +132,7 @@ func newClusterValue(c *Cluster) (cv *clusterValue) {
 		DataNodeDeleteLimitRate:                c.cfg.DataNodeDeleteLimitRate,
 		MetaNodeDeleteBatchCount:               c.cfg.MetaNodeDeleteBatchCount,
 		MetaNodeDeleteWorkerSleepMs:            c.cfg.MetaNodeDeleteWorkerSleepMs,
+		MetaNodeDelTreeMaxItemLimit:            atomic.LoadUint64(&c.cfg.MetaNodeDelTreeMaxItemLimit),
 		FollowerReadLeaseTime:                  c.cfg.FollowerReadLeaseTime,
 		DataNodeAutoRepairLimitRate:            c.cfg.DataNodeAutoRepairLimitRate,
 		DisableAutoAllocate:                    c.DisableAutoAllocate,
@@ -1339,6 +1341,12 @@ func (c *Cluster) updateMetaNodeDeleteWorkerSleepMs(val uint64) {
 	atomic.StoreUint64(&c.cfg.MetaNodeDeleteWorkerSleepMs, val)
 }
 
+// updateMetaNodeDelTreeMaxItemLimit persists per-MP enqueue cap (0 off; >0 clamped).
+// Metanode drops enqueue when tree is full (audit + manual/blobstore-cli); see enqueueObjExtentDelWrap.
+func (c *Cluster) updateMetaNodeDelTreeMaxItemLimit(val uint64) {
+	atomic.StoreUint64(&c.cfg.MetaNodeDelTreeMaxItemLimit, proto.NormalizeDelTreeMaxItemLimit(val))
+}
+
 func (c *Cluster) updateFollowerReadLeaseTime(val uint64) {
 	if val == 0 {
 		val = defaultFollowerReadLeaseTime
@@ -1670,6 +1678,7 @@ func (c *Cluster) loadClusterValue() (err error) {
 		c.updateDirChildrenNumLimit(cv.DirChildrenNumLimit)
 		c.updateMetaNodeDeleteBatchCount(cv.MetaNodeDeleteBatchCount)
 		c.updateMetaNodeDeleteWorkerSleepMs(cv.MetaNodeDeleteWorkerSleepMs)
+		c.updateMetaNodeDelTreeMaxItemLimit(cv.MetaNodeDelTreeMaxItemLimit)
 		c.updateFollowerReadLeaseTime(cv.FollowerReadLeaseTime)
 		c.updateDataNodeDeleteLimitRate(cv.DataNodeDeleteLimitRate)
 		c.updateDataNodeAutoRepairLimit(cv.DataNodeAutoRepairLimitRate)

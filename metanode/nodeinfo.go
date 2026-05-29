@@ -41,6 +41,10 @@ var (
 
 	// Directory children number limit
 	dirChildrenNumLimit uint32 = proto.DefaultDirChildrenNumLimit
+
+	// delTreeMaxItemLimit from Master ClusterInfo / setNodeInfo: 0=no cap; >0=per-MP async delete queue limit
+	// (normalized to at least proto.MinDelTreeMaxItemLimit). On full queue, skip enqueue+audit; see enqueueObjExtentDelWrap.
+	delTreeMaxItemLimit uint64 = 0
 )
 
 // DeleteBatchCount returns the current delete batch count
@@ -68,6 +72,21 @@ func DeleteWorkerSleepMs() {
 	if val > 0 {
 		time.Sleep(time.Duration(val) * time.Millisecond)
 	}
+}
+
+// updateDelTreeMaxItemLimit mirrors Master delTreeMaxItemLimit (0 off; >0 clamped).
+func updateDelTreeMaxItemLimit(val uint64) {
+	atomic.StoreUint64(&delTreeMaxItemLimit, proto.NormalizeDelTreeMaxItemLimit(val))
+}
+
+// DelTreeEnqueueLimitEnabled is true when delTreeMaxItemLimit > 0 (enqueue cap on; full queue drops new oeks by design).
+func DelTreeEnqueueLimitEnabled() bool {
+	return atomic.LoadUint64(&delTreeMaxItemLimit) > 0
+}
+
+// DelTreeMaxItemLimit returns the per-MP cap from Master (meaningful only when DelTreeEnqueueLimitEnabled).
+func DelTreeMaxItemLimit() int64 {
+	return int64(atomic.LoadUint64(&delTreeMaxItemLimit))
 }
 
 // startUpdateNodeInfo starts the node information update goroutine
@@ -112,6 +131,8 @@ func (m *MetaNode) updateNodeInfo() error {
 
 	// Update delete worker sleep time
 	updateDeleteWorkerSleepMs(clusterInfo.MetaNodeDeleteWorkerSleepMs)
+
+	updateDelTreeMaxItemLimit(clusterInfo.MetaNodeDelTreeMaxItemLimit)
 
 	// Update follower read lease time
 	updateFollowerReadLeaseTime(clusterInfo.FollowerReadLeaseTime)

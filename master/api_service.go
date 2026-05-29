@@ -1505,11 +1505,13 @@ func (m *Server) getIPAddr(w http.ResponseWriter, r *http.Request) {
 	dirChildrenNumLimit := atomic.LoadUint32(&m.cluster.cfg.DirChildrenNumLimit)
 	dpMaxRepairErrCnt := atomic.LoadUint64(&m.cluster.cfg.DpMaxRepairErrCnt)
 	followerReadLeaseTime := atomic.LoadUint64(&m.cluster.cfg.FollowerReadLeaseTime)
+	delTreeMaxItemLimit := atomic.LoadUint64(&m.cluster.cfg.MetaNodeDelTreeMaxItemLimit)
 
 	cInfo := &proto.ClusterInfo{
 		Cluster:                     m.cluster.Name,
 		MetaNodeDeleteBatchCount:    batchCount,
 		MetaNodeDeleteWorkerSleepMs: deleteSleepMs,
+		MetaNodeDelTreeMaxItemLimit: delTreeMaxItemLimit,
 		DataNodeDeleteLimitRate:     limitRate,
 		DataNodeAutoRepairLimitRate: autoRepairRate,
 		DpMaxRepairErrCnt:           dpMaxRepairErrCnt,
@@ -4813,6 +4815,15 @@ func (m *Server) setNodeInfoHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if val, ok := params[nodeDelTreeMaxItemLimit]; ok {
+		if v, ok := val.(uint64); ok {
+			if err = m.cluster.setMetaNodeDelTreeMaxItemLimit(v); err != nil {
+				sendErrReply(w, r, newErrHTTPReply(err))
+				return
+			}
+		}
+	}
+
 	if val, ok := params[maxDpCntLimitKey]; ok {
 		if v, ok := val.(uint64); ok {
 			if err = m.cluster.setMaxDpCntLimit(v); err != nil {
@@ -5931,6 +5942,7 @@ func (m *Server) getNodeInfoHandler(w http.ResponseWriter, r *http.Request) {
 	resp[nodeDeleteBatchCountKey] = fmt.Sprintf("%v", m.cluster.cfg.MetaNodeDeleteBatchCount)
 	resp[nodeMarkDeleteRateKey] = fmt.Sprintf("%v", m.cluster.cfg.DataNodeDeleteLimitRate)
 	resp[nodeDeleteWorkerSleepMs] = fmt.Sprintf("%v", m.cluster.cfg.MetaNodeDeleteWorkerSleepMs)
+	resp[nodeDelTreeMaxItemLimit] = fmt.Sprintf("%v", atomic.LoadUint64(&m.cluster.cfg.MetaNodeDelTreeMaxItemLimit))
 	resp[nodeAutoRepairRateKey] = fmt.Sprintf("%v", m.cluster.cfg.DataNodeAutoRepairLimitRate)
 	resp[nodeDpMaxRepairErrCntKey] = fmt.Sprintf("%v", m.cluster.cfg.DpMaxRepairErrCnt)
 	resp[clusterLoadFactorKey] = fmt.Sprintf("%v", m.cluster.cfg.ClusterLoadFactor)
@@ -7543,6 +7555,7 @@ func getMetaPartitionView(mp *MetaPartition) (mpView *proto.MetaPartitionView) {
 	mpView.InodeCount = mp.InodeCount
 	mpView.DentryCount = mp.DentryCount
 	mpView.FreeListLen = mp.FreeListLen
+	mpView.DeleteTreeLen = mp.DeleteTreeLen
 	mpView.TxCnt = mp.TxCnt
 	mpView.TxRbInoCnt = mp.TxRbInoCnt
 	mpView.TxRbDenCnt = mp.TxRbDenCnt

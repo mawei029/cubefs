@@ -711,6 +711,8 @@ type ClusterInfo struct {
 	ClusterUuidEnable                  bool
 	ClusterEnableSnapshot              bool
 	RaftPartitionCanUsingDifferentPort bool
+	// MetaNodeDelTreeMaxItemLimit: 0=off; >0=per-MP enqueue cap. When full, metanode skips enqueue + audit; ops use blobstore-cli.
+	MetaNodeDelTreeMaxItemLimit uint64
 }
 
 // CreateDataPartitionRequest defines the request to create a data partition.
@@ -1078,6 +1080,7 @@ type MetaPartitionReport struct {
 	TxRbInoCnt                uint64
 	TxRbDenCnt                uint64
 	FreeListLen               uint64
+	DeleteTreeLen             uint64
 	ForbidWriteOpOfProtoVer0  bool
 	UidInfo                   []*UidReportSpaceInfo
 	QuotaReportInfos          []*QuotaReportInfo
@@ -1309,6 +1312,7 @@ type MetaPartitionView struct {
 	InodeCount         uint64
 	DentryCount        uint64
 	FreeListLen        uint64
+	DeleteTreeLen      uint64
 	TxCnt              uint64
 	TxRbInoCnt         uint64
 	TxRbDenCnt         uint64

@@ -44,6 +44,7 @@ type MetaReplica struct {
 	TxRbInoCnt                uint64
 	TxRbDenCnt                uint64
 	FreeListLen               uint64
+	DeleteTreeLen             uint64
 	ReportTime                int64
 	Status                    int8 // unavailable, readOnly, readWrite
 	IsLeader                  bool
@@ -69,6 +70,7 @@ type MetaPartition struct {
 	InodeCount       uint64
 	DentryCount      uint64
 	FreeListLen      uint64
+	DeleteTreeLen    uint64
 	TxCnt            uint64
 	TxRbInoCnt       uint64
 	TxRbDenCnt       uint64
@@ -481,6 +483,7 @@ func (mp *MetaPartition) updateMetaPartition(mgr *proto.MetaPartitionReport, met
 	mp.setInodeCount()
 	mp.setDentryCount()
 	mp.setFreeListLen()
+	mp.setDeleteTreeLen()
 	mp.SetTxCnt()
 	mp.removeMissingReplica(metaNode.Addr)
 	mp.setUidInfo(mgr)
@@ -892,6 +895,7 @@ func (mr *MetaReplica) updateMetric(mgr *proto.MetaPartitionReport) {
 	mr.TxRbInoCnt = mgr.TxRbInoCnt
 	mr.TxRbDenCnt = mgr.TxRbDenCnt
 	mr.FreeListLen = mgr.FreeListLen
+	mr.DeleteTreeLen = mgr.DeleteTreeLen
 	mr.dataSize = mgr.Size
 	mr.ForbidWriteOpOfProtoVer0 = mgr.ForbidWriteOpOfProtoVer0
 	mr.ReadOnlyReasons = mgr.ReadOnlyReasons
@@ -1093,6 +1097,17 @@ func (mp *MetaPartition) setFreeListLen() {
 		}
 	}
 	mp.FreeListLen = freeListLen
+}
+
+// setDeleteTreeLen sets DeleteTreeLen to the max DeleteTreeLen among replicas (tolerates follower lag).
+func (mp *MetaPartition) setDeleteTreeLen() {
+	var n uint64
+	for _, r := range mp.Replicas {
+		if r.DeleteTreeLen > n {
+			n = r.DeleteTreeLen
+		}
+	}
+	mp.DeleteTreeLen = n
 }
 
 func (mp *MetaPartition) SetTxCnt() {

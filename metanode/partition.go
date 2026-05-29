@@ -320,6 +320,7 @@ type MetaPartition interface {
 	Stop()
 	DataSize() uint64
 	GetFreeListLen() int
+	GetObjExtentDelTreeLen() int
 	OpMeta
 	LoadSnapshot(path string) error
 	ForceSetMetaPartitionToLoadding()
@@ -759,6 +760,13 @@ func (mp *metaPartition) DataSize() uint64 {
 
 func (mp *metaPartition) GetFreeListLen() int {
 	return mp.freeList.Len()
+}
+
+func (mp *metaPartition) GetObjExtentDelTreeLen() int {
+	if mp.objExtentDelTree == nil {
+		return 0
+	}
+	return mp.objExtentDelTree.Len()
 }
 
 // Start starts a meta partition.

@@ -34,7 +34,20 @@ const (
 	MaxFollowerReadLeaseTimeSec uint64 = 7200
 	// DefaultFollowerReadLeaseTimeSec is the cluster default lease duration in seconds (reduces lease heartbeat Raft traffic when follower read is unused).
 	DefaultFollowerReadLeaseTimeSec uint64 = 3600
+	// MinDelTreeMaxItemLimit is the per-MP enqueue floor when delTreeMaxItemLimit>0; full-queue drop: enqueueObjExtentDelWrap.
+	MinDelTreeMaxItemLimit uint64 = 100_000
 )
+
+// NormalizeDelTreeMaxItemLimit: 0 disables cap; >0 clamps to at least MinDelTreeMaxItemLimit. Full queue skip is by design.
+func NormalizeDelTreeMaxItemLimit(val uint64) uint64 {
+	if val <= 0 {
+		return 0
+	}
+	if val < MinDelTreeMaxItemLimit {
+		return MinDelTreeMaxItemLimit
+	}
+	return val
+}
 
 // ValidateFollowerReadLeaseTime returns nil if val is in [MinFollowerReadLeaseTimeSec, MaxFollowerReadLeaseTimeSec].
 func ValidateFollowerReadLeaseTime(val uint64) error {

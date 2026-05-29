@@ -28,6 +28,7 @@ import (
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/raftstore"
 	"github.com/cubefs/cubefs/sdk/data/blobstore"
+	"github.com/cubefs/cubefs/util/auditlog"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 )
@@ -79,6 +80,11 @@ func createTestObjExtentKey(fileOffset, size, bid uint64) proto.ObjExtentKey {
 		},
 		Crc: 12345,
 	}
+}
+
+// isObjExtentDelTreeGCBackoffSleep matches runObjExtentDelTreeGCWorker idle/error backoff.
+func isObjExtentDelTreeGCBackoffSleep(d time.Duration) bool {
+	return d == AsyncDeleteInterval
 }
 
 // TestRunObjExtentDelTreeGCOnce_Dequeue enqueues pending keys, runs one GC tick, and Raft-dequeues after EBS delete succeeds.
@@ -287,7 +293,7 @@ func TestRunObjExtentDelTreeGCWorker_EncodeErrorBackoff(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 	patches.ApplyFunc(time.Sleep, func(d time.Duration) {
-		if d == AsyncDeleteInterval {
+		if isObjExtentDelTreeGCBackoffSleep(d) {
 			atomic.StoreInt32(&slept, 1)
 			select {
 			case <-stop:
@@ -436,35 +442,35 @@ func TestRunObjExtentDelTreeGCWorker_entryGuards(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	var sleptAsync, sleptMinute int32
+	var sleptDelTreeBackoff, sleptMinute int32
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 	patches.ApplyFunc(time.Sleep, func(d time.Duration) {
-		switch d {
-		case AsyncDeleteInterval:
-			atomic.StoreInt32(&sleptAsync, 1)
-		case time.Minute:
+		switch {
+		case isObjExtentDelTreeGCBackoffSleep(d):
+			atomic.StoreInt32(&sleptDelTreeBackoff, 1)
+		case d == time.Minute:
 			atomic.StoreInt32(&sleptMinute, 1)
 		}
 	})
 
 	t.Run("nil tree", func(t *testing.T) {
-		atomic.StoreInt32(&sleptAsync, 0)
+		atomic.StoreInt32(&sleptDelTreeBackoff, 0)
 		mp := newTestMetaPartition(rootDir, ctrl)
 		mp.objExtentDelTree = nil
 		mp.runObjExtentDelTreeGCWorker()
-		require.Equal(t, int32(1), atomic.LoadInt32(&sleptAsync))
+		require.Equal(t, int32(1), atomic.LoadInt32(&sleptDelTreeBackoff))
 	})
 
 	t.Run("not leader at entry", func(t *testing.T) {
-		atomic.StoreInt32(&sleptAsync, 0)
+		atomic.StoreInt32(&sleptDelTreeBackoff, 0)
 		mp := newTestMetaPartition(rootDir, ctrl)
 		raft := raftstoremock.NewMockPartition(ctrl)
 		raft.EXPECT().Status().Return(&raftstore.PartitionStatus{RestoringSnapshot: false}).AnyTimes()
 		raft.EXPECT().LeaderTerm().Return(uint64(2), uint64(1)).AnyTimes()
 		mp.raftPartition = raft
 		mp.runObjExtentDelTreeGCWorker()
-		require.Equal(t, int32(1), atomic.LoadInt32(&sleptAsync))
+		require.Equal(t, int32(1), atomic.LoadInt32(&sleptDelTreeBackoff))
 	})
 
 	t.Run("empty tree sleeps minute", func(t *testing.T) {
@@ -598,7 +604,7 @@ func TestRunObjExtentDelTreeGCWorker_errorBackoffInLoop(t *testing.T) {
 	stop := make(chan bool)
 	mp.stopC = stop
 	patches.ApplyFunc(time.Sleep, func(d time.Duration) {
-		if d == AsyncDeleteInterval {
+		if isObjExtentDelTreeGCBackoffSleep(d) {
 			select {
 			case <-stop:
 			default:
@@ -653,4 +659,64 @@ func TestApply_objExtentGcFsmOps(t *testing.T) {
 	peek := mp.objExtentDelTree.PeekFirstN(1)
 	require.Equal(t, int64(1700000099999), peek.Items[0].TsMs)
 	require.Equal(t, uint64(201), peek.Items[0].RaftIdx)
+}
+
+// TestObjExtentDelTreeEnqueue covers cap-on behavior: full queue must not grow (by design, not data-loss bug).
+func TestObjExtentDelTreeEnqueue(t *testing.T) {
+	rootDir, err := os.MkdirTemp("", "obj_extent_del_metrics")
+	require.NoError(t, err)
+	defer os.RemoveAll(rootDir)
+
+	t.Run("queueFullRejectsEnqueue", func(t *testing.T) {
+		defer swapDelTreeMaxItemLimitRaw(1)()
+		mp := newTestMetaPartition(rootDir, nil)
+		mp.enqueueObjExtentDelWrap(42, 1700000000, 7, []proto.ObjExtentKey{createTestObjExtentKey(0, 1024, 1)})
+		require.Equal(t, 1, mp.objExtentDelTree.Len())
+
+		mp.enqueueObjExtentDelWrap(99, 1700000001, 8, []proto.ObjExtentKey{createTestObjExtentKey(10, 512, 2)})
+		require.Equal(t, 1, mp.objExtentDelTree.Len())
+	})
+
+	t.Run("queueFullAudit", func(t *testing.T) {
+		defer swapDelTreeMaxItemLimitRaw(1)()
+		mp := newTestMetaPartition(rootDir, nil)
+		mp.enqueueObjExtentDelWrap(42, 1700000000, 7, []proto.ObjExtentKey{createTestObjExtentKey(0, 1024, 1)})
+
+		dropped := []proto.ObjExtentKey{
+			createTestObjExtentKey(10, 512, 2),
+			createTestObjExtentKey(20, 256, 3),
+		}
+		var auditOp, auditMsg string
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyFunc(auditlog.LogOpMsg, func(op, msg string, err error) {
+			auditOp = op
+			auditMsg = msg
+		})
+
+		mp.enqueueObjExtentDelWrap(99, 1700000001, 8, dropped)
+		require.Equal(t, "ObjExtentDelTreeFull", auditOp)
+		require.Contains(t, auditMsg, "mp=10001")
+		require.Contains(t, auditMsg, "inode=99")
+		require.Contains(t, auditMsg, "oek[0]="+dropped[0].String())
+		require.Contains(t, auditMsg, "oek[1]="+dropped[1].String())
+	})
+
+	t.Run("detachRemovesPartition", func(t *testing.T) {
+		mp := newTestMetaPartition(rootDir, nil)
+		mp.manager.partitions[mp.config.PartitionId] = mp
+		mp.objExtentDelTree.EnqueueFromApply(1, 0, 1, []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 1)})
+		require.NoError(t, mp.manager.detachPartition(mp.config.PartitionId))
+		_, ok := mp.manager.partitions[mp.config.PartitionId]
+		require.False(t, ok)
+	})
+
+	t.Run("enqueueNoLimitWhenMaxIsZero", func(t *testing.T) {
+		defer swapDelTreeMaxItemLimit(0)()
+		mp := newTestMetaPartition(rootDir, nil)
+		for i := 0; i < 3; i++ {
+			mp.enqueueObjExtentDelWrap(uint64(100+i), 1700000000, uint64(i), []proto.ObjExtentKey{createTestObjExtentKey(0, 1, uint64(i+1))})
+		}
+		require.Equal(t, 3, mp.objExtentDelTree.Len())
+	})
 }

@@ -77,6 +77,7 @@ const (
 	nodeDeleteBatchCountKey                = "batchCount"
 	nodeMarkDeleteRateKey                  = "markDeleteRate"
 	nodeDeleteWorkerSleepMs                = "deleteWorkerSleepMs"
+	nodeDelTreeMaxItemLimit                = "delTreeMaxItemLimit"
 	followerReadLeaseTimeKey               = "followerReadLeaseTime"
 	nodeAutoRepairRateKey                  = "autoRepairRate"
 	metaAutoAddReplicaLimitKey             = "metaAutoAddReplicaLimit"

@@ -142,7 +142,7 @@ func mockPartitionRaft(ctrl *gomock.Controller) *metaPartition {
 		VerSeq:    0,
 		StoreMode: proto.StoreModeMem,
 	}
-	partition := NewMetaPartition(conf, nil).(*metaPartition)
+	partition := NewMetaPartition(conf, newMetaPartitionTestManager()).(*metaPartition)
 	err := partition.initObjects(true)
 	if err != nil {
 		panic(err)

@@ -33,11 +33,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// copyVolForTest returns a shallow copy of v for isolated test mutations.
-// Vol embeds sync.RWMutex through TopoSubItem; this is safe in tests where
-// the mutex is guaranteed to be unlocked at the point of copy.
-func copyVolForTest(v *Vol) Vol {
-	return *v //nolint:govet
+// copyVolForTest clones v for isolated test mutations without copying embedded locks.
+func copyVolForTest(v *Vol) *Vol {
+	if v == nil {
+		return nil
+	}
+	data, err := json.Marshal(v)
+	if err != nil {
+		panic(fmt.Sprintf("copyVolForTest marshal: %v", err))
+	}
+	cp := new(Vol)
+	if err = json.Unmarshal(data, cp); err != nil {
+		panic(fmt.Sprintf("copyVolForTest unmarshal: %v", err))
+	}
+	return cp
 }
 
 func apiArgsNewGet(t *testing.T, rawQuery string) *http.Request {
@@ -255,7 +264,7 @@ func TestParseVolUpdateReq_minimal(t *testing.T) {
 	vol.allowedStorageClass = []uint32{vol.volStorageClass}
 	req := &updateVolReq{}
 	r := apiArgsNewGet(t, "txTimeout=1&txConflictRetryNum=100&txConflictRetryInterval=500")
-	err = parseVolUpdateReq(r, &vol, req)
+	err = parseVolUpdateReq(r, vol, req)
 	require.NoError(t, err)
 }
 
@@ -771,6 +780,7 @@ func TestParseAndExtractSetNodeInfoParams_comprehensive(t *testing.T) {
 	v.Set(nodeMarkDeleteRateKey, "1")
 	v.Set(nodeAutoRepairRateKey, "2")
 	v.Set(nodeDeleteWorkerSleepMs, "100")
+	v.Set(nodeDelTreeMaxItemLimit, "250000")
 	v.Set(clusterLoadFactorKey, "50.5")
 	v.Set(maxDpCntLimitKey, "1000")
 	v.Set(maxMpCntLimitKey, "2000")
@@ -829,6 +839,44 @@ func TestParseAndExtractSetNodeInfoParams_comprehensive(t *testing.T) {
 	m, err := parseAndExtractSetNodeInfoParams(apiArgsNewPostForm(t, v))
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, len(m), 20)
+	require.Equal(t, uint64(250000), m[nodeDelTreeMaxItemLimit])
+}
+
+func TestParseAndExtractSetNodeInfoParams_delTreeMaxItemLimit_zeroDisables(t *testing.T) {
+	v := url.Values{}
+	v.Set(nodeDelTreeMaxItemLimit, "0")
+	m, err := parseAndExtractSetNodeInfoParams(apiArgsNewPostForm(t, v))
+	require.NoError(t, err)
+	val, ok := m[nodeDelTreeMaxItemLimit]
+	require.True(t, ok)
+	require.Equal(t, uint64(0), val)
+}
+
+func TestParseAndExtractSetNodeInfoParams_delTreeMaxItemLimit(t *testing.T) {
+	v := url.Values{}
+	v.Set(nodeDelTreeMaxItemLimit, "300000")
+	m, err := parseAndExtractSetNodeInfoParams(apiArgsNewPostForm(t, v))
+	require.NoError(t, err)
+	val, ok := m[nodeDelTreeMaxItemLimit]
+	require.True(t, ok)
+	require.Equal(t, uint64(300000), val)
+}
+
+func TestParseAndExtractSetNodeInfoParams_delTreeMaxItemLimit_parsesRawBeforeMasterClamp(t *testing.T) {
+	v := url.Values{}
+	v.Set(nodeDelTreeMaxItemLimit, "50000")
+	m, err := parseAndExtractSetNodeInfoParams(apiArgsNewPostForm(t, v))
+	require.NoError(t, err)
+	val, ok := m[nodeDelTreeMaxItemLimit]
+	require.True(t, ok)
+	require.Equal(t, uint64(50_000), val)
+}
+
+func TestParseAndExtractSetNodeInfoParams_delTreeMaxItemLimit_invalid(t *testing.T) {
+	v := url.Values{}
+	v.Set(nodeDelTreeMaxItemLimit, "bad")
+	_, err := parseAndExtractSetNodeInfoParams(apiArgsNewPostForm(t, v))
+	require.Error(t, err)
 }
 
 func TestParseAndExtractSetNodeInfoParams_invalidUint(t *testing.T) {
@@ -937,7 +985,7 @@ func TestParseVolUpdateReq_extended(t *testing.T) {
 	u := "http://127.0.0.1/admin?" + q.Encode()
 	r := httptest.NewRequest(http.MethodGet, u, nil)
 	req := &updateVolReq{}
-	err = parseVolUpdateReq(r, &vol, req)
+	err = parseVolUpdateReq(r, vol, req)
 	require.NoError(t, err)
 	require.Equal(t, "seln", req.dpSelectorName)
 	require.Equal(t, "selp", req.dpSelectorParm)
@@ -1003,7 +1051,7 @@ func TestParseVolUpdateReq_quotaAndErrors(t *testing.T) {
 		q.Set(quotaOfPool, "5")
 		u := "http://127.0.0.1/admin?" + q.Encode()
 		req := &updateVolReq{}
-		err := parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), &vol, req)
+		err := parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), vol, req)
 		require.NoError(t, err)
 	})
 
@@ -1015,7 +1063,7 @@ func TestParseVolUpdateReq_quotaAndErrors(t *testing.T) {
 		q.Set(trashIntervalKey, strconv.FormatInt(int64(maxTrashInterval)+1, 10))
 		u := "http://127.0.0.1/admin?" + q.Encode()
 		req := &updateVolReq{}
-		err := parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), &vol, req)
+		err := parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), vol, req)
 		require.Error(t, err)
 	})
 
@@ -1027,7 +1075,7 @@ func TestParseVolUpdateReq_quotaAndErrors(t *testing.T) {
 		q.Set(dpSelectorNameKey, "onlyName")
 		u := "http://127.0.0.1/admin?" + q.Encode()
 		req := &updateVolReq{}
-		err := parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), &vol, req)
+		err := parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), vol, req)
 		require.Error(t, err)
 	})
 }
@@ -1064,7 +1112,7 @@ func TestParseVolUpdateReq_branches(t *testing.T) {
 		q.Set(volCapacityKey, "notuint")
 		u := "http://127.0.0.1/admin?" + q.Encode()
 		req := &updateVolReq{}
-		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), &vol, req)
+		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), vol, req)
 		require.Error(t, err)
 	})
 
@@ -1078,7 +1126,7 @@ func TestParseVolUpdateReq_branches(t *testing.T) {
 		q.Set(volStorageClassKey, "notnum")
 		u := "http://127.0.0.1/admin?" + q.Encode()
 		req := &updateVolReq{}
-		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), &vol, req)
+		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), vol, req)
 		require.Error(t, err)
 	})
 
@@ -1093,7 +1141,7 @@ func TestParseVolUpdateReq_branches(t *testing.T) {
 		q.Set(quotaOfClass, "1")
 		u := "http://127.0.0.1/admin?" + q.Encode()
 		req := &updateVolReq{}
-		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), &vol, req)
+		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), vol, req)
 		require.Error(t, err)
 	})
 
@@ -1107,7 +1155,7 @@ func TestParseVolUpdateReq_branches(t *testing.T) {
 		q.Set(quotaClass, "1")
 		u := "http://127.0.0.1/admin?" + q.Encode()
 		req := &updateVolReq{}
-		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), &vol, req)
+		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), vol, req)
 		require.Error(t, err)
 	})
 
@@ -1124,7 +1172,7 @@ func TestParseVolUpdateReq_branches(t *testing.T) {
 		q.Set(quotaOfClass, "100")
 		u := "http://127.0.0.1/admin?" + q.Encode()
 		req := &updateVolReq{}
-		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), &vol, req)
+		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), vol, req)
 		require.Error(t, err)
 	})
 
@@ -1140,7 +1188,7 @@ func TestParseVolUpdateReq_branches(t *testing.T) {
 		q.Set(quotaOfPool, "1")
 		u := "http://127.0.0.1/admin?" + q.Encode()
 		req := &updateVolReq{}
-		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), &vol, req)
+		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), vol, req)
 		require.Error(t, err)
 	})
 
@@ -1155,7 +1203,7 @@ func TestParseVolUpdateReq_branches(t *testing.T) {
 		q.Set(quotaPool, fmt.Sprintf("%d", proto.DefaultSSDPoolId))
 		u := "http://127.0.0.1/admin?" + q.Encode()
 		req := &updateVolReq{}
-		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), &vol, req)
+		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), vol, req)
 		require.Error(t, err)
 	})
 
@@ -1173,7 +1221,7 @@ func TestParseVolUpdateReq_branches(t *testing.T) {
 		q.Set(quotaOfPool, "999")
 		u := "http://127.0.0.1/admin?" + q.Encode()
 		req := &updateVolReq{}
-		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), &vol, req)
+		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), vol, req)
 		require.Error(t, err)
 	})
 
@@ -1188,7 +1236,7 @@ func TestParseVolUpdateReq_branches(t *testing.T) {
 		q.Set(volStorageClassKey, fmt.Sprintf("%d", proto.StorageClass_Replica_HDD))
 		u := "http://127.0.0.1/admin?" + q.Encode()
 		req := &updateVolReq{}
-		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), &vol, req)
+		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), vol, req)
 		require.Error(t, err)
 	})
 
@@ -1203,7 +1251,7 @@ func TestParseVolUpdateReq_branches(t *testing.T) {
 		q.Set(volStorageClassKey, fmt.Sprintf("%d", proto.StorageClass_Replica_HDD))
 		u := "http://127.0.0.1/admin?" + q.Encode()
 		req := &updateVolReq{}
-		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), &vol, req)
+		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), vol, req)
 		require.NoError(t, err)
 		require.Equal(t, proto.StorageClass_Replica_HDD, req.volStorageClass)
 	})
@@ -1219,7 +1267,7 @@ func TestParseVolUpdateReq_branches(t *testing.T) {
 		q.Set(volStorageClassKey, fmt.Sprintf("%d", proto.StorageClass_Replica_HDD))
 		u := "http://127.0.0.1/admin?" + q.Encode()
 		req := &updateVolReq{}
-		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), &vol, req)
+		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), vol, req)
 		require.Error(t, err)
 	})
 
@@ -1234,7 +1282,7 @@ func TestParseVolUpdateReq_branches(t *testing.T) {
 		q.Set(volStorageClassKey, fmt.Sprintf("%d", proto.StorageClass_BlobStore))
 		u := "http://127.0.0.1/admin?" + q.Encode()
 		req := &updateVolReq{}
-		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), &vol, req)
+		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), vol, req)
 		require.Error(t, err)
 	})
 
@@ -1248,7 +1296,7 @@ func TestParseVolUpdateReq_branches(t *testing.T) {
 		q.Set(poolIdKey, "notuint8")
 		u := "http://127.0.0.1/admin?" + q.Encode()
 		req := &updateVolReq{}
-		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), &vol, req)
+		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), vol, req)
 		require.Error(t, err)
 	})
 
@@ -1263,7 +1311,7 @@ func TestParseVolUpdateReq_branches(t *testing.T) {
 		q.Set(ebsBlkSizeKey, "bad")
 		u := "http://127.0.0.1/admin?" + q.Encode()
 		req := &updateVolReq{}
-		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), &vol, req)
+		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), vol, req)
 		require.Error(t, err)
 	})
 }
@@ -1474,7 +1522,7 @@ func TestParseVolUpdateReq_quotaParseErrors(t *testing.T) {
 		q.Set(quotaClass, "nope")
 		u := "http://127.0.0.1/admin?" + q.Encode()
 		req := &updateVolReq{}
-		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), &vol, req)
+		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), vol, req)
 		require.Error(t, err)
 	})
 
@@ -1484,7 +1532,7 @@ func TestParseVolUpdateReq_quotaParseErrors(t *testing.T) {
 		q.Set(quotaOfClass, "x")
 		u := "http://127.0.0.1/admin?" + q.Encode()
 		req := &updateVolReq{}
-		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), &vol, req)
+		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), vol, req)
 		require.Error(t, err)
 	})
 
@@ -1493,7 +1541,7 @@ func TestParseVolUpdateReq_quotaParseErrors(t *testing.T) {
 		q.Set(quotaPool, "bad")
 		u := "http://127.0.0.1/admin?" + q.Encode()
 		req := &updateVolReq{}
-		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), &vol, req)
+		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), vol, req)
 		require.Error(t, err)
 	})
 
@@ -1501,11 +1549,11 @@ func TestParseVolUpdateReq_quotaParseErrors(t *testing.T) {
 		q := base()
 		q.Set(quotaPool, fmt.Sprintf("%d", proto.DefaultSSDPoolId))
 		q.Set(quotaOfPool, "z")
-		vol2 := copyVolForTest(&vol)
+		vol2 := copyVolForTest(vol)
 		vol2.allowedPools = []uint8{proto.DefaultSSDPoolId}
 		u := "http://127.0.0.1/admin?" + q.Encode()
 		req := &updateVolReq{}
-		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), &vol2, req)
+		err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), vol2, req)
 		require.Error(t, err)
 	})
 }
@@ -1837,7 +1885,7 @@ func TestParseVolUpdateReq_invalidEnablePosixAcl(t *testing.T) {
 	q.Set(enablePosixAclKey, "notbool")
 	u := "http://127.0.0.1/admin?" + q.Encode()
 	req := &updateVolReq{}
-	err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), &vol, req)
+	err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), vol, req)
 	require.Error(t, err)
 }
 
@@ -1854,7 +1902,7 @@ func TestParseVolUpdateReq_invalidTxForceReset(t *testing.T) {
 	q.Set(txForceResetKey, "bad")
 	u := "http://127.0.0.1/admin?" + q.Encode()
 	req := &updateVolReq{}
-	err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), &vol, req)
+	err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), vol, req)
 	require.Error(t, err)
 }
 
@@ -1881,7 +1929,7 @@ func TestParseVolUpdateReq_invalidTxMaskString(t *testing.T) {
 	q.Set(txForceResetKey, "false")
 	u := "http://127.0.0.1/admin?" + q.Encode()
 	req := &updateVolReq{}
-	err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), &vol, req)
+	err = parseVolUpdateReq(httptest.NewRequest(http.MethodGet, u, nil), vol, req)
 	require.Error(t, err)
 }
 

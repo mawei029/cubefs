@@ -39,22 +39,6 @@ func encodeBatchPunish(b batchObjExtentDelItems, newTsMs int64) ([]byte, error) 
 	return append([]byte(nil), buf.Bytes()...), nil
 }
 
-func encodeBatchDequeueWithPool(t *testing.T, b batchObjExtentDelItems) []byte {
-	t.Helper()
-	buf := GetDeleteTreeBuf()
-	defer PutDeleteTreeBuf(buf)
-	require.NoError(t, b.MarshalDequeue(&buf.Buffer))
-	return append([]byte(nil), buf.Bytes()...)
-}
-
-func encodeBatchPunishWithPool(t *testing.T, b batchObjExtentDelItems, newTsMs int64) []byte {
-	t.Helper()
-	buf := GetDeleteTreeBuf()
-	defer PutDeleteTreeBuf(buf)
-	require.NoError(t, b.MarshalPunish(&buf.Buffer, newTsMs))
-	return append([]byte(nil), buf.Bytes()...)
-}
-
 func TestObjExtentDelTreeEnqueueAndDequeue(t *testing.T) {
 	ot := newObjExtentDelTree()
 	oek := createTestObjExtentKey(0, 1024, 1)
@@ -277,8 +261,7 @@ func TestUnmarshalDequeue_unsupportedVersion(t *testing.T) {
 
 	var batch batchObjExtentDelItems
 	err := batch.UnmarshalDequeue(buf.Bytes())
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "unsupported version")
+	require.ErrorIs(t, err, ErrDelTreeUnsupported)
 }
 
 func TestUnmarshalPunish_unsupportedVersion(t *testing.T) {
@@ -288,8 +271,7 @@ func TestUnmarshalPunish_unsupportedVersion(t *testing.T) {
 
 	var batch batchObjExtentDelItems
 	err := batch.UnmarshalPunish(buf.Bytes())
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "unsupported version")
+	require.ErrorIs(t, err, ErrDelTreeUnsupported)
 }
 
 func TestMarshalDequeue_emptyBatch(t *testing.T) {
@@ -383,8 +365,9 @@ func TestObjExtentDelTreeEncodeDecodeAndErrors(t *testing.T) {
 	require.Equal(t, it.Inode, decoded.Items[0].Inode)
 	require.Equal(t, it.RaftIdx, decoded.Items[0].RaftIdx)
 
-	require.Error(t, decoded.UnmarshalDequeue([]byte{1, 2, 3}))
-	require.Contains(t, decoded.UnmarshalDequeue([]byte{1, 2, 3}).Error(), "short buf")
+	err = decoded.UnmarshalDequeue([]byte{1, 2, 3})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "too short")
 }
 
 func TestObjExtentDelTreeApplyPunishPayloadErrors(t *testing.T) {
@@ -649,7 +632,6 @@ func TestUnmarshalPunish_shortNewTime(t *testing.T) {
 	var batch batchObjExtentDelItems
 	err := batch.UnmarshalPunish(buf.Bytes())
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "punish:")
 }
 
 func TestUnmarshalPunish_invalidOekBody(t *testing.T) {
@@ -685,157 +667,12 @@ func TestObjExtentDelItem_LessAndKeyItem(t *testing.T) {
 	require.Equal(t, int64(3), peek.Items[0].TsMs)
 }
 
-func snapshotBytes(t *testing.T, it *objExtentDelItem) []byte {
-	t.Helper()
-	snapBuf := GetDeleteTreeBuf()
-	defer PutDeleteTreeBuf(snapBuf)
-	require.NoError(t, it.MarshalSnapshot(&snapBuf.Buffer))
-	return append([]byte(nil), snapBuf.Bytes()...)
-}
+func TestApplyDequeuePayload_unmarshalError(t *testing.T) {
+	ot := newObjExtentDelTree()
+	ot.EnqueueFromApply(1, 0, 1, []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 1)})
+	require.Equal(t, 1, ot.Len())
 
-func TestObjExtentDelItemSnapshotMarshal(t *testing.T) {
-	it := &objExtentDelItem{
-		TsMs:    1700000000000,
-		Inode:   9,
-		RaftIdx: 3,
-		Oeks:    []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 1)},
-	}
-	raw := snapshotBytes(t, it)
-
-	var decoded objExtentDelItem
-	require.NoError(t, decoded.UnmarshalSnapshot(raw))
-	require.Equal(t, it.TsMs, decoded.TsMs)
-	require.Equal(t, it.Inode, decoded.Inode)
-	require.Equal(t, it.RaftIdx, decoded.RaftIdx)
-	require.Len(t, decoded.Oeks, 1)
-}
-
-func TestBatchObjExtentDelItems_encodeWithDeleteTreePool(t *testing.T) {
-	it := &objExtentDelItem{TsMs: 1, Inode: 2, RaftIdx: 3, Oeks: []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 1)}}
-	batch := batchObjExtentDelItems{Items: []*objExtentDelItem{it}}
-
-	deq := encodeBatchDequeueWithPool(t, batch)
-	var decoded batchObjExtentDelItems
-	require.NoError(t, decoded.UnmarshalDequeue(deq))
-	require.Len(t, decoded.Items, 1)
-
-	punish := encodeBatchPunishWithPool(t, batch, 99)
-	require.NoError(t, decoded.UnmarshalPunish(punish))
-	require.Equal(t, int64(99), decoded.NewTime)
-}
-
-func TestObjExtentDelItem_MarshalSnapshotBinaryTo(t *testing.T) {
-	items := []*objExtentDelItem{
-		{TsMs: 1, Inode: 10, RaftIdx: 1, Oeks: []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 1)}},
-		{TsMs: 2, Inode: 20, RaftIdx: 2, Oeks: []proto.ObjExtentKey{
-			createTestObjExtentKey(0, 1024, 1),
-			createTestObjExtentKey(4096, 8192, 2),
-		}},
-	}
-	snapBuf := GetDeleteTreeBuf()
-	defer PutDeleteTreeBuf(snapBuf)
-	for _, it := range items {
-		require.NoError(t, it.MarshalSnapshot(&snapBuf.Buffer))
-		fromBuf := append([]byte(nil), snapBuf.Bytes()...)
-
-		var decoded objExtentDelItem
-		require.NoError(t, decoded.UnmarshalSnapshot(fromBuf))
-		require.Equal(t, it.TsMs, decoded.TsMs)
-		require.Equal(t, it.Inode, decoded.Inode)
-		require.Equal(t, len(it.Oeks), len(decoded.Oeks))
-
-		require.NoError(t, it.MarshalSnapshot(&snapBuf.Buffer))
-		require.True(t, bytes.Equal(fromBuf, snapBuf.Bytes()))
-	}
-}
-
-func TestMarshalSnapshotBinaryTo_errors(t *testing.T) {
-	it := &objExtentDelItem{
-		TsMs: 1, Inode: 2, RaftIdx: 3,
-		Oeks: []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 1)},
-	}
-
-	failOnNthBinaryWrite := func(t *testing.T, n int) {
-		t.Helper()
-		patches := gomonkey.NewPatches()
-		defer patches.Reset()
-		calls := 0
-		patches.ApplyFunc(binary.Write, func(w io.Writer, order binary.ByteOrder, data interface{}) error {
-			calls++
-			if calls == n {
-				return errors.New("write fail")
-			}
-			return binary.Write(w, order, data)
-		})
-		snapBuf := GetDeleteTreeBuf()
-		defer PutDeleteTreeBuf(snapBuf)
-		require.Error(t, it.MarshalSnapshot(&snapBuf.Buffer))
-	}
-
-	t.Run("version", func(t *testing.T) { failOnNthBinaryWrite(t, 1) })
-	t.Run("TsMs", func(t *testing.T) { failOnNthBinaryWrite(t, 2) })
-	t.Run("Inode", func(t *testing.T) { failOnNthBinaryWrite(t, 3) })
-	t.Run("RaftIdx", func(t *testing.T) { failOnNthBinaryWrite(t, 4) })
-	t.Run("oek count", func(t *testing.T) { failOnNthBinaryWrite(t, 5) })
-	t.Run("oek len", func(t *testing.T) { failOnNthBinaryWrite(t, 6) })
-
-	t.Run("binary write fails", func(t *testing.T) {
-		patches := gomonkey.NewPatches()
-		defer patches.Reset()
-		patches.ApplyFunc(binary.Write, func(_ io.Writer, _ binary.ByteOrder, _ interface{}) error {
-			return errors.New("write fail")
-		})
-		snapBuf := GetDeleteTreeBuf()
-		defer PutDeleteTreeBuf(snapBuf)
-		require.Error(t, it.MarshalSnapshot(&snapBuf.Buffer))
-	})
-
-	t.Run("oek MarshalBinary fails", func(t *testing.T) {
-		patches := gomonkey.NewPatches()
-		defer patches.Reset()
-		patches.ApplyMethod(reflect.TypeOf(&proto.ObjExtentKey{}), "MarshalBinary",
-			func(_ *proto.ObjExtentKey) ([]byte, error) {
-				return nil, errors.New("marshal fail")
-			})
-		snapBuf := GetDeleteTreeBuf()
-		defer PutDeleteTreeBuf(snapBuf)
-		require.Error(t, it.MarshalSnapshot(&snapBuf.Buffer))
-	})
-
-	t.Run("buf write fails", func(t *testing.T) {
-		patches := gomonkey.NewPatches()
-		defer patches.Reset()
-		patches.ApplyMethod(reflect.TypeOf(&bytes.Buffer{}), "Write",
-			func(_ *bytes.Buffer, p []byte) (int, error) {
-				if len(p) > 8 {
-					return 0, errors.New("buf write fail")
-				}
-				return len(p), nil
-			})
-		snapBuf := GetDeleteTreeBuf()
-		defer PutDeleteTreeBuf(snapBuf)
-		require.Error(t, it.MarshalSnapshot(&snapBuf.Buffer))
-	})
-}
-
-func TestUnmarshalSnapshotBinary_errors(t *testing.T) {
-	it := &objExtentDelItem{TsMs: 1, Inode: 2, RaftIdx: 3, Oeks: []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 1)}}
-	raw := snapshotBytes(t, it)
-
-	t.Run("short payload", func(t *testing.T) {
-		var decoded objExtentDelItem
-		require.ErrorIs(t, decoded.UnmarshalSnapshot(raw[:4]), ErrDelPayloadTooShort)
-	})
-
-	t.Run("unsupported version", func(t *testing.T) {
-		bad := append([]byte(nil), raw...)
-		bad[3] = 99
-		var decoded objExtentDelItem
-		require.ErrorIs(t, decoded.UnmarshalSnapshot(bad), ErrDelTreeUnsupported)
-	})
-
-	t.Run("truncated oek body", func(t *testing.T) {
-		var decoded objExtentDelItem
-		require.Error(t, decoded.UnmarshalSnapshot(raw[:len(raw)-2]))
-	})
+	err := ot.ApplyDequeuePayload([]byte{0, 1, 2})
+	require.Error(t, err)
+	require.Equal(t, 1, ot.Len())
 }

@@ -196,6 +196,9 @@ type clusterConfig struct {
 	MetaNodeDeleteBatchCount            uint64 // metanode delete batch count
 	DataNodeDeleteLimitRate             uint64 // datanode delete limit rate
 	MetaNodeDeleteWorkerSleepMs         uint64 // metaNode delete worker sleep time with millisecond. if 0 for no sleep
+	// MetaNodeDelTreeMaxItemLimit: 0=off; >0=per-MP objExtentDelTree cap. When full, metanode skips enqueue+audit;
+	// discard oeks need manual/blobstore-cli delete (by design). See enqueueObjExtentDelWrap.
+	MetaNodeDelTreeMaxItemLimit uint64
 	// MaxDpCntLimit                       uint64 // datanode data partition limit
 	// MaxMpCntLimit                       uint64 // metanode meta partition limit
 	DataNodeAutoRepairLimitRate uint64 // datanode autorepair limit rate

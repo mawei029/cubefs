@@ -65,12 +65,23 @@ var cfgJSON = `{
 		"clusterName":"cubefs"
 	}`
 
+func newTestMetaNode() *MetaNode {
+	mn := &MetaNode{}
+	mn.clusterEnableSnapshot = true
+	return mn
+}
+
+func newMetaPartitionTestManager() *metadataManager {
+	return &metadataManager{metaNode: newTestMetaNode()}
+}
+
 func newManager() *metadataManager {
 	return &metadataManager{
 		partitions:      make(map[uint64]MetaPartition),
 		volUpdating:     new(sync.Map),
 		rocksdbManager:  NewPerDiskRocksdbManager(&RocksdbManagerConfig{}),
 		fileStatsConfig: &fileStatsConfig{},
+		metaNode:        newTestMetaNode(),
 	}
 }
 
@@ -1436,7 +1447,7 @@ func NewMetaPartitionForTest(storeMode proto.StoreMode) *metaPartition {
 	if mpC.StoreMode == proto.StoreModeRocksDb {
 		mpC.RocksDBDir = fmt.Sprintf("%v/%v_%v", RocksdbMultiVerTestDir, partitionId, time.Now().UnixMilli())
 	}
-	partition := NewMetaPartition(mpC, nil).(*metaPartition)
+	partition := NewMetaPartition(mpC, newMetaPartitionTestManager()).(*metaPartition)
 	partition.rocksdbManager = NewPerDiskRocksdbManager(&RocksdbManagerConfig{})
 	err := partition.rocksdbManager.Register(mpC.RocksDBDir)
 	if err != nil {

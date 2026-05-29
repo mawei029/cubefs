@@ -21,11 +21,13 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/cubefs/cubefs/datanode/storage"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/util"
+	"github.com/cubefs/cubefs/util/auditlog"
 	"github.com/cubefs/cubefs/util/log"
 	"github.com/cubefs/cubefs/util/timeutil"
 )
@@ -886,7 +888,7 @@ func (mp *metaPartition) fsmAppendObjExtentsWithCheck(dbHandle interface{}, inoP
 
 	// Schedule discard extents for async EBS delete (replicated btree; same apply index for idempotent replay).
 	if !discardExtent.IsEmpty() {
-		mp.objExtentDelTree.EnqueueFromApply(inoId, inoParam.ModifyTime, mp.fsmRaftApplyIndex, []proto.ObjExtentKey{discardExtent})
+		mp.enqueueObjExtentDelWrap(inoId, inoParam.ModifyTime, mp.fsmRaftApplyIndex, []proto.ObjExtentKey{discardExtent})
 	}
 
 	if err = mp.inodeTree.Update(dbHandle, fsmIno); err != nil {
@@ -1119,7 +1121,7 @@ func (mp *metaPartition) fsmExtentsTruncateV2(dbHandle interface{}, req *proto.T
 
 	// Step 4: After inode commit, schedule async EBS GC for every key in toEnqueue (idempotent by apply index).
 	if len(toEnqueue) > 0 {
-		mp.objExtentDelTree.EnqueueFromApply(req.Inode, req.Timestamp, mp.fsmRaftApplyIndex, toEnqueue)
+		mp.enqueueObjExtentDelWrap(req.Inode, req.Timestamp, mp.fsmRaftApplyIndex, toEnqueue)
 	}
 	log.LogDebugf("[fsmExtentsTruncateV2] mpId(%v) ino(%v) size(%v) finalExtentsLen(%v) enqueueLen(%v)",
 		mpId, inoId, req.Size, len(eksInInode), len(toEnqueue))
@@ -1821,4 +1823,36 @@ func (mp *metaPartition) fsmUpdateInodeMeta(handle interface{}, req *UpdateInode
 		return
 	}
 	return
+}
+
+// enqueueObjExtentDelWrap schedules async EBS deletes via objExtentDelTree after metanode FSM has committed.
+//
+// Design note (ops / QA / dev — intentional, not a defect):
+//   - delTreeMaxItemLimit>0 enables a per-MP enqueue cap (Master setNodeInfo; 0 disables throttling).
+//   - When len>=cap, discard oeks for this apply are **not enqueued**; audit ObjExtentDelTreeFull is emitted.
+//   - Raft metadata is already committed; only async blob delete is blocked. Dropped oeks are not auto-retried.
+//   - Remediation: raise delTreeMaxItemLimit or set 0 and wait for GC; or delete blobs manually from audit oeks
+//     via blobstore-cli (docs/source/user-guide/cli/blobstore-cli.md).
+//   - Do not enqueue on a full queue to satisfy tests/reviewers; that hides backlog and increases MP memory pressure.
+func (mp *metaPartition) enqueueObjExtentDelWrap(inode uint64, modifyTimeSec int64, raftApplyIndex uint64, oeks []proto.ObjExtentKey) {
+	if !DelTreeEnqueueLimitEnabled() {
+		mp.objExtentDelTree.EnqueueFromApply(inode, modifyTimeSec, raftApplyIndex, oeks)
+		return
+	}
+
+	maxLmt := DelTreeMaxItemLimit()
+	if mp.objExtentDelTree.Len() >= int(maxLmt) {
+		// Full queue: reject enqueue (expected). See comment above; audit oeks for manual/blobstore-cli cleanup.
+		var auditMsg strings.Builder
+		fmt.Fprintf(&auditMsg, "mp=%d inode=%d modifyTimeSec=%d raftApplyIndex=%d oekCnt=%d len=%d max=%d",
+			mp.config.PartitionId, inode, modifyTimeSec, raftApplyIndex, len(oeks),
+			mp.objExtentDelTree.Len(), maxLmt)
+		for i := range oeks {
+			fmt.Fprintf(&auditMsg, " oek[%d]=%s", i, oeks[i].String())
+		}
+		auditlog.LogOpMsg("ObjExtentDelTreeFull", auditMsg.String(), ErrDelTreeItemsFull)
+		return
+	}
+
+	mp.objExtentDelTree.EnqueueFromApply(inode, modifyTimeSec, raftApplyIndex, oeks)
 }

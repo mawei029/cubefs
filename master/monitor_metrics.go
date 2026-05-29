@@ -929,6 +929,7 @@ func (mm *monitorMetrics) setVolMetrics() {
 		dentryCount := uint64(0)
 		mpCount := uint64(0)
 		freeListLen := uint64(0)
+		delTreeLen := uint64(0)
 		txCnt := uint64(0)
 
 		for _, mpv := range vol.getMetaPartitionsView() {
@@ -936,6 +937,8 @@ func (mm *monitorMetrics) setVolMetrics() {
 			dentryCount += mpv.DentryCount
 			mpCount += 1
 			freeListLen += mpv.FreeListLen
+			// delTreeLen: sum of per-MP DeleteTreeLen; each MP value is max(replica reports), same as freeListLen.
+			delTreeLen += mpv.DeleteTreeLen
 			txCnt += mpv.TxCnt
 		}
 
@@ -991,6 +994,7 @@ func (mm *monitorMetrics) setVolMetrics() {
 		mm.volMetaCount.SetWithLabelValues(float64(mpCount), volName, "mp")
 		mm.volMetaCount.SetWithLabelValues(float64(vol.getDataPartitionsCount()), volName, "dp")
 		mm.volMetaCount.SetWithLabelValues(float64(freeListLen), volName, "freeList")
+		mm.volMetaCount.SetWithLabelValues(float64(delTreeLen), volName, "deleteTreeLen")
 		mm.volMetaCount.SetWithLabelValues(float64(txCnt), volName, txLabel)
 	}
 
@@ -1024,6 +1028,7 @@ func (mm *monitorMetrics) deleteVolMetric(volName string) {
 	mm.volMetaCount.DeleteLabelValues(volName, "mp")
 	mm.volMetaCount.DeleteLabelValues(volName, "dp")
 	mm.volMetaCount.DeleteLabelValues(volName, "freeList")
+	mm.volMetaCount.DeleteLabelValues(volName, "deleteTreeLen")
 	mm.volMetaCount.DeleteLabelValues(volName, txLabel)
 	mm.volStats.Reset()
 }

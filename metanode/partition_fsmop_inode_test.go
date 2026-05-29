@@ -867,8 +867,17 @@ func TestFsmAppendObjExtentsWithCheck(t *testing.T) {
 			existingExtent, // discard
 		})
 
+		mp.fsmRaftApplyIndex = 42
+		require.Equal(t, 0, mp.objExtentDelTree.Len())
+
 		status, _ := mp.fsmAppendObjExtentsWithCheck(handle, inoParam)
 		require.Equal(t, proto.OpOk, status)
+		require.Equal(t, 1, mp.objExtentDelTree.Len())
+		peek := mp.objExtentDelTree.PeekFirstN(1)
+		require.Len(t, peek.Items, 1)
+		require.Equal(t, inoId, peek.Items[0].Inode)
+		require.Equal(t, uint64(42), peek.Items[0].RaftIdx)
+		require.True(t, peek.Items[0].Oeks[0].IsEquals(&existingExtent))
 
 		updatedIno, err := mp.inodeTree.CopyGet(fsmIno)
 		require.NoError(t, err)

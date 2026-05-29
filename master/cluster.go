@@ -5828,6 +5828,23 @@ func (c *Cluster) setMetaNodeDeleteWorkerSleepMs(val uint64) (err error) {
 	return
 }
 
+func (c *Cluster) setMetaNodeDelTreeMaxItemLimit(val uint64) (err error) {
+	if val > 0 && val < proto.MinDelTreeMaxItemLimit {
+		log.LogErrorf("action[setMetaNodeDelTreeMaxItemLimit] value %d below min %d", val, proto.MinDelTreeMaxItemLimit)
+		return fmt.Errorf("set value %d below min %d", val, proto.MinDelTreeMaxItemLimit)
+	}
+
+	oldVal := atomic.LoadUint64(&c.cfg.MetaNodeDelTreeMaxItemLimit)
+	c.updateMetaNodeDelTreeMaxItemLimit(val)
+	if err = c.syncPutCluster(); err != nil {
+		log.LogErrorf("action[setMetaNodeDelTreeMaxItemLimit] err[%v]", err)
+		atomic.StoreUint64(&c.cfg.MetaNodeDelTreeMaxItemLimit, oldVal)
+		err = proto.ErrPersistenceByRaft
+		return
+	}
+	return
+}
+
 func (c *Cluster) getMaxDpCntLimit() (dpCntLimit uint64) {
 	dpCntLimit = atomic.LoadUint64(&clusterDpCntLimit)
 	return
