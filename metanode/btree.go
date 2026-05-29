@@ -81,6 +81,7 @@ func NewSnapshot(mp *metaPartition) (snap Snapshot, err error) {
 			transaction:         &TransactionBTree{mp.txProcessor.txManager.txTree.(*TransactionBTree).GetTree()},
 			transactionRbInode:  &TransactionRollbackInodeBTree{mp.txProcessor.txResource.txRbInodeTree.(*TransactionRollbackInodeBTree).GetTree()},
 			transactionRbDentry: &TransactionRollbackDentryBTree{mp.txProcessor.txResource.txRbDentryTree.(*TransactionRollbackDentryBTree).GetTree()},
+			objExtentDelTree:    snapshotObjExtentDelTree(mp),
 		}
 	} else if storeMode == proto.StoreModeRocksDb {
 		snap = NewRocksSnapShot(mp)
@@ -90,6 +91,15 @@ func NewSnapshot(mp *metaPartition) (snap Snapshot, err error) {
 		err = ErrOpenSnapshot
 	}
 	return
+}
+
+func snapshotObjExtentDelTree(mp *metaPartition) *objExtentDelTree {
+	mp.ensureObjExtentDelTree()
+	inner, ok := mp.objExtentDelTree.(*objExtentDelTree)
+	if !ok || inner == nil {
+		return newObjExtentDelTree()
+	}
+	return &objExtentDelTree{t: inner.GetTree()}
 }
 
 type Snapshot interface {
@@ -127,10 +137,11 @@ type Tree interface {
 	GetApplyIdFromDisk() (uint64, error)
 }
 
-// ObjExtentDelTree stores pending object extent deletions.
+// ObjExtentDelTreeAPI stores pending object extent deletions.
 // The tree key order must be time-first for GC scanning.
-type ObjExtentDelTree interface {
+type ObjExtentDelTreeAPI interface {
 	Len() int
+	GetTree() *BTree
 	EnqueueFromApply(inode uint64, modifyTimeSec int64, raftApplyIndex uint64, oeks []proto.ObjExtentKey)
 	PeekFirstN(n int) batchObjExtentDelItems
 	ApplyDequeuePayload(val []byte) error

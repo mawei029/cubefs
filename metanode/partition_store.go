@@ -58,6 +58,7 @@ const (
 	uniqIDFile              = "uniqID"
 	uniqCheckerFile         = "uniqChecker"
 	verdataFile             = "multiVer"
+	deletedObjExtentsFile   = "deleted_obj_extents"
 	StaleMetadataSuffix     = ".old"
 	StaleMetadataTimeFormat = "20060102150405.000000000"
 	writeBuffSize           = 1024 * 1024
@@ -1530,6 +1531,179 @@ func (mp *metaPartition) storeMultipart(rootDir string, sm *storeMsg) (crc uint3
 	return
 }
 
+func (mp *metaPartition) storeDeletedObjExtents(rootDir string, sm *storeMsg) (crc uint32, err error) {
+	if mp.inodeTree.GetStoreMode() != proto.StoreModeMem {
+		return 0, nil
+	}
+	if sm == nil || sm.snap == nil {
+		return 0, errors.NewErrorf("[storeDeletedObjExtents] nil snapshot")
+	}
+
+	fp := path.Join(rootDir, deletedObjExtentsFile)
+	f, err := newBufFile(fp, os.O_RDWR|os.O_TRUNC|os.O_APPEND|os.O_CREATE, 0o755)
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		closeErr := f.Close()
+		if err == nil && closeErr != nil {
+			err = closeErr
+		}
+	}()
+
+	writer := bufio.NewWriterSize(f, 4*1024*1024)
+	crc32h := crc32.NewIEEE()
+	varintTmp := make([]byte, binary.MaxVarintLen64)
+	itemCount := sm.snap.Count(DeletedObjExtentsType)
+	n := binary.PutUvarint(varintTmp, itemCount)
+	if _, err = writer.Write(varintTmp[:n]); err != nil {
+		return
+	}
+	if _, err = crc32h.Write(varintTmp[:n]); err != nil {
+		return
+	}
+
+	lenBuf := make([]byte, 4)
+	var written uint64
+	snapBuf := GetDeleteTreeBuf()
+	defer PutDeleteTreeBuf(snapBuf)
+
+	rangeErr := sm.snap.Range(DeletedObjExtentsType, func(i interface{}) bool {
+		snapBuf.Reset()
+		it := i.(*objExtentDelItem)
+		if err = it.MarshalSnapshot(&snapBuf.Buffer); err != nil {
+			return false
+		}
+		raw := snapBuf.Bytes()
+		binary.BigEndian.PutUint32(lenBuf, uint32(len(raw)))
+		if _, err = writer.Write(lenBuf); err != nil {
+			return false
+		}
+		if _, err = crc32h.Write(lenBuf); err != nil {
+			return false
+		}
+		if _, err = writer.Write(raw); err != nil {
+			return false
+		}
+		if _, err = crc32h.Write(raw); err != nil {
+			return false
+		}
+		written++
+		return true
+	})
+	if rangeErr != nil {
+		err = rangeErr
+		return
+	}
+	if err != nil {
+		return
+	}
+	if written != itemCount {
+		err = errors.NewErrorf("[storeDeletedObjExtents] snapshot count mismatch: header=%d written=%d", itemCount, written)
+		return
+	}
+	if err = writer.Flush(); err != nil {
+		return
+	}
+	if err = f.Sync(); err != nil {
+		return
+	}
+	crc = crc32h.Sum32()
+	log.LogInfof("storeDeletedObjExtents: store complete: partitionID(%v) volume(%v) numItems(%v) crc(%v)",
+		mp.config.PartitionId, mp.config.VolName, itemCount, crc)
+	return
+}
+
+func (mp *metaPartition) loadDeletedObjExtents(rootDir string, crc uint32) (err error) {
+	if mp.inodeTree.GetStoreMode() != proto.StoreModeMem {
+		return nil
+	}
+
+	var numItems uint64
+	defer func() {
+		if err == nil {
+			log.LogInfof("loadDeletedObjExtents: load complete: partitionID(%v) volume(%v) numItems(%v)",
+				mp.config.PartitionId, mp.config.VolName, numItems)
+		}
+	}()
+
+	mp.ensureObjExtentDelTree()
+	ot, ok := mp.objExtentDelTree.(*objExtentDelTree)
+	if !ok || ot == nil {
+		return nil
+	}
+
+	filename := path.Join(rootDir, deletedObjExtentsFile)
+	if _, err = os.Stat(filename); err != nil {
+		if os.IsNotExist(err) {
+			log.LogErrorf("[loadDeletedObjExtents]: file missing, expected crc[%d]", crc)
+			return ErrSnapshotCrcMismatch
+		}
+		return errors.NewErrorf("[loadDeletedObjExtents] Stat: %s", err.Error())
+	}
+
+	fp, err := os.OpenFile(filename, os.O_RDONLY, 0o644)
+	if err != nil {
+		return errors.NewErrorf("[loadDeletedObjExtents] OpenFile: %s", err.Error())
+	}
+	defer fp.Close()
+
+	reader := bufio.NewReaderSize(fp, 4*1024*1024)
+	limitReader := &io.LimitedReader{R: reader}
+	crcCheck := crc32.NewIEEE()
+	varintTmp := make([]byte, binary.MaxVarintLen64)
+	lenBuf := make([]byte, 4)
+
+	count, err := binary.ReadUvarint(reader)
+	if err != nil {
+		return errors.NewErrorf("[loadDeletedObjExtents] ReadCount: %s", err.Error())
+	}
+	n := binary.PutUvarint(varintTmp, count)
+	if _, err = crcCheck.Write(varintTmp[:n]); err != nil {
+		return err
+	}
+
+	snapBuf := GetDeleteTreeBuf()
+	defer PutDeleteTreeBuf(snapBuf)
+
+	var it objExtentDelItem
+	for i := uint64(0); i < count; i++ {
+		lenBuf = lenBuf[:4]
+		if _, err = io.ReadFull(reader, lenBuf); err != nil {
+			return errors.NewErrorf("[loadDeletedObjExtents] ReadHeader: %s", err.Error())
+		}
+		if _, err = crcCheck.Write(lenBuf); err != nil {
+			return err
+		}
+
+		length := binary.BigEndian.Uint32(lenBuf)
+		snapBuf.Reset()
+		limitReader.N = int64(length)
+
+		var n int64
+		if n, err = io.Copy(snapBuf, limitReader); err != nil || n != int64(length) {
+			return errors.NewErrorf("[loadDeletedObjExtents] ReadBody: %s, n %d, length %d", err, n, length)
+		}
+
+		raw := snapBuf.Bytes()
+		if err = it.UnmarshalSnapshot(raw); err != nil {
+			return errors.NewErrorf("[loadDeletedObjExtents] Unmarshal: %s", err.Error())
+		}
+		if _, err = crcCheck.Write(raw); err != nil {
+			return err
+		}
+
+		ot.restoreFromSnapshot(&it)
+		numItems++
+	}
+
+	if res := crcCheck.Sum32(); res != crc {
+		log.LogErrorf("[loadDeletedObjExtents]: crc mismatch, expected[%d], actual[%d]", crc, res)
+		return ErrSnapshotCrcMismatch
+	}
+	return nil
+}
+
 func (mp *metaPartition) doStoreUniqID(rootDir string, uniqId uint64) (err error) {
 	filename := path.Join(rootDir, uniqIDFile)
 	fp, err := os.OpenFile(filename, os.O_RDWR|os.O_APPEND|os.O_TRUNC|os.
@@ -1760,7 +1934,7 @@ func (mp *metaPartition) loadRocksdbFile() (err error) {
 	}
 
 	if err = mp.loadUniqChecker(snapshotPath, crcs[0]); err != nil {
-		log.LogErrorf("loadRocksdbFile loadMultiVer failed, err: %v", err)
+		log.LogErrorf("loadRocksdbFile loadUniqChecker failed, err: %v", err)
 		return
 	}
 

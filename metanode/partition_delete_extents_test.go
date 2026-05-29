@@ -15,6 +15,7 @@
 package metanode
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"reflect"
@@ -242,8 +243,8 @@ func TestRunObjExtentDelTreeGCOnce_ReturnsEncodeErrors(t *testing.T) {
 		patches.ApplyMethod(reflect.TypeOf(&blobstore.BlobStoreClient{}), "Delete",
 			func(_ *blobstore.BlobStoreClient, _ []proto.ObjExtentKey) error { return errors.New("delete failed") })
 		patches.ApplyMethod(reflect.TypeOf(&batchObjExtentDelItems{}), "MarshalPunish",
-			func(_ *batchObjExtentDelItems, _ int64) ([]byte, error) {
-				return nil, errors.New("encode punish failed")
+			func(_ *batchObjExtentDelItems, _ *bytes.Buffer, _ int64) error {
+				return errors.New("encode punish failed")
 			})
 		onceErr := mp.runObjExtentDelTreeGCOnce()
 		require.ErrorContains(t, onceErr, "encode punish failed")
@@ -260,7 +261,9 @@ func TestRunObjExtentDelTreeGCOnce_ReturnsEncodeErrors(t *testing.T) {
 		patches.ApplyMethod(reflect.TypeOf(&blobstore.BlobStoreClient{}), "Delete",
 			func(_ *blobstore.BlobStoreClient, _ []proto.ObjExtentKey) error { return nil })
 		patches.ApplyMethod(reflect.TypeOf(&batchObjExtentDelItems{}), "MarshalDequeue",
-			func(_ *batchObjExtentDelItems) ([]byte, error) { return nil, errors.New("encode dequeue failed") })
+			func(_ *batchObjExtentDelItems, _ *bytes.Buffer) error {
+				return errors.New("encode dequeue failed")
+			})
 		onceErr := mp.runObjExtentDelTreeGCOnce()
 		require.ErrorContains(t, onceErr, "encode dequeue failed")
 		require.Equal(t, 1, mp.objExtentDelTree.Len())
@@ -296,8 +299,8 @@ func TestRunObjExtentDelTreeGCWorker_EncodeErrorBackoff(t *testing.T) {
 	patches.ApplyMethod(reflect.TypeOf(&blobstore.BlobStoreClient{}), "Delete",
 		func(_ *blobstore.BlobStoreClient, _ []proto.ObjExtentKey) error { return errors.New("delete failed") })
 	patches.ApplyMethod(reflect.TypeOf(&batchObjExtentDelItems{}), "MarshalPunish",
-		func(_ *batchObjExtentDelItems, _ int64) ([]byte, error) {
-			return nil, errors.New("encode punish failed")
+		func(_ *batchObjExtentDelItems, _ *bytes.Buffer, _ int64) error {
+			return errors.New("encode punish failed")
 		})
 	mp.runObjExtentDelTreeGCWorker()
 	require.Equal(t, int32(1), atomic.LoadInt32(&slept))
@@ -628,7 +631,7 @@ func TestApply_objExtentGcFsmOps(t *testing.T) {
 	require.Equal(t, 1, mp.objExtentDelTree.Len())
 
 	batch := mp.objExtentDelTree.PeekFirstN(1)
-	deqPayload, err := batch.MarshalDequeue()
+	deqPayload, err := encodeBatchDequeue(batch)
 	require.NoError(t, err)
 	deqItem := NewMetaItem(opFSMObjExtentGcDequeue, nil, deqPayload)
 	deqCmd, err := deqItem.MarshalJson()
@@ -639,7 +642,7 @@ func TestApply_objExtentGcFsmOps(t *testing.T) {
 
 	mp.objExtentDelTree.EnqueueFromApply(99, 1700000001, 3, []proto.ObjExtentKey{oek})
 	batch = mp.objExtentDelTree.PeekFirstN(1)
-	punishPayload, err := batch.MarshalPunish(1700000099999)
+	punishPayload, err := encodeBatchPunish(batch, 1700000099999)
 	require.NoError(t, err)
 	punishItem := NewMetaItem(opFSMObjExtentGcPunishRequeue, nil, punishPayload)
 	punishCmd, err := punishItem.MarshalJson()

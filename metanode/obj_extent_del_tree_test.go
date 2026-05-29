@@ -23,6 +23,38 @@ func writeObjExtentDelV1PunishHeader(buf *bytes.Buffer, cnt uint32, newTsMs int6
 	_ = binary.Write(buf, binary.BigEndian, newTsMs)
 }
 
+func encodeBatchDequeue(b batchObjExtentDelItems) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := b.MarshalDequeue(&buf); err != nil {
+		return nil, err
+	}
+	return append([]byte(nil), buf.Bytes()...), nil
+}
+
+func encodeBatchPunish(b batchObjExtentDelItems, newTsMs int64) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := b.MarshalPunish(&buf, newTsMs); err != nil {
+		return nil, err
+	}
+	return append([]byte(nil), buf.Bytes()...), nil
+}
+
+func encodeBatchDequeueWithPool(t *testing.T, b batchObjExtentDelItems) []byte {
+	t.Helper()
+	buf := GetDeleteTreeBuf()
+	defer PutDeleteTreeBuf(buf)
+	require.NoError(t, b.MarshalDequeue(&buf.Buffer))
+	return append([]byte(nil), buf.Bytes()...)
+}
+
+func encodeBatchPunishWithPool(t *testing.T, b batchObjExtentDelItems, newTsMs int64) []byte {
+	t.Helper()
+	buf := GetDeleteTreeBuf()
+	defer PutDeleteTreeBuf(buf)
+	require.NoError(t, b.MarshalPunish(&buf.Buffer, newTsMs))
+	return append([]byte(nil), buf.Bytes()...)
+}
+
 func TestObjExtentDelTreeEnqueueAndDequeue(t *testing.T) {
 	ot := newObjExtentDelTree()
 	oek := createTestObjExtentKey(0, 1024, 1)
@@ -38,7 +70,7 @@ func TestObjExtentDelTreeEnqueueAndDequeue(t *testing.T) {
 	require.Len(t, items.Items[0].Oeks, 1)
 	require.True(t, items.Items[0].Oeks[0].IsEquals(&oek))
 
-	val, err := items.MarshalDequeue()
+	val, err := encodeBatchDequeue(items)
 	require.NoError(t, err)
 	require.Equal(t, byte(objExtentDelVersion1), val[3])
 	require.NoError(t, ot.ApplyDequeuePayload(val))
@@ -54,7 +86,7 @@ func TestObjExtentDelTreeApplyPunishPayload(t *testing.T) {
 	require.Len(t, oldItems.Items, 1)
 
 	newTs := int64(1700000005000)
-	payload, err := oldItems.MarshalPunish(newTs)
+	payload, err := encodeBatchPunish(oldItems, newTs)
 	require.NoError(t, err)
 	require.Equal(t, byte(objExtentDelVersion1), payload[3])
 	require.NoError(t, ot.ApplyPunishPayload(payload, 11))
@@ -112,14 +144,17 @@ func TestBatchObjExtentDelItems_MarshalEncodeErrors(t *testing.T) {
 		patches.ApplyFunc(binary.Write, func(_ io.Writer, _ binary.ByteOrder, _ interface{}) error {
 			return errors.New("write fail")
 		})
-		_, err := batch.MarshalDequeue()
+		_, err := encodeBatchDequeue(batch)
 		require.Error(t, err)
 	})
 
-	t.Run("MarshalPunish invalid oek count", func(t *testing.T) {
+	t.Run("MarshalPunish empty oeks encodes then unmarshal rejects", func(t *testing.T) {
 		empty := batchObjExtentDelItems{Items: []*objExtentDelItem{{TsMs: 1, Inode: 2, RaftIdx: 3}}}
-		_, err := empty.MarshalPunish(99)
-		require.Error(t, err)
+		raw, err := encodeBatchPunish(empty, 99)
+		require.NoError(t, err)
+		var decoded batchObjExtentDelItems
+		err = decoded.UnmarshalPunish(raw)
+		require.ErrorIs(t, err, ErrDelTreeUnsupported)
 	})
 
 	t.Run("MarshalPunish write fails", func(t *testing.T) {
@@ -128,7 +163,7 @@ func TestBatchObjExtentDelItems_MarshalEncodeErrors(t *testing.T) {
 		patches.ApplyFunc(binary.Write, func(_ io.Writer, _ binary.ByteOrder, _ interface{}) error {
 			return errors.New("write fail")
 		})
-		_, err := batch.MarshalPunish(99)
+		_, err := encodeBatchPunish(batch, 99)
 		require.Error(t, err)
 	})
 }
@@ -150,7 +185,7 @@ func TestBatchObjExtentDelItems_MarshalDequeueMultiItemWriteErrors(t *testing.T)
 			}
 			return binary.Write(w, order, data)
 		})
-		_, err := batch.MarshalDequeue()
+		_, err := encodeBatchDequeue(batch)
 		require.Error(t, err)
 	}
 
@@ -174,7 +209,7 @@ func TestBatchObjExtentDelItems_MarshalPunishPerOekErrors(t *testing.T) {
 			func(_ *proto.ObjExtentKey) ([]byte, error) {
 				return nil, errors.New("marshal fail")
 			})
-		_, err := batch.MarshalPunish(99)
+		_, err := encodeBatchPunish(batch, 99)
 		require.Error(t, err)
 	})
 
@@ -190,7 +225,7 @@ func TestBatchObjExtentDelItems_MarshalPunishPerOekErrors(t *testing.T) {
 			}
 			return binary.Write(w, order, data)
 		})
-		_, err := batch.MarshalPunish(99)
+		_, err := encodeBatchPunish(batch, 99)
 		require.Error(t, err)
 	})
 }
@@ -212,7 +247,7 @@ func TestBatchObjExtentDelItems_MarshalPunishMultiItemWriteErrors(t *testing.T) 
 			}
 			return binary.Write(w, order, data)
 		})
-		_, err := batch.MarshalPunish(99)
+		_, err := encodeBatchPunish(batch, 99)
 		require.Error(t, err)
 	}
 
@@ -232,8 +267,7 @@ func TestBatchObjExtentDelItems_UnmarshalPunish_invalidOekCount(t *testing.T) {
 
 	var batch batchObjExtentDelItems
 	err := batch.UnmarshalPunish(buf.Bytes())
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "invalid oek count")
+	require.ErrorIs(t, err, ErrDelTreeUnsupported)
 }
 
 func TestUnmarshalDequeue_unsupportedVersion(t *testing.T) {
@@ -258,25 +292,23 @@ func TestUnmarshalPunish_unsupportedVersion(t *testing.T) {
 	require.Contains(t, err.Error(), "unsupported version")
 }
 
-func TestUnmarshalDequeue_tooManyItems(t *testing.T) {
-	var buf bytes.Buffer
-	writeObjExtentDelV1DequeueHeader(&buf, maxObjExtentDelBatch+1)
-
-	var batch batchObjExtentDelItems
-	err := batch.UnmarshalDequeue(buf.Bytes())
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "too many items")
-}
-
 func TestMarshalDequeue_emptyBatch(t *testing.T) {
 	var batch batchObjExtentDelItems
-	raw, err := batch.MarshalDequeue()
+	raw, err := encodeBatchDequeue(batch)
 	require.NoError(t, err)
 	require.Len(t, raw, 8)
 
 	var decoded batchObjExtentDelItems
 	require.NoError(t, decoded.UnmarshalDequeue(raw))
 	require.Empty(t, decoded.Items)
+}
+
+func TestUnmarshalDequeue_truncatedWhenCountLarge(t *testing.T) {
+	var buf bytes.Buffer
+	writeObjExtentDelV1DequeueHeader(&buf, 64)
+
+	var batch batchObjExtentDelItems
+	require.Error(t, batch.UnmarshalDequeue(buf.Bytes()))
 }
 
 func TestObjExtentDelPunishReplace_mergesOnDuplicateNewKey(t *testing.T) {
@@ -342,7 +374,7 @@ func TestObjExtentDelTreeEncodeDecodeAndErrors(t *testing.T) {
 
 	var batch batchObjExtentDelItems
 	batch.Items = []*objExtentDelItem{it}
-	val, err := batch.MarshalDequeue()
+	val, err := encodeBatchDequeue(batch)
 	require.NoError(t, err)
 	var decoded batchObjExtentDelItems
 	require.NoError(t, decoded.UnmarshalDequeue(val))
@@ -353,20 +385,12 @@ func TestObjExtentDelTreeEncodeDecodeAndErrors(t *testing.T) {
 
 	require.Error(t, decoded.UnmarshalDequeue([]byte{1, 2, 3}))
 	require.Contains(t, decoded.UnmarshalDequeue([]byte{1, 2, 3}).Error(), "short buf")
-
-	var tooManyBuf bytes.Buffer
-	writeObjExtentDelV1DequeueHeader(&tooManyBuf, maxObjExtentDelBatch+1)
-	require.Error(t, decoded.UnmarshalDequeue(tooManyBuf.Bytes()))
 }
 
 func TestObjExtentDelTreeApplyPunishPayloadErrors(t *testing.T) {
 	ot := newObjExtentDelTree()
 
 	require.Error(t, ot.ApplyPunishPayload([]byte{1, 2, 3}, 1))
-
-	var tooManyBuf bytes.Buffer
-	writeObjExtentDelV1PunishHeader(&tooManyBuf, maxObjExtentDelBatch+1, 0)
-	require.Error(t, ot.ApplyPunishPayload(tooManyBuf.Bytes(), 1))
 
 	var truncated bytes.Buffer
 	writeObjExtentDelV1PunishHeader(&truncated, 1, 99)
@@ -407,7 +431,7 @@ func TestObjExtentDelTreeApplyPunishPayloadMultiOek(t *testing.T) {
 	oldItems := ot.PeekFirstN(1)
 	require.Len(t, oldItems.Items, 1)
 	newTs := int64(1700000005000)
-	payload, err := oldItems.MarshalPunish(newTs)
+	payload, err := encodeBatchPunish(oldItems, newTs)
 	require.NoError(t, err)
 	require.NoError(t, ot.ApplyPunishPayload(payload, 21))
 	items := ot.PeekFirstN(1)
@@ -419,10 +443,10 @@ func TestObjExtentDelTreeApplyPunishPayloadMultiOek(t *testing.T) {
 	require.True(t, items.Items[0].Oeks[1].IsEquals(&b))
 }
 
-func TestApplyPunishPayload_tooManyItems(t *testing.T) {
+func TestApplyPunishPayload_truncatedWhenCountLarge(t *testing.T) {
 	ot := newObjExtentDelTree()
 	var buf bytes.Buffer
-	writeObjExtentDelV1PunishHeader(&buf, maxObjExtentDelBatch+1, 0)
+	writeObjExtentDelV1PunishHeader(&buf, 32, 0)
 	require.Error(t, ot.ApplyPunishPayload(buf.Bytes(), 1))
 }
 
@@ -434,7 +458,7 @@ func TestApplyPunishPayload_invalidOekCount(t *testing.T) {
 	require.NoError(t, binary.Write(&buf, binary.BigEndian, uint64(2)))
 	require.NoError(t, binary.Write(&buf, binary.BigEndian, uint64(3)))
 	require.NoError(t, binary.Write(&buf, binary.BigEndian, uint32(0)))
-	require.Error(t, ot.ApplyPunishPayload(buf.Bytes(), 1))
+	require.ErrorIs(t, ot.ApplyPunishPayload(buf.Bytes(), 1), ErrDelTreeUnsupported)
 }
 
 func TestApplyPunishPayload_truncatedOekBody(t *testing.T) {
@@ -458,7 +482,7 @@ func TestApplyPunishPayload_singleItem_roundTrip(t *testing.T) {
 	oek := createTestObjExtentKey(0, 50, 1)
 	ot.EnqueueFromApply(3, 1000, 7, []proto.ObjExtentKey{oek})
 	items := ot.PeekFirstN(1)
-	payload, err := items.MarshalPunish(2000)
+	payload, err := encodeBatchPunish(items, 2000)
 	require.NoError(t, err)
 	require.NoError(t, ot.ApplyPunishPayload(payload, 8))
 	out := ot.PeekFirstN(1)
@@ -472,7 +496,7 @@ func TestEncodeObjExtentGcPunish_multiOek(t *testing.T) {
 	it := &objExtentDelItem{TsMs: 1, Inode: 2, RaftIdx: 3, Oeks: []proto.ObjExtentKey{a, b}}
 	var batch batchObjExtentDelItems
 	batch.Items = []*objExtentDelItem{it}
-	payload, err := batch.MarshalPunish(99)
+	payload, err := encodeBatchPunish(batch, 99)
 	require.NoError(t, err)
 	require.NotEmpty(t, payload)
 	ot := newObjExtentDelTree()
@@ -489,7 +513,7 @@ func TestApplyPunishPayload_sameInodeMergedRaftIdx(t *testing.T) {
 
 	newTs := int64(5000)
 	batch := ot.PeekFirstN(2)
-	payload, err := batch.MarshalPunish(newTs)
+	payload, err := encodeBatchPunish(batch, newTs)
 	require.NoError(t, err)
 	require.NoError(t, ot.ApplyPunishPayload(payload, 11))
 	items := ot.PeekFirstN(10)
@@ -507,7 +531,7 @@ func TestBatchObjExtentDelItems_MarshalPunishRoundTrip(t *testing.T) {
 		{TsMs: 1700000000, Inode: 42, RaftIdx: 9, Oeks: []proto.ObjExtentKey{a, b}},
 	}}
 	newTs := int64(1700000005000)
-	raw, err := src.MarshalPunish(newTs)
+	raw, err := encodeBatchPunish(src, newTs)
 	require.NoError(t, err)
 
 	var dst batchObjExtentDelItems
@@ -582,7 +606,7 @@ func TestObjExtentDelTree_FullFlowDequeue(t *testing.T) {
 	require.Equal(t, int64(101), batch.Items[0].TsMs, "time-first: smaller TsMs first")
 	require.Equal(t, uint64(99), batch.Items[0].Inode)
 
-	payload, err := batch.MarshalDequeue()
+	payload, err := encodeBatchDequeue(batch)
 	require.NoError(t, err)
 	require.NoError(t, ot.ApplyDequeuePayload(payload))
 	require.Equal(t, 0, ot.Len())
@@ -595,7 +619,7 @@ func TestObjExtentDelTree_FullFlowPunish(t *testing.T) {
 
 	batch := ot.PeekFirstN(1)
 	penaltyTs := int64(1700000000000)
-	payload, err := batch.MarshalPunish(penaltyTs)
+	payload, err := encodeBatchPunish(batch, penaltyTs)
 	require.NoError(t, err)
 
 	require.NoError(t, ot.ApplyPunishPayload(payload, 200))
@@ -659,4 +683,159 @@ func TestObjExtentDelItem_LessAndKeyItem(t *testing.T) {
 	ot.EnqueueFromApply(2, 0, 3, []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 1)})
 	peek := ot.PeekFirstN(1)
 	require.Equal(t, int64(3), peek.Items[0].TsMs)
+}
+
+func snapshotBytes(t *testing.T, it *objExtentDelItem) []byte {
+	t.Helper()
+	snapBuf := GetDeleteTreeBuf()
+	defer PutDeleteTreeBuf(snapBuf)
+	require.NoError(t, it.MarshalSnapshot(&snapBuf.Buffer))
+	return append([]byte(nil), snapBuf.Bytes()...)
+}
+
+func TestObjExtentDelItemSnapshotMarshal(t *testing.T) {
+	it := &objExtentDelItem{
+		TsMs:    1700000000000,
+		Inode:   9,
+		RaftIdx: 3,
+		Oeks:    []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 1)},
+	}
+	raw := snapshotBytes(t, it)
+
+	var decoded objExtentDelItem
+	require.NoError(t, decoded.UnmarshalSnapshot(raw))
+	require.Equal(t, it.TsMs, decoded.TsMs)
+	require.Equal(t, it.Inode, decoded.Inode)
+	require.Equal(t, it.RaftIdx, decoded.RaftIdx)
+	require.Len(t, decoded.Oeks, 1)
+}
+
+func TestBatchObjExtentDelItems_encodeWithDeleteTreePool(t *testing.T) {
+	it := &objExtentDelItem{TsMs: 1, Inode: 2, RaftIdx: 3, Oeks: []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 1)}}
+	batch := batchObjExtentDelItems{Items: []*objExtentDelItem{it}}
+
+	deq := encodeBatchDequeueWithPool(t, batch)
+	var decoded batchObjExtentDelItems
+	require.NoError(t, decoded.UnmarshalDequeue(deq))
+	require.Len(t, decoded.Items, 1)
+
+	punish := encodeBatchPunishWithPool(t, batch, 99)
+	require.NoError(t, decoded.UnmarshalPunish(punish))
+	require.Equal(t, int64(99), decoded.NewTime)
+}
+
+func TestObjExtentDelItem_MarshalSnapshotBinaryTo(t *testing.T) {
+	items := []*objExtentDelItem{
+		{TsMs: 1, Inode: 10, RaftIdx: 1, Oeks: []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 1)}},
+		{TsMs: 2, Inode: 20, RaftIdx: 2, Oeks: []proto.ObjExtentKey{
+			createTestObjExtentKey(0, 1024, 1),
+			createTestObjExtentKey(4096, 8192, 2),
+		}},
+	}
+	snapBuf := GetDeleteTreeBuf()
+	defer PutDeleteTreeBuf(snapBuf)
+	for _, it := range items {
+		require.NoError(t, it.MarshalSnapshot(&snapBuf.Buffer))
+		fromBuf := append([]byte(nil), snapBuf.Bytes()...)
+
+		var decoded objExtentDelItem
+		require.NoError(t, decoded.UnmarshalSnapshot(fromBuf))
+		require.Equal(t, it.TsMs, decoded.TsMs)
+		require.Equal(t, it.Inode, decoded.Inode)
+		require.Equal(t, len(it.Oeks), len(decoded.Oeks))
+
+		require.NoError(t, it.MarshalSnapshot(&snapBuf.Buffer))
+		require.True(t, bytes.Equal(fromBuf, snapBuf.Bytes()))
+	}
+}
+
+func TestMarshalSnapshotBinaryTo_errors(t *testing.T) {
+	it := &objExtentDelItem{
+		TsMs: 1, Inode: 2, RaftIdx: 3,
+		Oeks: []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 1)},
+	}
+
+	failOnNthBinaryWrite := func(t *testing.T, n int) {
+		t.Helper()
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		calls := 0
+		patches.ApplyFunc(binary.Write, func(w io.Writer, order binary.ByteOrder, data interface{}) error {
+			calls++
+			if calls == n {
+				return errors.New("write fail")
+			}
+			return binary.Write(w, order, data)
+		})
+		snapBuf := GetDeleteTreeBuf()
+		defer PutDeleteTreeBuf(snapBuf)
+		require.Error(t, it.MarshalSnapshot(&snapBuf.Buffer))
+	}
+
+	t.Run("version", func(t *testing.T) { failOnNthBinaryWrite(t, 1) })
+	t.Run("TsMs", func(t *testing.T) { failOnNthBinaryWrite(t, 2) })
+	t.Run("Inode", func(t *testing.T) { failOnNthBinaryWrite(t, 3) })
+	t.Run("RaftIdx", func(t *testing.T) { failOnNthBinaryWrite(t, 4) })
+	t.Run("oek count", func(t *testing.T) { failOnNthBinaryWrite(t, 5) })
+	t.Run("oek len", func(t *testing.T) { failOnNthBinaryWrite(t, 6) })
+
+	t.Run("binary write fails", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyFunc(binary.Write, func(_ io.Writer, _ binary.ByteOrder, _ interface{}) error {
+			return errors.New("write fail")
+		})
+		snapBuf := GetDeleteTreeBuf()
+		defer PutDeleteTreeBuf(snapBuf)
+		require.Error(t, it.MarshalSnapshot(&snapBuf.Buffer))
+	})
+
+	t.Run("oek MarshalBinary fails", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyMethod(reflect.TypeOf(&proto.ObjExtentKey{}), "MarshalBinary",
+			func(_ *proto.ObjExtentKey) ([]byte, error) {
+				return nil, errors.New("marshal fail")
+			})
+		snapBuf := GetDeleteTreeBuf()
+		defer PutDeleteTreeBuf(snapBuf)
+		require.Error(t, it.MarshalSnapshot(&snapBuf.Buffer))
+	})
+
+	t.Run("buf write fails", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyMethod(reflect.TypeOf(&bytes.Buffer{}), "Write",
+			func(_ *bytes.Buffer, p []byte) (int, error) {
+				if len(p) > 8 {
+					return 0, errors.New("buf write fail")
+				}
+				return len(p), nil
+			})
+		snapBuf := GetDeleteTreeBuf()
+		defer PutDeleteTreeBuf(snapBuf)
+		require.Error(t, it.MarshalSnapshot(&snapBuf.Buffer))
+	})
+}
+
+func TestUnmarshalSnapshotBinary_errors(t *testing.T) {
+	it := &objExtentDelItem{TsMs: 1, Inode: 2, RaftIdx: 3, Oeks: []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 1)}}
+	raw := snapshotBytes(t, it)
+
+	t.Run("short payload", func(t *testing.T) {
+		var decoded objExtentDelItem
+		require.ErrorIs(t, decoded.UnmarshalSnapshot(raw[:4]), ErrDelPayloadTooShort)
+	})
+
+	t.Run("unsupported version", func(t *testing.T) {
+		bad := append([]byte(nil), raw...)
+		bad[3] = 99
+		var decoded objExtentDelItem
+		require.ErrorIs(t, decoded.UnmarshalSnapshot(bad), ErrDelTreeUnsupported)
+	})
+
+	t.Run("truncated oek body", func(t *testing.T) {
+		var decoded objExtentDelItem
+		require.Error(t, decoded.UnmarshalSnapshot(raw[:len(raw)-2]))
+	})
 }

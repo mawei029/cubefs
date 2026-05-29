@@ -942,7 +942,7 @@ func objExtentDelDedupKey(o proto.ObjExtentKey) string {
 	return fmt.Sprintf("%d:%d:%d", o.FileOffset, o.Size, o.Cid)
 }
 
-func collectAllObjExtentDelOeks(ot ObjExtentDelTree) []proto.ObjExtentKey {
+func collectAllObjExtentDelOeks(ot ObjExtentDelTreeAPI) []proto.ObjExtentKey {
 	if ot == nil || ot.Len() == 0 {
 		return nil
 	}

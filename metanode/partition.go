@@ -572,7 +572,7 @@ type metaPartition struct {
 
 	// fsmRaftApplyIndex is the raft apply index for the op currently executing in Apply (for objExtentDelTree keys).
 	fsmRaftApplyIndex uint64
-	objExtentDelTree  ObjExtentDelTree
+	objExtentDelTree  ObjExtentDelTreeAPI
 
 	rocksdbManager  RocksdbManager
 	db              *RocksdbOperator
@@ -1210,10 +1210,11 @@ func (mp *metaPartition) parseCrcFromFile() ([]uint32, error) {
 }
 
 const (
-	CRC_COUNT_BASIC      int = 4
-	CRC_COUNT_TX_STUFF   int = 7
-	CRC_COUNT_UINQ_STUFF int = 8
-	CRC_COUNT_MULTI_VER  int = 9
+	CRC_COUNT_BASIC          int = 4
+	CRC_COUNT_TX_STUFF       int = 7
+	CRC_COUNT_UINQ_STUFF     int = 8
+	CRC_COUNT_MULTI_VER      int = 9
+	CRC_COUNT_OBJ_EXTENT_DEL int = 10
 )
 
 func (mp *metaPartition) LoadSnapshot(snapshotPath string) (err error) {
@@ -1230,7 +1231,8 @@ func (mp *metaPartition) LoadSnapshot(snapshotPath string) (err error) {
 	}
 
 	crc_count := len(crcs)
-	if crc_count != CRC_COUNT_BASIC && crc_count != CRC_COUNT_TX_STUFF && crc_count != CRC_COUNT_UINQ_STUFF && crc_count != CRC_COUNT_MULTI_VER {
+	if crc_count != CRC_COUNT_BASIC && crc_count != CRC_COUNT_TX_STUFF && crc_count != CRC_COUNT_UINQ_STUFF &&
+		crc_count != CRC_COUNT_MULTI_VER && crc_count != CRC_COUNT_OBJ_EXTENT_DEL {
 		log.LogErrorf("action[LoadSnapshot] crc array length %d not match", len(crcs))
 		return ErrSnapshotCrcMismatch
 	}
@@ -1318,6 +1320,12 @@ func (mp *metaPartition) LoadSnapshot(snapshotPath string) (err error) {
 			multiVerList: mp.multiVersionList.VerList,
 			applyIndex:   mp.GetApplyID(),
 		})
+	}
+
+	if crc_count >= CRC_COUNT_OBJ_EXTENT_DEL {
+		if err = mp.loadDeletedObjExtents(snapshotPath, crcs[CRC_COUNT_OBJ_EXTENT_DEL-1]); err != nil {
+			return
+		}
 	}
 	return
 }
@@ -1465,6 +1473,7 @@ func (mp *metaPartition) store(sm *storeMsg) (err error) {
 		mp.storeTxRbDentry,
 		mp.storeUniqChecker,
 		mp.storeMultiVersion,
+		mp.storeDeletedObjExtents,
 	}
 	for _, storeFunc := range storeFuncs {
 		var crc uint32
@@ -2053,6 +2062,13 @@ func (mp *metaPartition) initMemoryTree() {
 	mp.inodeTree = &InodeBTree{NewBtree()}
 	mp.extendTree = &ExtendBTree{NewBtree()}
 	mp.multipartTree = &MultipartBTree{NewBtree()}
+}
+
+func (mp *metaPartition) ensureObjExtentDelTree() {
+	if mp.objExtentDelTree != nil {
+		return
+	}
+	mp.objExtentDelTree = newObjExtentDelTree()
 }
 
 func (mp *metaPartition) initRocksDBTree() (err error) {

@@ -40,7 +40,7 @@ type MemSnapShot struct {
 	transactionRbInode  *TransactionRollbackInodeBTree
 	transactionRbDentry *TransactionRollbackDentryBTree
 	deletedExtents      *DeletedExtentsBTree
-	deletedObjExtents   *DeletedObjExtentsBTree
+	objExtentDelTree    *objExtentDelTree
 	txID                uint64
 }
 
@@ -81,6 +81,11 @@ func (b *MemSnapShot) Range(tp TreeType, cb func(item interface{}) bool) error {
 			return cb(dentry)
 		}
 		return b.transactionRbDentry.Range(nil, nil, callBackFunc)
+	case DeletedObjExtentsType:
+		callBackFunc := func(it *objExtentDelItem) bool {
+			return cb(it)
+		}
+		return b.objExtentDelTree.Range(nil, nil, callBackFunc)
 	default:
 	}
 	panic("out of type")
@@ -115,7 +120,7 @@ func (b *MemSnapShot) Count(tp TreeType) uint64 {
 	case DeletedExtentsType:
 		return b.deletedExtents.Count()
 	case DeletedObjExtentsType:
-		return b.deletedObjExtents.Count()
+		return uint64(b.objExtentDelTree.Len())
 	default:
 	}
 	panic("out of type")
@@ -171,6 +176,7 @@ type DeletedExtentsBTree struct {
 	*BTree
 }
 
+// Deprecated: legacy RocksDB/mem btree placeholder; objExtentDelTree is the active pending-delete queue.
 type DeletedObjExtentsBTree struct {
 	*BTree
 }

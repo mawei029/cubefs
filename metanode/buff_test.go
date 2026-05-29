@@ -91,8 +91,38 @@ func TestBuffNilHandling(t *testing.T) {
 	// Test PutReadBuf with nil
 	PutReadBuf(nil)
 
+	// Test PutDeleteTreeBuf with nil
+	PutDeleteTreeBuf(nil)
+
 	// Should not panic
 	require.True(t, true)
+}
+
+func TestBuffDeleteTreeBuf(t *testing.T) {
+	b1 := GetDeleteTreeBuf()
+	require.True(t, b1.Cap() == deleteTreeBufSize && b1.Len() == 0)
+
+	d1 := []byte("delete tree payload")
+	n, err := b1.Write(d1)
+	if err != nil || n != len(d1) {
+		t.Fail()
+	}
+	PutDeleteTreeBuf(b1)
+
+	b2 := GetDeleteTreeBuf()
+	require.True(t, b2.Cap() == deleteTreeBufSize)
+	require.True(t, b2.Len() == 0)
+}
+
+func TestBuffDeleteTreeBuf_exceedsInitialCap(t *testing.T) {
+	b := GetDeleteTreeBuf()
+	defer PutDeleteTreeBuf(b)
+
+	payload := make([]byte, deleteTreeBufSize+1024)
+	n, err := b.Write(payload)
+	require.NoError(t, err)
+	require.Equal(t, len(payload), n)
+	require.GreaterOrEqual(t, b.Len(), deleteTreeBufSize+1024)
 }
 
 // TestBuffBufferReuse tests that buffers are properly reused from the pool

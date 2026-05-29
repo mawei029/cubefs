@@ -578,28 +578,29 @@ func (mp *metaPartition) runObjExtentDelTreeGCOnce() (err error) {
 		oeks = append(oeks, it.Oeks...)
 	}
 
+	encBuf := GetDeleteTreeBuf()
+	defer PutDeleteTreeBuf(encBuf)
+
 	if err = mp.deleteObjExtents(oeks); err != nil {
 		log.LogWarnf("[runObjExtentDelTreeGCOnce] mp(%v) delete ebs failed cnt(%v): %v", mp.config.PartitionId, len(oeks), err)
 		newTs := time.Now().UnixMilli() + objExtentDelGcPenaltyMs
-		payload, encErr := items.MarshalPunish(newTs)
-		if encErr != nil {
+		if encErr := items.MarshalPunish(&encBuf.Buffer, newTs); encErr != nil {
 			log.LogErrorf("[runObjExtentDelTreeGCOnce] mp(%v) encode punish: %v", mp.config.PartitionId, encErr)
 			return encErr
 		}
 
-		if _, err = mp.submit(opFSMObjExtentGcPunishRequeue, payload); err != nil {
+		if _, err = mp.submit(opFSMObjExtentGcPunishRequeue, append([]byte(nil), encBuf.Bytes()...)); err != nil {
 			log.LogErrorf("[runObjExtentDelTreeGCOnce] mp(%v) submit punish: %v", mp.config.PartitionId, err)
 		}
 		return err
 	}
 
-	payload, encErr := items.MarshalDequeue()
-	if encErr != nil {
+	if encErr := items.MarshalDequeue(&encBuf.Buffer); encErr != nil {
 		log.LogErrorf("[runObjExtentDelTreeGCOnce] mp(%v) encode dequeue: %v", mp.config.PartitionId, encErr)
 		return encErr
 	}
 
-	if _, err = mp.submit(opFSMObjExtentGcDequeue, payload); err != nil {
+	if _, err = mp.submit(opFSMObjExtentGcDequeue, append([]byte(nil), encBuf.Bytes()...)); err != nil {
 		log.LogErrorf("[runObjExtentDelTreeGCOnce] mp(%v) submit dequeue: %v", mp.config.PartitionId, err)
 		return err
 	}

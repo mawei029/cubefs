@@ -865,3 +865,126 @@ func TestLoadDataFromRocksDb(t *testing.T) {
 		t.Fatalf("UniqId mismatch, expect:0 actual:%v", got)
 	}
 }
+
+func newMemMPForDelTreeSnapshotTest(t *testing.T) *metaPartition {
+	t.Helper()
+	metaM := &metadataManager{
+		metaNode:        &MetaNode{},
+		fileStatsConfig: &fileStatsConfig{},
+	}
+	mpC := &MetaPartitionConfig{
+		PartitionId: 1,
+		VolName:     "test_vol",
+		RootDir:     t.TempDir(),
+		StoreMode:   proto.StoreModeMem,
+	}
+	mp := NewMetaPartition(mpC, metaM).(*metaPartition)
+	require.NoError(t, mp.initObjects(true))
+	return mp
+}
+
+func TestDeletedObjExtentsSnapshotRoundTrip(t *testing.T) {
+	mp := newMemMPForDelTreeSnapshotTest(t)
+
+	oek := createTestObjExtentKey(4096, 1, 1)
+	mp.objExtentDelTree.EnqueueFromApply(42, 1700000000, 7, []proto.ObjExtentKey{oek})
+	require.Equal(t, 1, mp.objExtentDelTree.Len())
+
+	snap, err := mp.GetSnapShot()
+	require.NoError(t, err)
+	msg := &storeMsg{
+		snap:        snap,
+		applyIndex:  mp.GetAppliedID(),
+		uniqId:      mp.GetUniqId(),
+		uniqChecker: mp.uniqChecker,
+	}
+	require.NoError(t, mp.store(msg))
+	snap.Close()
+
+	mp2 := newMemMPForDelTreeSnapshotTest(t)
+	mp2.config.RootDir = mp.config.RootDir
+	require.Equal(t, 0, mp2.objExtentDelTree.Len())
+
+	snapshotPath := path.Join(mp.config.RootDir, snapshotDir)
+	require.NoError(t, mp2.LoadSnapshot(snapshotPath))
+	require.Equal(t, 1, mp2.objExtentDelTree.Len())
+
+	peek := mp2.objExtentDelTree.PeekFirstN(1)
+	require.Len(t, peek.Items, 1)
+	require.Equal(t, uint64(42), peek.Items[0].Inode)
+	require.Len(t, peek.Items[0].Oeks, 1)
+}
+
+func TestDeletedObjExtentsSnapshotRoundTrip_multipleItems(t *testing.T) {
+	mp := newMemMPForDelTreeSnapshotTest(t)
+
+	mp.objExtentDelTree.EnqueueFromApply(1, 1700000000, 1, []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 1)})
+	mp.objExtentDelTree.EnqueueFromApply(2, 1700000001, 2, []proto.ObjExtentKey{
+		createTestObjExtentKey(0, 4096, 1),
+		createTestObjExtentKey(8192, 16384, 2),
+	})
+	mp.objExtentDelTree.EnqueueFromApply(3, 1700000002, 3, []proto.ObjExtentKey{createTestObjExtentKey(0, 1024, 3)})
+	require.Equal(t, 3, mp.objExtentDelTree.Len())
+
+	snap, err := mp.GetSnapShot()
+	require.NoError(t, err)
+	msg := &storeMsg{
+		snap:        snap,
+		applyIndex:  mp.GetAppliedID(),
+		uniqId:      mp.GetUniqId(),
+		uniqChecker: mp.uniqChecker,
+	}
+	require.NoError(t, mp.store(msg))
+	snap.Close()
+
+	mp2 := newMemMPForDelTreeSnapshotTest(t)
+	mp2.config.RootDir = mp.config.RootDir
+	snapshotPath := path.Join(mp.config.RootDir, snapshotDir)
+	require.NoError(t, mp2.LoadSnapshot(snapshotPath))
+	require.Equal(t, 3, mp2.objExtentDelTree.Len())
+
+	peek := mp2.objExtentDelTree.PeekFirstN(3)
+	require.Len(t, peek.Items, 3)
+	require.Equal(t, uint64(1), peek.Items[0].Inode)
+	require.Equal(t, uint64(2), peek.Items[1].Inode)
+	require.Len(t, peek.Items[1].Oeks, 2)
+	require.Equal(t, uint64(3), peek.Items[2].Inode)
+}
+
+func TestLoadDeletedObjExtents_missingFileRejectsCRC(t *testing.T) {
+	mp := newMemMPForDelTreeSnapshotTest(t)
+	err := mp.loadDeletedObjExtents(t.TempDir(), 12345)
+	require.ErrorIs(t, err, ErrSnapshotCrcMismatch)
+}
+
+func TestDeletedObjExtentsSnapshotRoundTrip_largeRecord(t *testing.T) {
+	mp := newMemMPForDelTreeSnapshotTest(t)
+
+	oeks := make([]proto.ObjExtentKey, 0, 512)
+	for i := 0; i < 512; i++ {
+		oeks = append(oeks, createTestObjExtentKey(uint64(i*4096), 4096, uint64(i+1)))
+	}
+	mp.objExtentDelTree.EnqueueFromApply(99, 1700000000, 1, oeks)
+	require.Equal(t, 1, mp.objExtentDelTree.Len())
+
+	snap, err := mp.GetSnapShot()
+	require.NoError(t, err)
+	msg := &storeMsg{
+		snap:        snap,
+		applyIndex:  mp.GetAppliedID(),
+		uniqId:      mp.GetUniqId(),
+		uniqChecker: mp.uniqChecker,
+	}
+	require.NoError(t, mp.store(msg))
+	snap.Close()
+
+	mp2 := newMemMPForDelTreeSnapshotTest(t)
+	mp2.config.RootDir = mp.config.RootDir
+	snapshotPath := path.Join(mp.config.RootDir, snapshotDir)
+	require.NoError(t, mp2.LoadSnapshot(snapshotPath))
+	require.Equal(t, 1, mp2.objExtentDelTree.Len())
+
+	peek := mp2.objExtentDelTree.PeekFirstN(1)
+	require.Len(t, peek.Items, 1)
+	require.Len(t, peek.Items[0].Oeks, len(oeks))
+}

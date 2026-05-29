@@ -7,8 +7,9 @@ import (
 )
 
 const (
-	inodeBufSize  = 40960 // size about 128G
-	dentryBufSize = 1024
+	inodeBufSize      = 40960 // size about 128G
+	dentryBufSize     = 1024
+	deleteTreeBufSize = 40960
 )
 
 var inodeBufPool = sync.Pool{
@@ -26,6 +27,12 @@ var dentryBufPool = sync.Pool{
 var readBufPool = sync.Pool{
 	New: func() interface{} {
 		return buf.NewReadByteBuf()
+	},
+}
+
+var deleteTreeBufPool = sync.Pool{
+	New: func() interface{} {
+		return buf.NewByteBufEx(deleteTreeBufSize)
 	},
 }
 
@@ -68,5 +75,21 @@ func PutReadBuf(buf *buf.ReadByteBuff) {
 	if buf != nil {
 		buf.Reset()
 		readBufPool.Put(buf)
+	}
+}
+
+func GetDeleteTreeBuf() *buf.ByteBufExt {
+	return deleteTreeBufPool.Get().(*buf.ByteBufExt)
+}
+
+func PutDeleteTreeBuf(buf *buf.ByteBufExt) {
+	if buf != nil {
+		buf.Reset()
+		// if the buffer is too large, don't put it back to the pool. let it be GCed.
+		if buf.Cap() > deleteTreeBufSize*8 {
+			return
+		}
+
+		deleteTreeBufPool.Put(buf)
 	}
 }

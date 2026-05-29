@@ -18,9 +18,15 @@ import (
 )
 
 const (
-	maxObjExtentDelBatch   = 1 << 20 // limit payload item count to avoid malformed input allocating huge memory.
-	objExtentDelVersion1   = 1
-	minObjExtentDelPayload = 8 // version + count
+	objExtentDelVersion1      = 1
+	minObjExtentDelPayload    = 8  // version + count
+	minObjExtentDelSnapRecord = 28 // version + TsMs + Inode + RaftIdx + oek count
+)
+
+var (
+	ErrDelTreeItemsFull   = errors.New("delete tree items full")
+	ErrDelTreeUnsupported = errors.New("delete tree payload unsupported")
+	ErrDelPayloadTooShort = errors.New("delete payload too short")
 )
 
 // objExtentDelTree: in-memory B-tree holding pending ObjExtentKeys to delete.
@@ -83,7 +89,7 @@ type objExtentDelTree struct {
 	t  *BTree
 }
 
-var _ ObjExtentDelTree = (*objExtentDelTree)(nil)
+var _ ObjExtentDelTreeAPI = (*objExtentDelTree)(nil)
 
 func newObjExtentDelTree() *objExtentDelTree {
 	return &objExtentDelTree{t: NewBtree()}
@@ -93,6 +99,13 @@ func (ot *objExtentDelTree) Len() int {
 	ot.mu.Lock()
 	defer ot.mu.Unlock()
 	return ot.t.Len()
+}
+
+func (ot *objExtentDelTree) GetTree() *BTree {
+	if ot == nil || ot.t == nil {
+		return NewBtree()
+	}
+	return ot.t.GetTree()
 }
 
 // EnqueueFromApply inserts discard keys during Raft Apply (same log index as append op → replay-idempotent ReplaceOrInsert).
@@ -182,6 +195,107 @@ func (ot *objExtentDelTree) ApplyPunishPayload(val []byte, applyIndex uint64) er
 	return nil
 }
 
+func (ot *objExtentDelTree) Range(start, end *objExtentDelItem, cb func(it *objExtentDelItem) bool) error {
+	if ot == nil || ot.t == nil {
+		return nil
+	}
+
+	callback := func(i BtreeItem) bool {
+		return cb(i.(*objExtentDelItem))
+	}
+
+	if start == nil {
+		start = &objExtentDelItem{}
+	}
+
+	if end == nil {
+		ot.t.AscendGreaterOrEqual(start, callback)
+	} else {
+		ot.t.AscendRange(start, end, callback)
+	}
+	return nil
+}
+
+func (it *objExtentDelItem) MarshalSnapshot(buf *bytes.Buffer) error {
+	buf.Reset()
+	if err := binary.Write(buf, binary.BigEndian, uint32(objExtentDelVersion1)); err != nil {
+		return err
+	}
+	if err := binary.Write(buf, binary.BigEndian, it.TsMs); err != nil {
+		return err
+	}
+	if err := binary.Write(buf, binary.BigEndian, it.Inode); err != nil {
+		return err
+	}
+	if err := binary.Write(buf, binary.BigEndian, it.RaftIdx); err != nil {
+		return err
+	}
+	if err := binary.Write(buf, binary.BigEndian, uint32(len(it.Oeks))); err != nil {
+		return err
+	}
+	for j := range it.Oeks {
+		ob, err := it.Oeks[j].MarshalBinary()
+		if err != nil {
+			return err
+		}
+		if err := binary.Write(buf, binary.BigEndian, uint32(len(ob))); err != nil {
+			return err
+		}
+		if _, err := buf.Write(ob); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (it *objExtentDelItem) UnmarshalSnapshot(data []byte) error {
+	if len(data) < minObjExtentDelSnapRecord {
+		return ErrDelPayloadTooShort
+	}
+	br := bytes.NewReader(data)
+	var ver uint32
+	if err := binary.Read(br, binary.BigEndian, &ver); err != nil {
+		return err
+	}
+	if ver != objExtentDelVersion1 {
+		log.LogErrorf("snapshot: %v, version %d", ErrDelTreeUnsupported, ver)
+		return ErrDelTreeUnsupported
+	}
+	if err := binary.Read(br, binary.BigEndian, &it.TsMs); err != nil {
+		return err
+	}
+	if err := binary.Read(br, binary.BigEndian, &it.Inode); err != nil {
+		return err
+	}
+	if err := binary.Read(br, binary.BigEndian, &it.RaftIdx); err != nil {
+		return err
+	}
+	var n uint32
+	if err := binary.Read(br, binary.BigEndian, &n); err != nil {
+		return err
+	}
+	it.Oeks = make([]proto.ObjExtentKey, 0, n)
+	for i := uint32(0); i < n; i++ {
+		var oekLen uint32
+		if err := binary.Read(br, binary.BigEndian, &oekLen); err != nil {
+			return err
+		}
+		if oekLen == 0 {
+			continue
+		}
+		ob := make([]byte, oekLen)
+		if _, err := io.ReadFull(br, ob); err != nil {
+			return err
+		}
+		var oek proto.ObjExtentKey
+		if err := oek.UnmarshalBinary(bytes.NewBuffer(ob)); err != nil {
+			return err
+		}
+		it.Oeks = append(it.Oeks, oek)
+	}
+	return nil
+}
+
 func (ot *objExtentDelTree) objExtentDelPunishReplace(raftIdx uint64, item *objExtentDelItem, newTime int64) {
 	oeks := make([]proto.ObjExtentKey, len(item.Oeks))
 	for k := range item.Oeks {
@@ -214,32 +328,45 @@ func (ot *objExtentDelTree) objExtentDelPunishReplace(raftIdx uint64, item *objE
 	ot.t.ReplaceOrInsert(nit, true)
 }
 
+func (ot *objExtentDelTree) restoreFromSnapshot(it *objExtentDelItem) {
+	if ot == nil || it == nil {
+		return
+	}
+	cp := it.CopyItem()
+	ot.mu.Lock()
+	defer ot.mu.Unlock()
+	if ot.t == nil {
+		ot.t = NewBtree()
+	}
+	ot.t.ReplaceOrInsert(cp, true)
+}
+
 // batchObjExtentDelItem : Encode/Decode for Raft payload (dequeue / punish), batch delete items.
 type batchObjExtentDelItems struct {
 	Items   []*objExtentDelItem // btree items (peek / dequeue / punish old keys)
 	NewTime int64               // new schedule time (ms), set by UnmarshalPunish
 }
 
-func (b *batchObjExtentDelItems) MarshalDequeue() ([]byte, error) {
-	buf := bytes.NewBuffer(nil)
+func (b *batchObjExtentDelItems) MarshalDequeue(buf *bytes.Buffer) error {
+	buf.Reset()
 
 	if err := b.writeBatchItemsHeader(buf); err != nil {
-		return nil, err
+		return err
 	}
 
 	for _, it := range b.Items {
 		if err := binary.Write(buf, binary.BigEndian, it.TsMs); err != nil {
-			return nil, err
+			return err
 		}
 		if err := binary.Write(buf, binary.BigEndian, it.Inode); err != nil {
-			return nil, err
+			return err
 		}
 		if err := binary.Write(buf, binary.BigEndian, it.RaftIdx); err != nil {
-			return nil, err
+			return err
 		}
 	}
 
-	return buf.Bytes(), nil
+	return nil
 }
 
 func (b *batchObjExtentDelItems) UnmarshalDequeue(data []byte) error {
@@ -276,45 +403,41 @@ func (b *batchObjExtentDelItems) UnmarshalDequeue(data []byte) error {
 }
 
 // MarshalPunish encodes punish payload: version, cnt, newTsMs, then per item (old key, nOeks, oeks...).
-func (b *batchObjExtentDelItems) MarshalPunish(newTsMs int64) ([]byte, error) {
-	buf := bytes.NewBuffer(nil)
+func (b *batchObjExtentDelItems) MarshalPunish(buf *bytes.Buffer, newTsMs int64) error {
+	buf.Reset()
 	b.NewTime = newTsMs
 	if err := b.writeBatchItemsPunishHeader(buf); err != nil {
-		return nil, err
+		return err
 	}
 
 	for _, it := range b.Items {
 		if err := binary.Write(buf, binary.BigEndian, it.TsMs); err != nil {
-			return nil, err
+			return err
 		}
 		if err := binary.Write(buf, binary.BigEndian, it.Inode); err != nil {
-			return nil, err
+			return err
 		}
 		if err := binary.Write(buf, binary.BigEndian, it.RaftIdx); err != nil {
-			return nil, err
+			return err
 		}
-		n := uint32(len(it.Oeks))
-		if n == 0 || n > maxObjExtentDelBatch {
-			return nil, fmt.Errorf("punish encode: invalid oek count %d", n)
-		}
-		if err := binary.Write(buf, binary.BigEndian, n); err != nil {
-			return nil, err
+
+		if err := binary.Write(buf, binary.BigEndian, uint32(len(it.Oeks))); err != nil {
+			return err
 		}
 		for j := range it.Oeks {
 			ob, err := it.Oeks[j].MarshalBinary()
 			if err != nil {
-				return nil, err
+				return err
 			}
 			if err := binary.Write(buf, binary.BigEndian, uint32(len(ob))); err != nil {
-				return nil, err
+				return err
 			}
 			if _, err := buf.Write(ob); err != nil {
-				return nil, err
+				return err
 			}
 		}
 	}
-
-	return buf.Bytes(), nil
+	return nil
 }
 
 // UnmarshalPunish decodes punish payload produced by MarshalPunish.
@@ -347,8 +470,9 @@ func (b *batchObjExtentDelItems) UnmarshalPunish(data []byte) error {
 			if err := binary.Read(br, binary.BigEndian, &nOeks); err != nil {
 				return err
 			}
-			if nOeks == 0 || nOeks > maxObjExtentDelBatch {
-				return fmt.Errorf("punish: invalid oek count %d", nOeks)
+			if nOeks == 0 {
+				log.LogErrorf("umarshal punish item, invalid oek count: %d", nOeks)
+				return ErrDelTreeUnsupported
 			}
 			oeks := make([]proto.ObjExtentKey, 0, nOeks)
 			for j := uint32(0); j < nOeks; j++ {
@@ -392,9 +516,6 @@ func (b *batchObjExtentDelItems) readBatchItemsHeader(br *bytes.Reader) (version
 	}
 	if err = binary.Read(br, binary.BigEndian, &cnt); err != nil {
 		return
-	}
-	if cnt > maxObjExtentDelBatch {
-		err = fmt.Errorf("too many items %d", cnt)
 	}
 
 	b.Items = make([]*objExtentDelItem, 0, cnt)
