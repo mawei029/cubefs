@@ -22,6 +22,7 @@ import (
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/remotecache/flashgroupmanager"
+	"github.com/cubefs/cubefs/remotecache/flashnode"
 	"github.com/cubefs/cubefs/util/errors"
 	"github.com/cubefs/cubefs/util/log"
 )
@@ -142,6 +143,8 @@ func (c *Cluster) loadFlashTopos() (err error) {
 			topo.FlashNodeReadDataNodeTimeout = ftv.FlashNodeReadDataNodeTimeout
 			topo.FlashHotKeyMissCount = ftv.FlashHotKeyMissCount
 			topo.FlashNodeReadRps = ftv.FlashNodeReadRps
+			topo.FlashNodeLruCapacity = ftv.FlashNodeLruCapacity
+			topo.FlashNodeLruFhCapacity = ftv.FlashNodeLruFhCapacity
 			topo.FlashReadFlowLimit = ftv.FlashReadFlowLimit
 			topo.FlashWriteFlowLimit = ftv.FlashWriteFlowLimit
 			topo.FlashKeyFlowLimit = ftv.FlashKeyFlowLimit
@@ -189,6 +192,8 @@ func (c *Cluster) defaultFlashNodeHeartbeatConfig() flashgroupmanager.FlashNodeH
 		FlashNodeReadDataNodeTimeout: c.cfg.flashNodeReadDataNodeTimeout,
 		FlashHotKeyMissCount:         c.cfg.flashHotKeyMissCount,
 		FlashNodeReadRps:             c.cfg.flashNodeReadRps,
+		FlashNodeLruCapacity:         flashnode.DefaultLRUCapacity,
+		FlashNodeLruFhCapacity:       flashnode.DefaultLRUFhCapacity,
 		FlashReadFlowLimit:           c.cfg.flashReadFlowLimit,
 		FlashWriteFlowLimit:          c.cfg.flashWriteFlowLimit,
 		FlashKeyFlowLimit:            c.cfg.flashKeyFlowLimit,

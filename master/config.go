@@ -80,6 +80,8 @@ const (
 	flashNodeReadDataNodeTimeout = "flashNodeReadDataNodeTimeout"
 	flashHotKeyMissCount         = "flashHotKeyMissCount"
 	flashNodeReadRps             = "flashNodeReadRps"
+	flashNodeLruCapacity         = "flashNodeLruCapacity"
+	flashNodeLruFhCapacity       = "flashNodeLruFhCapacity"
 	preheatTotalTask             = "preheatTotalTask"
 	maxDisableFlashGroupPercent  = "maxDisableFlashGroupPercent"
 	flashReadFlowLimit           = "flashReadFlowLimit"

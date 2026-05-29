@@ -290,6 +290,8 @@ type flashTopoUpdateArgs struct {
 	FlashNodeReadDataNodeTimeout *int
 	FlashHotKeyMissCount         *int
 	FlashNodeReadRps             *int64
+	FlashNodeLruCapacity         *int
+	FlashNodeLruFhCapacity       *int
 	FlashReadFlowLimit           *int64
 	FlashWriteFlowLimit          *int64
 	FlashKeyFlowLimit            *int64
@@ -337,6 +339,22 @@ func parseRequestToUpdateFlashTopo(r *http.Request) (args *flashTopoUpdateArgs, 
 			return nil, unmatchedKey(cfgFlashNodeReadRps)
 		}
 		args.FlashNodeReadRps = &val
+		hasValue = true
+	}
+	if value := r.FormValue(cfgFlashNodeLruCapacity); value != "" {
+		val, parseErr := strconv.Atoi(value)
+		if parseErr != nil || val <= 0 {
+			return nil, unmatchedKey(cfgFlashNodeLruCapacity)
+		}
+		args.FlashNodeLruCapacity = &val
+		hasValue = true
+	}
+	if value := r.FormValue(cfgFlashNodeLruFhCapacity); value != "" {
+		val, parseErr := strconv.Atoi(value)
+		if parseErr != nil || val <= 0 || val >= 1000000 {
+			return nil, unmatchedKey(cfgFlashNodeLruFhCapacity)
+		}
+		args.FlashNodeLruFhCapacity = &val
 		hasValue = true
 	}
 	if value := r.FormValue(cfgFlashReadFlowLimit); value != "" {

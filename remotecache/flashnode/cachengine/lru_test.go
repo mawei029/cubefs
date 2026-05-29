@@ -31,10 +31,10 @@ var (
 
 func TestLRUManyThings(t *testing.T) {
 	require.PanicsWithValue(t, "must provide a positive capacity", func() {
-		_ = NewCache(LRUFileHandleCacheType, 0, util.MB*100, time.Hour, nilDeleteFunc, nil, nilCloseFunc)
+		_ = NewCache(LRUFileHandleCacheType, 0, util.MB*100, time.Hour, nilDeleteFunc, nilCloseFunc)
 	})
 
-	c := NewCache(LRUFileHandleCacheType, 10, util.MB*100, time.Hour, nilDeleteFunc, nil, nilCloseFunc)
+	c := NewCache(LRUFileHandleCacheType, 10, util.MB*100, time.Hour, nilDeleteFunc, nilCloseFunc)
 	defer c.Close()
 	var (
 		k  = 1
@@ -84,7 +84,6 @@ func TestLRUCapacity(t *testing.T) {
 			}
 			return nil
 		},
-		nil,
 		nilCloseFunc)
 	defer c.Close()
 
@@ -110,7 +109,7 @@ func TestLRUCapacity(t *testing.T) {
 }
 
 func TestLRUExpired(t *testing.T) {
-	c := NewCache(LRUFileHandleCacheType, 2, util.MB*100, time.Hour, nilDeleteFunc, nil, nilCloseFunc)
+	c := NewCache(LRUFileHandleCacheType, 2, util.MB*100, time.Hour, nilDeleteFunc, nilCloseFunc)
 	defer c.Close()
 	e := -time.Hour
 	c.Set(1, &CacheBlock{blockKey: "block1"}, e)
@@ -144,27 +143,47 @@ func setCacheBlocks(t *testing.T, c LruCache, start, count int) {
 	}
 }
 
+func cacheHighWaterCnt(fc *fCache) int64 {
+	return atomic.LoadInt64(&fc.highWaterCnt)
+}
+
+func cacheLowWaterCnt(fc *fCache) int64 {
+	return atomic.LoadInt64(&fc.lowWaterCnt)
+}
+
+func cacheHighWaterSize(fc *fCache) int64 {
+	return atomic.LoadInt64(&fc.highWaterSize)
+}
+
+func cacheLowWaterSize(fc *fCache) int64 {
+	return atomic.LoadInt64(&fc.lowWaterSize)
+}
+
+func cacheHardLimitSize(fc *fCache) int64 {
+	return atomic.LoadInt64(&fc.hardLimitSize)
+}
+
 func TestInitWatermarks(t *testing.T) {
 	const capacity = 100
 	maxSize := int64(util.GB)
-	c := NewCache(LRUCacheBlockCacheType, capacity, maxSize, time.Hour, nilDeleteFunc, nil, nilCloseFunc)
+	c := NewCache(LRUCacheBlockCacheType, capacity, maxSize, time.Hour, nilDeleteFunc, nilCloseFunc)
 	defer c.Close()
 
 	fc := c.(*fCache)
-	require.Equal(t, int64(float64(capacity)*HighWaterCntRatio), fc.highWaterCnt)
-	require.Equal(t, int64(float64(capacity)*LowWaterCntRatio), fc.lowWaterCnt)
+	require.Equal(t, int64(float64(capacity)*HighWaterCntRatio), cacheHighWaterCnt(fc))
+	require.Equal(t, int64(float64(capacity)*LowWaterCntRatio), cacheLowWaterCnt(fc))
 	wantHighSize := int64(float64(maxSize) * HighWaterSizeRatio)
 	wantLowSize := int64(float64(maxSize) * LowWaterSizeRatio)
 	wantHardLimit := int64(float64(maxSize) * HardLimitSizeRatio)
-	require.Equal(t, wantHighSize, fc.highWaterSize)
-	require.Equal(t, wantLowSize, fc.lowWaterSize)
-	require.Equal(t, wantHardLimit, fc.hardLimitSize)
-	require.Greater(t, fc.highWaterCnt, fc.lowWaterCnt)
-	require.Greater(t, fc.highWaterSize, fc.lowWaterSize)
+	require.Equal(t, wantHighSize, cacheHighWaterSize(fc))
+	require.Equal(t, wantLowSize, cacheLowWaterSize(fc))
+	require.Equal(t, wantHardLimit, cacheHardLimitSize(fc))
+	require.Greater(t, cacheHighWaterCnt(fc), cacheLowWaterCnt(fc))
+	require.Greater(t, cacheHighWaterSize(fc), cacheLowWaterSize(fc))
 }
 
 func TestWatermarkThresholds(t *testing.T) {
-	c := NewCache(LRUFileHandleCacheType, 100, util.MB*100, time.Hour, nilDeleteFunc, nil, nilCloseFunc)
+	c := NewCache(LRUFileHandleCacheType, 100, util.MB*100, time.Hour, nilDeleteFunc, nilCloseFunc)
 	defer c.Close()
 	fc := c.(*fCache)
 
@@ -182,49 +201,49 @@ func TestWatermarkThresholds(t *testing.T) {
 
 func TestWatermarkEvictor(t *testing.T) {
 	const capacity = 10
-	c := NewCache(LRUFileHandleCacheType, capacity, util.MB*100, time.Hour, nilDeleteFunc, nil, nilCloseFunc)
+	c := NewCache(LRUFileHandleCacheType, capacity, util.MB*100, time.Hour, nilDeleteFunc, nilCloseFunc)
 	defer c.Close()
 
 	fc := c.(*fCache)
-	require.Equal(t, int64(9), fc.highWaterCnt)
-	require.Equal(t, int64(8), fc.lowWaterCnt)
+	require.Equal(t, int64(9), cacheHighWaterCnt(fc))
+	require.Equal(t, int64(8), cacheLowWaterCnt(fc))
 
 	setCacheBlocks(t, c, 0, capacity)
 	require.Equal(t, capacity, c.Len())
 
 	waitCacheUntil(t, 2*time.Second, func() bool {
-		return c.Len() <= int(fc.lowWaterCnt)
+		return c.Len() <= int(cacheLowWaterCnt(fc))
 	})
-	require.LessOrEqual(t, c.Len(), int(fc.lowWaterCnt))
-	require.Less(t, c.Len(), int(fc.highWaterCnt))
+	require.LessOrEqual(t, c.Len(), int(cacheLowWaterCnt(fc)))
+	require.Less(t, c.Len(), int(cacheHighWaterCnt(fc)))
 	require.Equal(t, int32(0), atomic.LoadInt32(&fc.watermarkEvicting))
 }
 
 func TestWatermarkEvictsToLowNotHigh(t *testing.T) {
 	const capacity = 100
-	c := NewCache(LRUFileHandleCacheType, capacity, util.MB*100, time.Hour, nilDeleteFunc, nil, nilCloseFunc)
+	c := NewCache(LRUFileHandleCacheType, capacity, util.MB*100, time.Hour, nilDeleteFunc, nilCloseFunc)
 	defer c.Close()
 
 	fc := c.(*fCache)
 	setCacheBlocks(t, c, 0, capacity)
 	waitCacheUntil(t, 5*time.Second, func() bool {
-		return c.Len() <= int(fc.lowWaterCnt)
+		return c.Len() <= int(cacheLowWaterCnt(fc))
 	})
-	require.LessOrEqual(t, c.Len(), int(fc.lowWaterCnt))
-	require.Less(t, c.Len(), int(fc.highWaterCnt))
+	require.LessOrEqual(t, c.Len(), int(cacheLowWaterCnt(fc)))
+	require.Less(t, c.Len(), int(cacheHighWaterCnt(fc)))
 }
 
 func TestWatermarkDeadBandNoEviction(t *testing.T) {
 	const capacity = 100
-	c := NewCache(LRUFileHandleCacheType, capacity, util.MB*100, time.Hour, nilDeleteFunc, nil, nilCloseFunc)
+	c := NewCache(LRUFileHandleCacheType, capacity, util.MB*100, time.Hour, nilDeleteFunc, nilCloseFunc)
 	defer c.Close()
 
 	fc := c.(*fCache)
 	const inDeadBand = 90
 	setCacheBlocks(t, c, 0, inDeadBand)
 	require.Equal(t, inDeadBand, c.Len())
-	require.Greater(t, c.Len(), int(fc.lowWaterCnt))
-	require.LessOrEqual(t, c.Len(), int(fc.highWaterCnt))
+	require.Greater(t, c.Len(), int(cacheLowWaterCnt(fc)))
+	require.LessOrEqual(t, c.Len(), int(cacheHighWaterCnt(fc)))
 	require.False(t, fc.overHighWater())
 
 	time.Sleep(4 * WatermarkEvictTickInterval)
@@ -234,7 +253,7 @@ func TestWatermarkDeadBandNoEviction(t *testing.T) {
 
 func TestWatermarkResumeEvictionBelowHigh(t *testing.T) {
 	const capacity = 100
-	c := NewCache(LRUFileHandleCacheType, capacity, util.MB*100, time.Hour, nilDeleteFunc, nil, nilCloseFunc)
+	c := NewCache(LRUFileHandleCacheType, capacity, util.MB*100, time.Hour, nilDeleteFunc, nilCloseFunc)
 	defer c.Close()
 
 	fc := c.(*fCache)
@@ -252,15 +271,15 @@ func TestWatermarkResumeEvictionBelowHigh(t *testing.T) {
 	}
 
 	waitCacheUntil(t, 5*time.Second, func() bool {
-		return c.Len() <= int(fc.lowWaterCnt)
+		return c.Len() <= int(cacheLowWaterCnt(fc))
 	})
-	require.LessOrEqual(t, c.Len(), int(fc.lowWaterCnt))
+	require.LessOrEqual(t, c.Len(), int(cacheLowWaterCnt(fc)))
 	require.Equal(t, int32(0), atomic.LoadInt32(&fc.watermarkEvicting))
 }
 
 func TestSetNoBulkEvictAtCapacity(t *testing.T) {
 	const capacity = 10
-	c := NewCache(LRUFileHandleCacheType, capacity, util.MB*100, time.Hour, nilDeleteFunc, nil, nilCloseFunc)
+	c := NewCache(LRUFileHandleCacheType, capacity, util.MB*100, time.Hour, nilDeleteFunc, nilCloseFunc)
 	defer c.Close()
 
 	for i := 0; i < capacity; i++ {
@@ -281,7 +300,6 @@ func TestEmergencyEvictOnHardLimit(t *testing.T) {
 			}
 			return nil
 		},
-		nil,
 		nilCloseFunc)
 	defer c.Close()
 
@@ -311,7 +329,6 @@ func TestBlockCacheAsyncEvict(t *testing.T) {
 			}
 			return nil
 		},
-		nil,
 		nilCloseFunc)
 	defer c.Close()
 
@@ -327,49 +344,4 @@ func TestBlockCacheAsyncEvict(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("expected async onDelete after block cache eviction")
 	}
-}
-
-func TestEvictUnlinkBeforeAsyncOnDelete(t *testing.T) {
-	var unlinkOrder, deleteOrder int32
-	unlinked := make(chan struct{}, 1)
-	deleted := make(chan struct{}, 1)
-
-	c := NewCache(LRUCacheBlockCacheType, 10, util.MB*100, time.Hour,
-		func(v interface{}, reason string, removeOuter bool) error {
-			atomic.StoreInt32(&deleteOrder, atomic.LoadInt32(&unlinkOrder)+1)
-			select {
-			case deleted <- struct{}{}:
-			default:
-			}
-			return nil
-		},
-		func(key interface{}) {
-			atomic.StoreInt32(&unlinkOrder, 1)
-			select {
-			case unlinked <- struct{}{}:
-			default:
-			}
-		},
-		nilCloseFunc)
-	defer c.Close()
-
-	k := "vol/inode#0#0"
-	_, err := c.Set(k, &CacheBlock{blockKey: k}, time.Hour)
-	require.NoError(t, err)
-
-	require.True(t, c.Evict(k))
-	select {
-	case <-unlinked:
-	case <-time.After(time.Second):
-		t.Fatal("expected onUnlink during Evict")
-	}
-	select {
-	case <-deleted:
-	case <-time.After(time.Second):
-		t.Fatal("expected async onDelete after Evict")
-	}
-	require.Equal(t, int32(1), atomic.LoadInt32(&unlinkOrder))
-	require.Equal(t, int32(2), atomic.LoadInt32(&deleteOrder))
-
-	require.True(t, c.Evict(k))
 }

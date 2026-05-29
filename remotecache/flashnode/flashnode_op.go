@@ -190,6 +190,8 @@ func (f *FlashNode) opFlashNodeHeartbeat(conn net.Conn, p *proto.Packet) (err er
 			f.hotKeyMissCount = int32(req.FlashHotKeyMissCount)
 		}
 		f.setReadRps(req.FlashNodeReadRps)
+		f.setLruCapacity(req.FlashNodeLruCapacity)
+		f.setLruFhCapacity(req.FlashNodeLruFhCapacity)
 		if req.FlashKeyFlowLimit != f.keyLimiterFlow {
 			f.keyLimiterFlow = req.FlashKeyFlowLimit
 			f.cacheEngine.SetKeyLimiterFlow(req.FlashKeyFlowLimit)

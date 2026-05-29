@@ -1636,7 +1636,8 @@ func (api *AdminAPI) RenameFlashTopo(srcName, dstName string) (result string, er
 }
 
 func (api *AdminAPI) UpdateFlashTopo(name string, flashNodeHandleReadTimeout, flashNodeReadDataNodeTimeout,
-	flashHotKeyMissCount int, flashNodeReadRps, flashReadFlowLimit, flashWriteFlowLimit, flashKeyFlowLimit, flashNodeConnectionLimit int64,
+	flashHotKeyMissCount, flashNodeLruCapacity, flashNodeLruFhCapacity int,
+	flashNodeReadRps, flashReadFlowLimit, flashWriteFlowLimit, flashKeyFlowLimit, flashNodeConnectionLimit int64,
 ) (result string, err error) {
 	req := newRequest(post, proto.AdminFlashTopoUpdate).Header(api.h)
 	req.addParam("name", name)
@@ -1651,6 +1652,12 @@ func (api *AdminAPI) UpdateFlashTopo(name string, flashNodeHandleReadTimeout, fl
 	}
 	if flashNodeReadRps >= 0 {
 		req.addParamAny("flashNodeReadRps", flashNodeReadRps)
+	}
+	if flashNodeLruCapacity >= 0 {
+		req.addParamAny("flashNodeLruCapacity", flashNodeLruCapacity)
+	}
+	if flashNodeLruFhCapacity >= 0 {
+		req.addParamAny("flashNodeLruFhCapacity", flashNodeLruFhCapacity)
 	}
 	if flashReadFlowLimit >= 0 {
 		req.addParamAny("flashReadFlowLimit", flashReadFlowLimit)

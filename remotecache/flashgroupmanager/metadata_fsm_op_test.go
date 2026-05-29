@@ -10,6 +10,7 @@ import (
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/raftstore"
 	"github.com/cubefs/cubefs/raftstore/raftstore_db"
+	"github.com/cubefs/cubefs/remotecache/flashnode"
 	"github.com/stretchr/testify/require"
 )
 
@@ -136,6 +137,8 @@ func TestLoadFlashToposPersistsDefaultAndIdleTopos(t *testing.T) {
 		FlashNodeReadDataNodeTimeout: 222,
 		FlashHotKeyMissCount:         333,
 		FlashNodeReadRps:             defaultFlashNodeReadRps,
+		FlashNodeLruCapacity:         flashnode.DefaultLRUCapacity,
+		FlashNodeLruFhCapacity:       flashnode.DefaultLRUFhCapacity,
 		FlashReadFlowLimit:           444,
 		FlashWriteFlowLimit:          555,
 		FlashKeyFlowLimit:            0,

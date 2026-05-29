@@ -175,7 +175,8 @@ func (flashNode *FlashNode) checkLiveliness() {
 
 func (flashNode *FlashNode) createHeartbeatTask(masterAddr string, flashNodeHandleReadTimeout int,
 	flashNodeReadDataNodeTimeout int, flashHotKeyMissCount int,
-	flashNodeReadRps int64, flashReadFlowLimit int64, flashWriteFlowLimit int64, flashKeyFlowLimit int64, flashNodeConnectionLimit int64, slots []uint32,
+	flashNodeReadRps int64, flashNodeLruCapacity, flashNodeLruFhCapacity int,
+	flashReadFlowLimit int64, flashWriteFlowLimit int64, flashKeyFlowLimit int64, flashNodeConnectionLimit int64, slots []uint32,
 	remoteCacheDisableTTLMap map[string]bool, remoteCacheReadFlowMap map[string]int64, remoteCacheWriteFlowMap map[string]int64,
 ) (task *proto.AdminTask) {
 	request := &proto.HeartBeatRequest{
@@ -186,6 +187,8 @@ func (flashNode *FlashNode) createHeartbeatTask(masterAddr string, flashNodeHand
 	request.FlashNodeReadDataNodeTimeout = flashNodeReadDataNodeTimeout
 	request.FlashHotKeyMissCount = flashHotKeyMissCount
 	request.FlashNodeReadRps = flashNodeReadRps
+	request.FlashNodeLruCapacity = flashNodeLruCapacity
+	request.FlashNodeLruFhCapacity = flashNodeLruFhCapacity
 	request.FlashReadFlowLimit = flashReadFlowLimit
 	request.FlashWriteFlowLimit = flashWriteFlowLimit
 	request.FlashKeyFlowLimit = flashKeyFlowLimit

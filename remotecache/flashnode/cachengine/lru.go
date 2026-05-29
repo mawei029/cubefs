@@ -69,9 +69,6 @@ type LruCache interface {
 	Set(key interface{}, value interface{}, expiration time.Duration) (n int, err error)
 	// BatchSet inserts or updates multiple entries. n has the same meaning as Set.
 	BatchSet(keys []interface{}, values []interface{}, expirations []time.Duration) (n int, err error)
-	// Evict removes key from the LRU when present. It always returns true: a missing
-	// key is treated as already evicted (idempotent), not a failure. Callers use this
-	// to proceed with engine-level index cleanup; do not interpret false as "not found".
 	Evict(key interface{}) bool
 	EvictAll(cacheEvictWorkerNum int)
 	Close() error
@@ -139,7 +136,6 @@ type fCache struct {
 	items map[interface{}]*list.Element
 
 	onDelete OnDeleteF
-	onUnlink OnUnlinkF
 	onClose  OnCloseF
 
 	// volMap stores volume -> remoteCacheDisableTTL mapping
@@ -163,18 +159,13 @@ type entry struct {
 }
 
 type (
-	// OnDelete releases cache entry resources (e.g. unlink block file). For block cache,
-	// keyToDiskMap is cleared synchronously via OnUnlink before async OnDelete runs.
 	OnDeleteF func(v interface{}, reason string, removeOuter bool) error
-	// OnUnlink removes the key from outer indexes (e.g. keyToDiskMap) when an entry is
-	// unlinked from LRU. Must be synchronous so index exists => LRU Get-able holds.
-	OnUnlinkF func(key interface{})
 	OnCloseF  func(v interface{}) error
 )
 
 // NewCache constructs a new LruCache of the given size that is not safe for
 // concurrent use. If it will be panic, if size is not a positive integer.
-func NewCache(cacheType int, capacity int, maxSize int64, ttl time.Duration, onDelete OnDeleteF, onUnlink OnUnlinkF, onClose OnCloseF) LruCache {
+func NewCache(cacheType int, capacity int, maxSize int64, ttl time.Duration, onDelete OnDeleteF, onClose OnCloseF) LruCache {
 	if capacity <= 0 {
 		panic("must provide a positive capacity")
 	}
@@ -188,7 +179,6 @@ func NewCache(cacheType int, capacity int, maxSize int64, ttl time.Duration, onD
 		hits:               1,
 		recent:             &RateStat{},
 		onDelete:           onDelete,
-		onUnlink:           onUnlink,
 		onClose:            onClose,
 		closeCh:            make(chan struct{}),
 		items:              make(map[interface{}]*list.Element),
@@ -227,23 +217,27 @@ func NewCache(cacheType int, capacity int, maxSize int64, ttl time.Duration, onD
 }
 
 func (c *fCache) initWatermarks() {
-	c.highWaterCnt = int64(float64(c.capacity) * HighWaterCntRatio)
-	c.lowWaterCnt = int64(float64(c.capacity) * LowWaterCntRatio)
-	if c.highWaterCnt < 1 {
-		c.highWaterCnt = 1
+	highCnt := int64(float64(c.capacity) * HighWaterCntRatio)
+	lowCnt := int64(float64(c.capacity) * LowWaterCntRatio)
+	if highCnt < 1 {
+		highCnt = 1
 	}
-	if c.lowWaterCnt < 1 {
-		c.lowWaterCnt = 1
+	if lowCnt < 1 {
+		lowCnt = 1
 	}
+	atomic.StoreInt64(&c.highWaterCnt, highCnt)
+	atomic.StoreInt64(&c.lowWaterCnt, lowCnt)
 	if c.maxSize > 0 {
-		c.highWaterSize = int64(float64(c.maxSize) * HighWaterSizeRatio)
-		c.lowWaterSize = int64(float64(c.maxSize) * LowWaterSizeRatio)
-		c.hardLimitSize = int64(float64(c.maxSize) * HardLimitSizeRatio)
+		atomic.StoreInt64(&c.highWaterSize, int64(float64(c.maxSize)*HighWaterSizeRatio))
+		atomic.StoreInt64(&c.lowWaterSize, int64(float64(c.maxSize)*LowWaterSizeRatio))
+		atomic.StoreInt64(&c.hardLimitSize, int64(float64(c.maxSize)*HardLimitSizeRatio))
 	}
 	if log.EnableInfo() {
 		log.LogInfof("[initWatermarks] highWaterCnt (%v) lowWaterCnt (%v) highWaterSize (%v) lowWaterSize (%v) "+
 			"hardLimitSize (%v)",
-			c.highWaterCnt, c.lowWaterCnt, c.highWaterSize, c.lowWaterSize, c.hardLimitSize)
+			atomic.LoadInt64(&c.highWaterCnt), atomic.LoadInt64(&c.lowWaterCnt),
+			atomic.LoadInt64(&c.highWaterSize), atomic.LoadInt64(&c.lowWaterSize),
+			atomic.LoadInt64(&c.hardLimitSize))
 	}
 }
 
@@ -251,7 +245,7 @@ func (c *fCache) overHardLimit() bool {
 	if atomic.LoadInt64(&c.length) > int64(c.capacity) {
 		return true
 	}
-	if c.maxSize > 0 && atomic.LoadInt64(&c.allocated) > c.hardLimitSize {
+	if c.maxSize > 0 && atomic.LoadInt64(&c.allocated) > atomic.LoadInt64(&c.hardLimitSize) {
 		return true
 	}
 	return false
@@ -279,20 +273,20 @@ func (c *fCache) finishInsert() (n int) {
 }
 
 func (c *fCache) overHighWater() bool {
-	if atomic.LoadInt64(&c.length) > c.highWaterCnt {
+	if atomic.LoadInt64(&c.length) > atomic.LoadInt64(&c.highWaterCnt) {
 		return true
 	}
-	if c.maxSize > 0 && atomic.LoadInt64(&c.allocated) > c.highWaterSize {
+	if c.maxSize > 0 && atomic.LoadInt64(&c.allocated) > atomic.LoadInt64(&c.highWaterSize) {
 		return true
 	}
 	return false
 }
 
 func (c *fCache) reachedLowWater() bool {
-	if atomic.LoadInt64(&c.length) > c.lowWaterCnt {
+	if atomic.LoadInt64(&c.length) > atomic.LoadInt64(&c.lowWaterCnt) {
 		return false
 	}
-	if c.maxSize > 0 && atomic.LoadInt64(&c.allocated) > c.lowWaterSize {
+	if c.maxSize > 0 && atomic.LoadInt64(&c.allocated) > atomic.LoadInt64(&c.lowWaterSize) {
 		return false
 	}
 	return true
@@ -375,19 +369,13 @@ func (c *fCache) collectVictims(limit int, reason string) []evictItem {
 	return victims
 }
 
-func (c *fCache) unlinkOuter(key interface{}) {
-	if c.onUnlink != nil {
-		c.onUnlink(key)
-	}
-}
-
 func (c *fCache) drainVictims(victims []evictItem) {
 	if len(victims) == 0 {
 		return
 	}
 	go func(items []evictItem) {
 		for _, item := range items {
-			_ = c.onDelete(item.value, item.reason, false)
+			_ = c.onDelete(item.value, item.reason, true)
 			if c.cacheType == LRUCacheBlockCacheType && log.EnableInfo() {
 				log.LogInfof("delete(%s) for %s, len(%d) size(%d / %d)",
 					item.key, item.reason, atomic.LoadInt64(&c.length),
@@ -563,7 +551,7 @@ func (c *fCache) CheckDiskSpace(dataPath string, key interface{}, size int64, re
 	}
 	c.lock.Unlock()
 	for k, e := range toEvicts {
-		_ = c.onDelete(e, fmt.Sprintf("lru disk space is full(%d / %d) diskSpaceLeft(%d)", atomic.LoadInt64(&c.allocated), c.maxSize, diskSpaceLeft), false)
+		_ = c.onDelete(e, fmt.Sprintf("lru disk space is full(%d / %d) diskSpaceLeft(%d)", atomic.LoadInt64(&c.allocated), c.maxSize, diskSpaceLeft), true)
 		if log.EnableInfo() {
 			log.LogInfof("delete(%s) cos disk space full, len(%d) size(%d / %d) diskSpaceLeft(%d) preAllocated(%d)", k, atomic.LoadInt64(&c.length), atomic.LoadInt64(&c.allocated), c.maxSize, diskSpaceLeft, preAllocated)
 		}
@@ -709,7 +697,7 @@ func (c *fCache) Get(key interface{}) (interface{}, error) {
 		c.lock.Unlock()
 		if expiredValue != nil {
 			go func(val interface{}, reason string) {
-				_ = c.onDelete(val, reason, false)
+				_ = c.onDelete(val, reason, true)
 			}(expiredValue, expiredReason)
 		}
 		return nil, fmt.Errorf("expired key[%v]", key)
@@ -758,9 +746,6 @@ func (c *fCache) EvictAll(cacheEvictWorkerNum int) {
 	atomic.StoreInt64(&c.length, 0)
 }
 
-// Evict unlinks key from the LRU when it exists and schedules onDelete asynchronously.
-// Always returns true, including when key is absent (desired end state: not in cache).
-// This matches historical behavior and lru_test Evict-on-missing-key expectations.
 func (c *fCache) Evict(key interface{}) bool {
 	var val interface{}
 	c.lock.Lock()
@@ -777,16 +762,12 @@ func (c *fCache) Evict(key interface{}) bool {
 			_ = c.onDelete(v, "execute evict operation", false)
 		}(val)
 	}
-	// Intentional: not "return val != nil". Absent keys are success for volume evict paths.
 	return true
 }
 
-// deleteElement unlinks ent from the LRU, synchronously clears outer indexes via
-// onUnlink, and returns the value for async resource release (onDelete).
 func (c *fCache) deleteElement(ent *list.Element) interface{} {
 	v := ent.Value.(*entry)
 	c.removeElement(ent)
-	c.unlinkOuter(v.key)
 	atomic.AddInt32(&c.evicts, 1)
 	c.sendStat(v.key, StatEvict, 1)
 	return v.value
@@ -946,10 +927,7 @@ func (c *fCache) backgroundCleanup(itemCount int, diskSpaceLeft int64) {
 
 func (c *fCache) SetCapacity(capacity int) {
 	c.lock.Lock()
+	defer c.lock.Unlock()
 	c.capacity = capacity
 	c.initWatermarks()
-	c.lock.Unlock()
-	// Shrinking capacity lowers watermarks; length/allocated may now exceed them.
-	// Wake the async evictor without waiting for the next Set or 100ms tick.
-	c.triggerEvictor()
 }

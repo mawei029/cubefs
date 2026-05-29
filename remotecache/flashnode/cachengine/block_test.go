@@ -124,7 +124,6 @@ func testWriteSingleFile(t *testing.T) {
 			file := v.(*os.File)
 			return file.Close()
 		},
-		nil,
 		func(v interface{}) error {
 			file := v.(*os.File)
 			return file.Close()
@@ -148,7 +147,6 @@ func testWriteSingleFileError(t *testing.T) {
 			file := v.(*os.File)
 			return file.Close()
 		},
-		nil,
 		func(v interface{}) error {
 			file := v.(*os.File)
 			return file.Close()
@@ -174,7 +172,6 @@ func testWriteCacheBlockFull(t *testing.T) {
 			file := v.(*os.File)
 			return file.Close()
 		},
-		nil,
 		func(v interface{}) error {
 			file := v.(*os.File)
 			return file.Close()
@@ -207,7 +204,6 @@ func newCacheBlockWithDiffInode(volume string, index int, allocSize uint64) (cac
 			file := v.(*os.File)
 			return file.Close()
 		},
-		nil,
 		func(v interface{}) error {
 			file := v.(*os.File)
 			return file.Close()
@@ -229,7 +225,6 @@ func newCacheBlockWithDiffVolume(volume string, index int, allocSize uint64) (ca
 			file := v.(*os.File)
 			return file.Close()
 		},
-		nil,
 		func(v interface{}) error {
 			file := v.(*os.File)
 			return file.Close()
@@ -283,7 +278,6 @@ func TestBlockReadCache(t *testing.T) {
 			file := v.(*os.File)
 			return file.Close()
 		},
-		nil,
 		func(v interface{}) error {
 			file := v.(*os.File)
 			return file.Close()
@@ -324,7 +318,6 @@ func testParallelOperation(t *testing.T) {
 			file := v.(*os.File)
 			return file.Close()
 		},
-		nil,
 		func(v interface{}) error {
 			file := v.(*os.File)
 			return file.Close()
@@ -428,7 +421,6 @@ func testWriteSingleFileV2(t *testing.T) {
 			file := v.(*os.File)
 			return file.Close()
 		},
-		nil,
 		func(v interface{}) error {
 			file := v.(*os.File)
 			return file.Close()
@@ -483,7 +475,6 @@ func testWriteSingleFileErrorV2(t *testing.T) {
 			file := v.(*os.File)
 			return file.Close()
 		},
-		nil,
 		func(v interface{}) error {
 			file := v.(*os.File)
 			return file.Close()
@@ -522,7 +513,6 @@ func testWriteCacheBlockFullV2(t *testing.T) {
 			file := v.(*os.File)
 			return file.Close()
 		},
-		nil,
 		func(v interface{}) error {
 			file := v.(*os.File)
 			return file.Close()
@@ -570,7 +560,6 @@ func testWriteMultiCacheBlockV2(t *testing.T) {
 					file := v.(*os.File)
 					return file.Close()
 				},
-				nil,
 				func(v interface{}) error {
 					file := v.(*os.File)
 					return file.Close()

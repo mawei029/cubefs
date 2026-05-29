@@ -42,6 +42,8 @@ const (
 	cfgRemoteCacheSameRegionTimeout = "remoteCacheSameRegionTimeout"
 	cfgFlashHotKeyMissCount         = "flashHotKeyMissCount"
 	cfgFlashNodeReadRps             = "flashNodeReadRps"
+	cfgFlashNodeLruCapacity         = "flashNodeLruCapacity"
+	cfgFlashNodeLruFhCapacity       = "flashNodeLruFhCapacity"
 	cfgMaxDisableFlashGroupPercent  = "maxDisableFlashGroupPercent"
 	cfgFlashReadFlowLimit           = "flashReadFlowLimit"
 	cfgFlashWriteFlowLimit          = "flashWriteFlowLimit"

@@ -585,13 +585,16 @@ func TestFlashGroupManagerSetConfigSyncsDisablePercentToTopos(t *testing.T) {
 func TestParseRequestToUpdateFlashTopo(t *testing.T) {
 	args, err := parseRequestToUpdateFlashTopo(httptest.NewRequest(http.MethodGet,
 		"/?name=topo-a&flashNodeHandleReadTimeout=11&flashNodeReadDataNodeTimeout=12&flashHotKeyMissCount=13"+
-			"&flashNodeReadRps=18&flashReadFlowLimit=14&flashWriteFlowLimit=15&flashKeyFlowLimit=16&flashNodeConnectionLimit=17", nil))
+			"&flashNodeReadRps=18&flashNodeLruCapacity=100&flashNodeLruFhCapacity=2000"+
+			"&flashReadFlowLimit=14&flashWriteFlowLimit=15&flashKeyFlowLimit=16&flashNodeConnectionLimit=17", nil))
 	require.NoError(t, err)
 	require.Equal(t, "topo-a", args.Name)
 	require.Equal(t, 11, *args.FlashNodeHandleReadTimeout)
 	require.Equal(t, 12, *args.FlashNodeReadDataNodeTimeout)
 	require.Equal(t, 13, *args.FlashHotKeyMissCount)
 	require.Equal(t, int64(18), *args.FlashNodeReadRps)
+	require.Equal(t, 100, *args.FlashNodeLruCapacity)
+	require.Equal(t, 2000, *args.FlashNodeLruFhCapacity)
 	require.Equal(t, int64(14), *args.FlashReadFlowLimit)
 	require.Equal(t, int64(15), *args.FlashWriteFlowLimit)
 	require.Equal(t, int64(16), *args.FlashKeyFlowLimit)
@@ -611,6 +614,10 @@ func TestParseRequestToUpdateFlashTopo(t *testing.T) {
 	_, err = parseRequestToUpdateFlashTopo(httptest.NewRequest(http.MethodGet, "/?flashNodeReadRps=bad", nil))
 	require.Error(t, err)
 	_, err = parseRequestToUpdateFlashTopo(httptest.NewRequest(http.MethodGet, "/?flashNodeReadRps=0", nil))
+	require.Error(t, err)
+	_, err = parseRequestToUpdateFlashTopo(httptest.NewRequest(http.MethodGet, "/?flashNodeLruCapacity=bad", nil))
+	require.Error(t, err)
+	_, err = parseRequestToUpdateFlashTopo(httptest.NewRequest(http.MethodGet, "/?flashNodeLruFhCapacity=1000000", nil))
 	require.Error(t, err)
 }
 
@@ -637,18 +644,30 @@ func TestFlashGroupManagerReadRpsHandlers(t *testing.T) {
 	topo, err := manager.cluster.PeekFlashTopo("topo-a")
 	require.NoError(t, err)
 	require.Equal(t, int64(170003), topo.GetHeartbeatConfig().FlashNodeReadRps)
+
+	reply = runAPIServiceRequest(t, manager.updateFlashTopo,
+		"name=topo-a&flashNodeLruCapacity=9000&flashNodeLruFhCapacity=8000&flashNodeReadRps=18&flashNodeHandleReadTimeout=11&flashNodeReadDataNodeTimeout=12&flashHotKeyMissCount=13&flashReadFlowLimit=14&flashWriteFlowLimit=15&flashKeyFlowLimit=16&flashNodeConnectionLimit=17")
+	view = decodeAPIServiceReplyData[proto.FlashTopologyAdminView](t, reply)
+	require.Equal(t, 9000, view.FlashNodeLruCapacity)
+	require.Equal(t, 8000, view.FlashNodeLruFhCapacity)
+	topo, err = manager.cluster.PeekFlashTopo("topo-a")
+	require.NoError(t, err)
+	require.Equal(t, 9000, topo.GetHeartbeatConfig().FlashNodeLruCapacity)
+	require.Equal(t, 8000, topo.GetHeartbeatConfig().FlashNodeLruFhCapacity)
 }
 
 func TestFlashGroupManagerUpdateFlashTopoErrorsBeforeSync(t *testing.T) {
 	manager := newAPIServiceTestManager(t)
 
-	reply := runAPIServiceRequest(t, manager.updateFlashTopo, "name=topo-a&flashNodeReadRps=18&flashNodeHandleReadTimeout=11&flashNodeReadDataNodeTimeout=12&flashHotKeyMissCount=13&flashReadFlowLimit=14&flashWriteFlowLimit=15&flashKeyFlowLimit=16&flashNodeConnectionLimit=17")
+	reply := runAPIServiceRequest(t, manager.updateFlashTopo, "name=topo-a&flashNodeReadRps=18&flashNodeLruCapacity=100&flashNodeLruFhCapacity=2000&flashNodeHandleReadTimeout=11&flashNodeReadDataNodeTimeout=12&flashHotKeyMissCount=13&flashReadFlowLimit=14&flashWriteFlowLimit=15&flashKeyFlowLimit=16&flashNodeConnectionLimit=17")
 	view := decodeAPIServiceReplyData[proto.FlashTopologyAdminView](t, reply)
 	require.Equal(t, "topo-a", view.Name)
 	require.Equal(t, 11, view.FlashNodeHandleReadTimeout)
 	require.Equal(t, 12, view.FlashNodeReadDataNodeTimeout)
 	require.Equal(t, 13, view.FlashHotKeyMissCount)
 	require.Equal(t, int64(18), view.FlashNodeReadRps)
+	require.Equal(t, 100, view.FlashNodeLruCapacity)
+	require.Equal(t, 2000, view.FlashNodeLruFhCapacity)
 	require.Equal(t, int64(14), view.FlashReadFlowLimit)
 	require.Equal(t, int64(15), view.FlashWriteFlowLimit)
 	require.Equal(t, int64(16), view.FlashKeyFlowLimit)

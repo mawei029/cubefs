@@ -794,6 +794,12 @@ func (m *Server) updateFlashTopo(w http.ResponseWriter, r *http.Request) {
 	if args.FlashNodeReadRps != nil {
 		cfg.FlashNodeReadRps = *args.FlashNodeReadRps
 	}
+	if args.FlashNodeLruCapacity != nil {
+		cfg.FlashNodeLruCapacity = *args.FlashNodeLruCapacity
+	}
+	if args.FlashNodeLruFhCapacity != nil {
+		cfg.FlashNodeLruFhCapacity = *args.FlashNodeLruFhCapacity
+	}
 	if args.FlashReadFlowLimit != nil {
 		cfg.FlashReadFlowLimit = *args.FlashReadFlowLimit
 	}

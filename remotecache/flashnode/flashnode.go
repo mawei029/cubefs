@@ -21,6 +21,7 @@ import (
 	syslog "log"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -46,14 +47,19 @@ import (
 // TODO: remove this later.
 //go:generate golangci-lint run --issues-exit-code=1 -D errcheck -E bodyclose ./...
 
+// DefaultLRUCapacity and DefaultLRUFhCapacity are shared defaults for FlashNode block/file-handle LRU.
+// Master and FlashGroupManager use them when initializing flash topo heartbeat config.
+var (
+	DefaultLRUCapacity   = 40000000
+	DefaultLRUFhCapacity = 500000
+)
+
 const (
 	DefaultMemDataPath = "/cfs/tmpfs"
 
 	moduleName = "flashNode"
 
 	_defaultReadBurst                      = 200000
-	_defaultLRUCapacity                    = 40000000
-	_defaultLRUFhCapacity                  = 500000
 	_defaultDiskUnavailableCbErrorCount    = 3
 	_defaultCacheLoadWorkerNum             = 16
 	_defaultCacheEvictWorkerNum            = 16
@@ -415,7 +421,7 @@ func (f *FlashNode) parseConfig(cfg *config.Config) (err error) {
 	}
 	lruCapacity := cfg.GetInt(cfgLruCapacity)
 	if lruCapacity <= 0 {
-		lruCapacity = _defaultLRUCapacity
+		lruCapacity = DefaultLRUCapacity
 	}
 	f.lruCapacity = lruCapacity
 	if f.enableTmpfs {
@@ -507,8 +513,13 @@ func (f *FlashNode) parseConfig(cfg *config.Config) (err error) {
 		if len(disks) < 1 {
 			return errors.NewErrorf("the number of disks configured is less than 1")
 		}
-		for _, disk := range disks {
-			disk.Capacity = int(float64(disk.TotalSpace) / float64(allDiskSpace) * float64(f.lruCapacity))
+		spaces := make([]int64, len(disks))
+		for i, disk := range disks {
+			spaces[i] = disk.TotalSpace
+		}
+		capacities := splitLruCapacityByDiskSpace(f.lruCapacity, spaces)
+		for i, disk := range disks {
+			disk.Capacity = capacities[i]
 		}
 		f.disks = disks
 	}
@@ -517,7 +528,7 @@ func (f *FlashNode) parseConfig(cfg *config.Config) (err error) {
 	f.limitRead = util.NewIOLimiterEx(f.diskReadFlow, f.diskReadIocc*len(f.disks), f.diskReadIoFactorFlow, _defaultFlashLimitHangTimeout)
 	lruFhCapacity := cfg.GetInt(cfgLruFhCapacity)
 	if lruFhCapacity <= 0 || lruFhCapacity >= 1000000 {
-		lruFhCapacity = _defaultLRUFhCapacity
+		lruFhCapacity = DefaultLRUFhCapacity
 	}
 	f.lruFhCapacity = lruFhCapacity
 	diskUnavailableCbErrorCount := cfg.GetInt64(cfgDiskUnavailableCbErrorCount)
@@ -754,6 +765,62 @@ func (f *FlashNode) setReadRps(readRps int64) {
 	f.readRps = newReadRps
 	f.readLimiter.SetLimit(rate.Limit(newReadRps))
 	f.readLimiter.SetBurst(2 * newReadRps)
+}
+
+func (f *FlashNode) setLruCapacity(total int) {
+	if total <= 0 || f.cacheEngine == nil {
+		return
+	}
+	if f.lruCapacity == total {
+		return
+	}
+	if len(f.disks) == 0 {
+		return
+	}
+	f.lruCapacity = total
+	if f.enableTmpfs && len(f.disks) == 1 {
+		f.disks[0].Capacity = total
+		cachePath := path.Join(f.memDataPath, cachengine.DefaultCacheDirName)
+		if err := f.cacheEngine.SetDiskCacheCapacity(cachePath, total); err != nil {
+			log.LogWarnf("FlashNode set lruCapacity on %s failed: %v", cachePath, err)
+		}
+		log.LogInfof("FlashNode set lruCapacity from local config to %d (tmpfs)", total)
+		return
+	}
+	var allDiskSpace int64
+	for _, disk := range f.disks {
+		allDiskSpace += disk.TotalSpace
+	}
+	if allDiskSpace <= 0 {
+		return
+	}
+	spaces := make([]int64, len(f.disks))
+	for i, disk := range f.disks {
+		spaces[i] = disk.TotalSpace
+	}
+	capacities := splitLruCapacityByDiskSpace(total, spaces)
+	for i, disk := range f.disks {
+		capacity := capacities[i]
+		disk.Capacity = capacity
+		cachePath := path.Join(disk.Path, cachengine.DefaultCacheDirName)
+		log.LogInfof("FlashNode set disk %v lruCapacity to %d", cachePath, capacity)
+		if err := f.cacheEngine.SetDiskCacheCapacity(cachePath, capacity); err != nil {
+			log.LogWarnf("FlashNode set lruCapacity on %s failed: %v", cachePath, err)
+		}
+	}
+	log.LogInfof("FlashNode set lruCapacity to %d", total)
+}
+
+func (f *FlashNode) setLruFhCapacity(capacity int) {
+	if capacity <= 0 || capacity >= 1000000 || f.cacheEngine == nil {
+		return
+	}
+	if f.lruFhCapacity == capacity {
+		return
+	}
+	f.lruFhCapacity = capacity
+	f.cacheEngine.SetFhCacheCapacity(capacity)
+	log.LogInfof("FlashNode set lruFhCapacity to %d", capacity)
 }
 
 func (f *FlashNode) setConnectionLimit(limit int64) {
