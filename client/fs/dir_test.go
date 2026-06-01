@@ -10,12 +10,11 @@ package fs
 
 import (
 	"context"
-<<<<<<< HEAD
 	"errors"
-=======
 	"encoding/json"
->>>>>>> fd4086858 (feat(metanode): introduce async extents list operation and enhance extents handling. #1001014271)
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"sync"
 	"reflect"
