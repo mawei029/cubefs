@@ -339,6 +339,7 @@ const (
 	OpMetaAsyncLinkInode         uint8 = 0x95 // Async version of OpMetaLinkInode
 	OpMetaAsyncUpdateDentry      uint8 = 0x96 // Async version of OpMetaUpdateDentry
 	OpMetaAsyncBatchDeleteDentry uint8 = 0x97 // Async version of OpMetaBatchDeleteDentry
+	OpMetaAsyncExtentsList       uint8 = 0x98 // Async version of OpMetaExtentsList
 )
 
 // GOpInfo maps operation names to operation codes for metanode operations
@@ -434,6 +435,7 @@ var GOpInfo map[string]uint8 = map[string]uint8{
 	"metaasyncdeleteentry":      OpMetaAsyncDeleteDentry,
 	"metaasyncupdatedentry":     OpMetaAsyncUpdateDentry,
 	"metaasyncbatchdeleteentry": OpMetaAsyncBatchDeleteDentry,
+	"metaasyncextentslist":      OpMetaAsyncExtentsList,
 	"metaasyncunlinkinode":      OpMetaAsyncUnlinkInode,
 	"metaasyncevictinode":       OpMetaAsyncEvictInode,
 	"metaasynclinkinode":        OpMetaAsyncLinkInode,
@@ -948,6 +950,8 @@ func (p *Packet) GetOpMsg() (m string) {
 		m = "OpMetaAsyncUpdateDentry"
 	case OpMetaAsyncBatchDeleteDentry:
 		m = "OpMetaAsyncBatchDeleteDentry"
+	case OpMetaAsyncExtentsList:
+		m = "OpMetaAsyncExtentsList"
 	case OpQuotaAsyncCreateDentry:
 		m = "OpQuotaAsyncCreateDentry"
 	case OpFlashNodeCachePutBlock:

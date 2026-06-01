@@ -32,6 +32,30 @@ func newSuperDirDirtyHarness(metaAccel bool) *Super {
 	}
 }
 
+func TestMetaCacheAccelerationInitializesReadDirPool(t *testing.T) {
+	t.Parallel()
+	s := &Super{metaCacheAcceleration: true}
+	s.initReadDirPool()
+	require.NotNil(t, s.readDirPool)
+
+	done := make(chan struct{})
+	s.readDirPool.Run(func() {
+		close(done)
+	})
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("readDirPool task did not run")
+	}
+}
+
+func TestMetaCacheAccelerationOffLeavesReadDirPoolNil(t *testing.T) {
+	t.Parallel()
+	s := &Super{metaCacheAcceleration: false}
+	s.initReadDirPool()
+	require.Nil(t, s.readDirPool)
+}
+
 func TestReadDirAllCacheBegin_metaAccelerationOff(t *testing.T) {
 	t.Parallel()
 	s := newSuperDirDirtyHarness(false)
