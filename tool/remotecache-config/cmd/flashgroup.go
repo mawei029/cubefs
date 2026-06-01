@@ -15,9 +15,8 @@ import (
 const _flashgroupID = " [FlashGroupID]"
 
 type slotInfo struct {
-	fgID    uint64
-	slot    uint32
-	percent float64
+	fgID uint64
+	slot uint32
 }
 
 func newFlashGroupCmd(client *master.MasterClient) *cobra.Command {
@@ -32,6 +31,8 @@ func newFlashGroupCmd(client *master.MasterClient) *cobra.Command {
 		newCmdFlashGroupRemove(client),
 		newCmdFlashGroupNodeAdd(client),
 		newCmdFlashGroupNodeRemove(client),
+		newCmdFlashGroupAddSlots(client),
+		newCmdFlashGroupSuggestSlots(client),
 		newCmdFlashGroupGet(client),
 		newCmdFlashGroupList(client),
 		newCmdFlashGroupClient(client),
@@ -286,6 +287,246 @@ func newCmdFlashGroupNodeRemove(client *master.MasterClient) *cobra.Command {
 	return cmd
 }
 
+func newCmdFlashGroupAddSlots(client *master.MasterClient) *cobra.Command {
+	var optSlots string
+	var name string
+	cmd := &cobra.Command{
+		Use:   "addSlots" + _flashgroupID,
+		Short: "add specified slots to a flash group",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) (err error) {
+			flashGroupID, err := parseFlashGroupID(args[0])
+			if err != nil {
+				return
+			}
+			if optSlots == "" {
+				err = fmt.Errorf("param slots is required")
+				return
+			}
+			if name == "" {
+				name = proto.DefaultTopoName
+			}
+			fgView, err := client.AdminAPI().FlashGroupAddSlotsByName(name, flashGroupID, optSlots)
+			if err != nil {
+				return
+			}
+			stdoutln(formatFlashGroupView(&fgView))
+			return
+		},
+	}
+	cmd.Flags().StringVarP(&name, "topoName", "n", proto.DefaultTopoName, "flash topology name")
+	cmd.Flags().StringVar(&optSlots, "slots", "", "slots to add, e.g., --slots=1,2,3")
+	return cmd
+}
+
+func newCmdFlashGroupSuggestSlots(client *master.MasterClient) *cobra.Command {
+	var optCount int
+	var optErrorRate float64
+	var name string
+	cmd := &cobra.Command{
+		Use:   "suggestSlots" + _flashgroupID,
+		Short: "suggest slots to add for a given flash group to balance distribution",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) (err error) {
+			targetFgID, err := parseFlashGroupID(args[0])
+			if err != nil {
+				return
+			}
+
+			if name == "" {
+				name = proto.DefaultTopoName
+			}
+			fgView, err := client.AdminAPI().ListFlashGroupsByName(name, false)
+			if err != nil {
+				return
+			}
+
+			foundTarget := false
+			for _, fg := range fgView.FlashGroups {
+				if fg.ID == targetFgID {
+					foundTarget = true
+					break
+				}
+			}
+			if !foundTarget {
+				err = fmt.Errorf("target flash group %d not found", targetFgID)
+				return
+			}
+
+			type slotRange struct {
+				fgID    uint64
+				slot    uint32
+				start   uint32
+				end     uint32
+				percent float64
+			}
+
+			slots := make([]slotInfo, 0)
+			activeFGs := 0
+			for _, fg := range fgView.FlashGroups {
+				if fg.Status == proto.FlashGroupStatus_Active {
+					activeFGs++
+					for _, slot := range fg.Slots {
+						slots = append(slots, slotInfo{
+							fgID: fg.ID,
+							slot: slot,
+						})
+					}
+				}
+			}
+
+			if activeFGs == 0 || len(slots) == 0 {
+				stdoutln("No active flash groups or slots found to suggest from.")
+				return nil
+			}
+
+			sort.Slice(slots, func(i, j int) bool {
+				return slots[i].slot < slots[j].slot
+			})
+
+			fgTotalPercent := make(map[uint64]float64)
+			var allRanges []slotRange
+
+			n := len(slots)
+			for i := 0; i < n; i++ {
+				curr := slots[i]
+				prev := slots[(i-1+n)%n]
+
+				var dist uint64
+				if i == 0 {
+					dist = uint64(curr.slot) + (uint64(math.MaxUint32) - uint64(prev.slot)) + 1
+				} else {
+					dist = uint64(curr.slot) - uint64(prev.slot)
+				}
+
+				pct := float64(dist) * 100 / 4294967296.0
+				startSlot := prev.slot + 1
+				if i == 0 && prev.slot == math.MaxUint32 {
+					startSlot = 0
+				}
+
+				sr := slotRange{
+					fgID:    curr.fgID,
+					slot:    curr.slot,
+					start:   startSlot,
+					end:     curr.slot,
+					percent: pct,
+				}
+				allRanges = append(allRanges, sr)
+				fgTotalPercent[curr.fgID] += pct
+			}
+
+			avgPct := 100.0 / float64(activeFGs)
+			threshold := avgPct * (1.0 + optErrorRate)
+			minTakePct := optErrorRate * 100
+
+			var candidateRanges []slotRange
+			for _, r := range allRanges {
+				if fgTotalPercent[r.fgID] > threshold && r.fgID != targetFgID {
+					candidateRanges = append(candidateRanges, r)
+				}
+			}
+
+			if len(candidateRanges) == 0 {
+				stdoutln("No suitable large flash groups found to take slots from.")
+				return nil
+			}
+
+			sort.Slice(candidateRanges, func(i, j int) bool {
+				return candidateRanges[i].percent > candidateRanges[j].percent
+			})
+
+			var suggestions []uint32
+			tbl := table{{"From_FG", "Interval_Start", "Interval_End", "Original_Percent", "Taken_Percent", "Remain_Percent", "Suggested_Slot"}}
+
+			currentPct := fgTotalPercent[targetFgID]
+			for i := 0; i < len(candidateRanges); i++ {
+				if len(suggestions) >= optCount {
+					break
+				}
+				neededPct := threshold - currentPct
+				if neededPct <= minTakePct {
+					break
+				}
+
+				r := candidateRanges[i]
+				maxTakeFromSource := fgTotalPercent[r.fgID] - threshold
+				if maxTakeFromSource <= minTakePct {
+					continue
+				}
+
+				takePct := neededPct
+				if takePct > maxTakeFromSource {
+					takePct = maxTakeFromSource
+				}
+				if takePct > r.percent*0.5 {
+					takePct = r.percent * 0.5
+				}
+				if takePct <= minTakePct {
+					continue
+				}
+
+				var dist uint64
+				if r.end < r.start {
+					dist = uint64(r.end) + (uint64(math.MaxUint32) - uint64(r.start)) + 1
+				} else {
+					dist = uint64(r.end) - uint64(r.start) + 1
+				}
+				offset := uint64((takePct / 100.0) * 4294967296.0)
+				if offset == 0 {
+					offset = 1
+				}
+				if offset >= dist {
+					offset = dist - 1
+				}
+				if offset == 0 {
+					continue
+				}
+
+				suggestSlot := uint64(r.start) + offset - 1
+				if suggestSlot > math.MaxUint32 {
+					suggestSlot -= math.MaxUint32 + 1
+				}
+				suggestions = append(suggestions, uint32(suggestSlot))
+
+				addedPct := float64(offset) * 100.0 / 4294967296.0
+				currentPct += addedPct
+				fgTotalPercent[r.fgID] -= addedPct
+				remainPct := r.percent - addedPct
+
+				tbl = tbl.append(arow(r.fgID, r.start, r.end, fmt.Sprintf("%0.5f%%", r.percent), fmt.Sprintf("%0.5f%%", addedPct), fmt.Sprintf("%0.5f%%", remainPct), uint32(suggestSlot)))
+			}
+
+			if len(suggestions) == 0 {
+				stdoutln("Target FlashGroup already has enough percent, no slots needed to be added.")
+				return nil
+			}
+
+			stdoutlnf("Target FlashGroup: %d, Percent: %0.5f%% -> %0.5f%%", targetFgID, fgTotalPercent[targetFgID], currentPct)
+			stdoutlnf("Average Percent: %0.5f%%, Threshold to take from: %0.5f%%", avgPct, threshold)
+			stdoutln("\n[Suggested Slots to Add]")
+			stdoutln(alignTable(tbl...))
+
+			var strSlots []string
+			for _, s := range suggestions {
+				strSlots = append(strSlots, fmt.Sprintf("%d", s))
+			}
+			stdoutln("\nCommand to execute:")
+			if name == proto.DefaultTopoName {
+				stdoutlnf("remotecache-config flashgroup addSlots %d --slots=%s", targetFgID, strings.Join(strSlots, ","))
+			} else {
+				stdoutlnf("remotecache-config flashgroup addSlots %d --slots=%s -n %s", targetFgID, strings.Join(strSlots, ","), name)
+			}
+
+			return
+		},
+	}
+	cmd.Flags().StringVarP(&name, "topoName", "n", proto.DefaultTopoName, "flash topology name")
+	cmd.Flags().IntVarP(&optCount, "count", "c", 8, "number of slots to suggest")
+	cmd.Flags().Float64VarP(&optErrorRate, "errorRate", "e", 0.0005, "allowed error rate over average (e.g. 0.05 for 5% over avg)")
+	return cmd
+}
+
 func newCmdFlashGroupGet(client *master.MasterClient) *cobra.Command {
 	var name string
 	cmd := &cobra.Command{
@@ -383,27 +624,66 @@ func newCmdFlashGroupList(client *master.MasterClient) *cobra.Command {
 			}
 			stdoutln(alignTable(tbl...))
 
+			printGroupedSlots := func(title string, sl []*slotInfo) {
+				if len(sl) == 0 {
+					return
+				}
+				stdoutln(title + ":")
+				type slotRange struct {
+					slot    uint32
+					start   uint32
+					end     uint32
+					percent float64
+				}
+				fgSlots := make(map[uint64][]slotRange)
+				fgTotalPercent := make(map[uint64]float64)
+				n := len(sl)
+				for i := 0; i < n; i++ {
+					curr := sl[i]
+					prev := sl[(i-1+n)%n]
+
+					var dist uint64
+					if i == 0 {
+						dist = uint64(curr.slot) + (uint64(math.MaxUint32) - uint64(prev.slot)) + 1
+					} else {
+						dist = uint64(curr.slot) - uint64(prev.slot)
+					}
+
+					pct := float64(dist) * 100 / 4294967296.0
+					startSlot := prev.slot + 1
+					if i == 0 && prev.slot == math.MaxUint32 {
+						startSlot = 0
+					}
+
+					fgSlots[curr.fgID] = append(fgSlots[curr.fgID], slotRange{
+						slot:    curr.slot,
+						start:   startSlot,
+						end:     curr.slot,
+						percent: pct,
+					})
+					fgTotalPercent[curr.fgID] += pct
+				}
+
+				for _, fg := range fgView.FlashGroups {
+					if len(fgSlots[fg.ID]) == 0 {
+						continue
+					}
+					stdoutlnf("FlashGroup: %d, Total Percent: %0.5f%%", fg.ID, fgTotalPercent[fg.ID])
+					for _, sr := range fgSlots[fg.ID] {
+						stdoutlnf("  slot:%d range:[%d, %d] percent:%0.5f%%", sr.slot, sr.start, sr.end, sr.percent)
+					}
+				}
+			}
+
 			sort.Slice(slots, func(i, j int) bool {
 				return slots[i].slot < slots[j].slot
 			})
-			stdoutln("Slots:")
-			for i, info := range slots {
-				if i < len(slots)-1 {
-					info.percent = float64(slots[i+1].slot-info.slot) * 100 / math.MaxUint32
-				} else {
-					info.percent = float64(math.MaxUint32-info.slot) * 100 / math.MaxUint32
-				}
-				stdoutlnf("num:%d slot:%d fg:%d percent:%0.5f%%", i+1, info.slot, info.fgID, info.percent)
-			}
-			stdoutln("ReservedSlots:")
-			for i, info := range reservedSlots {
-				if i < len(reservedSlots)-1 {
-					info.percent = float64(reservedSlots[i+1].slot-info.slot) * 100 / math.MaxUint32
-				} else {
-					info.percent = float64(math.MaxUint32-info.slot) * 100 / math.MaxUint32
-				}
-				stdoutlnf("num:%d slot:%d fg:%d percent:%0.5f%%", i+1, info.slot, info.fgID, info.percent)
-			}
+			printGroupedSlots("Slots", slots)
+
+			sort.Slice(reservedSlots, func(i, j int) bool {
+				return reservedSlots[i].slot < reservedSlots[j].slot
+			})
+			printGroupedSlots("ReservedSlots", reservedSlots)
 			return
 		},
 	}

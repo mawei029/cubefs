@@ -386,6 +386,69 @@ func (t *FlashNodeTopology) createFlashGroup(fgID uint64, syncAddFlashGroupFunc 
 	return
 }
 
+func (t *FlashNodeTopology) AddFlashGroupSlots(fgID uint64, syncUpdateFlashGroupFunc SyncUpdateFlashGroupFunc, setSlots []uint32) (flashGroup *FlashGroup, err error) {
+	if len(setSlots) == 0 {
+		return nil, fmt.Errorf("slots parameter cannot be empty")
+	}
+
+	t.createFlashGroupLock.Lock()
+	defer t.createFlashGroupLock.Unlock()
+
+	val, ok := t.flashGroupMap.Load(fgID)
+	if !ok {
+		return nil, proto.ErrorNoFlashGroup
+	}
+	flashGroup = val.(*FlashGroup)
+	if flashGroup.GetSlotStatus() != proto.SlotStatus_Completed {
+		return nil, fmt.Errorf("flashGroup %v slotStatus is %v, addSlots not allowed", fgID, flashGroup.GetSlotStatus())
+	}
+
+	// verify that slots are not already assigned to another group
+	for _, slot := range setSlots {
+		if ownerID, in := t.slotsMap[slot]; in {
+			if ownerID == fgID {
+				// already in this group, continue
+				continue
+			}
+			return nil, fmt.Errorf("slot %v already belongs to flashGroup %v", slot, ownerID)
+		}
+	}
+	flashGroup.lock.Lock()
+	// Create a unique set of all slots to add
+	slotSet := make(map[uint32]struct{})
+	for _, slot := range setSlots {
+		slotSet[slot] = struct{}{}
+	}
+	// Check if already in group
+	for _, slot := range flashGroup.Slots {
+		delete(slotSet, slot)
+	}
+
+	if len(slotSet) == 0 {
+		flashGroup.lock.Unlock()
+		return flashGroup, nil // All slots already in group
+	}
+
+	oldSlots := make([]uint32, len(flashGroup.Slots))
+	copy(oldSlots, flashGroup.Slots)
+
+	for slot := range slotSet {
+		flashGroup.Slots = append(flashGroup.Slots, slot)
+	}
+	sort.Slice(flashGroup.Slots, func(i, j int) bool { return flashGroup.Slots[i] < flashGroup.Slots[j] })
+	if err = syncUpdateFlashGroupFunc(flashGroup); err != nil {
+		flashGroup.Slots = oldSlots
+		flashGroup.lock.Unlock()
+		return nil, err
+	}
+	for slot := range slotSet {
+		t.slotsMap[slot] = fgID
+	}
+	flashGroup.lock.Unlock()
+	t.UpdateClientCache()
+	return flashGroup, nil
+}
+
 func (t *FlashNodeTopology) DettachFlashGroup(flashGroup *FlashGroup, syncDeleteFlashGroupFunc SyncDeleteFlashGroupFunc) (err error) {
 	t.createFlashGroupLock.Lock()
 	defer t.createFlashGroupLock.Unlock()

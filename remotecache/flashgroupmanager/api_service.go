@@ -385,6 +385,54 @@ func (m *FlashGroupManager) createFlashGroup(w http.ResponseWriter, r *http.Requ
 	sendOkReply(w, r, newSuccessHTTPReply(flashGroup.GetAdminView()))
 }
 
+func (m *FlashGroupManager) addFlashGroupSlots(w http.ResponseWriter, r *http.Request) {
+	var (
+		err          error
+		flashGroupID common.Uint
+		setSlots     []uint32
+		flashTopo    *FlashNodeTopology
+	)
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.AdminFlashGroupAddSlots))
+	defer func() {
+		doStatAndMetric(proto.AdminFlashGroupAddSlots, metric, err, nil)
+	}()
+
+	if err = parseArgs(r, flashGroupID.ID()); err != nil {
+		sendErrReply(w, r, newErrHTTPReply(err))
+		return
+	}
+
+	if setSlots, err = getSetSlots(r); err != nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
+
+	var topoName string
+	if flashTopo, err = m.cluster.PeekFlashTopoByFgId(flashGroupID.V); err != nil {
+		topoName = r.FormValue(nameKey)
+		if topoName == "" {
+			topoName = proto.DefaultTopoName
+		}
+	} else {
+		topoName = flashTopo.Name
+	}
+
+	if topoName == proto.IdleTopoName {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: "idle topo doesn't support this option"})
+		return
+	}
+	if flashTopo, err = m.cluster.PeekFlashTopo(topoName); err == nil && flashTopo.IsMarkDelete() {
+		sendErrReply(w, r, newErrHTTPReply(fmt.Errorf("topo[%v] is markDeleted, operation not allowed", topoName)))
+		return
+	}
+	flashGroup, err := m.cluster.addFlashGroupSlots(topoName, flashGroupID.V, setSlots)
+	if err != nil {
+		sendErrReply(w, r, newErrHTTPReply(err))
+		return
+	}
+	sendOkReply(w, r, newSuccessHTTPReply(flashGroup.GetAdminView()))
+}
+
 func (m *FlashGroupManager) removeFlashGroup(w http.ResponseWriter, r *http.Request) {
 	var (
 		err         error

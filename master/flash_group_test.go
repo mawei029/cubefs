@@ -64,6 +64,7 @@ func testFlashGroup(t *testing.T) {
 	t.Run("Node", testFlashGroupNode)
 	t.Run("Get", testFlashGroupGet)
 	t.Run("List", testFlashGroupList)
+	t.Run("AddSlots", testFlashGroupAddSlots)
 	t.Run("Client", testFlashGroupClient)
 }
 
@@ -185,4 +186,37 @@ func testFlashGroupClient(t *testing.T) {
 	fgs, err := mc.AdminAPI().ClientFlashGroups(proto.DefaultTopoName)
 	require.NoError(t, err)
 	t.Logf("%+v", fgs)
+}
+
+func testFlashGroupAddSlots(t *testing.T) {
+	groups := createFlashGroups(t)
+	defer removeFlashGroups(t, groups)
+	g := groups[0]
+
+	// Test add slots via FlashGroupAddSlotsByName (default topo)
+	fgView, err := mc.AdminAPI().FlashGroupAddSlotsByName(proto.DefaultTopoName, g.ID, "500,600")
+	require.NoError(t, err)
+	require.NotNil(t, fgView)
+	// Verify slots were added: original slot + new slots
+	require.Contains(t, fgView.Slots, uint32(500))
+	require.Contains(t, fgView.Slots, uint32(600))
+
+	// Test add slots via FlashGroupAddSlots shorthand
+	fgView2, err := mc.AdminAPI().FlashGroupAddSlots(g.ID, "700")
+	require.NoError(t, err)
+	require.NotNil(t, fgView2)
+	require.Contains(t, fgView2.Slots, uint32(700))
+
+	// Test add slot that already belongs to another group — should fail
+	_, err = mc.AdminAPI().FlashGroupAddSlots(groups[2].ID, "500")
+	require.Error(t, err)
+
+	// Test add nonexistent group ID — should fail
+	_, err = mc.AdminAPI().FlashGroupAddSlots(999999, "1000")
+	require.Error(t, err)
+
+	// Test add slot already in same group — should succeed (no-op)
+	fgView3, err := mc.AdminAPI().FlashGroupAddSlots(g.ID, "500")
+	require.NoError(t, err)
+	require.Contains(t, fgView3.Slots, uint32(500))
 }

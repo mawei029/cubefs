@@ -1494,6 +1494,16 @@ func (api *AdminAPI) FlashGroupRemoveFlashNodeByName(name string, flashGroupID u
 	return api.flashGroupFlashNodesByName(name, proto.AdminFlashGroupNodeRemove, flashGroupID, count, zoneName, addr)
 }
 
+func (api *AdminAPI) FlashGroupAddSlots(flashGroupID uint64, slots string) (fgView proto.FlashGroupAdminView, err error) {
+	return api.FlashGroupAddSlotsByName(proto.DefaultTopoName, flashGroupID, slots)
+}
+
+func (api *AdminAPI) FlashGroupAddSlotsByName(name string, flashGroupID uint64, slots string) (fgView proto.FlashGroupAdminView, err error) {
+	err = api.mc.requestWith(&fgView, newRequest(post, proto.AdminFlashGroupAddSlots).Header(api.h).
+		Param(anyParam{"id", flashGroupID}, anyParam{"name", name}, anyParam{"slots", slots}))
+	return
+}
+
 func (api *AdminAPI) GetFlashGroup(flashGroupID uint64) (fgView proto.FlashGroupAdminView, err error) {
 	err = api.mc.requestWith(&fgView, newRequest(get, proto.AdminFlashGroupGet).
 		Header(api.h).addParamAny("id", flashGroupID))

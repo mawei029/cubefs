@@ -278,6 +278,23 @@ func (c *Cluster) RemoveFlashNodesFromFlashGroup(srcTop, idleTop *FlashNodeTopol
 	return
 }
 
+func (c *Cluster) addFlashGroupSlots(topoName string, id uint64, setSlots []uint32) (fg *FlashGroup, err error) {
+	defer func() {
+		if err != nil {
+			log.LogErrorf("action[addFlashGroupSlots],clusterID[%v] topoName[%v] id:%v err:%v ", c.Name, topoName, id, err.Error())
+		}
+	}()
+	flashTopo, err := c.PeekFlashTopo(topoName)
+	if err != nil {
+		return nil, err
+	}
+	fg, err = flashTopo.AddFlashGroupSlots(id, c.syncUpdateFlashGroup, setSlots)
+	if err == nil {
+		log.LogInfof("action[addFlashGroupSlots],clusterID[%v] topoName[%v] id:%v addedSlots:%v totalSlots:%v success", c.Name, topoName, id, setSlots, fg.GetSlots())
+	}
+	return
+}
+
 func (c *Cluster) peekFlashNode(topoName, addr string) (flashNode *FlashNode, err error) {
 	flashTopo, err := c.PeekFlashTopo(topoName)
 	if err != nil {

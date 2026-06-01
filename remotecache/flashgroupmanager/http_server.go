@@ -80,6 +80,7 @@ func (m *FlashGroupManager) registerAPIRoutes(router *mux.Router) {
 	router.NewRoute().Methods(http.MethodGet, http.MethodPost).Path(proto.AdminFlashGroupRemove).HandlerFunc(m.removeFlashGroup)
 	router.NewRoute().Methods(http.MethodGet, http.MethodPost).Path(proto.AdminFlashGroupNodeAdd).HandlerFunc(m.flashGroupAddFlashNode)
 	router.NewRoute().Methods(http.MethodGet, http.MethodPost).Path(proto.AdminFlashGroupNodeRemove).HandlerFunc(m.flashGroupRemoveFlashNode)
+	router.NewRoute().Methods(http.MethodGet, http.MethodPost).Path(proto.AdminFlashGroupAddSlots).HandlerFunc(m.addFlashGroupSlots)
 	router.NewRoute().Methods(http.MethodGet).Path(proto.AdminFlashGroupGet).HandlerFunc(m.getFlashGroup)
 	router.NewRoute().Methods(http.MethodGet).Path(proto.AdminFlashGroupList).HandlerFunc(m.listFlashGroups)
 	router.NewRoute().Methods(http.MethodGet).Path(proto.ClientFlashGroups).HandlerFunc(m.clientFlashGroups)

@@ -692,3 +692,97 @@ func TestFlashGroupManagerUpdateFlashTopoErrorsBeforeSync(t *testing.T) {
 	reply = runAPIServiceRequest(t, manager.updateFlashTopo, "name=topo-a&flashKeyFlowLimit=1")
 	require.NotEqualValues(t, proto.ErrCodeSuccess, reply.Code)
 }
+
+// --- addFlashGroupSlots handler tests ---
+
+func TestAPIService_addFlashGroupSlots_ParseArgsError(t *testing.T) {
+	manager := newAPIServiceTestManager(t)
+
+	// Missing id parameter
+	reply := runAPIServiceRequest(t, manager.addFlashGroupSlots, "slots=300")
+	require.NotEqualValues(t, proto.ErrCodeSuccess, reply.Code)
+
+	// Invalid id parameter (non-numeric)
+	reply = runAPIServiceRequest(t, manager.addFlashGroupSlots, "id=abc&slots=300")
+	require.NotEqualValues(t, proto.ErrCodeSuccess, reply.Code)
+}
+
+func TestAPIService_addFlashGroupSlots_GetSetSlotsError(t *testing.T) {
+	manager := newAPIServiceTestManager(t)
+
+	reply := runAPIServiceRequest(t, manager.addFlashGroupSlots, "id=101&slots=not-a-number")
+	require.NotEqualValues(t, proto.ErrCodeSuccess, reply.Code)
+	require.Contains(t, reply.Msg, "strconv")
+}
+
+func TestAPIService_addFlashGroupSlots_IdleTopo(t *testing.T) {
+	manager := newAPIServiceTestManager(t)
+
+	// Use a nonexistent fgID so PeekFlashTopoByFgId fails, falling back to name=idle
+	reply := runAPIServiceRequest(t, manager.addFlashGroupSlots, "id=9999&slots=300&name=idle")
+	require.NotEqualValues(t, proto.ErrCodeSuccess, reply.Code)
+	require.Contains(t, reply.Msg, "idle topo doesn't support")
+}
+
+func TestAPIService_addFlashGroupSlots_MarkDeletedTopo(t *testing.T) {
+	manager := newAPIServiceTestManager(t)
+
+	// Mark the default topo as markDeleted
+	topo, err := manager.cluster.PeekFlashTopo(proto.DefaultTopoName)
+	require.NoError(t, err)
+	atomic.StoreUint32(&topo.Status, proto.TopoStatusMarkDelete)
+
+	reply := runAPIServiceRequest(t, manager.addFlashGroupSlots, "id=101&slots=300")
+	require.NotEqualValues(t, proto.ErrCodeSuccess, reply.Code)
+	require.Contains(t, reply.Msg, "markDeleted")
+}
+
+func TestAPIService_addFlashGroupSlots_Success(t *testing.T) {
+	manager := newAPIServiceTestManager(t)
+
+	reply := runAPIServiceRequest(t, manager.addFlashGroupSlots, "id=101&slots=300,400")
+	require.EqualValues(t, proto.ErrCodeSuccess, reply.Code)
+
+	fgView := decodeAPIServiceReplyData[proto.FlashGroupAdminView](t, reply)
+	require.Contains(t, fgView.Slots, uint32(300))
+	require.Contains(t, fgView.Slots, uint32(400))
+}
+
+func TestAPIService_addFlashGroupSlots_NonexistentGroup(t *testing.T) {
+	manager := newAPIServiceTestManager(t)
+
+	reply := runAPIServiceRequest(t, manager.addFlashGroupSlots, "id=999&slots=300")
+	require.NotEqualValues(t, proto.ErrCodeSuccess, reply.Code)
+}
+
+func TestAPIService_addFlashGroupSlots_SlotConflict(t *testing.T) {
+	manager := newAPIServiceTestManager(t)
+
+	// Create a second group in the default topo that owns slot 500
+	defaultTopo, err := manager.cluster.PeekFlashTopo(proto.DefaultTopoName)
+	require.NoError(t, err)
+	fg2 := newFlashGroup(102, []uint32{500}, proto.SlotStatus_Completed, nil, 1,
+		proto.FlashGroupStatus_Active, 1, proto.DefaultTopoName, proto.DefaultRegion)
+	defaultTopo.flashGroupMap.Store(fg2.ID, fg2)
+	defaultTopo.slotsMap[500] = fg2.ID
+
+	// Try to add slot 500 (owned by group 102) to group 101 — should fail
+	reply := runAPIServiceRequest(t, manager.addFlashGroupSlots, "id=101&slots=500")
+	require.NotEqualValues(t, proto.ErrCodeSuccess, reply.Code)
+	require.Contains(t, reply.Msg, "already belongs")
+}
+
+func TestAPIService_addFlashGroupSlots_EmptySlots(t *testing.T) {
+	manager := newAPIServiceTestManager(t)
+
+	reply := runAPIServiceRequest(t, manager.addFlashGroupSlots, "id=101")
+	require.NotEqualValues(t, proto.ErrCodeSuccess, reply.Code)
+}
+
+func TestAPIService_addFlashGroupSlots_TopoNameFromFgId(t *testing.T) {
+	manager := newAPIServiceTestManager(t)
+
+	// When PeekFlashTopoByFgId succeeds, topoName should be resolved from fgID
+	reply := runAPIServiceRequest(t, manager.addFlashGroupSlots, "id=101&slots=300")
+	require.EqualValues(t, proto.ErrCodeSuccess, reply.Code)
+}

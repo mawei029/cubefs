@@ -158,6 +158,57 @@ func (m *Server) createFlashGroup(w http.ResponseWriter, r *http.Request) {
 	sendOkReply(w, r, newSuccessHTTPReply(flashGroup.GetAdminView()))
 }
 
+func (m *Server) addFlashGroupSlots(w http.ResponseWriter, r *http.Request) {
+	var (
+		err          error
+		flashGroupID common.Uint
+		setSlots     []uint32
+		flashTopo    *flashgroupmanager.FlashNodeTopology
+	)
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.AdminFlashGroupAddSlots))
+	defer func() {
+		doStatAndMetric(proto.AdminFlashGroupAddSlots, metric, err, nil)
+	}()
+
+	if err = parseArgs(r, flashGroupID.ID()); err != nil {
+		sendErrReply(w, r, newErrHTTPReply(err))
+		return
+	}
+
+	if setSlots, err = getSetSlots(r); err != nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
+
+	var topoName string
+	if flashTopo, err = m.cluster.PeekFlashTopoByFgId(flashGroupID.V); err != nil {
+		topoName = r.FormValue(nameKey)
+		if topoName == "" {
+			topoName = proto.DefaultTopoName
+		}
+	} else {
+		topoName = flashTopo.Name
+	}
+	if topoName == proto.IdleTopoName {
+		err = fmt.Errorf("idle topo doesn't support this option")
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
+
+	// forbid operations on markDeleted topology
+	if flashTopo, err = m.cluster.PeekFlashTopo(topoName); err == nil && flashTopo.IsMarkDelete() {
+		sendErrReply(w, r, newErrHTTPReply(fmt.Errorf("topo[%v] is markDeleted, operation not allowed", topoName)))
+		return
+	}
+
+	flashGroup, err := m.cluster.addFlashGroupSlots(flashGroupID.V, setSlots, topoName)
+	if err != nil {
+		sendErrReply(w, r, newErrHTTPReply(err))
+		return
+	}
+	sendOkReply(w, r, newSuccessHTTPReply(flashGroup.GetAdminView()))
+}
+
 func (c *Cluster) createFlashGroup(setSlots []uint32, setWeight uint32, gradualFlag bool,
 	step uint32, topoName string,
 ) (fg *flashgroupmanager.FlashGroup, err error) {
@@ -178,6 +229,25 @@ func (c *Cluster) createFlashGroup(setSlots []uint32, setWeight uint32, gradualF
 
 	fg, err = flashTopo.CreateFlashGroup(id, c.syncUpdateFlashGroup, c.syncAddFlashGroup, setSlots, setWeight, gradualFlag, step)
 	log.LogInfof("action[addFlashGroup],clusterID[%v] id:%v Weight:%v Slots:%v success", c.Name, fg.ID, fg.Weight, fg.GetSlots())
+	return
+}
+
+func (c *Cluster) addFlashGroupSlots(id uint64, setSlots []uint32, topoName string) (fg *flashgroupmanager.FlashGroup, err error) {
+	defer func() {
+		if err != nil {
+			log.LogErrorf("action[addFlashGroupSlots],clusterID[%v] id:%v err:%v ", c.Name, id, err.Error())
+		}
+	}()
+	var flashTopo *flashgroupmanager.FlashNodeTopology
+	flashTopo, err = c.PeekFlashTopo(topoName)
+	if err != nil {
+		return
+	}
+
+	fg, err = flashTopo.AddFlashGroupSlots(id, c.syncUpdateFlashGroup, setSlots)
+	if err == nil {
+		log.LogInfof("action[addFlashGroupSlots],clusterID[%v] id:%v addedSlots:%v totalSlots:%v success", c.Name, id, setSlots, fg.GetSlots())
+	}
 	return
 }
 

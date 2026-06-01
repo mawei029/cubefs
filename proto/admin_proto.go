@@ -369,6 +369,7 @@ const (
 	AdminFlashGroupNodeRemove = "/flashGroup/removeFlashNode"
 	AdminFlashGroupGet        = "/flashGroup/get"
 	AdminFlashGroupList       = "/flashGroup/list"
+	AdminFlashGroupAddSlots   = "/flashGroup/addSlots"
 	ClientFlashGroups         = "/client/flashGroups"
 
 	AdminFlashTopoList            = "/flashTopo/list"
