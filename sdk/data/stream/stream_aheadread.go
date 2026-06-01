@@ -56,16 +56,26 @@ type AheadReadBlock struct {
 	readed      uint32
 }
 
+// aheadReadBlockSize is the per-window cache block size, configurable via
+// the client option aheadReadBlockSizeMB. It is set once at cache creation
+// before any block is allocated, defaulting to util.DefaultAheadReadBlockSize (2MB).
+var aheadReadBlockSize int64 = util.DefaultAheadReadBlockSize
+
 var aheadReadBlockPool = sync.Pool{
 	New: func() interface{} {
 		return &AheadReadBlock{
-			data: make([]byte, util.CacheReadBlockSize),
+			data: make([]byte, atomic.LoadInt64(&aheadReadBlockSize)),
 		}
 	},
 }
 
 func getAheadReadBlock() *AheadReadBlock {
-	return aheadReadBlockPool.Get().(*AheadReadBlock)
+	block := aheadReadBlockPool.Get().(*AheadReadBlock)
+	// guard against a configured size that differs from a pooled block
+	if size := atomic.LoadInt64(&aheadReadBlockSize); int64(cap(block.data)) != size {
+		block.data = make([]byte, size)
+	}
+	return block
 }
 
 func putAheadReadBlock(block *AheadReadBlock) {
@@ -106,6 +116,7 @@ type AheadReadCache struct {
 	enable                bool
 	blockTimeOut          int
 	winCnt                int
+	blockSize             int64
 	availableBlockC       chan struct{}
 	availableBlockCnt     int64
 	totalBlockCnt         int64
@@ -114,23 +125,37 @@ type AheadReadCache struct {
 	creatingBlockCacheMap sync.Map
 }
 
-func NewAheadReadCache(enable bool, totalMem int64, blockTimeOut, winCnt int) *AheadReadCache {
+func NewAheadReadCache(enable bool, totalMem int64, blockTimeOut, winCnt int, blockSize int64) *AheadReadCache {
 	if !enable {
 		return nil
+	}
+	// fall back to the default block size when not configured
+	if blockSize <= 0 {
+		blockSize = util.DefaultAheadReadBlockSize
+	}
+	// publish the block size for the pool allocation before any block is created
+	atomic.StoreInt64(&aheadReadBlockSize, blockSize)
+	// guarantee at least one block so the cache stays usable even when the
+	// configured total memory is smaller than a single block.
+	totalBlockCnt := totalMem / blockSize
+	if totalBlockCnt < 1 {
+		log.LogWarnf("aheadRead totalMem(%v) is smaller than blockSize(%v), clamp totalBlockCnt to 1", totalMem, blockSize)
+		totalBlockCnt = 1
 	}
 	arc := &AheadReadCache{
 		enable:        enable,
 		blockTimeOut:  blockTimeOut,
 		winCnt:        winCnt,
+		blockSize:     blockSize,
 		stopC:         make(chan interface{}),
-		totalBlockCnt: totalMem / util.CacheReadBlockSize,
+		totalBlockCnt: totalBlockCnt,
 	}
 	atomic.StoreInt64(&arc.availableBlockCnt, arc.totalBlockCnt)
 	arc.availableBlockC = make(chan struct{}, arc.availableBlockCnt)
 	for i := int64(0); i < arc.totalBlockCnt; i++ {
 		arc.availableBlockC <- struct{}{}
 	}
-	log.LogInfof("aheadRead enable(%v) totalMem(%v) availableBlockCnt(%v) winCnt(%v)", enable, totalMem, arc.availableBlockCnt, winCnt)
+	log.LogInfof("aheadRead enable(%v) totalMem(%v) availableBlockCnt(%v) winCnt(%v) blockSize(%v)", enable, totalMem, arc.availableBlockCnt, winCnt, blockSize)
 	go arc.checkBlockTimeOut()
 	return arc
 }
@@ -715,7 +740,7 @@ func (s *Streamer) getCurrentExtent(offset int) (ek *proto.ExtentKey) {
 	defer s.extents.RUnlock()
 	s.extents.root.Ascend(func(i btree.Item) bool {
 		e := i.(*proto.ExtentKey)
-		if e.Size < util.CacheReadBlockSize {
+		if e.Size < s.aheadReadBlockSize {
 			return true
 		}
 		ekStart := int(e.FileOffset)

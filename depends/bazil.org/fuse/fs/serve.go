@@ -790,6 +790,9 @@ func (s *Server) LoadFuseContext(fs FS, sockaddr string) error {
 			cn := ContextNodeFromBytes(data)
 			sn := newServeNode(cn.Inode, cn.Generation, nil, cn.Refs)
 			if sn.node, err = fs.Node(cn.Inode, cn.ParentIno, cn.Mode); err != nil {
+				// the node was never published to c.node, drop its persisted
+				// refs so releaseServeNode can return it to the pool
+				sn.refs = 0
 				releaseServeNode(sn)
 				err = fmt.Errorf("LoadFuseContext: failed to get fs.Node of %v: %v\n", cn.Inode, err)
 				return err

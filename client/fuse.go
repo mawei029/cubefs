@@ -1104,6 +1104,7 @@ func parseMountOption(cfg *config.Config) (*proto.MountOptions, error) {
 		)
 		opt.AheadReadBlockTimeOut = int(GlobalMountOptions[proto.AheadReadBlockTimeOut].GetInt64())
 		opt.AheadReadWindowCnt = int(GlobalMountOptions[proto.AheadReadWindowCnt].GetInt64())
+		opt.AheadReadBlockSize = GlobalMountOptions[proto.AheadReadBlockSizeMB].GetInt64() * util.MB
 		opt.AheadReadTotalMem = GlobalMountOptions[proto.AheadReadTotalMemGB].GetInt64() * util.GB
 		total, used, err = util.GetMemInfo()
 		if err != nil {

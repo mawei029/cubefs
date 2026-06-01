@@ -37,6 +37,7 @@
 | aheadReadTotalMemGB | int    | 预读总内存（GB），默认10                        | 否   |
 | aheadReadBlockTimeOut | int  | 预读数据块过期时间（秒），默认3                   | 否   |
 | aheadReadWindowCnt | int     | 预读窗口内并发块数，默认8                        | 否   |
+| aheadReadBlockSizeMB | int   | 预读窗口内每个缓存块的大小（MB），默认4              | 否   |
 | minReadAheadSize | int       | 触发预读的最小文件大小（字节），默认10485760（10MB） | 否   |
 | enableAsyncFlush | bool      | 开启ExtentHandler异步刷写，默认true              | 否   |
 | readDirLimit     | int       | 预热流程读取目录项的最大数量限制，默认500          | 否   |

@@ -362,6 +362,7 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 		AheadReadTotalMem:          opt.AheadReadTotalMem,
 		AheadReadBlockTimeOut:      opt.AheadReadBlockTimeOut,
 		AheadReadWindowCnt:         opt.AheadReadWindowCnt,
+		AheadReadBlockSize:         opt.AheadReadBlockSize,
 		MinReadAheadSize:           uint64(opt.MinReadAheadSize),
 		NeedRemoteCache:            true,
 		ForceRemoteCache:           opt.ForceRemoteCache,
@@ -370,9 +371,6 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 		MetaAcceleration:           opt.MetaCacheAcceleration,
 		RemoteCacheName:            opt.RemoteCacheName,
 	}
-
-	log.LogInfof("ahead info enable %+v, totalMem %+v, timeout %+v, winCnt %+v, minReadAhead %+v, EbsblockSize %+v (stream + blob read prefetch)",
-		opt.AheadReadEnable, opt.AheadReadTotalMem, opt.AheadReadBlockTimeOut, opt.AheadReadWindowCnt, opt.MinReadAheadSize, opt.EbsBlockSize)
 
 	s.ec, err = stream.NewExtentClient(extentConfig)
 	if err != nil {

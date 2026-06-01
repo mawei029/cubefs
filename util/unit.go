@@ -42,10 +42,13 @@ const (
 	ReadBlockSize       = BlockSize
 	RepairReadBlockSize = 512 * KB
 	CacheReadBlockSize  = 4 * MB
-	PerBlockCrcSize     = 4
-	ExtentSize          = BlockCount * BlockSize
-	BlockHeaderSize     = 4096
-	SyscallTryMaxTimes  = 3
+	// DefaultAheadReadBlockSize is the default per-window block size used by the
+	// ahead-read cache when aheadReadBlockSizeMB is not configured.
+	DefaultAheadReadBlockSize = 2 * MB
+	PerBlockCrcSize           = 4
+	ExtentSize                = BlockCount * BlockSize
+	BlockHeaderSize           = 4096
+	SyscallTryMaxTimes        = 3
 
 	PacketHeaderSize         = 57 // original header size
 	PacketHeaderVerSize      = 65 // add field VerSeq in Packet struct, for snapshot version

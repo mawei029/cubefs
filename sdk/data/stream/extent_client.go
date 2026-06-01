@@ -165,6 +165,7 @@ type ExtentConfig struct {
 	AheadReadBlockTimeOut int
 	AheadReadWindowCnt    int
 	MinReadAheadSize      uint64
+	AheadReadBlockSize    int64
 	// remoteCache
 	NeedRemoteCache            bool
 	ForceRemoteCache           bool
@@ -426,7 +427,7 @@ retry:
 			config.NeedRemoteCache)
 	}
 
-	client.AheadRead = NewAheadReadCache(config.AheadReadEnable, config.AheadReadTotalMem, config.AheadReadBlockTimeOut, config.AheadReadWindowCnt)
+	client.AheadRead = NewAheadReadCache(config.AheadReadEnable, config.AheadReadTotalMem, config.AheadReadBlockTimeOut, config.AheadReadWindowCnt, config.AheadReadBlockSize)
 
 	return
 }

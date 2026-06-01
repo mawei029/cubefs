@@ -133,7 +133,10 @@ func NewStreamer(client *ExtentClient, inode uint64, openForWrite, isCache bool,
 	}
 	if client.AheadRead != nil {
 		s.aheadReadEnable = client.AheadRead.enable
-		s.aheadReadBlockSize = util.CacheReadBlockSize
+		s.aheadReadBlockSize = uint32(client.AheadRead.blockSize)
+		if s.aheadReadBlockSize == 0 {
+			s.aheadReadBlockSize = util.DefaultAheadReadBlockSize
+		}
 		// set min read ahead size from config, default 1MB when zero
 		if client.extentConfig != nil && client.extentConfig.MinReadAheadSize > 0 {
 			s.minReadAheadSize = atomic.LoadUint64(&client.extentConfig.MinReadAheadSize)

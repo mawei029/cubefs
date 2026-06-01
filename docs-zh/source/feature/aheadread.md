@@ -13,9 +13,10 @@
 | aheadReadTotalMemGB      | int64 | 预读占用内存(单位GB,默认10)，若不够10G则占用当前可用内存的1/3 | 否  |
 | aheadReadBlockTimeOut      | int64 | 缓存块未命中的回收时间(单位秒,默认3)                   | 否  |
 | aheadReadWindowCnt          | int64 | 缓存滑动窗口的大小(默认：8)                     | 否  |
+| aheadReadBlockSizeMB          | int64 | 滑动窗口内每个缓存数据块的大小(单位MB，默认2)                     | 否  |
 | minReadAheadSize          | int64 | 触发预读功能所需文件大小的最小值(单位字节，默认10)                     | 否  |
 
-开启预读功能后，对于文件大小超过minReadAheadSize的文件，预读功能会将当前读取请求偏移offset之后，aheadReadWindowCnt个缓存数据块的内容通过异步的方式，加载到客户端的内存中，从而提升顺序读的性能。目前每个缓存数据块的大小为4MB。
+开启预读功能后，对于文件大小超过minReadAheadSize的文件，预读功能会将当前读取请求偏移offset之后，aheadReadWindowCnt个缓存数据块的内容通过异步的方式，加载到客户端的内存中，从而提升顺序读的性能。每个缓存数据块的大小可通过 aheadReadBlockSizeMB 配置，默认为 2MB。
 
 所有文件的预读缓存数块总量共享一个缓存资源池，资源池大小为aheadReadTotalMemGB。如果缓存资源池满了，则无法继续缓存新的数据内容，需要等之前的缓存数据块淘汰。
 

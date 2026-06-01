@@ -37,6 +37,7 @@
 | aheadReadTotalMemGB  | int   | Total memory for read-ahead (GB), default 10                                                                       | No       |
 | aheadReadBlockTimeOut| int   | Read-ahead block expiration time (seconds), default 3                                                               | No       |
 | aheadReadWindowCnt   | int   | Number of concurrent blocks in the read-ahead window, default 8                                                     | No       |
+| aheadReadBlockSizeMB | int   | Size of each read-ahead window block (MB), default 4                                                                | No       |
 | minReadAheadSize     | int   | Minimum file size to trigger read-ahead (bytes), default 10485760 (10MB)                                            | No       |
 | enableAsyncFlush     | bool  | Enable asynchronous flush for ExtentHandler, default true                                                           | No       |
 | readDirLimit         | int   | Maximum number of directory entries read during warm-up, default 500                                                | No       |

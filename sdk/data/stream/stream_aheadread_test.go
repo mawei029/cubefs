@@ -26,7 +26,7 @@ func newTestStreamerWithAheadRead(t *testing.T, partitionID uint64) (*Streamer, 
 	client.streamRetryTimeout = time.Second
 
 	// Enable AheadRead cache
-	arc := NewAheadReadCache(true, 16*util.MB, 100000, 2)
+	arc := NewAheadReadCache(true, 16*util.MB, 100000, 2, util.CacheReadBlockSize)
 
 	s := &Streamer{}
 	s.client = client
@@ -120,6 +120,124 @@ func TestAheadRead_PartialHit_SingleBlock(t *testing.T) {
 		if reqData[i] != 'A' {
 			t.Fatalf("unexpected data at %d, want 'A', got %v", i, reqData[i])
 		}
+	}
+}
+
+func TestAheadReadBlockPool_SizeGuard(t *testing.T) {
+	orig := atomic.LoadInt64(&aheadReadBlockSize)
+	defer atomic.StoreInt64(&aheadReadBlockSize, orig)
+
+	// Drain any pooled blocks so the pool New func (allocating with the
+	// currently published size) is exercised deterministically.
+	atomic.StoreInt64(&aheadReadBlockSize, 2*int64(util.MB))
+	blk := getAheadReadBlock()
+	if int64(cap(blk.data)) != 2*int64(util.MB) {
+		t.Fatalf("pooled block cap mismatch, want %d, got %d", 2*util.MB, cap(blk.data))
+	}
+	putAheadReadBlock(blk)
+
+	// Publish a different size; getAheadReadBlock must reallocate the buffer
+	// because the pooled block no longer matches the configured size.
+	atomic.StoreInt64(&aheadReadBlockSize, 8*int64(util.MB))
+	blk2 := getAheadReadBlock()
+	if int64(cap(blk2.data)) != 8*int64(util.MB) {
+		t.Fatalf("guard reallocation failed, want cap %d, got %d", 8*util.MB, cap(blk2.data))
+	}
+	putAheadReadBlock(blk2)
+
+	// Same size again: guard branch should not reallocate (cap stays the same).
+	blk3 := getAheadReadBlock()
+	if int64(cap(blk3.data)) != 8*int64(util.MB) {
+		t.Fatalf("unexpected cap on matching size, want %d, got %d", 8*util.MB, cap(blk3.data))
+	}
+	putAheadReadBlock(blk3)
+}
+
+func TestNewAheadReadCache_BlockSizeFallback(t *testing.T) {
+	orig := atomic.LoadInt64(&aheadReadBlockSize)
+	defer atomic.StoreInt64(&aheadReadBlockSize, orig)
+
+	// Disabled cache returns nil regardless of other params.
+	if arc := NewAheadReadCache(false, 16*util.MB, 100, 2, util.CacheReadBlockSize); arc != nil {
+		t.Fatalf("expected nil cache when disabled, got %v", arc)
+	}
+
+	// Non-positive block size must fall back to the default (2MB).
+	arc := NewAheadReadCache(true, 16*util.MB, 100, 2, 0)
+	if arc == nil {
+		t.Fatal("expected non-nil cache")
+	}
+	defer arc.Stop()
+	if arc.blockSize != util.DefaultAheadReadBlockSize {
+		t.Fatalf("expected fallback block size %d, got %d", util.DefaultAheadReadBlockSize, arc.blockSize)
+	}
+	if got := atomic.LoadInt64(&aheadReadBlockSize); got != util.DefaultAheadReadBlockSize {
+		t.Fatalf("expected published block size %d, got %d", util.DefaultAheadReadBlockSize, got)
+	}
+	wantBlocks := int64(16*util.MB) / int64(util.DefaultAheadReadBlockSize)
+	if arc.totalBlockCnt != wantBlocks {
+		t.Fatalf("expected totalBlockCnt %d, got %d", wantBlocks, arc.totalBlockCnt)
+	}
+
+	// Explicit custom block size is honoured.
+	custom := int64(2 * util.MB)
+	arc2 := NewAheadReadCache(true, 16*util.MB, 100, 2, custom)
+	if arc2 == nil {
+		t.Fatal("expected non-nil cache for custom size")
+	}
+	defer arc2.Stop()
+	if arc2.blockSize != custom {
+		t.Fatalf("expected custom block size %d, got %d", custom, arc2.blockSize)
+	}
+}
+
+func TestNewAheadReadCache_TotalBlockCntClamp(t *testing.T) {
+	orig := atomic.LoadInt64(&aheadReadBlockSize)
+	defer atomic.StoreInt64(&aheadReadBlockSize, orig)
+
+	// totalMem smaller than a single block would yield totalBlockCnt == 0;
+	// the cache must clamp it to 1 so prefetch stays usable.
+	arc := NewAheadReadCache(true, 1*util.MB, 100, 2, 4*int64(util.MB))
+	if arc == nil {
+		t.Fatal("expected non-nil cache")
+	}
+	defer arc.Stop()
+	if arc.totalBlockCnt != 1 {
+		t.Fatalf("expected totalBlockCnt clamped to 1, got %d", arc.totalBlockCnt)
+	}
+	if got := atomic.LoadInt64(&arc.availableBlockCnt); got != 1 {
+		t.Fatalf("expected availableBlockCnt 1, got %d", got)
+	}
+	if cap(arc.availableBlockC) != 1 {
+		t.Fatalf("expected availableBlockC capacity 1, got %d", cap(arc.availableBlockC))
+	}
+}
+
+func TestGetCurrentExtent_SkipSmallExtents(t *testing.T) {
+	s, arc := newTestStreamerWithAheadRead(t, 9)
+	defer arc.Stop()
+	s.aheadReadBlockSize = util.CacheReadBlockSize
+
+	// Small extent (below block size) must be skipped even if it covers the offset.
+	small := &proto.ExtentKey{PartitionId: 9, ExtentId: 10, FileOffset: 0, Size: uint32(util.CacheReadBlockSize) - 1}
+	// Large extent covering the same offset range; this is the expected match.
+	large := &proto.ExtentKey{PartitionId: 9, ExtentId: 11, FileOffset: uint64(util.CacheReadBlockSize), Size: uint32(8 * util.MB)}
+	s.extents.root.ReplaceOrInsert(small)
+	s.extents.root.ReplaceOrInsert(large)
+
+	// Offset inside the large extent: small extent is skipped, large extent returned.
+	off := util.CacheReadBlockSize + 1024
+	ek := s.getCurrentExtent(off)
+	if ek == nil {
+		t.Fatalf("expected to find large extent at offset %d", off)
+	}
+	if ek.ExtentId != 11 {
+		t.Fatalf("expected extent 11, got %d", ek.ExtentId)
+	}
+
+	// Offset only covered by the small extent: nothing should match.
+	if ek := s.getCurrentExtent(100); ek != nil {
+		t.Fatalf("expected no extent when only small extent covers offset, got %v", ek)
 	}
 }
 
