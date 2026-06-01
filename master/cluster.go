@@ -3132,9 +3132,9 @@ func (c *Cluster) decommissionDiskPause(disk *DecommissionDisk) (err error, fail
 	return
 }
 
-func (c *Cluster) migrateDataNode(srcAddr, targetAddr string, raftForce bool, limit int, weight int) (err error) {
-	msg := fmt.Sprintf("action[migrateDataNode], src(%s) migrate to target(%s) raftForcs(%v) limit(%v)",
-		srcAddr, targetAddr, raftForce, limit)
+func (c *Cluster) migrateDataNode(srcAddr, targetAddr string, raftForce bool, limit int, weight int, targetTag string) (err error) {
+	msg := fmt.Sprintf("action[migrateDataNode], src(%s) migrate to target(%s) raftForcs(%v) limit(%v) targetTag(%v)",
+		srcAddr, targetAddr, raftForce, limit, targetTag)
 	log.LogWarn(msg)
 
 	srcNode, err := c.dataNode(srcAddr)
@@ -3165,14 +3165,84 @@ func (c *Cluster) migrateDataNode(srcAddr, targetAddr string, raftForce bool, li
 		log.LogWarnf("action[migrateDataNode] %v", err)
 		return
 	}
-	srcNode.markDecommission(targetAddr, raftForce, limit, weight)
+	srcNode.markDecommission(targetAddr, raftForce, limit, weight, targetTag)
 	c.syncUpdateDataNode(srcNode)
 	log.LogInfof("action[migrateDataNode] %v return now", srcAddr)
 	return
 }
 
 func (c *Cluster) decommissionDataNode(dataNode *DataNode, force bool) (err error) {
-	return c.migrateDataNode(dataNode.Addr, "", false, 0, lowPriorityDecommissionWeight)
+	return c.migrateDataNode(dataNode.Addr, "", false, 0, lowPriorityDecommissionWeight, "")
+}
+
+func (c *Cluster) validateDataNodeDecommissionTargetTag(srcAddr, targetTag string) error {
+	if targetTag == "" {
+		return nil
+	}
+	if !proto.TagPattern.MatchString(targetTag) {
+		return fmt.Errorf("targetTag invalid: length must be < 50 and only [0-9a-zA-Z] allowed")
+	}
+
+	srcNode, err := c.dataNode(srcAddr)
+	if err != nil {
+		return err
+	}
+
+	var (
+		hasTargetTag bool
+		candidates   []*DataNode
+		available    uint64
+	)
+	c.dataNodes.Range(func(_, value interface{}) bool {
+		dataNode, ok := value.(*DataNode)
+		if !ok || dataNode.Tag != targetTag {
+			return true
+		}
+		hasTargetTag = true
+		if dataNode.Addr == srcAddr || dataNode.MediaType != srcNode.MediaType {
+			return true
+		}
+		if !dataNode.IsActiveNode() || !dataNode.canAllocDp() {
+			return true
+		}
+		candidates = append(candidates, dataNode)
+		if dataNode.AvailableSpace > dataNode.PreReservedSpace {
+			available += dataNode.AvailableSpace - dataNode.PreReservedSpace
+		}
+		return true
+	})
+	if !hasTargetTag {
+		return fmt.Errorf("targetTag %s has no datanode", targetTag)
+	}
+	if len(candidates) == 0 {
+		return fmt.Errorf("targetTag %s has no writable datanode with mediaType %s",
+			targetTag, proto.MediaTypeString(srcNode.MediaType))
+	}
+
+	partitions := c.getAllDataPartitionByDataNode(srcAddr)
+	var need uint64
+	for _, dp := range partitions {
+		replica, err := dp.getReplica(srcAddr)
+		if err != nil {
+			return fmt.Errorf("targetTag %s precheck dp %d get src replica failed: %v", targetTag, dp.PartitionID, err)
+		}
+		need += replica.Used
+
+		hasCandidate := false
+		for _, candidate := range candidates {
+			if !dp.hasHost(candidate.Addr) {
+				hasCandidate = true
+				break
+			}
+		}
+		if !hasCandidate {
+			return fmt.Errorf("targetTag %s has no candidate for dp %d", targetTag, dp.PartitionID)
+		}
+	}
+	if available < need {
+		return fmt.Errorf("targetTag %s available capacity is not enough, available %d need %d", targetTag, available, need)
+	}
+	return nil
 }
 
 func (c *Cluster) delDataNodeFromCache(dataNode *DataNode) {
@@ -6179,7 +6249,7 @@ func (c *Cluster) TryDecommissionDataNode(dataNode *DataNode) {
 			break
 		}
 		if left-dpCnt >= 0 {
-			err = c.migrateDisk(dataNode, disk, dataNode.DecommissionDstAddr, dataNode.DecommissionRaftForce, dpCnt, true, ManualDecommission, dataNode.DecommissionWeight)
+			err = c.migrateDisk(dataNode, disk, dataNode.DecommissionDstAddr, dataNode.DecommissionRaftForce, dpCnt, true, ManualDecommission, dataNode.DecommissionWeight, dataNode.DecommissionTargetTag)
 			if err != nil {
 				if strings.Contains(err.Error(), "still on working") {
 					decommissionDiskList = append(decommissionDiskList, disk)
@@ -6194,7 +6264,7 @@ func (c *Cluster) TryDecommissionDataNode(dataNode *DataNode) {
 			decommissionDpTotal += dpCnt
 			left = left - dpCnt
 		} else {
-			err = c.migrateDisk(dataNode, disk, dataNode.DecommissionDstAddr, dataNode.DecommissionRaftForce, left, true, ManualDecommission, dataNode.DecommissionWeight)
+			err = c.migrateDisk(dataNode, disk, dataNode.DecommissionDstAddr, dataNode.DecommissionRaftForce, left, true, ManualDecommission, dataNode.DecommissionWeight, dataNode.DecommissionTargetTag)
 			if err != nil {
 				if strings.Contains(err.Error(), "still on working") {
 					decommissionDiskList = append(decommissionDiskList, disk)
@@ -6318,7 +6388,7 @@ func (c *Cluster) checkDataNodeAddrMediaTypeForMigrate(srcAddr, dstAddr string) 
 	return c.checkDataNodesMediaTypeForMigrate(srcNode, dstAddr)
 }
 
-func (c *Cluster) migrateDisk(dataNode *DataNode, diskPath, dstAddr string, raftForce bool, limit int, diskDisable bool, migrateType uint32, weight int) (err error) {
+func (c *Cluster) migrateDisk(dataNode *DataNode, diskPath, dstAddr string, raftForce bool, limit int, diskDisable bool, migrateType uint32, weight int, targetTag string) (err error) {
 	var disk *DecommissionDisk
 	nodeAddr := dataNode.Addr
 	if dstAddr != "" {
@@ -6354,7 +6424,7 @@ func (c *Cluster) migrateDisk(dataNode *DataNode, diskPath, dstAddr string, raft
 	disk.ResidualDecommissionDps = make([]proto.IgnoreDecommissionDP, 0)
 	disk.IgnoreDecommissionDps = make([]proto.IgnoreDecommissionDP, 0)
 	// disk should be decommission all the dp
-	disk.markDecommission(dstAddr, raftForce, limit)
+	disk.markDecommission(dstAddr, raftForce, limit, targetTag)
 	if err = c.syncAddDecommissionDisk(disk); err != nil {
 		err = fmt.Errorf("action[addDecommissionDisk],clusterID[%v] dataNodeAddr:%v diskPath:%v err:%v ",
 			c.Name, nodeAddr, diskPath, err.Error())
@@ -6524,7 +6594,7 @@ func (c *Cluster) handleDataNodeBadDisk(dataNode *DataNode) {
 					dataNode.Addr, disk.DiskPath, GetDecommissionStatusMessage(status))
 				continue
 			}
-			err := c.migrateDisk(dataNode, disk.DiskPath, "", false, 0, true, AutoDecommission, mediumPriorityDecommissionWeight)
+			err := c.migrateDisk(dataNode, disk.DiskPath, "", false, 0, true, AutoDecommission, mediumPriorityDecommissionWeight, "")
 			if err != nil {
 				msg := fmt.Sprintf("disk(%v_%v)failed to mark decommission", dataNode.Addr, disk.DiskPath)
 				auditlog.LogMasterOp("DiskDecommission", msg, err)
@@ -6712,7 +6782,7 @@ func (c *Cluster) TryDecommissionDisk(disk *DecommissionDisk) {
 			RaftForce:        disk.DecommissionRaftForce,
 			Term:             disk.DecommissionTerm,
 			MigrateType:      disk.Type,
-			Tag:              "",
+			Tag:              disk.DecommissionTargetTag,
 			Weight:           disk.DecommissionWeight,
 			SrcAddrs:         nil,
 			DstAddrs:         nil,

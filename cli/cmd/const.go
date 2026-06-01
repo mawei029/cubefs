@@ -169,6 +169,7 @@ const (
 	CliFlagEnablePersistAccessTime                = "enablePersistAccessTime"
 	CliFlagDecommissionRaftForce                  = "raftForceDel"
 	CliFLagDecommissionWeight                     = "decommissionWeight"
+	CliFlagDecommissionTargetTag                  = "target-tag"
 	CliFlagDecommissionDstNodeSet                 = "decommissionDstNodeSet"
 	CliFlagShowQueuedTask                         = "showQueuedTask"
 	CliFLagRecommissionType                       = "recommissionType"

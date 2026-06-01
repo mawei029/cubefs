@@ -139,13 +139,16 @@ func (api *NodeAPI) ResponseDataNodeTask(task *proto.AdminTask) (err error) {
 	return api.mc.request(newRequest(post, proto.GetDataNodeTaskResponse).Header(api.h).Body(task))
 }
 
-func (api *NodeAPI) DataNodeDecommission(nodeAddr string, count int, clientIDKey string, raftForce bool, weight int) (err error) {
+func (api *NodeAPI) DataNodeDecommission(nodeAddr string, count int, clientIDKey string, raftForce bool, weight int, targetTag string) (err error) {
 	request := newRequest(get, proto.DecommissionDataNode).Header(api.h).NoTimeout()
 	request.addParam("addr", nodeAddr)
 	request.addParam("count", strconv.Itoa(count))
 	request.addParam("clientIDKey", clientIDKey)
 	request.addParam("raftForceDel", strconv.FormatBool(raftForce))
 	request.addParam("weight", strconv.Itoa(weight))
+	if targetTag != "" {
+		request.addParam("targetTag", targetTag)
+	}
 	if _, err = api.mc.serveRequest(request); err != nil {
 		return
 	}

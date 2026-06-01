@@ -55,7 +55,7 @@ Response Example
 ## Decommission Node
 
 ``` bash
-curl -v "http://192.168.0.11:17010/dataNode/decommission?addr=192.168.0.33:17310&weight=2"
+curl -v "http://192.168.0.11:17010/dataNode/decommission?addr=192.168.0.33:17310&weight=2&targetTag=target"
 ```
 
 Removes a data node from the cluster. All data shards on the data node will be asynchronously migrated to other available data nodes in the cluster.
@@ -66,6 +66,7 @@ Parameter List
 |-----------|--------|------------------------------------------------------|
 | addr      | string | Address for interaction between data node and master |
 | weight    | int    | Decommission weight, default is 2                    |
+| targetTag | string | Optional. Target data node tag for migration during this decommission |
 
 ## Get Disk
 

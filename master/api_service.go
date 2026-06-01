@@ -4332,12 +4332,13 @@ func (m *Server) decommissionDataNode(w http.ResponseWriter, r *http.Request) {
 		raftForce   bool
 		limit       int
 		weight      int
+		targetTag   string
 		err         error
 	)
 	metric := exporter.NewTPCnt(apiToMetricsName(proto.DecommissionDataNode))
 	defer func() {
 		doStatAndMetric(proto.DecommissionDataNode, metric, err, nil)
-		AuditLog(r, proto.DecommissionDataNode, fmt.Sprintf("decommission data node [%v] raftForce(%v) limit(%v)", offLineAddr, raftForce, limit), err)
+		AuditLog(r, proto.DecommissionDataNode, fmt.Sprintf("decommission data node [%v] raftForce(%v) limit(%v) targetTag(%v)", offLineAddr, raftForce, limit, targetTag), err)
 	}()
 
 	if offLineAddr, limit, err = parseDecomDataNodeReq(r); err != nil {
@@ -4360,13 +4361,21 @@ func (m *Server) decommissionDataNode(w http.ResponseWriter, r *http.Request) {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
 		return
 	}
+	if targetTag, err = parseTargetTag(r); err != nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
 
 	if _, err = m.cluster.dataNode(offLineAddr); err != nil {
 		sendErrReply(w, r, newErrHTTPReply(proto.ErrDataNodeNotExists))
 		return
 	}
+	if err = m.cluster.validateDataNodeDecommissionTargetTag(offLineAddr, targetTag); err != nil {
+		sendErrReply(w, r, newErrHTTPReply(err))
+		return
+	}
 
-	if err = m.cluster.migrateDataNode(offLineAddr, "", raftForce, limit, weight); err != nil {
+	if err = m.cluster.migrateDataNode(offLineAddr, "", raftForce, limit, weight, targetTag); err != nil {
 		sendErrReply(w, r, newErrHTTPReply(err))
 		return
 	}
@@ -4436,7 +4445,7 @@ func (m *Server) migrateDataNodeHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if err = m.cluster.migrateDataNode(srcAddr, targetAddr, raftForce, limit, weight); err != nil {
+	if err = m.cluster.migrateDataNode(srcAddr, targetAddr, raftForce, limit, weight, ""); err != nil {
 		sendErrReply(w, r, newErrHTTPReply(err))
 		return
 	}
@@ -6122,7 +6131,7 @@ func (m *Server) decommissionDisk(w http.ResponseWriter, r *http.Request) {
 	if decommissionType == int(InitialDecommission) {
 		decommissionType = int(ManualDecommission)
 	}
-	if err = m.cluster.migrateDisk(dataNode, diskPath, "", raftForce, limit, diskDisable, uint32(decommissionType), weight); err != nil {
+	if err = m.cluster.migrateDisk(dataNode, diskPath, "", raftForce, limit, diskDisable, uint32(decommissionType), weight, ""); err != nil {
 		sendErrReply(w, r, newErrHTTPReply(err))
 		return
 	}
@@ -7142,6 +7151,17 @@ func parseWeight(r *http.Request) (int, error) {
 	}
 
 	return newVal, nil
+}
+
+func parseTargetTag(r *http.Request) (string, error) {
+	targetTag := r.FormValue(targetTagKey)
+	if targetTag == "" {
+		return "", nil
+	}
+	if !proto.TagPattern.MatchString(targetTag) {
+		return "", fmt.Errorf("targetTag invalid: length must be < 50 and only [0-9a-zA-Z] allowed")
+	}
+	return targetTag, nil
 }
 
 func parseDstNodeSet(r *http.Request) (uint64, error) {

@@ -213,6 +213,7 @@ const (
 	PromoteKey    = "promote"
 	SelectTypeKey = "selectType"
 	TagKey        = "tag"
+	targetTagKey  = "targetTag"
 	RocksdbDirKey = "rocksdbDir"
 	DpTagKey      = "dpTag"
 	MpTagKey      = "mpTag"

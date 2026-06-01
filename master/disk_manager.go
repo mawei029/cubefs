@@ -345,6 +345,7 @@ type DecommissionDisk struct {
 	DecommissionDpTotal      int
 	DecommissionTerm         uint64
 	DecommissionWeight       int
+	DecommissionTargetTag    string
 	DecommissionDpCount      int
 	DiskDisable              bool
 	IgnoreDecommissionDps    []proto.IgnoreDecommissionDP
@@ -648,13 +649,14 @@ func (dd *DecommissionDisk) GetDecommissionFailedDP(c *Cluster) (error, []uint64
 	return nil, failedDps
 }
 
-func (dd *DecommissionDisk) markDecommission(dstAddr string, raftForce bool, limit int) {
+func (dd *DecommissionDisk) markDecommission(dstAddr string, raftForce bool, limit int, targetTag string) {
 	// if transfer from pause,do not change these attrs
 	if dd.GetDecommissionStatus() != DecommissionPause {
 		dd.DecommissionDpTotal = InvalidDecommissionDpCnt
 		dd.DecommissionDpCount = limit
 		dd.DecommissionRaftForce = raftForce
 		dd.DstAddr = dstAddr
+		dd.DecommissionTargetTag = targetTag
 		dd.DecommissionTimes = 0
 	}
 	dd.DecommissionTerm = uint64(time.Now().Unix())

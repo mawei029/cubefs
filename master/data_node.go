@@ -75,6 +75,7 @@ type DataNode struct {
 	QosFlowWLimit                      uint64
 	DecommissionStatus                 uint32
 	DecommissionDstAddr                string
+	DecommissionTargetTag              string
 	DecommissionRaftForce              bool
 	DecommissionLimit                  int
 	DecommissionWeight                 int
@@ -846,12 +847,13 @@ func (dataNode *DataNode) GetDecommissionFailedDP(c *Cluster) (error, []uint64) 
 	return nil, failedDps
 }
 
-func (dataNode *DataNode) markDecommission(targetAddr string, raftForce bool, limit int, weight int) {
+func (dataNode *DataNode) markDecommission(targetAddr string, raftForce bool, limit int, weight int, targetTag string) {
 	dataNode.DecommissionSyncMutex.Lock()
 	defer dataNode.DecommissionSyncMutex.Unlock()
 	dataNode.SetDecommissionStatus(markDecommission)
 	dataNode.DecommissionRaftForce = raftForce
 	dataNode.DecommissionDstAddr = targetAddr
+	dataNode.DecommissionTargetTag = targetTag
 	dataNode.DecommissionLimit = limit
 	dataNode.DecommissionWeight = weight
 	dataNode.DecommissionDiskList = make([]string, 0)
@@ -883,6 +885,7 @@ func (dataNode *DataNode) resetDecommissionStatus() {
 	dataNode.SetDecommissionStatus(DecommissionInitial)
 	dataNode.DecommissionRaftForce = false
 	dataNode.DecommissionDstAddr = ""
+	dataNode.DecommissionTargetTag = ""
 	dataNode.DecommissionLimit = 0
 	dataNode.DecommissionWeight = 0
 	dataNode.DecommissionCompleteTime = 0

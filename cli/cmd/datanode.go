@@ -166,6 +166,7 @@ func newDataNodeDecommissionCmd(client *master.MasterClient) *cobra.Command {
 		clientIDKey  string
 		raftForceDel bool
 		weight       int
+		targetTag    string
 	)
 	cmd := &cobra.Command{
 		Use:   CliOpDecommission + " [{HOST}:{PORT}]",
@@ -176,7 +177,11 @@ func newDataNodeDecommissionCmd(client *master.MasterClient) *cobra.Command {
 				stdoutln("Migrate dp count should >= 0")
 				return nil
 			}
-			if err := client.NodeAPI().DataNodeDecommission(args[0], optCount, clientIDKey, raftForceDel, weight); err != nil {
+			if targetTag != "" && !proto.TagPattern.MatchString(targetTag) {
+				stdoutln("target tag invalid: length must be < 50 and only [0-9a-zA-Z] allowed")
+				return nil
+			}
+			if err := client.NodeAPI().DataNodeDecommission(args[0], optCount, clientIDKey, raftForceDel, weight, targetTag); err != nil {
 				return err
 			}
 			stdoutln("Decommission data node successfully")
@@ -193,6 +198,7 @@ func newDataNodeDecommissionCmd(client *master.MasterClient) *cobra.Command {
 	cmd.Flags().StringVar(&clientIDKey, CliFlagClientIDKey, client.ClientIDKey(), CliUsageClientIDKey)
 	cmd.Flags().BoolVarP(&raftForceDel, CliFlagDecommissionRaftForce, "r", false, "true for raftForceDel")
 	cmd.Flags().IntVar(&weight, CliFLagDecommissionWeight, lowPriorityDecommissionWeight, "decommission weight")
+	cmd.Flags().StringVar(&targetTag, CliFlagDecommissionTargetTag, "", "decommission target data node tag")
 	return cmd
 }
 

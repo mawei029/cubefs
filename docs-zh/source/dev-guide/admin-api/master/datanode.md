@@ -55,7 +55,7 @@ curl -v "http://10.196.59.198:17010/dataNode/get?addr=10.196.59.201:17310"  | py
 ## 下线节点
 
 ``` bash
-curl -v "http://192.168.0.11:17010/dataNode/decommission?addr=192.168.0.33:17310&weight=2"
+curl -v "http://192.168.0.11:17010/dataNode/decommission?addr=192.168.0.33:17310&weight=2&targetTag=target"
 ```
 
 从集群中下线某个数据节点,
@@ -67,6 +67,7 @@ curl -v "http://192.168.0.11:17010/dataNode/decommission?addr=192.168.0.33:17310
 |------|--------|--------------------------|
 | addr | string | 数据节点和master的交互地址 |
 | weight | int | 下线权重，默认是2 |
+| targetTag | string | 可选，指定本次下线迁移的目标数据节点 tag |
 
 ## 获取磁盘信息
 
