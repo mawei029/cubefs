@@ -118,6 +118,13 @@ func (s *ECStreamer) OeksLocked() []proto.ObjExtentKey {
 	return append([]proto.ObjExtentKey(nil), s.oeks...)
 }
 
+func (s *ECStreamer) HasObjExtents() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.oeks != nil && len(s.oeks) > 0
+}
+
 // String for debug logs; reads atomic fields and ino without s.mu.
 func (s *ECStreamer) String() string {
 	if s == nil {

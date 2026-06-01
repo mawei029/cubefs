@@ -227,10 +227,6 @@ type file struct {
 	// dir only
 	dirp *dirStream
 
-	// rw
-	fileWriter *blobstore.Writer
-	fileReader *blobstore.Reader
-
 	path         string
 	storageClass uint32
 	poolId       uint8
@@ -810,7 +806,9 @@ func cfs_open(id C.int64_t, path *C.char, flags C.int, mode C.mode_t) C.int {
 	}
 
 	if proto.IsRegular(info.Mode) {
-		c.openStream(f, absPath)
+		if err := c.openRegularFile(f, absPath); err != nil {
+			return errorToStatus(err)
+		}
 		if fuseFlags&uint32(C.O_TRUNC) != 0 {
 			if accFlags != uint32(C.O_WRONLY) && accFlags != uint32(C.O_RDWR) {
 				c.closeStream(f)
@@ -1760,70 +1758,58 @@ func (c *client) openOECStream(f *file, info *proto.InodeInfo, openFlags uint32,
 	return c.oec.OpenStreamWithArgs(args)
 }
 
-func (c *client) openStream(f *file, fullPath string) {
-	if proto.IsCold(c.volType) || proto.IsStorageClassBlobStore(f.storageClass) {
+func (c *client) openRegularFile(f *file, absPath string) error {
+	if err := c.openStream(f, absPath); err != nil {
+		c.releaseFD(f.fd)
+		return err
+	}
+	return nil
+}
+
+func (c *client) openStream(f *file, fullPath string) error {
+	if proto.DataPlaneUsesBlobEC(c.volType, f.storageClass) {
 		info := c.ic.Get(f.ino)
 		if info == nil {
 			var err error
 			info, err = c.mw.InodeGet_ll(f.ino, false)
 			if err != nil {
 				log.LogErrorf("openStream: InodeGet ino(%v) err(%v)", f.ino, err)
-				return
+				return err
 			}
 		}
 		openFlags := uint32(f.flags & 0xff)
 		if err := c.openOECStream(f, info, openFlags, info.Size); err != nil {
 			log.LogErrorf("openStream: openOECStream ino(%v) path(%v) err(%v)", f.ino, fullPath, err)
-			return
+			return err
 		}
-		f.fileReader = c.oec.Reader(f.ino)
-		f.fileWriter = c.oec.Writer(f.ino)
-		switch f.flags & 0xff {
-		case syscall.O_RDONLY:
-			f.fileWriter = nil
-		case syscall.O_WRONLY:
-			f.fileReader = nil
-		}
-		return
+		return nil
 	}
 	isCache := false
-	_ = c.ec.OpenStream(f.ino, f.openForWrite, isCache, fullPath)
+	return c.ec.OpenStream(f.ino, f.openForWrite, isCache, fullPath)
 }
 
 func (c *client) closeStream(f *file) {
-	if proto.IsCold(c.volType) || proto.IsStorageClassBlobStore(f.storageClass) {
+	if proto.DataPlaneUsesBlobEC(c.volType, f.storageClass) {
 		_ = c.oec.CloseStream(f.ino)
 		_ = c.oec.EvictStream(f.ino)
-		f.fileReader = nil
-		f.fileWriter = nil
 		return
 	}
 	_ = c.ec.CloseStream(f.ino)
 	_ = c.ec.EvictStream(f.ino)
-	if f.fileWriter != nil {
-		f.fileWriter.FreeCache()
-	}
-	f.fileWriter = nil
-	f.fileReader = nil
 }
 
 func (c *client) flush(f *file) error {
 	if proto.IsHot(c.volType) || proto.IsStorageClassReplica(f.storageClass) {
 		return c.ec.Flush(f.ino)
-	} else {
-		if f.fileWriter != nil {
-			return f.fileWriter.Flush(f.ino, c.ctx(c.id, f.ino))
-		}
 	}
-	return nil
+	return c.oec.Flush(f.ino)
 }
 
 func (c *client) truncate(f *file, size int) error {
-	err := c.ec.Truncate(c.mw, f.pino, f.ino, size, f.path)
-	if err != nil {
-		return err
+	if proto.DataPlaneUsesBlobEC(c.volType, f.storageClass) {
+		return c.oec.Truncate(f.pino, f.ino, uint64(size), f.path)
 	}
-	return nil
+	return c.ec.Truncate(c.mw, f.pino, f.ino, size, f.path)
 }
 
 func (c *client) write(f *file, offset int, data []byte, flags int) (n int, err error) {
@@ -1845,7 +1831,7 @@ func (c *client) write(f *file, offset int, data []byte, flags int) (n int, err 
 		}
 		n, err = c.ec.Write(f.ino, offset, data, flags, checkFunc, f.poolId, f.storageClass, false, false)
 	} else {
-		n, err = f.fileWriter.Write(c.ctx(c.id, f.ino), offset, data, flags)
+		n, err = c.oec.Write(f.ino, offset, data, flags)
 	}
 	if err != nil {
 		return 0, err
@@ -1857,7 +1843,7 @@ func (c *client) read(f *file, offset int, data []byte) (n int, err error) {
 	if proto.IsHot(c.volType) || proto.IsStorageClassReplica(f.storageClass) {
 		n, err = c.ec.Read(f.ino, data, offset, len(data), f.poolId, false)
 	} else {
-		n, err = f.fileReader.Read(c.ctx(c.id, f.ino), data, offset, len(data))
+		n, err = c.oec.Read(f.ino, data, offset, len(data))
 	}
 	if err != nil && err != io.EOF {
 		return 0, err

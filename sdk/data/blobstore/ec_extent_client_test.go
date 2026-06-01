@@ -436,7 +436,31 @@ func TestECExtentClient_RefreshExtentsCache_nil_streamer_in_map(t *testing.T) {
 	c.mu.Lock()
 	c.streamers[88] = nil
 	c.mu.Unlock()
-	require.ErrorIs(t, c.RefreshExtentsCache(88), syscall.EBADF)
+	require.NoError(t, c.RefreshExtentsCache(88))
+}
+
+func TestECExtentClient_NeedRefreshObjExtents(t *testing.T) {
+	c := NewObjExtentClient(ObjExtentConfig{})
+	require.False(t, c.NeedRefreshObjExtents(404))
+
+	s := mustTestECStreamer(405, nil, nil)
+	c.SetStreamer(405, s)
+	require.True(t, c.NeedRefreshObjExtents(405))
+
+	s.mu.Lock()
+	s.oeks = []proto.ObjExtentKey{}
+	s.mu.Unlock()
+	require.True(t, c.NeedRefreshObjExtents(405))
+
+	s.mu.Lock()
+	s.oeks = []proto.ObjExtentKey{{FileOffset: 0, Size: 32}}
+	s.mu.Unlock()
+	require.False(t, c.NeedRefreshObjExtents(405))
+
+	c.mu.Lock()
+	c.streamers[406] = nil
+	c.mu.Unlock()
+	require.False(t, c.NeedRefreshObjExtents(406))
 }
 
 func TestECExtentClient_Truncate_delegates(t *testing.T) {

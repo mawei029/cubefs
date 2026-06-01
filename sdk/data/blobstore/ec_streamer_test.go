@@ -371,6 +371,21 @@ func TestECStreamer_OeksLocked_copy(t *testing.T) {
 	require.Equal(t, uint64(1), s.oeks[0].FileOffset)
 }
 
+func TestECStreamer_HasObjExtents(t *testing.T) {
+	s := mustTestECStreamer(24, nil, nil)
+	require.False(t, s.HasObjExtents())
+
+	s.mu.Lock()
+	s.oeks = []proto.ObjExtentKey{}
+	s.mu.Unlock()
+	require.False(t, s.HasObjExtents())
+
+	s.mu.Lock()
+	s.oeks = []proto.ObjExtentKey{{FileOffset: 0, Size: 8}}
+	s.mu.Unlock()
+	require.True(t, s.HasObjExtents())
+}
+
 func TestECStreamer_Write_empty_data(t *testing.T) {
 	s := mustTestECStreamer(34, nil, nil)
 	n, err := s.Write(context.Background(), 0, nil, 0)

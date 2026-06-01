@@ -337,17 +337,27 @@ func (c *ECExtentClient) Truncate(parentIno uint64, ino uint64, targetSize uint6
 	return s.Truncate(context.Background(), targetSize, fullPath)
 }
 
+// NeedRefreshObjExtents reports whether an open stream has no cached oeks yet.
+// Returns false when stream is not open (RefreshExtentsCache would be noop).
+func (c *ECExtentClient) NeedRefreshObjExtents(ino uint64) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	s, ok := c.streamers[ino]
+	if !ok || s == nil {
+		return false
+	}
+
+	return !s.HasObjExtents()
+}
+
 func (c *ECExtentClient) RefreshExtentsCache(ino uint64) error {
 	c.mu.RLock()
 	s, ok := c.streamers[ino]
 	c.mu.RUnlock()
 
-	if s == nil {
-		if ok {
-			log.LogErrorf("ECExtentClient RefreshExtentsCache: stream not opened, ino(%v)", ino)
-			return syscall.EBADF
-		}
-		log.LogInfof("ECExtentClient RefreshExtentsCache: stream not opened, ino(%v)", ino)
+	if s == nil || !ok {
+		log.LogDebugf("ECExtentClient RefreshExtentsCache: stream not opened, ino(%v)", ino)
 		return nil
 	}
 

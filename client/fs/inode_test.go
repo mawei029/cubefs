@@ -1,7 +1,6 @@
 package fs
 
 import (
-	"context"
 	"errors"
 	"reflect"
 	"syscall"
@@ -42,35 +41,81 @@ func TestInodeGet_FromCache(t *testing.T) {
 	require.Equal(t, expect.Inode, got.Inode)
 }
 
-func TestInodeGet_BlobStoreHasReaderWriterEarlyReturn(t *testing.T) {
+func TestInodeGet_BlobEmptyOeksTriggersRefresh(t *testing.T) {
 	s := newTestSuperForInode()
 	ino := uint64(99)
 	registerOecTestStreamerWithLogicalView(s, ino, &blobstore.Reader{}, &blobstore.Writer{}, 0, 1)
-	f := &File{super: s, ino: ino}
-	s.nodeCache[ino] = f
 
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 	patches.ApplyMethod(reflect.TypeOf(s.mw), "InodeGet_ll",
 		func(_ *meta.MetaWrapper, _ uint64, _ bool) (*proto.InodeInfo, error) {
-			return &proto.InodeInfo{Inode: ino, StorageClass: proto.StorageClass_BlobStore, PoolId: 1}, nil
+			return &proto.InodeInfo{Inode: ino, StorageClass: proto.StorageClass_BlobStore, PoolId: 1, Size: 64}, nil
 		})
-	openCalled := false
-	patches.ApplyPrivateMethod(reflect.TypeOf((*File)(nil)), "openOECStream",
-		func(_ *File, _ *proto.InodeInfo, _ uint32, _ uint64) error {
-			openCalled = true
+	refreshCalled := false
+	patches.ApplyMethod(reflect.TypeOf(s.oec), "RefreshExtentsCache",
+		func(_ *blobstore.ECExtentClient, gotIno uint64) error {
+			require.Equal(t, ino, gotIno)
+			refreshCalled = true
 			return nil
 		})
 
 	got, err := s.InodeGet(ino)
 	require.NoError(t, err)
-	require.False(t, openCalled)
+	require.True(t, refreshCalled)
 	require.True(t, proto.IsStorageClassBlobStore(got.StorageClass))
 }
 
-func TestInodeGet_BlobStoreFileRefreshReaderWriter(t *testing.T) {
+func TestInodeGet_BlobNonEmptyOeksSkipsRefresh(t *testing.T) {
 	s := newTestSuperForInode()
-	ino := uint64(100)
+	ino := uint64(98)
+	registerOecTestStreamerWithLogicalView(s, ino, &blobstore.Reader{}, &blobstore.Writer{}, 64, 1)
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "InodeGet_ll",
+		func(_ *meta.MetaWrapper, _ uint64, _ bool) (*proto.InodeInfo, error) {
+			return &proto.InodeInfo{Inode: ino, StorageClass: proto.StorageClass_BlobStore, PoolId: 1, Size: 64}, nil
+		})
+	patches.ApplyMethod(reflect.TypeOf(s.oec), "NeedRefreshObjExtents",
+		func(_ *blobstore.ECExtentClient, _ uint64) bool { return false })
+	refreshCalled := false
+	patches.ApplyMethod(reflect.TypeOf(s.oec), "RefreshExtentsCache",
+		func(_ *blobstore.ECExtentClient, _ uint64) error {
+			refreshCalled = true
+			return nil
+		})
+
+	got, err := s.InodeGet(ino)
+	require.NoError(t, err)
+	require.False(t, refreshCalled)
+	require.Equal(t, uint64(64), got.Size)
+}
+
+func TestInodeGet_BlobRefreshExtentsError(t *testing.T) {
+	s := newTestSuperForInode()
+	ino := uint64(102)
+	registerOecTestStreamerWithLogicalView(s, ino, &blobstore.Reader{}, &blobstore.Writer{}, 0, 1)
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "InodeGet_ll",
+		func(_ *meta.MetaWrapper, _ uint64, _ bool) (*proto.InodeInfo, error) {
+			return &proto.InodeInfo{
+				Inode:        ino,
+				StorageClass: proto.StorageClass_BlobStore,
+			}, nil
+		})
+	patches.ApplyMethod(reflect.TypeOf(s.oec), "RefreshExtentsCache",
+		func(_ *blobstore.ECExtentClient, _ uint64) error { return errors.New("refresh failed") })
+
+	_, err := s.InodeGet(ino)
+	require.Error(t, err)
+}
+
+func TestInodeGet_BlobNoStreamNoSideEffects(t *testing.T) {
+	s := newTestSuperForInode()
+	ino := uint64(101)
 	poolID := uint8(1)
 
 	f := &File{super: s, ino: ino}
@@ -87,59 +132,40 @@ func TestInodeGet_BlobStoreFileRefreshReaderWriter(t *testing.T) {
 				Inode:        ino,
 				StorageClass: proto.StorageClass_BlobStore,
 				PoolId:       poolID,
-				Size:         64,
-				Generation:   7,
+				Size:         50,
+				Generation:   2,
 			}, nil
 		})
-	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "OpenStreamWithArgs",
-		func(_ *blobstore.ECExtentClient, _ blobstore.ECStreamOpenArgs) error {
+
+	flushCalled, evictCalled, openCalled, refreshCalled := false, false, false, false
+	patches.ApplyMethod(reflect.TypeOf(s.oec), "RefreshExtentsCache",
+		func(_ *blobstore.ECExtentClient, _ uint64) error {
+			refreshCalled = true
+			return nil
+		})
+	patches.ApplyMethod(reflect.TypeOf(s.oec), "Flush",
+		func(_ *blobstore.ECExtentClient, _ uint64) error {
+			flushCalled = true
+			return nil
+		})
+	patches.ApplyMethod(reflect.TypeOf(s.oec), "EvictStream",
+		func(_ *blobstore.ECExtentClient, _ uint64) error {
+			evictCalled = true
 			return nil
 		})
 	patches.ApplyPrivateMethod(reflect.TypeOf((*File)(nil)), "openOECStream",
 		func(_ *File, _ *proto.InodeInfo, _ uint32, _ uint64) error {
-			return nil
+			openCalled = true
+			return errors.New("should not open")
 		})
-	patches.ApplyMethod(reflect.TypeOf(s.oec), "Flush", func(_ *blobstore.ECExtentClient, _ uint64) error { return nil })
 
 	got, err := s.InodeGet(ino)
 	require.NoError(t, err)
-	require.True(t, proto.IsStorageClassBlobStore(got.StorageClass))
-}
-
-func TestInodeGet_BlobFlushBeforeRefreshFails(t *testing.T) {
-	s := newTestSuperForInode()
-	ino := uint64(101)
-	poolID := uint8(1)
-
-	f := &File{super: s, ino: ino}
-	f.setFlag(syscall.O_RDONLY)
-	w := &blobstore.Writer{}
-	ei := f.getOrCreateExtendInfo()
-	ei.coldBlobWriter = w
-	s.nodeCache[ino] = f
-	s.ebsc[poolID] = &blobstore.BlobStoreClient{}
-
-	patches := gomonkey.NewPatches()
-	defer patches.Reset()
-	patches.ApplyMethod(reflect.TypeOf(s.mw), "InodeGet_ll",
-		func(_ *meta.MetaWrapper, gotIno uint64, _ bool) (*proto.InodeInfo, error) {
-			require.Equal(t, ino, gotIno)
-			return &proto.InodeInfo{
-				Inode:        ino,
-				StorageClass: proto.StorageClass_BlobStore,
-				PoolId:       poolID,
-				Size:         0,
-				Generation:   1,
-			}, nil
-		})
-	patches.ApplyMethod(reflect.TypeOf((*blobstore.Writer)(nil)), "Flush",
-		func(_ *blobstore.Writer, gotIno uint64, _ context.Context) error {
-			require.Equal(t, ino, gotIno)
-			return errors.New("flush failed")
-		})
-
-	_, err := s.InodeGet(ino)
-	require.Error(t, err)
+	require.False(t, refreshCalled)
+	require.False(t, flushCalled)
+	require.False(t, evictCalled)
+	require.False(t, openCalled)
+	require.Equal(t, uint64(50), got.Size)
 }
 
 func TestInodeGet_NoExtentsRefreshCache(t *testing.T) {
@@ -164,6 +190,32 @@ func TestInodeGet_NoExtentsRefreshCache(t *testing.T) {
 
 	_, err := s.InodeGet(ino)
 	require.NoError(t, err)
+}
+
+func TestInodeGet_ReplicaHasExtentsSkipsRefresh(t *testing.T) {
+	s := newTestSuperForInode()
+	ino := uint64(202)
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "InodeGet_ll",
+		func(_ *meta.MetaWrapper, _ uint64, _ bool) (*proto.InodeInfo, error) {
+			return &proto.InodeInfo{
+				Inode:        ino,
+				StorageClass: proto.StorageClass_Replica_HDD,
+				Extents:      &proto.GetExtentsResponse{},
+			}, nil
+		})
+	refreshCalled := false
+	patches.ApplyMethod(reflect.TypeOf(s.ec), "RefreshExtentsCache",
+		func(_ *stream.ExtentClient, _ uint64) error {
+			refreshCalled = true
+			return nil
+		})
+
+	_, err := s.InodeGet(ino)
+	require.NoError(t, err)
+	require.False(t, refreshCalled)
 }
 
 func TestInodeGet_RefreshExtentsError(t *testing.T) {
@@ -225,103 +277,4 @@ func TestSetattrFillAttrAndExpirationHelpers(t *testing.T) {
 	require.True(t, inodeExpired(info))
 	inodeSetExpiration(info, time.Second)
 	require.False(t, inodeExpired(info))
-}
-
-func TestInodeGet_BlobEvictZeroRef_and_largerFileSize(t *testing.T) {
-	s := newTestSuperForInode()
-	ino := uint64(150)
-	poolID := uint8(1)
-	f := &File{super: s, ino: ino}
-	f.setFlag(syscall.O_RDWR)
-	s.nodeCache[ino] = f
-	s.ebsc[poolID] = &blobstore.BlobStoreClient{}
-	registerOecTestStreamerWithLogicalView(s, ino, nil, &blobstore.Writer{}, 0, 1)
-
-	patches := gomonkey.NewPatches()
-	defer patches.Reset()
-	patches.ApplyMethod(reflect.TypeOf(s.oec), "RefCnt",
-		func(_ *blobstore.ECExtentClient, _ uint64) int32 { return 0 })
-	patches.ApplyMethod(reflect.TypeOf(s.oec), "HasReader",
-		func(_ *blobstore.ECExtentClient, _ uint64) bool { return false })
-	patches.ApplyMethod(reflect.TypeOf(s.oec), "HasWriter",
-		func(_ *blobstore.ECExtentClient, _ uint64) bool { return false })
-	patches.ApplyMethod(reflect.TypeOf(s.mw), "InodeGet_ll",
-		func(_ *meta.MetaWrapper, _ uint64, _ bool) (*proto.InodeInfo, error) {
-			return &proto.InodeInfo{
-				Inode:        ino,
-				StorageClass: proto.StorageClass_BlobStore,
-				PoolId:       poolID,
-				Size:         50,
-				Generation:   2,
-			}, nil
-		})
-	evicted := false
-	patches.ApplyMethod(reflect.TypeOf(s.oec), "EvictStream",
-		func(_ *blobstore.ECExtentClient, got uint64) error {
-			require.Equal(t, ino, got)
-			evicted = true
-			return nil
-		})
-	patches.ApplyMethod(reflect.TypeOf(s.oec), "Flush",
-		func(_ *blobstore.ECExtentClient, _ uint64) error { return nil })
-	patches.ApplyPrivateMethod(reflect.TypeOf((*File)(nil)), "fileSizeVersion2",
-		func(_ *File, _ uint64) (int, uint64) { return 200, 2 })
-	patches.ApplyMethod(reflect.TypeOf(s.oec), "OpenStreamWithArgs",
-		func(_ *blobstore.ECExtentClient, args blobstore.ECStreamOpenArgs) error {
-			require.Equal(t, uint64(200), args.FileSize)
-			return nil
-		})
-
-	got, err := s.InodeGet(ino)
-	require.NoError(t, err)
-	require.True(t, evicted)
-	require.True(t, proto.IsStorageClassBlobStore(got.StorageClass))
-}
-
-func TestInodeGet_BlobOpenOECStreamError(t *testing.T) {
-	s := newTestSuperForInode()
-	ino := uint64(151)
-	f := &File{super: s, ino: ino}
-	s.nodeCache[ino] = f
-	s.ebsc[1] = &blobstore.BlobStoreClient{}
-
-	patches := gomonkey.NewPatches()
-	defer patches.Reset()
-	patches.ApplyMethod(reflect.TypeOf(s.mw), "InodeGet_ll",
-		func(_ *meta.MetaWrapper, _ uint64, _ bool) (*proto.InodeInfo, error) {
-			return &proto.InodeInfo{Inode: ino, StorageClass: proto.StorageClass_BlobStore, PoolId: 1}, nil
-		})
-	patches.ApplyPrivateMethod(reflect.TypeOf((*File)(nil)), "openOECStream",
-		func(_ *File, _ *proto.InodeInfo, _ uint32, _ uint64) error {
-			return errors.New("open oec failed")
-		})
-
-	_, err := s.InodeGet(ino)
-	require.Error(t, err)
-}
-
-func TestInodeGet_BlobExtendInfoFlushPath(t *testing.T) {
-	s := newTestSuperForInode()
-	ino := uint64(152)
-	f := &File{super: s, ino: ino}
-	ei := f.getOrCreateExtendInfo()
-	ei.flag = syscall.O_WRONLY
-	s.nodeCache[ino] = f
-	s.ebsc[1] = &blobstore.BlobStoreClient{}
-
-	patches := gomonkey.NewPatches()
-	defer patches.Reset()
-	patches.ApplyMethod(reflect.TypeOf(s.mw), "InodeGet_ll",
-		func(_ *meta.MetaWrapper, _ uint64, _ bool) (*proto.InodeInfo, error) {
-			return &proto.InodeInfo{Inode: ino, StorageClass: proto.StorageClass_BlobStore, PoolId: 1}, nil
-		})
-	patches.ApplyMethod(reflect.TypeOf(s.oec), "Flush", func(_ *blobstore.ECExtentClient, _ uint64) error { return nil })
-	patches.ApplyPrivateMethod(reflect.TypeOf((*File)(nil)), "openOECStream",
-		func(_ *File, _ *proto.InodeInfo, flags uint32, _ uint64) error {
-			require.Equal(t, uint32(syscall.O_WRONLY), flags&0x0f)
-			return nil
-		})
-
-	_, err := s.InodeGet(ino)
-	require.NoError(t, err)
 }

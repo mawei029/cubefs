@@ -1056,12 +1056,6 @@ func (f *File) fileSizeVersion2(ino uint64) (size int, gen uint64) {
 		if !valid {
 			if info, err := f.super.InodeGet(ino); err == nil {
 				size = int(info.Size)
-				if w := f.coldBlobWriter(); w != nil {
-					cacheSize := w.CacheFileSize()
-					if cacheSize > size {
-						size = cacheSize
-					}
-				}
 				gen = info.Generation
 			}
 		}

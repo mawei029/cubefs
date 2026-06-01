@@ -15,7 +15,6 @@
 package fs
 
 import (
-	"syscall"
 	"time"
 
 	"github.com/cubefs/cubefs/depends/bazil.org/fuse"
@@ -49,48 +48,18 @@ func (s *Super) InodeGet(ino uint64) (info *proto.InodeInfo, err error) {
 		}
 	}
 	s.ic.Put(info)
-	s.fslock.Lock()
-	node, isFind := s.nodeCache[ino]
-	s.fslock.Unlock()
-	if isFind {
-		if f, ok := node.(*File); ok && proto.IsStorageClassBlobStore(info.StorageClass) {
-			if s.oec.RefCnt(ino) > 0 {
-				_ = s.oec.RefreshExtentsCache(ino)
-				return info, nil
-			}
-			if s.oec.HasReader(ino) || s.oec.HasWriter(ino) {
-				return info, nil
-			}
-			// inode cache miss: same as File.Open, openOECStream → OpenStreamWithArgs restores data plane.
-			openFlags := uint32(syscall.O_RDONLY)
-			if ei, found := f.getExtendInfo(); found && ei != nil {
-				ei.RLock()
-				openFlags = uint32(ei.flag & 0x0f)
-				// Legacy coldBlobWriter (non-oec) must flush first to avoid losing buffered bytes.
-				if err := s.oec.Flush(ino); err != nil {
-					ei.RUnlock()
-					log.LogErrorf("InodeGet: flush legacy cold blob writer ino(%v) err(%v)", ino, err)
-					return nil, ParseError(err)
-				}
-				ei.RUnlock()
-			}
-			// After CloseStream streamer may remain in map with released RW; Evict when ref==0 before rebuild.
-			if strm := s.oec.GetStreamer(ino); strm != nil && s.oec.RefCnt(ino) == 0 {
-				_ = s.oec.EvictStream(ino)
-			}
-			logicalSize := info.Size
-			if fileSize, _ := f.fileSizeVersion2(f.ino); uint64(fileSize) > logicalSize {
-				logicalSize = uint64(fileSize)
-			}
-			if err := f.openOECStream(info, openFlags, logicalSize); err != nil {
-				log.LogErrorf("InodeGet: openOECStream ino(%v) err(%v)", ino, err)
-				return nil, ParseError(err)
+
+	if proto.IsStorageClassBlobStore(info.StorageClass) {
+		if s.oec.NeedRefreshObjExtents(ino) {
+			if err = s.oec.RefreshExtentsCache(ino); err != nil {
+				log.LogErrorf("[InodeGet] get ino(%v) inode(%v) err: %v", ino, info, err)
+				return info, err
 			}
 		}
-	}
-	if proto.IsStorageClassBlobStore(info.StorageClass) {
+		log.LogInfof("[InodeGet] get ino(%v) inode(%v)", ino, info)
 		return info, nil
 	}
+
 	if !info.HasExtents() {
 		if err = s.ec.RefreshExtentsCache(ino); err != nil {
 			log.LogErrorf("[InodeGet] get ino(%v) inode(%v) err: %v", ino, info, err)

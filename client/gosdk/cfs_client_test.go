@@ -1,16 +1,18 @@
 package gosdk
 
 import (
-	"context"
+	"errors"
 	"reflect"
 	"syscall"
 	"testing"
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/bits-and-blooms/bitset"
+	"github.com/cubefs/cubefs/client/fs"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/blobstore"
 	"github.com/cubefs/cubefs/sdk/data/stream"
+	"github.com/cubefs/cubefs/sdk/meta"
 	"github.com/stretchr/testify/require"
 )
 
@@ -30,19 +32,20 @@ func TestFileWriteFileAppendFlags(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 
-	patches.ApplyMethod(reflect.TypeOf(&blobstore.Writer{}), "Write",
-		func(_ *blobstore.Writer, _ context.Context, _ int, data []byte, flags int) (int, error) {
+	c := newTestClientForOEC()
+	patches.ApplyMethod(reflect.TypeOf(c.oec), "Write",
+		func(_ *blobstore.ECExtentClient, ino uint64, _ int, data []byte, flags int) (int, error) {
+			require.Equal(t, uint64(1), ino)
 			require.NotZero(t, flags&proto.FlagsAppend)
 			require.NotZero(t, flags&proto.FlagsSyncWrite)
 			return len(data), nil
 		})
 
-	c := &Client{volType: proto.VolumeTypeCold}
 	f := &File{
-		client:     c,
-		flags:      syscall.O_WRONLY | syscall.O_APPEND,
-		ino:        1,
-		fileWriter: &blobstore.Writer{},
+		client:       c,
+		flags:        syscall.O_WRONLY | syscall.O_APPEND,
+		ino:          1,
+		storageClass: proto.StorageClass_BlobStore,
 	}
 	n, err := f.WriteFile([]byte("abc"), 0)
 	require.NoError(t, err)
@@ -53,19 +56,20 @@ func TestFileWriteFileColdNonAppend_NoAppendFlags(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 
-	patches.ApplyMethod(reflect.TypeOf(&blobstore.Writer{}), "Write",
-		func(_ *blobstore.Writer, _ context.Context, _ int, data []byte, flags int) (int, error) {
+	c := newTestClientForOEC()
+	patches.ApplyMethod(reflect.TypeOf(c.oec), "Write",
+		func(_ *blobstore.ECExtentClient, ino uint64, _ int, data []byte, flags int) (int, error) {
+			require.Equal(t, uint64(1), ino)
 			require.Zero(t, flags&proto.FlagsAppend)
 			require.Zero(t, flags&proto.FlagsSyncWrite)
 			return len(data), nil
 		})
 
-	c := &Client{volType: proto.VolumeTypeCold}
 	f := &File{
-		client:     c,
-		flags:      syscall.O_WRONLY,
-		ino:        1,
-		fileWriter: &blobstore.Writer{},
+		client:       c,
+		flags:        syscall.O_WRONLY,
+		ino:          1,
+		storageClass: proto.StorageClass_BlobStore,
 	}
 	n, err := f.WriteFile([]byte("abc"), 0)
 	require.NoError(t, err)
@@ -117,22 +121,272 @@ func TestClient_openOECStream_and_closeStream_coldBlob(t *testing.T) {
 			require.Equal(t, ino, args.Ino)
 			return nil
 		})
-	patches.ApplyMethod(reflect.TypeOf(c.oec), "Reader",
-		func(_ *blobstore.ECExtentClient, _ uint64) *blobstore.Reader { return &blobstore.Reader{} })
-	patches.ApplyMethod(reflect.TypeOf(c.oec), "Writer",
-		func(_ *blobstore.ECExtentClient, _ uint64) *blobstore.Writer { return &blobstore.Writer{} })
 	patches.ApplyMethod(reflect.TypeOf(c.oec), "CloseStream", func(_ *blobstore.ECExtentClient, _ uint64) error { return nil })
 	patches.ApplyMethod(reflect.TypeOf(c.oec), "EvictStream", func(_ *blobstore.ECExtentClient, _ uint64) error { return nil })
 
 	require.NoError(t, c.openOECStream(f, info, syscall.O_RDWR, info.Size))
-	f.fileReader = c.oec.Reader(f.ino)
-	f.fileWriter = c.oec.Writer(f.ino)
-	require.NotNil(t, f.fileReader)
-	require.NotNil(t, f.fileWriter)
+	require.NoError(t, c.closeStream(f))
+}
+
+func TestClient_openStream_openOECStreamFailure(t *testing.T) {
+	c := newTestClientForOEC()
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	f := &File{client: c, ino: 55, flags: syscall.O_RDWR, storageClass: proto.StorageClass_BlobStore}
+	c.ic = fs.NewInodeCache(fs.DefaultInodeExpiration, fs.MaxInodeCache, false)
+	c.ic.Put(&proto.InodeInfo{Inode: 55, PoolId: 1, Generation: 1, StorageClass: proto.StorageClass_BlobStore})
+	openErr := errors.New("open failed")
+	patches.ApplyMethod(reflect.TypeOf(c.oec), "OpenStreamWithArgs", func(_ *blobstore.ECExtentClient, _ blobstore.ECStreamOpenArgs) error {
+		return openErr
+	})
+
+	err := c.openStream(f, true, "/f")
+	require.ErrorIs(t, err, openErr)
+}
+
+func TestClient_openStream_inodeGetFailure(t *testing.T) {
+	c := newTestClientForOEC()
+	c.mw = &meta.MetaWrapper{}
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	f := &File{client: c, ino: 56, flags: syscall.O_RDWR, storageClass: proto.StorageClass_BlobStore}
+	c.ic = fs.NewInodeCache(fs.DefaultInodeExpiration, fs.MaxInodeCache, false)
+	getErr := errors.New("inode get failed")
+	patches.ApplyMethod(reflect.TypeOf(c.mw), "InodeGet_ll",
+		func(_ *meta.MetaWrapper, _ uint64, _ bool) (*proto.InodeInfo, error) {
+			return nil, getErr
+		})
+
+	err := c.openStream(f, true, "/f")
+	require.ErrorIs(t, err, getErr)
+}
+
+func TestClient_openStream_successViaInodeGet(t *testing.T) {
+	c := newTestClientForOEC()
+	c.mw = &meta.MetaWrapper{}
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	ino := uint64(57)
+	info := &proto.InodeInfo{Inode: ino, PoolId: 1, Size: 16, Generation: 1, StorageClass: proto.StorageClass_BlobStore}
+	f := &File{client: c, ino: ino, flags: syscall.O_RDWR, storageClass: proto.StorageClass_BlobStore}
+	c.ic = fs.NewInodeCache(fs.DefaultInodeExpiration, fs.MaxInodeCache, false)
+	patches.ApplyMethod(reflect.TypeOf(c.mw), "InodeGet_ll",
+		func(_ *meta.MetaWrapper, _ uint64, _ bool) (*proto.InodeInfo, error) {
+			return info, nil
+		})
+	patches.ApplyMethod(reflect.TypeOf(c.oec), "OpenStreamWithArgs", func(_ *blobstore.ECExtentClient, _ blobstore.ECStreamOpenArgs) error {
+		return nil
+	})
+
+	require.NoError(t, c.openStream(f, true, "/f"))
+}
+
+func TestClient_openStream_hotEcPath(t *testing.T) {
+	c := newTestClientForOEC()
+	c.volType = proto.VolumeTypeHot
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	f := &File{client: c, ino: 21, flags: syscall.O_RDWR, storageClass: proto.StorageClass_Replica_SSD}
+	patches.ApplyMethod(reflect.TypeOf(c.ec), "OpenStream",
+		func(_ *stream.ExtentClient, ino uint64, openForWrite, isCache bool, fullPath string) error {
+			require.Equal(t, uint64(21), ino)
+			require.True(t, openForWrite)
+			require.False(t, isCache)
+			require.Equal(t, "/hot", fullPath)
+			return nil
+		})
+
+	require.NoError(t, c.openStream(f, true, "/hot"))
+}
+
+func TestClient_openStreamFailureReleasesFD(t *testing.T) {
+	c := newTestClientForOEC()
+	c.fdmap = make(map[uint]*File)
+	c.fdset = bitset.New(maxFdNum)
+	c.fdset.Set(0).Set(1).Set(2)
+	c.ic = fs.NewInodeCache(fs.DefaultInodeExpiration, fs.MaxInodeCache, false)
+	c.ic.Put(&proto.InodeInfo{Inode: 67, PoolId: 1, Generation: 1, StorageClass: proto.StorageClass_BlobStore})
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(c.oec), "OpenStreamWithArgs", func(_ *blobstore.ECExtentClient, _ blobstore.ECStreamOpenArgs) error {
+		return errors.New("open failed")
+	})
+
+	f := c.allocFD(67, syscall.O_RDWR, 0, false, 0, 1, "/f", proto.StorageClass_BlobStore, 1)
+	require.NotNil(t, f)
+	if err := c.openStream(f, true, "/f"); err != nil {
+		c.releaseFD(f.fd)
+	}
+	require.Nil(t, c.getFile(f.fd))
+}
+
+func TestClient_closeStream_hotEcPath(t *testing.T) {
+	c := newTestClientForOEC()
+	c.volType = proto.VolumeTypeHot
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	f := &File{client: c, ino: 22, storageClass: proto.StorageClass_Replica_SSD}
+	closeErr := errors.New("close failed")
+	patches.ApplyMethod(reflect.TypeOf(c.ec), "CloseStream", func(_ *stream.ExtentClient, ino uint64) error {
+		require.Equal(t, uint64(22), ino)
+		return closeErr
+	})
+
+	err := c.closeStream(f)
+	require.ErrorIs(t, err, closeErr)
+}
+
+func TestClient_closeStream_hotEcSuccess(t *testing.T) {
+	c := newTestClientForOEC()
+	c.volType = proto.VolumeTypeHot
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	f := &File{client: c, ino: 24, storageClass: proto.StorageClass_Replica_SSD}
+	patches.ApplyMethod(reflect.TypeOf(c.ec), "CloseStream", func(_ *stream.ExtentClient, _ uint64) error { return nil })
+	patches.ApplyMethod(reflect.TypeOf(c.ec), "EvictStream", func(_ *stream.ExtentClient, ino uint64) error {
+		require.Equal(t, uint64(24), ino)
+		return nil
+	})
 
 	require.NoError(t, c.closeStream(f))
-	require.Nil(t, f.fileReader)
-	require.Nil(t, f.fileWriter)
+}
+
+func TestClient_openRegularFile_success(t *testing.T) {
+	c := newTestClientForOEC()
+	c.fdmap = make(map[uint]*File)
+	c.fdset = bitset.New(maxFdNum)
+	c.fdset.Set(0).Set(1).Set(2)
+	c.ic = fs.NewInodeCache(fs.DefaultInodeExpiration, fs.MaxInodeCache, false)
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyPrivateMethod(reflect.TypeOf(c), "openStream",
+		func(_ *Client, _ *File, _ bool, _ string) error {
+			return nil
+		})
+
+	f := c.allocFD(71, syscall.O_RDWR, 0, false, 0, 1, "/test", proto.StorageClass_BlobStore, 1)
+	require.NotNil(t, f)
+	require.NoError(t, c.openRegularFile(f, true, "/test"))
+	require.NotNil(t, c.getFile(f.fd))
+}
+
+func TestClient_OpenFile_openStreamFailureReleasesFD(t *testing.T) {
+	c := newTestClientForOEC()
+	c.fdmap = make(map[uint]*File)
+	c.fdset = bitset.New(maxFdNum)
+	c.fdset.Set(0).Set(1).Set(2)
+	c.cwd = "/"
+	c.ic = fs.NewInodeCache(fs.DefaultInodeExpiration, fs.MaxInodeCache, false)
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	dirInfo := &proto.InodeInfo{Inode: 1, Mode: uint32(syscall.S_IFDIR | 0o755)}
+	fileInfo := &proto.InodeInfo{Inode: 68, Mode: uint32(syscall.S_IFREG | 0o644), StorageClass: proto.StorageClass_BlobStore}
+	patches.ApplyPrivateMethod(reflect.TypeOf(c), "lookupPath",
+		func(_ *Client, path string) (*proto.InodeInfo, error) {
+			switch path {
+			case "/":
+				return dirInfo, nil
+			case "/test":
+				return fileInfo, nil
+			default:
+				return nil, syscall.ENOENT
+			}
+		})
+	openErr := errors.New("open stream failed")
+	patches.ApplyPrivateMethod(reflect.TypeOf(c), "openStream",
+		func(_ *Client, _ *File, _ bool, _ string) error {
+			return openErr
+		})
+
+	f, err := c.OpenFile("/test", syscall.O_RDWR, 0o644)
+	require.ErrorIs(t, err, openErr)
+	require.Nil(t, f)
+	require.Empty(t, c.fdmap)
+}
+
+func TestClient_truncate_replicaEcPath(t *testing.T) {
+	c := newTestClientForOEC()
+	c.volType = proto.VolumeTypeHot
+	c.mw = &meta.MetaWrapper{}
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	f := &File{client: c, ino: 23, pino: 4, path: "/r", storageClass: proto.StorageClass_Replica_SSD}
+	patches.ApplyMethod(reflect.TypeOf(c.ec), "Truncate",
+		func(_ *stream.ExtentClient, _ *meta.MetaWrapper, pino, ino uint64, size int, fullPath string) error {
+			require.Equal(t, uint64(4), pino)
+			require.Equal(t, uint64(23), ino)
+			require.Equal(t, 32, size)
+			require.Equal(t, "/r", fullPath)
+			return nil
+		})
+
+	require.NoError(t, c.truncate(f, 32))
+}
+
+func TestClient_coldBlobReadWriteFlushTruncate(t *testing.T) {
+	c := newTestClientForOEC()
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	f := &File{client: c, ino: 7, pino: 3, path: "/f", storageClass: proto.StorageClass_BlobStore}
+	var flushed bool
+	var truncated bool
+
+	patches.ApplyMethod(reflect.TypeOf(c.oec), "Read",
+		func(_ *blobstore.ECExtentClient, ino uint64, data []byte, offset, size int) (int, error) {
+			require.Equal(t, uint64(7), ino)
+			require.Equal(t, 2, offset)
+			require.Equal(t, 4, size)
+			copy(data, "abcd")
+			return 4, nil
+		})
+	patches.ApplyMethod(reflect.TypeOf(c.oec), "Write",
+		func(_ *blobstore.ECExtentClient, ino uint64, offset int, data []byte, flags int) (int, error) {
+			require.Equal(t, uint64(7), ino)
+			require.Equal(t, 10, offset)
+			return len(data), nil
+		})
+	patches.ApplyMethod(reflect.TypeOf(c.oec), "Flush",
+		func(_ *blobstore.ECExtentClient, ino uint64) error {
+			require.Equal(t, uint64(7), ino)
+			flushed = true
+			return nil
+		})
+	patches.ApplyMethod(reflect.TypeOf(c.oec), "Truncate",
+		func(_ *blobstore.ECExtentClient, parentIno, ino, targetSize uint64, fullPath string) error {
+			require.Equal(t, uint64(3), parentIno)
+			require.Equal(t, uint64(7), ino)
+			require.Equal(t, uint64(64), targetSize)
+			require.Equal(t, "/f", fullPath)
+			truncated = true
+			return nil
+		})
+
+	buf := make([]byte, 4)
+	n, err := c.read(f, 2, buf)
+	require.NoError(t, err)
+	require.Equal(t, 4, n)
+
+	n, err = c.write(f, 10, []byte("z"), 0)
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+
+	require.NoError(t, c.flush(f))
+	require.True(t, flushed)
+
+	require.NoError(t, c.truncate(f, 64))
+	require.True(t, truncated)
 }
 
 func testClientWithFDSet() *Client {
