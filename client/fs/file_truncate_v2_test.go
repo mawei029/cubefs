@@ -162,7 +162,7 @@ func TestFile_Open_HotReplica_metaCacheRefreshWithExtents(t *testing.T) {
 			return nil
 		})
 
-	_, err := f.Open(context.Background(), &fuse.OpenRequest{Flags: syscall.O_RDWR}, &fuse.OpenResponse{})
+	_, err := f.Open(context.Background(), &fuse.OpenRequest{Flags: syscall.O_RDONLY}, &fuse.OpenResponse{})
 	require.NoError(t, err)
 	require.True(t, refreshWithCache)
 }

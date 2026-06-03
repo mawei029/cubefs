@@ -65,7 +65,7 @@ func (s *Super) LoadInodeInfo(ino uint64) (info *proto.InodeInfo, err error) {
 		}
 	}
 
-	log.LogInfof("[InodeGet] get ino(%v) inode(%v), migrated(%v)", ino, info, migrated)
+	log.LogInfof("[InodeGet] get ino(%v) inode(%v)", ino, info)
 	return info, nil
 }
 

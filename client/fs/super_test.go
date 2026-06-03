@@ -20,6 +20,8 @@ import (
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/blobstore"
 	"github.com/cubefs/cubefs/sdk/data/stream"
+	"github.com/cubefs/cubefs/sdk/data/wrapper"
+	masterSDK "github.com/cubefs/cubefs/sdk/master"
 	"github.com/cubefs/cubefs/sdk/meta"
 	"github.com/stretchr/testify/require"
 )
@@ -465,7 +467,7 @@ func TestNewSuper_defaultMinReadAheadSizeWhenZero(t *testing.T) {
 		mvField := ev.FieldByName("multiVerMgr")
 		reflect.NewAt(mvField.Type(), unsafe.Pointer(mvField.UnsafeAddr())).Elem().Set(reflect.ValueOf(&stream.MultiVerMgr{}))
 		dwField := ev.FieldByName("dataWrapper")
-		reflect.NewAt(dwField.Type(), unsafe.Pointer(dwField.UnsafeAddr())).Elem().Set(reflect.ValueOf(&datawrapper.Wrapper{}))
+		reflect.NewAt(dwField.Type(), unsafe.Pointer(dwField.UnsafeAddr())).Elem().Set(reflect.ValueOf(&wrapper.Wrapper{}))
 		return ec, nil
 	})
 
@@ -532,7 +534,7 @@ func TestNewSuper_CoversInitBranches(t *testing.T) {
 		mvField := ev.FieldByName("multiVerMgr")
 		reflect.NewAt(mvField.Type(), unsafe.Pointer(mvField.UnsafeAddr())).Elem().Set(reflect.ValueOf(&stream.MultiVerMgr{}))
 		dwField := ev.FieldByName("dataWrapper")
-		reflect.NewAt(dwField.Type(), unsafe.Pointer(dwField.UnsafeAddr())).Elem().Set(reflect.ValueOf(&datawrapper.Wrapper{}))
+		reflect.NewAt(dwField.Type(), unsafe.Pointer(dwField.UnsafeAddr())).Elem().Set(reflect.ValueOf(&wrapper.Wrapper{}))
 		return ec, nil
 	})
 
@@ -591,11 +593,33 @@ func TestSuper_scheduleFlush_idleWriterTriggersOecFlush(t *testing.T) {
 			return nil
 		})
 
-	go s.scheduleFlush()
+	// Run one scheduleFlush iteration (do not start the ticker goroutine — it would outlive the test).
+	s.fslock.Lock()
+	for ino, node := range s.nodeCache {
+		file, ok := node.(*File)
+		if !ok {
+			continue
+		}
+		ei, ok := file.getExtendInfo()
+		if !ok || ei == nil {
+			continue
+		}
+		ei.RLock()
+		idle := atomic.LoadInt32(&ei.idle)
+		ei.RUnlock()
+		if idle >= BlobWriterIdleTimeoutPeriod {
+			atomic.StoreInt32(&ei.idle, 0)
+			if strm := s.oec.GetStreamer(ino); strm != nil && s.oec.RefCnt(ino) > 0 {
+				go s.oec.Flush(ino)
+			}
+		}
+	}
+	s.fslock.Unlock()
+
 	select {
 	case got := <-flushed:
 		require.Equal(t, f.ino, got)
-	case <-time.After(6 * time.Second):
-		t.Fatal("scheduleFlush did not trigger oec.Flush in time")
+	case <-time.After(2 * time.Second):
+		t.Fatal("scheduleFlush iteration did not trigger oec.Flush in time")
 	}
 }

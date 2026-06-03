@@ -718,7 +718,7 @@ func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) (err error) {
 	}
 
 	if DisableMetaCache && openForWrite {
-		f.super.ic.Delete(f.info.Inode)
+		f.super.ic.Delete(f.ino)
 	}
 
 	elapsed := time.Since(start)

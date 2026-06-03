@@ -131,29 +131,30 @@ func TestNewFile_replica_returnsFile(t *testing.T) {
 			node := NewFile(s, info, flag, 1, "a.txt")
 			require.NotNil(t, node)
 			f := node.(*File)
-			require.Equal(t, flag, f.flag)
 			require.Equal(t, "a.txt", f.name)
-			require.Nil(t, f.fReader)
-			require.Nil(t, f.fWriter)
 		})
 	}
 }
 
-func TestNewFile_blobStore_noClient_returnsNil(t *testing.T) {
+func TestNewFile_blobStore_returnsNodeWithoutOECOpen(t *testing.T) {
 	t.Parallel()
 	s := superForFileTest(t)
 	info := fileInodeInfoForMutationTest(90002)
 	info.StorageClass = proto.StorageClass_BlobStore
 
-	require.Nil(t, NewFile(s, info, syscall.O_RDONLY, 1, "cold.txt"))
+	node := NewFile(s, info, syscall.O_RDONLY, 1, "cold.txt")
+	require.NotNil(t, node)
+	f := node.(*File)
+	require.Equal(t, info.Inode, f.ino)
+	require.Equal(t, "cold.txt", f.name)
 }
 
 func TestFile_filterFilesSuffix(t *testing.T) {
 	t.Parallel()
-	f := &File{info: &proto.InodeInfo{Inode: 1}, name: "readme.txt"}
+	f := &File{ino: 1, name: "readme.txt"}
 
-	require.True(t, (&File{info: &proto.InodeInfo{Inode: 2}, name: ""}).filterFilesSuffix(""))
-	require.True(t, (&File{info: &proto.InodeInfo{Inode: 3}, name: ""}).filterFilesSuffix("py"))
+	require.True(t, (&File{ino: 2, name: ""}).filterFilesSuffix(""))
+	require.True(t, (&File{ino: 3, name: ""}).filterFilesSuffix("py"))
 
 	require.False(t, f.filterFilesSuffix("py"))
 	require.False(t, (&File{name: "readme.txt"}).filterFilesSuffix(""))
@@ -168,14 +169,14 @@ func TestFile_getParentPath(t *testing.T) {
 	t.Run("parent_is_root", func(t *testing.T) {
 		t.Parallel()
 		s := superForFileTest(t)
-		f := &File{super: s, parentIno: s.rootIno, name: "f.txt", info: &proto.InodeInfo{Inode: 10}}
+		f := &File{super: s, ino: 10, parentIno: s.rootIno, name: "f.txt"}
 		require.Equal(t, "/", f.getParentPath())
 	})
 
 	t.Run("cache_miss", func(t *testing.T) {
 		t.Parallel()
 		s := superForFileTest(t)
-		f := &File{super: s, parentIno: 404, name: "f.txt", info: &proto.InodeInfo{Inode: 11}}
+		f := &File{super: s, ino: 11, parentIno: 404, name: "f.txt"}
 		require.Equal(t, "unknown", f.getParentPath())
 	})
 
@@ -183,8 +184,8 @@ func TestFile_getParentPath(t *testing.T) {
 		t.Parallel()
 		const parentIno uint64 = 300
 		s := superForFileTest(t)
-		s.nodeCache[parentIno] = &File{super: s, parentIno: 1, name: "notdir", info: &proto.InodeInfo{Inode: parentIno}}
-		f := &File{super: s, parentIno: parentIno, name: "f.txt", info: &proto.InodeInfo{Inode: 12}}
+		s.nodeCache[parentIno] = &File{super: s, ino: parentIno, parentIno: 1, name: "notdir"}
+		f := &File{super: s, ino: 12, parentIno: parentIno, name: "f.txt"}
 		require.Equal(t, "unknown", f.getParentPath())
 	})
 
@@ -194,12 +195,12 @@ func TestFile_getParentPath(t *testing.T) {
 		s := superForFileTest(t)
 		parent := &Dir{
 			super:     s,
-			info:      dirInodeInfoForMutationTest(parentIno),
+			ino:       parentIno,
 			parentIno: s.rootIno,
 			name:      "mydir",
 		}
 		s.nodeCache[parentIno] = parent
-		f := &File{super: s, parentIno: parentIno, name: "f.txt", info: &proto.InodeInfo{Inode: 13}}
+		f := &File{super: s, ino: 13, parentIno: parentIno, name: "f.txt"}
 		require.Equal(t, "/mydir", f.getParentPath())
 	})
 }
@@ -386,7 +387,6 @@ func TestFile_Setattr_openForWriteFlag_stillPairsDirMutation(t *testing.T) {
 	s.ic.Put(info)
 
 	f := newTestFile(s, info, parentIno, "w.txt")
-	f.flag = syscall.O_WRONLY
 
 	req := &fuse.SetattrRequest{
 		Header: fuse.Header{Pid: 5152},

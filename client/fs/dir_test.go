@@ -10,14 +10,14 @@ package fs
 
 import (
 	"context"
-	"errors"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
-	"sync"
 	"reflect"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -30,7 +30,6 @@ import (
 	"github.com/cubefs/cubefs/sdk/data/blobstore"
 	"github.com/cubefs/cubefs/sdk/meta"
 	"github.com/stretchr/testify/require"
-	"github.com/cubefs/cubefs/sdk/meta"
 )
 
 func newTestSuperForDir() *Super {
@@ -170,9 +169,8 @@ func TestDir_ReadDir_metaCacheAccelerationUsesBatchInodeGetExtentsAsync(t *testi
 	}
 	d := &Dir{
 		super: super,
-		info:  &proto.InodeInfo{Inode: parentIno},
+		ino:   parentIno,
 		name:  "dir",
-		dctx:  NewDirContexts(),
 	}
 
 	dirents, err := d.ReadDir(context.Background(), &fuse.ReadRequest{
@@ -255,9 +253,8 @@ func TestDir_ReadDir_withoutMetaCacheAccelerationUsesBatchInodeGet(t *testing.T)
 	}
 	d := &Dir{
 		super: super,
-		info:  &proto.InodeInfo{Inode: parentIno},
+		ino:   parentIno,
 		name:  "dir",
-		dctx:  NewDirContexts(),
 	}
 
 	dirents, err := d.ReadDir(context.Background(), &fuse.ReadRequest{
@@ -287,7 +284,7 @@ func TestDir_readDirAllBatchesInodeGetsPerReadDirLimit(t *testing.T) {
 	}
 	d := &Dir{
 		super: super,
-		info:  &proto.InodeInfo{Inode: parentIno},
+		ino:   parentIno,
 		name:  "dir",
 	}
 
@@ -323,7 +320,7 @@ func TestDir_readDirAllBatchesInodeGetExtentsWhenMetaCacheAcceleration(t *testin
 	}
 	d := &Dir{
 		super: super,
-		info:  &proto.InodeInfo{Inode: parentIno},
+		ino:   parentIno,
 		name:  "dir",
 	}
 
@@ -483,12 +480,14 @@ func TestDir_Link_nonRegularFile_returnsEPermBeforeBegin(t *testing.T) {
 	const parentIno = uint64(88020)
 	srcDir := NewDir(s, dirInodeInfoForMutationTest(parentIno), 1, "p").(*Dir)
 
-	old := NewFile(s, &proto.InodeInfo{
+	symInfo := &proto.InodeInfo{
 		Inode:        88021,
 		Mode:         uint32(os.ModeSymlink | 0o777),
 		Nlink:        1,
 		StorageClass: proto.StorageClass_Replica_HDD,
-	}, syscall.O_RDONLY, parentIno, "sym").(*File)
+	}
+	s.ic.Put(symInfo)
+	old := NewFile(s, symInfo, syscall.O_RDONLY, parentIno, "sym").(*File)
 
 	_, err := srcDir.Link(context.Background(), &fuse.LinkRequest{
 		Header:  fuse.Header{Pid: 1},
@@ -750,7 +749,7 @@ func TestDir_Create_ColdBlob_openOECStreamError(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 	patches.ApplyMethod(reflect.TypeOf(s.mw), "Create_ll",
-		func(_ *meta.MetaWrapper, _ uint64, _ string, _ uint32, _ uint32, _ uint32, _ []byte, _ string, _ bool, _ bool) (*proto.InodeInfo, error) {
+		func(_ *meta.MetaWrapper, _ uint64, _ string, _ uint32, _ uint32, _ uint32, _ []byte, _ string, _ bool) (*proto.InodeInfo, error) {
 			return &proto.InodeInfo{Inode: 89, PoolId: 1, StorageClass: proto.StorageClass_BlobStore}, nil
 		})
 	patches.ApplyPrivateMethod(reflect.TypeOf((*File)(nil)), "openOECStream",
@@ -773,7 +772,7 @@ func TestDir_Create_ColdBlob_openOECStream(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 	patches.ApplyMethod(reflect.TypeOf(s.mw), "Create_ll",
-		func(_ *meta.MetaWrapper, _ uint64, _ string, _ uint32, _ uint32, _ uint32, _ []byte, _ string, _ bool, _ bool) (*proto.InodeInfo, error) {
+		func(_ *meta.MetaWrapper, _ uint64, _ string, _ uint32, _ uint32, _ uint32, _ []byte, _ string, _ bool) (*proto.InodeInfo, error) {
 			return &proto.InodeInfo{Inode: 88, PoolId: 1, StorageClass: proto.StorageClass_BlobStore, Size: 0}, nil
 		})
 	patches.ApplyPrivateMethod(reflect.TypeOf((*File)(nil)), "openOECStream",
@@ -801,7 +800,8 @@ func TestDir_ForgetRemovesExtendInfoWhenOpenCountZero(t *testing.T) {
 	require.False(t, still)
 	_, inNode := s.nodeCache[ino]
 	require.False(t, inNode)
-=======
+}
+
 var utMetaProtoOnce sync.Once
 
 func utMetaInitProto() {

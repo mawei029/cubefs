@@ -407,29 +407,26 @@ func TestLoadInodeInfo_metaNilInfo(t *testing.T) {
 	require.ErrorIs(t, err, fuse.ENOENT)
 }
 
-func TestLoadInodeInfo_migratedForceRefreshError(t *testing.T) {
+func TestLoadInodeInfo_refreshExtentsErrorWhenMissingExtents(t *testing.T) {
 	t.Parallel()
 	const ino = uint64(60004)
-	oldInfo := fileInodeInfoForMutationTest(ino)
-	oldInfo.PoolId = 0
 	newInfo := fileInodeInfoForMutationTest(ino)
-	newInfo.PoolId = 1
+	newInfo.Extents = nil
 
 	addr, cleanup := startInodeTestMetaListener(t, mockInodeGetHandler(newInfo, proto.OpOk))
 	t.Cleanup(cleanup)
 
 	mw := meta.NewTestMetaWrapperWithLeader(t, addr)
 	ec := stream.NewTestExtentClient(func(uint64, bool, bool, bool) (uint64, uint64, []proto.ExtentKey, error) {
-		return 0, 0, nil, errors.New("force refresh failed")
+		return 0, 0, nil, errors.New("refresh extents failed")
 	})
 	ec.RegisterTestStreamer(stream.NewTestStreamer(ec, ino))
 
 	s := superForLoadInodeTest(t, mw, ec)
-	s.nodeCache[ino] = newTestFile(s, oldInfo, 1, "mig.txt")
 
 	info, err := s.LoadInodeInfo(ino)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "force refresh failed")
+	require.Contains(t, err.Error(), "refresh extents failed")
 	require.NotNil(t, info)
 }
 
@@ -437,6 +434,7 @@ func TestLoadInodeInfo_refreshExtentsSuccess(t *testing.T) {
 	t.Parallel()
 	const ino = uint64(60005)
 	want := fileInodeInfoForMutationTest(ino)
+	want.Extents = nil
 
 	addr, cleanup := startInodeTestMetaListener(t, mockInodeGetHandler(want, proto.OpOk))
 	t.Cleanup(cleanup)
@@ -472,6 +470,7 @@ func TestLoadInodeInfo_blobStoreSkipsExtentRefresh(t *testing.T) {
 		return 0, 0, nil, nil
 	})
 	s := superForLoadInodeTest(t, mw, ec)
+	s.oec = blobstore.NewObjExtentClient(blobstore.ObjExtentConfig{})
 
 	info, err := s.LoadInodeInfo(ino)
 	require.NoError(t, err)
@@ -497,6 +496,8 @@ func TestLoadInodeInfo_dirInNodeCacheUpdatesInfo(t *testing.T) {
 	info, err := s.LoadInodeInfo(ino)
 	require.NoError(t, err)
 	require.Equal(t, uint64(200), info.Size)
-	dir := s.nodeCache[ino].(*Dir)
-	require.Equal(t, uint64(200), dir.info.Size)
+	require.NotNil(t, s.nodeCache[ino].(*Dir))
+	cached := s.ic.Get(ino)
+	require.NotNil(t, cached)
+	require.Equal(t, uint64(200), cached.Size)
 }

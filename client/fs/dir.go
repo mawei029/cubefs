@@ -110,12 +110,6 @@ type Dir struct {
 type readDirAllMetaClient interface {
 	ReadDirLimit_ll(parentID uint64, from string, limit uint64, isAsync bool) ([]proto.Dentry, error)
 	BatchInodeGet(inodes []uint64) []*proto.InodeInfo
-	BatchInodeGetExtents(inodes []uint64) []*proto.InodeInfo
-}
-
-type readDirAllMetaClient interface {
-	ReadDirLimit_ll(parentID uint64, from string, limit uint64, isAsync bool) ([]proto.Dentry, error)
-	BatchInodeGet(inodes []uint64) []*proto.InodeInfo
 	BatchInodeGetExtents(inodes []uint64, async bool) []*proto.InodeInfo
 }
 
@@ -244,8 +238,8 @@ func (d *Dir) Release(ctx context.Context, req *fuse.ReleaseRequest) (err error)
 // Create handles the create request.
 func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
 	start := time.Now()
-	d.super.BeginDirMutation(d.info.Inode)
-	defer d.super.EndDirMutation(d.info.Inode)
+	d.super.BeginDirMutation(d.ino)
+	defer d.super.EndDirMutation(d.ino)
 
 	bgTime := stat.BeginStat()
 	var err error
@@ -342,8 +336,8 @@ func (d *Dir) Forget() {
 // Mkdir handles the mkdir request.
 func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
 	start := time.Now()
-	d.super.BeginDirMutation(d.info.Inode)
-	defer d.super.EndDirMutation(d.info.Inode)
+	d.super.BeginDirMutation(d.ino)
+	defer d.super.EndDirMutation(d.ino)
 
 	bgTime := stat.BeginStat()
 	var err error
@@ -582,12 +576,12 @@ func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.Lo
 					log.LogDebugf("trigger ReadDirAll for ino(%v) name(%v)", d.ino, d.getCwd())
 					auditlog.LogClientOp("TriggerReadDirAllParent", d.getCwd(), "", err, time.Since(*bgTime).Microseconds(), ino, 0)
 
-					if d.super.readDirAllCacheBegin(d.info.Inode) {
-						log.LogDebugf("readDirAllCacheBegin skip for ino(%v) name(%v)", d.info.Inode, d.getCwd())
+					if d.super.readDirAllCacheBegin(d.ino) {
+						log.LogDebugf("readDirAllCacheBegin skip for ino(%v) name(%v)", d.ino, d.getCwd())
 						return
 					}
 
-					defer d.super.ReleaseDirDirty(d.info.Inode)
+					defer d.super.ReleaseDirDirty(d.ino)
 
 					d.ReadDirAll(context.Background())
 					d.storeLastDoing(0)
@@ -841,7 +835,7 @@ func (d *Dir) readDirAll(mw readDirAllMetaClient) ([]fuse.Dirent, error) {
 			dcache.Put(child.Name, child.Inode)
 		}
 
-		log.LogDebugf("ReadDirAll BatchInodeGet ino(%v) batchInodes(%v) from(%v)", d.info.Inode, len(inodes), from)
+		log.LogDebugf("ReadDirAll BatchInodeGet ino(%v) batchInodes(%v) from(%v)", d.ino, len(inodes), from)
 		if d.super.metaCacheAcceleration {
 			infos = append(infos, mw.BatchInodeGetExtents(inodes, true)...)
 		} else {
@@ -952,8 +946,8 @@ func (d *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Nod
 
 // Setattr handles the setattr request.
 func (d *Dir) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
-	d.super.BeginDirMutation(d.info.Inode)
-	defer d.super.EndDirMutation(d.info.Inode)
+	d.super.BeginDirMutation(d.ino)
+	defer d.super.EndDirMutation(d.ino)
 	var err error
 	bgTime := stat.BeginStat()
 	runningStat := d.super.runningMonitor.AddClientOp("setattr", req.Hdr().Pid)
@@ -992,8 +986,8 @@ func (d *Dir) Mknod(ctx context.Context, req *fuse.MknodRequest) (fs.Node, error
 	}
 
 	start := time.Now()
-	d.super.BeginDirMutation(d.info.Inode)
-	defer d.super.EndDirMutation(d.info.Inode)
+	d.super.BeginDirMutation(d.ino)
+	defer d.super.EndDirMutation(d.ino)
 
 	bgTime := stat.BeginStat()
 	var err error
@@ -1084,8 +1078,8 @@ func (d *Dir) Link(ctx context.Context, req *fuse.LinkRequest, old fs.Node) (fs.
 	}
 
 	start := time.Now()
-	d.super.BeginDirMutation(d.info.Inode)
-	defer d.super.EndDirMutation(d.info.Inode)
+	d.super.BeginDirMutation(d.ino)
+	defer d.super.EndDirMutation(d.ino)
 
 	bgTime := stat.BeginStat()
 	var err error
