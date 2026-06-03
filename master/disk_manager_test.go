@@ -54,7 +54,7 @@ func TestDecommissionDiskMarkDecommissionInitializesState(t *testing.T) {
 		DstAddr:             "old-target",
 	}
 
-	disk.markDecommission("10.0.0.2:17310", true, 2)
+	disk.markDecommission("10.0.0.2:17310", true, 2, "test")
 
 	require.EqualValues(t, markDecommission, disk.GetDecommissionStatus())
 	require.Equal(t, InvalidDecommissionDpCnt, disk.DecommissionDpTotal)
@@ -78,7 +78,7 @@ func TestDecommissionDiskMarkDecommissionFromPausePreservesPlan(t *testing.T) {
 		DecommissionCompleteTime: 99,
 	}
 
-	disk.markDecommission("10.0.0.3:17310", false, 9)
+	disk.markDecommission("10.0.0.3:17310", false, 9, "test")
 
 	require.EqualValues(t, markDecommission, disk.GetDecommissionStatus())
 	require.Equal(t, 5, disk.DecommissionDpTotal)
