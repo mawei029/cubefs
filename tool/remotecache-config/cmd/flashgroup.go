@@ -341,10 +341,12 @@ func newCmdFlashGroupSuggestSlots(client *master.MasterClient) *cobra.Command {
 				return
 			}
 
+			var targetWeight uint32
 			foundTarget := false
 			for _, fg := range fgView.FlashGroups {
 				if fg.ID == targetFgID {
 					foundTarget = true
+					targetWeight = fg.Weight
 					break
 				}
 			}
@@ -416,13 +418,27 @@ func newCmdFlashGroupSuggestSlots(client *master.MasterClient) *cobra.Command {
 				fgTotalPercent[curr.fgID] += pct
 			}
 
-			avgPct := 100.0 / float64(activeFGs)
-			threshold := avgPct * (1.0 + optErrorRate)
+			var totalWeight uint64
+			expectedPct := make(map[uint64]float64)
+			for _, fg := range fgView.FlashGroups {
+				if fg.Status == proto.FlashGroupStatus_Active || fg.ID == targetFgID {
+					totalWeight += uint64(fg.Weight)
+				}
+			}
+			if totalWeight > 0 {
+				for _, fg := range fgView.FlashGroups {
+					if fg.Status == proto.FlashGroupStatus_Active || fg.ID == targetFgID {
+						expectedPct[fg.ID] = float64(fg.Weight) * 100.0 / float64(totalWeight)
+					}
+				}
+			}
+
 			minTakePct := optErrorRate * 100
 
 			var candidateRanges []slotRange
 			for _, r := range allRanges {
-				if fgTotalPercent[r.fgID] > threshold && r.fgID != targetFgID {
+				sourceThreshold := expectedPct[r.fgID] * (1.0 + optErrorRate)
+				if fgTotalPercent[r.fgID] > sourceThreshold && r.fgID != targetFgID {
 					candidateRanges = append(candidateRanges, r)
 				}
 			}
@@ -437,20 +453,22 @@ func newCmdFlashGroupSuggestSlots(client *master.MasterClient) *cobra.Command {
 			})
 
 			var suggestions []uint32
-			tbl := table{{"From_FG", "Interval_Start", "Interval_End", "Original_Percent", "Taken_Percent", "Remain_Percent", "Suggested_Slot"}}
+			tbl := table{{"From_FG", "Interval_Start", "Interval_End", "Original_Percent", "Taken_Percent", "Remain_Percent", "Source_Total_Percent", "Suggested_Slot"}}
 
 			currentPct := fgTotalPercent[targetFgID]
+			targetExpected := expectedPct[targetFgID]
 			for i := 0; i < len(candidateRanges); i++ {
 				if len(suggestions) >= optCount {
 					break
 				}
-				neededPct := threshold - currentPct
+				neededPct := targetExpected - currentPct
 				if neededPct <= minTakePct {
 					break
 				}
 
 				r := candidateRanges[i]
-				maxTakeFromSource := fgTotalPercent[r.fgID] - threshold
+				sourceThreshold := expectedPct[r.fgID] * (1.0 + optErrorRate)
+				maxTakeFromSource := fgTotalPercent[r.fgID] - sourceThreshold
 				if maxTakeFromSource <= minTakePct {
 					continue
 				}
@@ -494,7 +512,7 @@ func newCmdFlashGroupSuggestSlots(client *master.MasterClient) *cobra.Command {
 				fgTotalPercent[r.fgID] -= addedPct
 				remainPct := r.percent - addedPct
 
-				tbl = tbl.append(arow(r.fgID, r.start, r.end, fmt.Sprintf("%0.5f%%", r.percent), fmt.Sprintf("%0.5f%%", addedPct), fmt.Sprintf("%0.5f%%", remainPct), uint32(suggestSlot)))
+				tbl = tbl.append(arow(r.fgID, r.start, r.end, fmt.Sprintf("%0.5f%%", r.percent), fmt.Sprintf("%0.5f%%", addedPct), fmt.Sprintf("%0.5f%%", remainPct), fmt.Sprintf("%0.5f%%", fgTotalPercent[r.fgID]), uint32(suggestSlot)))
 			}
 
 			if len(suggestions) == 0 {
@@ -502,8 +520,8 @@ func newCmdFlashGroupSuggestSlots(client *master.MasterClient) *cobra.Command {
 				return nil
 			}
 
-			stdoutlnf("Target FlashGroup: %d, Percent: %0.5f%% -> %0.5f%%", targetFgID, fgTotalPercent[targetFgID], currentPct)
-			stdoutlnf("Average Percent: %0.5f%%, Threshold to take from: %0.5f%%", avgPct, threshold)
+			stdoutlnf("Target FlashGroup: %d, Weight: %v, Expected Percent: %0.5f%%", targetFgID, targetWeight, expectedPct[targetFgID])
+			stdoutlnf("Percent: %0.5f%% -> %0.5f%%", fgTotalPercent[targetFgID], currentPct)
 			stdoutln("\n[Suggested Slots to Add]")
 			stdoutln(alignTable(tbl...))
 
@@ -513,9 +531,9 @@ func newCmdFlashGroupSuggestSlots(client *master.MasterClient) *cobra.Command {
 			}
 			stdoutln("\nCommand to execute:")
 			if name == proto.DefaultTopoName {
-				stdoutlnf("remotecache-config flashgroup addSlots %d --slots=%s", targetFgID, strings.Join(strSlots, ","))
+				stdoutlnf("./cfs-remotecache-config flashgroup addSlots %d --slots=%s", targetFgID, strings.Join(strSlots, ","))
 			} else {
-				stdoutlnf("remotecache-config flashgroup addSlots %d --slots=%s -n %s", targetFgID, strings.Join(strSlots, ","), name)
+				stdoutlnf("./cfs-remotecache-config flashgroup addSlots %d --slots=%s -n %s", targetFgID, strings.Join(strSlots, ","), name)
 			}
 
 			return
@@ -523,7 +541,7 @@ func newCmdFlashGroupSuggestSlots(client *master.MasterClient) *cobra.Command {
 	}
 	cmd.Flags().StringVarP(&name, "topoName", "n", proto.DefaultTopoName, "flash topology name")
 	cmd.Flags().IntVarP(&optCount, "count", "c", 8, "number of slots to suggest")
-	cmd.Flags().Float64VarP(&optErrorRate, "errorRate", "e", 0.0005, "allowed error rate over average (e.g. 0.05 for 5% over avg)")
+	cmd.Flags().Float64VarP(&optErrorRate, "errorRate", "e", 0.0001, "allowed error rate over average (e.g. 0.05 for 5% over avg)")
 	return cmd
 }
 
@@ -664,11 +682,20 @@ func newCmdFlashGroupList(client *master.MasterClient) *cobra.Command {
 					fgTotalPercent[curr.fgID] += pct
 				}
 
+				var totalWeight uint64
+				for _, fg := range fgView.FlashGroups {
+					totalWeight += uint64(fg.Weight)
+				}
+
 				for _, fg := range fgView.FlashGroups {
 					if len(fgSlots[fg.ID]) == 0 {
 						continue
 					}
-					stdoutlnf("FlashGroup: %d, Total Percent: %0.5f%%", fg.ID, fgTotalPercent[fg.ID])
+					var expectedPct float64
+					if totalWeight > 0 {
+						expectedPct = float64(fg.Weight) * 100.0 / float64(totalWeight)
+					}
+					stdoutlnf("FlashGroup: %d, Weight: %v, Expected Percent: %0.5f%%, Total Percent: %0.5f%%", fg.ID, fg.Weight, expectedPct, fgTotalPercent[fg.ID])
 					for _, sr := range fgSlots[fg.ID] {
 						stdoutlnf("  slot:%d range:[%d, %d] percent:%0.5f%%", sr.slot, sr.start, sr.end, sr.percent)
 					}

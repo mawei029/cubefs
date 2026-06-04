@@ -522,3 +522,182 @@ func TestFlashGroupListCmd_PercentFlag(t *testing.T) {
 	err = cmd.RunE(cmd, []string{})
 	require.NoError(t, err)
 }
+
+// TestFlashGroupListCmd_PercentWithWeight tests listFlashGroups with --percent flag
+// and flash groups that have non-zero Weight values, which triggers the
+// totalWeight and expectedPct calculation in the percent display section.
+func TestFlashGroupListCmd_PercentWithWeight(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fgView := proto.FlashGroupsAdminView{
+			FlashGroups: []proto.FlashGroupAdminView{
+				{
+					ID: 1, Status: proto.FlashGroupStatus_Active, Weight: 2,
+					Slots: []uint32{4294967290, 2000000000},
+				},
+				{
+					ID: 2, Status: proto.FlashGroupStatus_Active, Weight: 1,
+					Slots: []uint32{1000000000},
+				},
+				{ID: 3, Status: proto.FlashGroupStatus_Inactive, Weight: 1, Slots: []uint32{}},
+			},
+		}
+		reply := &proto.HTTPReply{Code: proto.ErrCodeSuccess, Data: fgView}
+		data, _ := json.Marshal(reply)
+		w.Write(data)
+	}))
+	defer server.Close()
+
+	client := master.NewMasterClient([]string{server.URL[7:]}, false)
+	cmd := newCmdFlashGroupList(client)
+	err := cmd.ParseFlags([]string{"--percent"})
+	require.NoError(t, err)
+
+	oldStdout := os.Stdout
+	rPipe, wPipe, _ := os.Pipe()
+	os.Stdout = wPipe
+
+	err = cmd.RunE(cmd, []string{})
+	require.NoError(t, err)
+
+	wPipe.Close()
+	os.Stdout = oldStdout
+
+	var buf bytes.Buffer
+	io.Copy(&buf, rPipe)
+	output := buf.String()
+
+	// Verify weight-based expected percent is displayed
+	require.Contains(t, output, "Weight: 2")
+	require.Contains(t, output, "Expected Percent")
+	require.Contains(t, output, "Total Percent")
+}
+
+// TestFlashGroupSuggestSlotsCmd_WeightBasedThreshold tests suggestSlots with groups
+// having different Weight values, verifying that the threshold is calculated
+// based on Weight (not simple average) and that the targetExpected and
+// sourceThreshold logic are exercised.
+func TestFlashGroupSuggestSlotsCmd_WeightBasedThreshold(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == proto.AdminFlashGroupList {
+			// Target FG (ID=1): Weight=3, Expected 60% but only has 2 tiny slots (~tiny pct)
+			// Source FG (ID=2): Weight=2, Expected 40% but has many slots covering most of the space
+			// Source FG (ID=3): Weight=2, Expected 40% but has many slots
+			// With errorRate=0.01, sourceThreshold for source FG = 40% * 1.01 = 40.4%
+			// Since source FGs have ~80% and ~20% of the space, both exceed 40.4%
+			fgView := proto.FlashGroupsAdminView{
+				FlashGroups: []proto.FlashGroupAdminView{
+					{
+						ID:             1,
+						Status:         proto.FlashGroupStatus_Active,
+						Slots:          []uint32{1000000, 2000000},
+						Weight:         3,
+						SlotStatus:     proto.SlotStatus_Completed,
+						FlashNodeCount: 1,
+					},
+					{
+						ID:             2,
+						Status:         proto.FlashGroupStatus_Active,
+						Slots:          []uint32{100000000, 200000000, 300000000, 400000000, 500000000, 600000000, 700000000, 800000000, 900000000, 1000000000, 1100000000, 1200000000, 1300000000, 1400000000, 1500000000, 1600000000, 1700000000, 1800000000},
+						Weight:         2,
+						SlotStatus:     proto.SlotStatus_Completed,
+						FlashNodeCount: 1,
+					},
+					{
+						ID:             3,
+						Status:         proto.FlashGroupStatus_Active,
+						Slots:          []uint32{2000000000, 2200000000, 2400000000, 2600000000, 2800000000, 3000000000, 3200000000, 3400000000, 3600000000, 3800000000, 4000000000},
+						Weight:         2,
+						SlotStatus:     proto.SlotStatus_Completed,
+						FlashNodeCount: 1,
+					},
+				},
+			}
+			reply := &proto.HTTPReply{Code: proto.ErrCodeSuccess, Data: fgView}
+			data, _ := json.Marshal(reply)
+			w.Write(data)
+			return
+		}
+		w.Write([]byte(`{"code":0,"msg":"success","data":{}}`))
+	}))
+	defer server.Close()
+
+	client := master.NewMasterClient([]string{server.URL[7:]}, false)
+	cmd := newCmdFlashGroupSuggestSlots(client)
+	err := cmd.ParseFlags([]string{"--count", "3", "--errorRate", "0.01"})
+	require.NoError(t, err)
+
+	oldStdout := os.Stdout
+	rPipe, wPipe, _ := os.Pipe()
+	os.Stdout = wPipe
+
+	err = cmd.RunE(cmd, []string{"1"})
+	require.NoError(t, err)
+
+	wPipe.Close()
+	os.Stdout = oldStdout
+
+	var buf bytes.Buffer
+	io.Copy(&buf, rPipe)
+	output := buf.String()
+
+	// Verify weight-based output
+	require.Contains(t, output, "Weight: 3")
+	require.Contains(t, output, "Expected Percent")
+	require.Contains(t, output, "Source_Total_Percent")
+	require.Contains(t, output, "Command to execute:")
+}
+
+// TestFlashGroupSuggestSlotsCmd_InactiveTarget tests suggestSlots where the target
+// flash group is currently inactive (but still included in weight calculations).
+func TestFlashGroupSuggestSlotsCmd_InactiveTarget(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == proto.AdminFlashGroupList {
+			// Target FG (ID=3) is inactive — still included in totalWeight because it's the target
+			fgView := proto.FlashGroupsAdminView{
+				FlashGroups: []proto.FlashGroupAdminView{
+					{
+						ID:             1,
+						Status:         proto.FlashGroupStatus_Active,
+						Slots:          []uint32{100000000, 200000000, 300000000, 400000000, 500000000, 600000000, 700000000, 800000000},
+						Weight:         2,
+						SlotStatus:     proto.SlotStatus_Completed,
+						FlashNodeCount: 1,
+					},
+					{
+						ID:             2,
+						Status:         proto.FlashGroupStatus_Active,
+						Slots:          []uint32{900000000, 1000000000},
+						Weight:         1,
+						SlotStatus:     proto.SlotStatus_Completed,
+						FlashNodeCount: 1,
+					},
+					{
+						ID:             3,
+						Status:         proto.FlashGroupStatus_Inactive,
+						Slots:          []uint32{1100000000},
+						Weight:         1,
+						SlotStatus:     proto.SlotStatus_Completed,
+						FlashNodeCount: 1,
+					},
+				},
+			}
+			reply := &proto.HTTPReply{Code: proto.ErrCodeSuccess, Data: fgView}
+			data, _ := json.Marshal(reply)
+			w.Write(data)
+			return
+		}
+		w.Write([]byte(`{"code":0,"msg":"success","data":{}}`))
+	}))
+	defer server.Close()
+
+	client := master.NewMasterClient([]string{server.URL[7:]}, false)
+	cmd := newCmdFlashGroupSuggestSlots(client)
+	err := cmd.ParseFlags([]string{"--count", "2", "--errorRate", "0.05"})
+	require.NoError(t, err)
+
+	err = cmd.RunE(cmd, []string{"3"})
+	require.NoError(t, err)
+}

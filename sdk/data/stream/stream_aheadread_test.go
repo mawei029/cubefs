@@ -331,7 +331,7 @@ func TestAheadRead_DoTask_ReadFailed(t *testing.T) {
 func TestAheadRead_BackgroundTaskTickerStop(t *testing.T) {
 	// This test verifies that backgroundAheadReadTask stops its ticker
 	// when the streamer is closed, covering the defer ticker.Stop() line.
-	arc := NewAheadReadCache(true, 16*util.MB, 100000, 2)
+	arc := NewAheadReadCache(true, 16*util.MB, 100000, 2, util.CacheReadBlockSize)
 
 	s := &Streamer{}
 	s.inode = 99999
