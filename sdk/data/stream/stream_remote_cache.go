@@ -103,9 +103,41 @@ func (s *Streamer) prepareRemoteCache(ctx context.Context, ek *proto.ExtentKey, 
 	}
 }
 
-func (s *Streamer) readFromRemoteCache(ctx context.Context, offset, size uint64, cReadRequests []*remotecache.CacheReadRequest) (total int, err error) {
-	metric := exporter.NewTPCnt("readFromRemoteCache")
-	metricBytes := exporter.NewCounter("readFromRemoteCacheBytes")
+func (s *Streamer) shouldTryHDDAccCache(storageClass uint32) bool {
+	if !s.client.HasHDDAccCache() {
+		return false
+	}
+	// SSD replica data is local; skip private-cloud HDDAccCache flash topo.
+	if storageClass == proto.StorageClass_Replica_SSD {
+		return false
+	}
+	return true
+}
+
+func (s *Streamer) readFromRemoteCache(ctx context.Context, offset, size uint64, cReadRequests []*remotecache.CacheReadRequest, storageClass uint32) (total int, err error) {
+	rc := s.client.RemoteCache.remoteCacheClient
+	if rc != nil {
+		total, err = s.readFromRemoteCacheClient(ctx, offset, size, cReadRequests, rc, "readRemoteCache")
+		if err == nil {
+			return total, nil
+		}
+	} else {
+		err = proto.ErrorNoFlashGroup
+	}
+	if !s.shouldTryHDDAccCache(storageClass) {
+		return total, err
+	}
+	hddAccRC := s.client.RemoteCache.hddAccCacheClient
+	log.LogDebugf("readFromRemoteCache: primary topo read failed(%v), try HDDAccCache topo(%s) inode(%d) offset(%v) size(%v)",
+		err, s.client.extentConfig.HDDAccCache, s.inode, offset, size)
+	return s.readFromRemoteCacheClient(ctx, offset, size, cReadRequests, hddAccRC, "readHDDAccCache")
+}
+
+func (s *Streamer) readFromRemoteCacheClient(ctx context.Context, offset, size uint64, cReadRequests []*remotecache.CacheReadRequest,
+	rcClient *remotecache.RemoteCacheClient, metricName string,
+) (total int, err error) {
+	metric := exporter.NewTPCnt(metricName)
+	metricBytes := exporter.NewCounter(metricName + "Bytes")
 	defer func() {
 		metric.SetWithLabels(err, map[string]string{exporter.Vol: s.client.volumeName})
 		metricBytes.AddWithLabels(int64(total), map[string]string{exporter.Vol: s.client.volumeName})
@@ -117,31 +149,36 @@ func (s *Streamer) readFromRemoteCache(ctx context.Context, offset, size uint64,
 			total += int(req.Size_)
 			continue
 		}
-		slot, fg, ownerSlot := s.GetFlashGroup(req.CacheRequest.FixedFileOffset)
+		slot, fg, ownerSlot := s.getFlashGroupByClient(req.CacheRequest.FixedFileOffset, rcClient)
 		if fg == nil {
 			err = proto.ErrorNoFlashGroup
-			log.LogWarnf("readFromRemoteCache: flashGroup read failed. offset(%v) size(%v) fg(%v) req(%v) err(%v)", offset, size, fg, req, err)
+			log.LogWarnf("%s: flashGroup read failed. offset(%v) size(%v) req(%v) err(%v)", metricName, offset, size, req, err)
 			return
 		}
 		req.CacheRequest.Slot = uint64(slot)<<32 | uint64(ownerSlot)
-		if read, err = s.client.RemoteCache.remoteCacheClient.Read(ctx, fg, 0, req); err != nil {
+		if read, err = rcClient.Read(ctx, fg, 0, req); err != nil {
 			if !proto.IsFlashNodeLimitError(err) {
-				log.LogWarnf("readFromRemoteCache: flashGroup read failed. offset(%v) size(%v) fg(%v) req(%v) err(%v)", offset, size, fg, req, err)
+				log.LogWarnf("%s: flashGroup read failed. offset(%v) size(%v) fg(%v) req(%v) err(%v)", metricName, offset, size, fg, req, err)
 			}
 			return
-		} else {
-			log.LogDebugf("readFromRemoteCache: inode(%d) cacheReadRequest version %v, source %v",
-				s.inode, req.CacheRequest.Version, req.CacheRequest.Sources)
-			total += read
 		}
+		log.LogDebugf("%s: inode(%d) cacheReadRequest version %v", metricName, s.inode, req.CacheRequest.Version)
+		total += read
 	}
-	log.LogDebugf("readFromRemoteCache: inode(%d), cacheReadRequests(%v) offset(%v) size(%v) total(%v)", s.inode, cReadRequests, offset, size, total)
+	log.LogDebugf("%s: inode(%d) offset(%v) size(%v) total(%v)", metricName, s.inode, offset, size, total)
 	return total, nil
 }
 
 func (s *Streamer) GetFlashGroup(fixedFileOffset uint64) (uint32, *remotecache.FlashGroup, uint32) {
+	return s.getFlashGroupByClient(fixedFileOffset, s.client.RemoteCache.remoteCacheClient)
+}
+
+func (s *Streamer) getFlashGroupByClient(fixedFileOffset uint64, rcClient *remotecache.RemoteCacheClient) (uint32, *remotecache.FlashGroup, uint32) {
 	slot := proto.ComputeCacheBlockSlot(s.client.dataWrapper.VolName, s.inode, fixedFileOffset)
-	fg, ownerSlot := s.client.RemoteCache.remoteCacheClient.GetFlashGroupBySlot(slot)
+	if rcClient == nil {
+		return slot, nil, 0
+	}
+	fg, ownerSlot := rcClient.GetFlashGroupBySlot(slot)
 	return slot, fg, ownerSlot
 }
 

@@ -63,6 +63,7 @@ type RemoteCache struct {
 	remoteCacheMaxFileSizeGB int64
 	remoteCacheMaxFileSizeMB int64
 	remoteCacheClient        *remotecache.RemoteCacheClient
+	hddAccCacheClient        *remotecache.RemoteCacheClient
 	WarmUpMetaPaths          sync.Map
 	WarmPathWorked           int32
 }
@@ -198,11 +199,24 @@ func (rc *RemoteCache) Init(client *ExtentClient) (err error) {
 	rc.remoteCacheClient, err = remotecache.NewRemoteCacheClient(cfg)
 	if err != nil {
 		log.LogWarnf("RemoteCache: new client err %v", err)
+	} else {
+		rc.remoteCacheClient.UpdateWarmPath = rc.UpdateWarmPath
+		if err = rc.remoteCacheClient.UpdateFlashGroups(); err != nil {
+			log.LogWarnf("RemoteCache: update flashgroups err %v", err)
+		}
+		log.LogInfof("RemoteCache: topo(%s) client initialized", client.extentConfig.RemoteCacheName)
 	}
-	rc.remoteCacheClient.UpdateWarmPath = rc.UpdateWarmPath
-	err = rc.remoteCacheClient.UpdateFlashGroups()
-	if err != nil {
-		log.LogWarnf("RemoteCache: update flashgroups err %v", err)
+	if client.extentConfig.HDDAccCache != "" {
+		backupCfg := *cfg
+		backupCfg.RemoteCacheName = client.extentConfig.HDDAccCache
+		rc.hddAccCacheClient, err = remotecache.NewRemoteCacheClient(&backupCfg)
+		if err != nil {
+			log.LogWarnf("RemoteCache: new HDDAccCache client topo(%s) err %v", client.extentConfig.HDDAccCache, err)
+		} else if err = rc.hddAccCacheClient.UpdateFlashGroups(); err != nil {
+			log.LogWarnf("RemoteCache: update HDDAccCache flashgroups topo(%s) err %v", client.extentConfig.HDDAccCache, err)
+		} else {
+			log.LogInfof("RemoteCache: HDDAccCache topo(%s) client initialized", client.extentConfig.HDDAccCache)
+		}
 	}
 	rc.cacheBloom = bloom.New(BloomBits, BloomHashNum)
 	rc.PrepareCh = make(chan *PrepareRemoteCacheRequest, 1024)
@@ -216,7 +230,12 @@ func (rc *RemoteCache) Init(client *ExtentClient) (err error) {
 func (rc *RemoteCache) Stop() {
 	rc.stopOnce.Do(func() {
 		rc.Started = false
-		rc.remoteCacheClient.Stop()
+		if rc.remoteCacheClient != nil {
+			rc.remoteCacheClient.Stop()
+		}
+		if rc.hddAccCacheClient != nil {
+			rc.hddAccCacheClient.Stop()
+		}
 	})
 }
 

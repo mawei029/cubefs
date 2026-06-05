@@ -370,6 +370,7 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 		UpdateInodeMetaOnOverwrite: opt.UpdateInodeMetaOnOverwrite,
 		MetaAcceleration:           opt.MetaCacheAcceleration,
 		RemoteCacheName:            opt.RemoteCacheName,
+		HDDAccCache:                opt.HDDAccCache,
 	}
 
 	s.ec, err = stream.NewExtentClient(extentConfig)

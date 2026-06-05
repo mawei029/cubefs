@@ -95,6 +95,7 @@ const (
 	EnableAsyncFlush
 	UpdateInodeMetaOnOverwrite
 	RemoteCacheName
+	HDDAccCache
 
 	// warm up
 	ReadDirLimit
@@ -222,6 +223,7 @@ func InitMountOptions(opts []MountOption) {
 	opts[InodeLruLimit] = MountOption{"inodeLruLimit", "capacity for inode lru", "", int64(2000000)}
 	opts[FuseServeThreads] = MountOption{"fuseServeThreads", "Fuse Serve Threads", "", int64(0)}
 	opts[RemoteCacheName] = MountOption{"remoteCacheTopoName", "name for target remote cache topology", "", "default"}
+	opts[HDDAccCache] = MountOption{"HDDAccCache", "fallback remote cache topology when primary remote cache misses (empty to disable)", "", ""}
 	opts[PoolId] = MountOption{"poolId", "Storage pool ID for new inodes (0 means use volume default)", "", int64(0)}
 	opts[MetaRegion] = MountOption{"metaRegion", "Meta region for creating inodes (empty means use volume default region)", "", ""}
 	opts[ExtentHandlerMaxRetryTime] = MountOption{"extentHandlerMaxRetryTime", "process-wide max extent alloc retry budget (seconds); 0 = use built-in 2*dpCheck+2*dpPull", "", int64(0)}
@@ -428,6 +430,7 @@ type MountOptions struct {
 	EnableAsyncFlush           bool
 	UpdateInodeMetaOnOverwrite bool
 	RemoteCacheName            string
+	HDDAccCache                string
 
 	// warm up
 	ReadDirLimit          int64

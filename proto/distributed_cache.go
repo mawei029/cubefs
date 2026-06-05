@@ -682,18 +682,6 @@ func GetMissEntryExpiration(info *CacheMissEntry) int64 {
 	return info.expiration
 }
 
-func IsCacheUnRetryable(err error) bool {
-	if err == nil {
-		return false
-	}
-	errStr := err.Error()
-	if strings.Contains(errStr, ErrorNoFlashGroup.Error()) || strings.Contains(errStr, ErrorNoAvailableHost.Error()) ||
-		strings.Contains(errStr, ErrorContextDeadLine.Error()) || strings.Contains(errStr, ErrorReadTimeout.Error()) {
-		return true
-	}
-	return false
-}
-
 func IsCacheMissError(err error) bool {
 	if err == nil {
 		return false

@@ -219,6 +219,7 @@ func newCmdFlashGroupNodeAdd(client *master.MasterClient) *cobra.Command {
 		optAddr     string
 		optZoneName string
 		optCount    int
+		name        string
 	)
 	cmd := &cobra.Command{
 		Use:   "nodeAdd" + _flashgroupID,
@@ -229,7 +230,10 @@ func newCmdFlashGroupNodeAdd(client *master.MasterClient) *cobra.Command {
 			if err != nil {
 				return
 			}
-			fgView, err := client.AdminAPI().FlashGroupAddFlashNodeByName(proto.DefaultTopoName, flashGroupID, optCount, optZoneName, optAddr)
+			if name == "" {
+				name = proto.DefaultTopoName
+			}
+			fgView, err := client.AdminAPI().FlashGroupAddFlashNodeByName(name, flashGroupID, optCount, optZoneName, optAddr)
 			if err != nil {
 				return
 			}
@@ -237,6 +241,7 @@ func newCmdFlashGroupNodeAdd(client *master.MasterClient) *cobra.Command {
 			return
 		},
 	}
+	cmd.Flags().StringVarP(&name, "topoName", "n", proto.DefaultTopoName, "flash topology name")
 	cmd.Flags().StringVar(&optAddr, CliFlagAddress, "", "add flash node of given addr")
 	cmd.Flags().StringVar(&optZoneName, CliFlagFlashZoneName, "", "add flash node from given zone")
 	cmd.Flags().IntVar(&optCount, CliFlagCount, 0, "add given count flash node from zone")

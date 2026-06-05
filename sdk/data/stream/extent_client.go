@@ -177,6 +177,7 @@ type ExtentConfig struct {
 	MetaAcceleration           bool
 
 	RemoteCacheName string
+	HDDAccCache     string
 }
 
 type MultiVerMgr struct {
@@ -453,6 +454,14 @@ func (client *ExtentClient) UpdateFlowInfo(limit *proto.LimitRsp2Client) {
 func (client *ExtentClient) SetClientID(id uint64) (err error) {
 	client.LimitManager.ID = id
 	return
+}
+
+func (client *ExtentClient) HasHDDAccCache() bool {
+	if client.extentConfig == nil || client.extentConfig.HDDAccCache == "" {
+		return false
+	}
+	backup := client.RemoteCache.hddAccCacheClient
+	return backup != nil && backup.IsClusterEnable()
 }
 
 func (client *ExtentClient) IsRemoteCacheEnabled() bool {

@@ -382,14 +382,14 @@ func (s *Streamer) read(data []byte, offset int, size int, poolId uint8) (total 
 						var read int
 						remoteCacheMetric := exporter.NewCounter("readRemoteCache")
 						remoteCacheMetric.AddWithLabels(1, map[string]string{exporter.Vol: s.client.volumeName})
-						if read, err = s.readFromRemoteCache(ctx, uint64(req.FileOffset), uint64(req.Size), cacheReadRequests); err == nil {
+						if read, err = s.readFromRemoteCache(ctx, uint64(req.FileOffset), uint64(req.Size), cacheReadRequests, inodeInfo.StorageClass); err == nil {
 							remoteCacheHitMetric := exporter.NewCounter("readRemoteCacheHit")
 							remoteCacheHitMetric.AddWithLabels(1, map[string]string{exporter.Vol: s.client.volumeName})
 							total += read
 							continue
 						}
 					}
-					if !proto.IsFlashNodeLimitError(err) {
+					if !proto.IsFlashNodeLimitError(err) && !proto.IsCacheMissError(err) {
 						log.LogWarnf("Stream read: readFromRemoteCache failed: ino(%v) offset(%v) size(%v), err(%v)", s.inode, req.FileOffset, req.Size, err)
 					}
 				} else {

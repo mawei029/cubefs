@@ -353,6 +353,40 @@ func printGoroutineInfo(logPath string) {
 	}
 }
 
+func validateFlashTopoNames(masterAddr, primaryTopo, backupTopo string) error {
+	names := make([]string, 0, 2)
+	if primaryTopo != "" && primaryTopo != proto.DefaultTopoName {
+		names = append(names, primaryTopo)
+	}
+	if backupTopo != "" && backupTopo != proto.DefaultTopoName {
+		if backupTopo == primaryTopo {
+			return errors.NewErrorf("HDDAccCache(%s) must differ from remoteCacheTopoName", backupTopo)
+		}
+		names = append(names, backupTopo)
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	mc := master.NewMasterClientFromString(masterAddr, false)
+	ftvs, err := mc.AdminAPI().ListAllFlashTopos()
+	if err != nil {
+		return errors.NewErrorf("validate remote cache topo failed: list flashTopo err(%v)", err)
+	}
+	for _, name := range names {
+		found := false
+		for _, v := range ftvs {
+			if v != nil && v.Name == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return errors.NewErrorf("remote cache topo(%s) not exist", name)
+		}
+	}
+	return nil
+}
+
 func main() {
 	flag.Parse()
 
@@ -404,29 +438,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Validate remoteCacheTopoName: when not the default, it must exist in master
-	if opt.RemoteCacheName != "" && opt.RemoteCacheName != proto.DefaultTopoName {
-		mc := master.NewMasterClientFromString(opt.Master, false)
-		ftvs, e := mc.AdminAPI().ListAllFlashTopos()
-		if e != nil {
-			err = errors.NewErrorf("validate remoteCacheTopoName failed: list flashTopo err(%v)", e)
-			fmt.Println(err)
-			daemonize.SignalOutcome(err)
-			os.Exit(1)
-		}
-		found := false
-		for _, v := range ftvs {
-			if v != nil && v.Name == opt.RemoteCacheName {
-				found = true
-				break
-			}
-		}
-		if !found {
-			err = errors.NewErrorf("remoteCacheTopoName(%s) not exist", opt.RemoteCacheName)
-			fmt.Println(err)
-			daemonize.SignalOutcome(err)
-			os.Exit(1)
-		}
+	// Validate remoteCacheTopoName / HDDAccCache when set to non-default names.
+	if err = validateFlashTopoNames(opt.Master, opt.RemoteCacheName, opt.HDDAccCache); err != nil {
+		fmt.Println(err)
+		daemonize.SignalOutcome(err)
+		os.Exit(1)
 	}
 
 	if opt.MaxCPUs > 0 {
@@ -1095,6 +1111,7 @@ func parseMountOption(cfg *config.Config) (*proto.MountOptions, error) {
 	opt.EnableAsyncFlush = GlobalMountOptions[proto.EnableAsyncFlush].GetBool()
 	opt.UpdateInodeMetaOnOverwrite = GlobalMountOptions[proto.UpdateInodeMetaOnOverwrite].GetBool()
 	opt.RemoteCacheName = GlobalMountOptions[proto.RemoteCacheName].GetString()
+	opt.HDDAccCache = GlobalMountOptions[proto.HDDAccCache].GetString()
 
 	if opt.AheadReadEnable {
 		var (

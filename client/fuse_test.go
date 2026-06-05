@@ -91,3 +91,22 @@ func TestParseMountOptionAheadReadBlockSize(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(util.DefaultAheadReadBlockSize), opt.AheadReadBlockSize)
 }
+
+func TestParseMountOptionHDDAccCache(t *testing.T) {
+	savedOptions := append([]proto.MountOption(nil), GlobalMountOptions...)
+	t.Cleanup(func() {
+		GlobalMountOptions = savedOptions
+	})
+
+	cfg := config.NewConfig()
+	cfg.SetString("mountPoint", t.TempDir())
+	cfg.SetString("volName", "testvol")
+	cfg.SetString("owner", "test-owner")
+	cfg.SetString("masterAddr", "127.0.0.1:17010")
+	cfg.SetNewVal("HDDAccCache", "private-topo")
+
+	GlobalMountOptions = append([]proto.MountOption(nil), savedOptions...)
+	opt, err := parseMountOption(cfg)
+	require.NoError(t, err)
+	require.Equal(t, "private-topo", opt.HDDAccCache)
+}
