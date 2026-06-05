@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/util"
@@ -47,6 +48,14 @@ type TransitionMgr struct {
 	ecForW    ExtentApi // extent client for write
 	ebsClient EbsApi
 	meta      MetaWrapper
+	limiter   *LcNodeIoLimiter
+}
+
+func (t *TransitionMgr) limiterOrDefault() *LcNodeIoLimiter {
+	if t != nil && t.limiter != nil {
+		return t.limiter
+	}
+	return defaultLcIoLimiter()
 }
 
 func (t *TransitionMgr) migrate(e *proto.ScanDentry) (err error) {
@@ -80,6 +89,7 @@ func (t *TransitionMgr) migrate(e *proto.ScanDentry) (err error) {
 	}()
 
 	var (
+		limiter     = t.limiterOrDefault()
 		md5Hash     = md5.New()
 		md5Value    string
 		readN       int
@@ -109,6 +119,16 @@ func (t *TransitionMgr) migrate(e *proto.ScanDentry) (err error) {
 			return
 		}
 		if readN > 0 {
+			if err = limiter.WaitRead(context.Background(), readN); err != nil {
+				err = fmt.Errorf("wait read limiter err(%v)", err)
+				log.LogWarnf("migrate: inode(%v), readOffset(%v): %v", e.Inode, readOffset, err)
+				return
+			}
+			if err = limiter.WaitWrite(context.Background(), readN); err != nil {
+				err = fmt.Errorf("wait write limiter err(%v)", err)
+				log.LogWarnf("migrate: inode(%v), writeOffset(%v): %v", e.Inode, writeOffset, err)
+				return
+			}
 			writeN, err = t.ecForW.Write(e.Inode, writeOffset, buf[:readN], 0, nil, e.DstPoolId, e.StorageClass, true, false)
 			if err != nil {
 				err = fmt.Errorf("write dst file err(%v)", err)
@@ -149,7 +169,7 @@ func (t *TransitionMgr) migrate(e *proto.ScanDentry) (err error) {
 
 	// check read from src extent
 	srcMd5Hash := md5.New()
-	err = t.readFromExtentClient(e, srcMd5Hash, false, 0, 0)
+	err = t.readFromExtentClient(e, srcMd5Hash, false, 0, 0, true)
 	if err != nil {
 		err = fmt.Errorf("check src file err(%v)", err)
 		log.LogWarnf("check: inode(%v): %v", e.Inode, err)
@@ -164,7 +184,7 @@ func (t *TransitionMgr) migrate(e *proto.ScanDentry) (err error) {
 
 	// check read from dst migration extent
 	dstMd5Hash := md5.New()
-	err = t.readFromExtentClient(e, dstMd5Hash, true, 0, 0)
+	err = t.readFromExtentClient(e, dstMd5Hash, true, 0, 0, true)
 	if err != nil {
 		err = fmt.Errorf("check dst file err(%v)", err)
 		log.LogWarnf("check: inode(%v): %v", e.Inode, err)
@@ -196,8 +216,9 @@ func (t *TransitionMgr) classifyMd5Mismatch(e *proto.ScanDentry, side, gotMd5, e
 		side, e.Inode, side, gotMd5, expectedMd5)
 }
 
-func (t *TransitionMgr) readFromExtentClient(e *proto.ScanDentry, writer io.Writer, isMigrationExtent bool, from, size int) (err error) {
+func (t *TransitionMgr) readFromExtentClient(e *proto.ScanDentry, writer io.Writer, isMigrationExtent bool, from, size int, chargeReadLimit bool) (err error) {
 	var (
+		limiter    = t.limiterOrDefault()
 		readN      int
 		readOffset int
 		readSize   int
@@ -238,11 +259,15 @@ func (t *TransitionMgr) readFromExtentClient(e *proto.ScanDentry, writer io.Writ
 		buf = buf[:readSize]
 
 		readN, err = ec.Read(e.Inode, buf, readOffset, readSize, e.SrcPoolId, isMigrationExtent)
-
 		if err != nil && err != io.EOF {
 			return
 		}
 		if readN > 0 {
+			if chargeReadLimit {
+				if err = limiter.WaitRead(context.Background(), readN); err != nil {
+					return fmt.Errorf("wait read limiter err(%v)", err)
+				}
+			}
 			readOffset += readN
 			if _, er := writer.Write(buf[:readN]); er != nil {
 				return er
@@ -275,7 +300,7 @@ func (t *TransitionMgr) migrateToEbs(e *proto.ScanDentry) (oek []proto.ObjExtent
 	var dstErr error
 	r, w := io.Pipe()
 	go func() {
-		srcErr = t.readFromExtentClient(e, w, false, 0, 0)
+		srcErr = t.readFromExtentClient(e, w, false, 0, 0, true)
 		if srcErr != nil {
 			srcErr = fmt.Errorf("read src file err(%v)", srcErr)
 			log.LogWarnf("migrate blobstore: inode(%v): %v", e.Inode, srcErr)
@@ -284,7 +309,7 @@ func (t *TransitionMgr) migrateToEbs(e *proto.ScanDentry) (oek []proto.ObjExtent
 	}()
 
 	ctx := context.Background()
-	oek, _md5, dstErr := t.ebsClient.Put(ctx, t.volume, r, e.Size)
+	oek, _md5, dstErr := t.ebsClient.Put(ctx, t.volume, &lcLimitedWriteReader{reader: r, limiter: t.limiterOrDefault()}, e.Size)
 	if dstErr != nil {
 		dstErr = fmt.Errorf("write dst file err(%v)", dstErr)
 		log.LogWarnf("migrate blobstore: inode(%v): %v", e.Inode, dstErr)
@@ -316,7 +341,7 @@ func (t *TransitionMgr) migrateToEbs(e *proto.ScanDentry) (oek []proto.ObjExtent
 		}
 		rest -= getSize
 		srcMd5Hash := md5.New()
-		err = t.readFromExtentClient(e, srcMd5Hash, false, from, int(getSize))
+		err = t.readFromExtentClient(e, srcMd5Hash, false, from, int(getSize), true)
 		if err != nil {
 			err = fmt.Errorf("check src file err(%v)", err)
 			log.LogWarnf("migrate blobstore: inode(%v) check err: %v", e.Inode, err)
@@ -333,4 +358,69 @@ func (t *TransitionMgr) migrateToEbs(e *proto.ScanDentry) (oek []proto.ObjExtent
 	}
 	log.LogInfof("migrate blobstore and check finished, inode(%v)", e.Inode)
 	return
+}
+
+// lcWriteLimiter limits bytes before they are exposed to EBS Put readers.
+type lcWriteLimiter interface {
+	WaitWrite(ctx context.Context, n int) error
+}
+
+type lcLimitedWriteReader struct {
+	reader  io.Reader
+	limiter lcWriteLimiter
+	pending []byte
+}
+
+const maxLcLimitedWriteReaderPooledBuffer = util.CacheReadBlockSize
+
+var lcLimitedWriteReaderBufferPool sync.Pool
+
+func getLcLimitedWriteReaderBuffer(size int) []byte {
+	if size <= 0 {
+		return nil
+	}
+	if size > maxLcLimitedWriteReaderPooledBuffer {
+		return make([]byte, size)
+	}
+	if v := lcLimitedWriteReaderBufferPool.Get(); v != nil {
+		buf := *(v.(*[]byte))
+		if cap(buf) >= size {
+			return buf[:size]
+		}
+	}
+	return make([]byte, size)
+}
+
+func putLcLimitedWriteReaderBuffer(buf []byte) {
+	if cap(buf) == 0 || cap(buf) > maxLcLimitedWriteReaderPooledBuffer {
+		return
+	}
+	buf = buf[:cap(buf)]
+	lcLimitedWriteReaderBufferPool.Put(&buf)
+}
+
+func (r *lcLimitedWriteReader) Read(p []byte) (n int, err error) {
+	if len(r.pending) > 0 {
+		if waitErr := r.limiter.WaitWrite(context.Background(), len(r.pending)); waitErr != nil {
+			return 0, waitErr
+		}
+		n = copy(p, r.pending)
+		r.pending = r.pending[n:]
+		return n, nil
+	}
+
+	// Read into temporary buffer first to avoid leaking data to caller when WaitWrite fails
+	tmp := getLcLimitedWriteReaderBuffer(len(p))
+	defer putLcLimitedWriteReaderBuffer(tmp)
+	n, err = r.reader.Read(tmp)
+	if n <= 0 {
+		return n, err
+	}
+	if waitErr := r.limiter.WaitWrite(context.Background(), n); waitErr != nil {
+		r.pending = append(r.pending[:0], tmp[:n]...)
+		return 0, waitErr
+	}
+	// Wait passed, copy temp to caller's buffer
+	n = copy(p, tmp[:n])
+	return n, err
 }

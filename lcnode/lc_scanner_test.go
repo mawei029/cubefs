@@ -71,6 +71,8 @@ func TestLcScanner(t *testing.T) {
 			ec:        NewMockExtentClient(),
 			ecForW:    NewMockExtentClient(),
 			ebsClient: NewMockEbsClient(),
+			meta:      NewMockMetaWrapper(),
+			limiter:   NewLcNodeIoLimiter(0, 0),
 		},
 		adminTask: &proto.AdminTask{
 			Response: &proto.LcNodeRuleTaskResponse{},
@@ -99,8 +101,11 @@ func TestLcScanner(t *testing.T) {
 	}
 	err := scanner.Start()
 	require.NoError(t, err)
-	time.Sleep(time.Second * 5)
-	require.Equal(t, true, scanner.DoneScanning())
+	deadline := time.Now().Add(30 * time.Second)
+	for !scanner.DoneScanning() && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	require.True(t, scanner.DoneScanning())
 	require.Equal(t, int64(4), scanner.currentStat.TotalFileScannedNum)
 	require.Equal(t, int64(3), scanner.currentStat.TotalFileExpiredNum)
 	require.Equal(t, int64(4), scanner.currentStat.TotalDirScannedNum)

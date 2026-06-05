@@ -15,6 +15,7 @@
 package lcnode
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -59,14 +60,16 @@ type LcNode struct {
 	rwlock sync.RWMutex
 	pools  map[uint8]*proto.StoragePoolInfo
 
-	localIP string
-	bindIp  bool
+	localIP   string
+	bindIp    bool
+	ioLimiter *LcNodeIoLimiter
 }
 
 func NewServer() *LcNode {
 	return &LcNode{
 		lcScanners:       make(map[string]*LcScanner),
 		snapshotScanners: make(map[string]*SnapshotScanner),
+		ioLimiter:        defaultLcIoLimiter(),
 	}
 }
 
@@ -217,6 +220,18 @@ func (l *LcNode) parseConfig(cfg *config.Config) (err error) {
 	// parse useCreateTime
 	useCreateTime = cfg.GetBool(configUseCreateTime)
 	log.LogWarnf("loadConfig: setup config: %v(%v)", configUseCreateTime, useCreateTime)
+
+	readLimitMB := cfg.GetInt64(configLcReadBandwidthLimitMB)
+	if readLimitMB < 0 {
+		readLimitMB = defaultLcReadBandwidthLimitMB
+	}
+	writeLimitMB := cfg.GetInt64(configLcWriteBandwidthLimitMB)
+	if writeLimitMB < 0 {
+		writeLimitMB = defaultLcWriteBandwidthLimitMB
+	}
+	l.ioLimiter = NewLcNodeIoLimiter(readLimitMB, writeLimitMB)
+	log.LogInfof("loadConfig: setup config: %v(%v), %v(%v)",
+		configLcReadBandwidthLimitMB, readLimitMB, configLcWriteBandwidthLimitMB, writeLimitMB)
 
 	// parse localIP and bindIp
 	l.localIP = cfg.GetString("localIP")
@@ -409,6 +424,12 @@ func (l *LcNode) httpServiceStart() {
 	router.NewRoute().Methods(http.MethodGet).
 		Path("/getFile").
 		HandlerFunc(l.httpServiceGetFile)
+	router.NewRoute().Methods(http.MethodPost).
+		Path("/setLcIoLimit").
+		HandlerFunc(l.httpServiceSetLcIoLimit)
+	router.NewRoute().Methods(http.MethodGet).
+		Path("/getLcIoLimit").
+		HandlerFunc(l.httpServiceGetLcIoLimit)
 
 	addr := fmt.Sprintf(":%v", l.httpListen)
 	if l.bindIp && l.localIP != "" {
@@ -459,6 +480,57 @@ func (l *LcNode) httpServiceStopScanner(w http.ResponseWriter, r *http.Request) 
 	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+func (l *LcNode) httpServiceSetLcIoLimit(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, fmt.Sprintf("httpServiceSetLcIoLimit ParseForm failed: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	limiter := ensureLcIoLimiter(l)
+	current := limiter.Snapshot()
+	readMBps, err := parseOptionalLimitMBps(r, "readMBps", current.ReadMBps)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeMBps, err := parseOptionalLimitMBps(r, "writeMBps", current.WriteMBps)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	limiter.UpdateByMBps(readMBps, writeMBps)
+	snapshot := limiter.Snapshot()
+	log.LogInfof("httpServiceSetLcIoLimit remote(%v), old(%+v), new(%+v)", r.RemoteAddr, current, snapshot)
+	writeJSON(w, snapshot)
+}
+
+func (l *LcNode) httpServiceGetLcIoLimit(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, ensureLcIoLimiter(l).Snapshot())
+}
+
+func parseOptionalLimitMBps(r *http.Request, key string, defaultValue int64) (int64, error) {
+	value := r.FormValue(key)
+	if value == "" {
+		return defaultValue, nil
+	}
+	limit, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse %s err: %v", key, err)
+	}
+	if limit < 0 {
+		return 0, fmt.Errorf("%s must be greater than or equal to 0", key)
+	}
+	return limit, nil
+}
+
+func writeJSON(w http.ResponseWriter, value interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 func (l *LcNode) httpServiceGetFile(w http.ResponseWriter, r *http.Request) {
@@ -548,15 +620,16 @@ func (l *LcNode) httpServiceGetFile(w http.ResponseWriter, r *http.Request) {
 	// defer extentClient.CloseStream(ino)
 
 	t := &TransitionMgr{
-		ec:     extentClient,
-		ecForW: extentClient,
+		ec:      extentClient,
+		ecForW:  extentClient,
+		limiter: ensureLcIoLimiter(l),
 	}
 	e := &proto.ScanDentry{
 		Size:         size,
 		Inode:        ino,
 		StorageClass: uint32(sc),
 	}
-	if err = t.readFromExtentClient(e, w, isMigrationExtent, 0, 0); err != nil {
+	if err = t.readFromExtentClient(e, w, isMigrationExtent, 0, 0, true); err != nil {
 		http.Error(w, fmt.Sprintf("readFromExtentClient err: %v", err.Error()), http.StatusBadRequest)
 		return
 	}

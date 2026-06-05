@@ -32,6 +32,8 @@ const (
 	configLcNodeTaskCountLimit         = "lcNodeTaskCountLimit"
 	configDelayDelMinute               = "delayDelMinute"
 	configUseCreateTime                = "useCreateTime"
+	configLcReadBandwidthLimitMB       = "lcReadBandwidthLimitMB"
+	configLcWriteBandwidthLimitMB      = "lcWriteBandwidthLimitMB"
 	// extentHandlerMaxRetrySec is the process-wide max time budget (seconds) for extent alloc/write retry; see stream.SetExentRetryArgs.
 	configExtentHandlerMaxRetrySec = "extentHandlerMaxRetrySec"
 )
@@ -53,6 +55,8 @@ const (
 	defaultDelayDelMinute            = 10080          // default retention min(7 days) of old eks after migration
 	MaxSizePutOnce                   = int64(1) << 23 // 8MB
 	DirTrashSkip                     = ".Trash"
+	defaultLcReadBandwidthLimitMB    = int64(0)
+	defaultLcWriteBandwidthLimitMB   = int64(0)
 
 	defaultAllocRetryInterval       = 100
 	defaultWriteRetryInterval       = 100

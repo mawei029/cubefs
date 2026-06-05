@@ -16,5 +16,7 @@
   "scanCheckInterval": "2",
   "s3ScanRoutineNumPerTask": "100",
   "snapShotRoutineNumPerTask": "100",
+  "lcReadBandwidthLimitMB": 0,
+  "lcWriteBandwidthLimitMB": 0,
   "extentHandlerMaxRetrySec": 600
 }
