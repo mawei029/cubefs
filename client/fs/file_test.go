@@ -20,6 +20,7 @@ import (
 	"github.com/cubefs/cubefs/depends/bazil.org/fuse"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/stream"
+	"github.com/cubefs/cubefs/sdk/meta"
 	"github.com/stretchr/testify/require"
 )
 
@@ -397,6 +398,60 @@ func TestFile_Setattr_openForWriteFlag_stillPairsDirMutation(t *testing.T) {
 	require.NoError(t, f.Setattr(context.Background(), req, resp))
 	_, inCount := s.dirDirtyCount[parentIno]
 	require.False(t, inCount)
+}
+
+func TestFile_Forget_deletesFromNodeCache(t *testing.T) {
+	const ino uint64 = 95001
+	// When DisableMetaCache=true (the default), Forget() calls ic.Delete then
+	// storageClass() which may fall through to InodeGet → mw.InodeGet_ll.
+	// Provide a real mw backed by a mock meta server so storageClass() resolves
+	// without panicking on nil mw.
+	addr, cleanup := startInodeTestMetaListener(t, mockInodeGetHandler(
+		fileInodeInfoForMutationTest(ino), proto.OpOk))
+	t.Cleanup(cleanup)
+
+	mw := meta.NewTestMetaWrapperWithLeader(t, addr)
+	s := superForFileTest(t)
+	s.mw = mw
+	s.orphan = NewOrphanInodeList()
+	// Don't put ino into orphan list — Evict returns false so Forget returns early,
+	// avoiding mw.Evict while still executing the nodeCache deletion lines.
+	info := fileInodeInfoForMutationTest(ino)
+	s.ic.Put(info)
+	f := newTestFile(s, info, s.rootIno, "forget.txt")
+
+	// Pre-populate nodeCache with the file so we can verify deletion.
+	s.nodeCache[ino] = f
+	_, okBefore := s.nodeCache[ino]
+	require.True(t, okBefore, "nodeCache should contain the file inode before Forget")
+
+	f.Forget()
+
+	_, okAfter := s.nodeCache[ino]
+	require.False(t, okAfter, "Forget must delete the file from nodeCache")
+}
+
+func TestFile_Forget_deletesFromNodeCache_whenDisableMetaCacheOff(t *testing.T) {
+	t.Parallel()
+	const ino uint64 = 95002
+	origDisableMetaCache := DisableMetaCache
+	DisableMetaCache = false
+	t.Cleanup(func() { DisableMetaCache = origDisableMetaCache })
+
+	s := superForFileTest(t)
+	s.orphan = NewOrphanInodeList()
+	info := fileInodeInfoForMutationTest(ino)
+	f := newTestFile(s, info, s.rootIno, "forget2.txt")
+
+	// Pre-populate nodeCache with the file so we can verify deletion.
+	s.nodeCache[ino] = f
+	_, okBefore := s.nodeCache[ino]
+	require.True(t, okBefore, "nodeCache should contain the file inode before Forget")
+
+	f.Forget()
+
+	_, okAfter := s.nodeCache[ino]
+	require.False(t, okAfter, "Forget must delete the file from nodeCache even when DisableMetaCache is false")
 }
 
 func flagName(flag uint32) string {

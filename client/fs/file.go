@@ -228,12 +228,11 @@ func (f *File) Forget() {
 	// log.LogErrorf("TRACE Forget: ino(%v)", ino)
 	//	f.fWriter.Close()
 	// }
-
+	f.super.fslock.Lock()
+	delete(f.super.nodeCache, ino)
+	f.super.fslock.Unlock()
 	if DisableMetaCache {
 		f.super.ic.Delete(ino)
-		f.super.fslock.Lock()
-		delete(f.super.nodeCache, ino)
-		f.super.fslock.Unlock()
 		fullPath := f.getParentPath() + f.name
 		if proto.DataPlaneUsesBlobEC(f.super.volType, f.storageClass()) {
 			// Evict oec only on cold/Blob; do not call ec.EvictStream.
@@ -366,10 +365,6 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) (err error
 		stat.EndStat("Release:file", err, bgTime, 1)
 		oecRef := f.super.oec.RefCnt(ino)
 		if f.super.ec.RefCnt(ino) == 0 && oecRef == 0 && !f.super.metaCacheAcceleration {
-			// keep nodeCache hold the latest inode info
-			f.super.fslock.Lock()
-			delete(f.super.nodeCache, ino)
-			f.super.fslock.Unlock()
 			if DisableMetaCache {
 				f.super.ic.Delete(ino)
 			}
