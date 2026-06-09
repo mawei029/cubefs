@@ -33,8 +33,38 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// newTestMetaPartition creates a metaPartition for testing
-func newTestMetaPartition(rootDir string, ctrl *gomock.Controller) *metaPartition {
+type testMetaPartitionRaftSetup func(ctrl *gomock.Controller, mp *metaPartition)
+
+func defaultTestMetaPartitionRaft(ctrl *gomock.Controller, mp *metaPartition) {
+	var applyIdx uint64 = 100
+	raft := raftstoremock.NewMockPartition(ctrl)
+	raft.EXPECT().LeaderTerm().Return(uint64(1), uint64(1)).AnyTimes()
+	raft.EXPECT().Status().Return(&raftstore.PartitionStatus{RestoringSnapshot: false}).AnyTimes()
+	raft.EXPECT().Submit(gomock.Any()).DoAndReturn(func(cmd []byte) (interface{}, error) {
+		idx := atomic.AddUint64(&applyIdx, 1)
+		_, err := mp.Apply(cmd, idx)
+		return nil, err
+	}).AnyTimes()
+	mp.raftPartition = raft
+}
+
+func stopTestMetaPartitionWorkers(mp *metaPartition) {
+	if mp == nil {
+		return
+	}
+	select {
+	case <-mp.stopC:
+	default:
+		close(mp.stopC)
+	}
+	time.Sleep(20 * time.Millisecond)
+}
+
+// newTestMetaPartition creates a metaPartition for testing.
+// Raft mock must be attached before initObjects: NewTransactionProcessor starts a
+// background goroutine that reads mp.raftPartition via IsLeader.
+func newTestMetaPartition(t *testing.T, rootDir string, ctrl *gomock.Controller, raftSetup ...testMetaPartitionRaftSetup) *metaPartition {
+	t.Helper()
 	config := &MetaPartitionConfig{
 		PartitionId:   10001,
 		VolName:       "test_vol",
@@ -46,23 +76,57 @@ func newTestMetaPartition(rootDir string, ctrl *gomock.Controller) *metaPartitio
 		NodeId:        1,
 		Peers:         []proto.Peer{{ID: 1, Addr: "127.0.0.1"}},
 	}
-	mp := newPartition(config, newManager())
-	mp.stopC = make(chan bool)
-
-	// Mock raft: leader + Submit applies through FSM (obj extent GC dequeue/punish).
-	if ctrl != nil {
-		var applyIdx uint64 = 100
-		raft := raftstoremock.NewMockPartition(ctrl)
-		raft.EXPECT().LeaderTerm().Return(uint64(1), uint64(1)).AnyTimes()
-		raft.EXPECT().Status().Return(&raftstore.PartitionStatus{RestoringSnapshot: false}).AnyTimes()
-		raft.EXPECT().Submit(gomock.Any()).DoAndReturn(func(cmd []byte) (interface{}, error) {
-			idx := atomic.AddUint64(&applyIdx, 1)
-			_, err := mp.Apply(cmd, idx)
-			return nil, err
-		}).AnyTimes()
-		mp.raftPartition = raft
+	manager := newManager()
+	mp := &metaPartition{
+		config:           config,
+		stopC:            make(chan bool),
+		storeChan:        make(chan *storeMsg, 100),
+		freeList:         newFreeList(),
+		freeHybridList:   newFreeList(),
+		extDelCh:         make(chan []proto.ExtentKey, defaultDelExtentsCnt),
+		objExtentDelTree: newObjExtentDelTree(),
+		extReset:         make(chan struct{}),
+		vol:              NewVol(),
+		manager:          manager,
+		verSeq:           config.VerSeq,
+		rocksdbManager:   manager.rocksdbManager,
 	}
-
+	if ctrl != nil {
+		if len(raftSetup) > 0 && raftSetup[0] != nil {
+			raftSetup[0](ctrl, mp)
+		} else {
+			defaultTestMetaPartitionRaft(ctrl, mp)
+		}
+	}
+	mp.config.Cursor = 0
+	mp.config.End = 100000
+	mp.uidManager = NewUidMgr(config.VolName, mp.config.PartitionId)
+	mp.mqMgr = NewQuotaManager(config.VolName, mp.config.PartitionId)
+	if err := mp.initObjects(true); err != nil {
+		panic(err)
+	}
+	mp.vol.info = &proto.SimpleVolView{
+		VolStorageClass: proto.StorageClass_Replica_SSD,
+		Pools: map[uint8]*proto.StoragePoolInfo{
+			proto.DefaultHDDPoolId: {
+				Id:           proto.DefaultHDDPoolId,
+				Name:         "default",
+				StorageClass: uint8(proto.StorageClass_Replica_HDD),
+			},
+			proto.DefaultSSDPoolId: {
+				Id:           proto.DefaultSSDPoolId,
+				Name:         "default",
+				StorageClass: uint8(proto.StorageClass_Replica_SSD),
+			},
+			proto.DefaultECPoolId: {
+				Id:           proto.DefaultECPoolId,
+				Name:         "default",
+				StorageClass: uint8(proto.StorageClass_BlobStore),
+			},
+		},
+		DefaultPoolId: proto.DefaultHDDPoolId,
+	}
+	t.Cleanup(func() { stopTestMetaPartitionWorkers(mp) })
 	return mp
 }
 
@@ -96,7 +160,7 @@ func TestRunObjExtentDelTreeGCOnce_Dequeue(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mp := newTestMetaPartition(rootDir, ctrl)
+	mp := newTestMetaPartition(t, rootDir, ctrl)
 	mp.blobClientWrapper = &BlobStoreClientWrapper{blobClient: &blobstore.BlobStoreClient{}}
 
 	oek := createTestObjExtentKey(0, 1024, 1)
@@ -124,7 +188,7 @@ func TestRunObjExtentDelTreeGCOnce_DequeueMultiOek(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mp := newTestMetaPartition(rootDir, ctrl)
+	mp := newTestMetaPartition(t, rootDir, ctrl)
 	mp.blobClientWrapper = &BlobStoreClientWrapper{blobClient: &blobstore.BlobStoreClient{}}
 
 	oek1 := createTestObjExtentKey(0, 1024, 1)
@@ -153,7 +217,7 @@ func TestRunObjExtentDelTreeGCOnce_PunishRequeue(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mp := newTestMetaPartition(rootDir, ctrl)
+	mp := newTestMetaPartition(t, rootDir, ctrl)
 	mp.blobClientWrapper = &BlobStoreClientWrapper{blobClient: &blobstore.BlobStoreClient{}}
 
 	oek := createTestObjExtentKey(0, 1024, 1)
@@ -183,7 +247,7 @@ func TestStartObjExtentDelTreeGC_StopImmediately(t *testing.T) {
 	require.NoError(t, err)
 	defer os.RemoveAll(rootDir)
 
-	mp := newTestMetaPartition(rootDir, nil)
+	mp := newTestMetaPartition(t, rootDir, nil)
 	mp.startObjExtentDelTreeGC()
 	close(mp.stopC)
 	time.Sleep(20 * time.Millisecond)
@@ -198,35 +262,38 @@ func TestRunObjExtentDelTreeGCOnce_EarlyReturnBranches(t *testing.T) {
 	defer ctrl.Finish()
 
 	t.Run("nil tree", func(t *testing.T) {
-		mp := newTestMetaPartition(rootDir, ctrl)
+		mp := newTestMetaPartition(t, rootDir, ctrl)
 		mp.objExtentDelTree = nil
 		mp.runObjExtentDelTreeGCOnce()
 	})
 
 	t.Run("restoring snapshot", func(t *testing.T) {
-		mp := newTestMetaPartition(rootDir, ctrl)
-		raft := raftstoremock.NewMockPartition(ctrl)
-		raft.EXPECT().Status().Return(&raftstore.PartitionStatus{RestoringSnapshot: true}).AnyTimes()
-		raft.EXPECT().LeaderTerm().Return(uint64(1), uint64(1)).AnyTimes()
-		mp.raftPartition = raft
+		mp := newTestMetaPartition(t, rootDir, ctrl, func(ctrl *gomock.Controller, mp *metaPartition) {
+			raft := raftstoremock.NewMockPartition(ctrl)
+			raft.EXPECT().Status().Return(&raftstore.PartitionStatus{RestoringSnapshot: true}).AnyTimes()
+			raft.EXPECT().LeaderTerm().Return(uint64(1), uint64(1)).AnyTimes()
+			mp.raftPartition = raft
+		})
 		mp.runObjExtentDelTreeGCOnce()
 	})
 
 	t.Run("not leader", func(t *testing.T) {
-		mp := newTestMetaPartition(rootDir, ctrl)
-		raft := raftstoremock.NewMockPartition(ctrl)
-		raft.EXPECT().Status().Return(&raftstore.PartitionStatus{RestoringSnapshot: false}).AnyTimes()
-		raft.EXPECT().LeaderTerm().Return(uint64(2), uint64(1)).AnyTimes()
-		mp.raftPartition = raft
+		mp := newTestMetaPartition(t, rootDir, ctrl, func(ctrl *gomock.Controller, mp *metaPartition) {
+			raft := raftstoremock.NewMockPartition(ctrl)
+			raft.EXPECT().Status().Return(&raftstore.PartitionStatus{RestoringSnapshot: false}).AnyTimes()
+			raft.EXPECT().LeaderTerm().Return(uint64(2), uint64(1)).AnyTimes()
+			mp.raftPartition = raft
+		})
 		mp.runObjExtentDelTreeGCOnce()
 	})
 
 	t.Run("empty tree", func(t *testing.T) {
-		mp := newTestMetaPartition(rootDir, ctrl)
-		raft := raftstoremock.NewMockPartition(ctrl)
-		raft.EXPECT().Status().Return(&raftstore.PartitionStatus{RestoringSnapshot: false}).AnyTimes()
-		raft.EXPECT().LeaderTerm().Return(uint64(1), uint64(1)).AnyTimes()
-		mp.raftPartition = raft
+		mp := newTestMetaPartition(t, rootDir, ctrl, func(ctrl *gomock.Controller, mp *metaPartition) {
+			raft := raftstoremock.NewMockPartition(ctrl)
+			raft.EXPECT().Status().Return(&raftstore.PartitionStatus{RestoringSnapshot: false}).AnyTimes()
+			raft.EXPECT().LeaderTerm().Return(uint64(1), uint64(1)).AnyTimes()
+			mp.raftPartition = raft
+		})
 		mp.runObjExtentDelTreeGCOnce()
 	})
 }
@@ -240,7 +307,7 @@ func TestRunObjExtentDelTreeGCOnce_ReturnsEncodeErrors(t *testing.T) {
 	defer ctrl.Finish()
 
 	t.Run("marshal punish", func(t *testing.T) {
-		mp := newTestMetaPartition(rootDir, ctrl)
+		mp := newTestMetaPartition(t, rootDir, ctrl)
 		mp.blobClientWrapper = &BlobStoreClientWrapper{blobClient: &blobstore.BlobStoreClient{}}
 		mp.objExtentDelTree.EnqueueFromApply(1, 1700000000, 1, []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 1)})
 
@@ -258,7 +325,7 @@ func TestRunObjExtentDelTreeGCOnce_ReturnsEncodeErrors(t *testing.T) {
 	})
 
 	t.Run("marshal dequeue", func(t *testing.T) {
-		mp := newTestMetaPartition(rootDir, ctrl)
+		mp := newTestMetaPartition(t, rootDir, ctrl)
 		mp.blobClientWrapper = &BlobStoreClientWrapper{blobClient: &blobstore.BlobStoreClient{}}
 		mp.objExtentDelTree.EnqueueFromApply(1, 1700000001, 2, []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 2)})
 
@@ -283,7 +350,7 @@ func TestRunObjExtentDelTreeGCWorker_EncodeErrorBackoff(t *testing.T) {
 
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	mp := newTestMetaPartition(rootDir, ctrl)
+	mp := newTestMetaPartition(t, rootDir, ctrl)
 	mp.blobClientWrapper = &BlobStoreClientWrapper{blobClient: &blobstore.BlobStoreClient{}}
 	mp.objExtentDelTree.EnqueueFromApply(1, 1700000000, 1, []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 1)})
 
@@ -319,7 +386,7 @@ func TestRunObjExtentDelTreeGCWorker_DrainsUntilEmpty(t *testing.T) {
 
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	mp := newTestMetaPartition(rootDir, ctrl)
+	mp := newTestMetaPartition(t, rootDir, ctrl)
 	mp.blobClientWrapper = &BlobStoreClientWrapper{blobClient: &blobstore.BlobStoreClient{}}
 
 	patches := gomonkey.NewPatches()
@@ -344,7 +411,7 @@ func TestStartObjExtentDelTreeGC_DrainsInBackground(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mp := newTestMetaPartition(rootDir, ctrl)
+	mp := newTestMetaPartition(t, rootDir, ctrl)
 	mp.blobClientWrapper = &BlobStoreClientWrapper{blobClient: &blobstore.BlobStoreClient{}}
 	mp.objExtentDelTree.EnqueueFromApply(1, 1700000000, 1, []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 1)})
 
@@ -373,7 +440,7 @@ func TestStartObjExtentDelTreeGC_PanicRecover(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mp2 := newTestMetaPartition(rootDir, ctrl)
+	mp2 := newTestMetaPartition(t, rootDir, ctrl)
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 	raft := raftstoremock.NewMockPartition(ctrl)
@@ -392,7 +459,7 @@ func TestRunObjExtentDelTreeGCOnce_ItemsEmptyAndSubmitErrors(t *testing.T) {
 
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	mp := newTestMetaPartition(rootDir, ctrl)
+	mp := newTestMetaPartition(t, rootDir, ctrl)
 	mp.blobClientWrapper = &BlobStoreClientWrapper{blobClient: &blobstore.BlobStoreClient{}}
 	oek := createTestObjExtentKey(0, 1024, 1)
 	mp.objExtentDelTree.EnqueueFromApply(42, 1700000000, 7, []proto.ObjExtentKey{oek})
@@ -456,7 +523,7 @@ func TestRunObjExtentDelTreeGCWorker_entryGuards(t *testing.T) {
 
 	t.Run("nil tree", func(t *testing.T) {
 		atomic.StoreInt32(&sleptDelTreeBackoff, 0)
-		mp := newTestMetaPartition(rootDir, ctrl)
+		mp := newTestMetaPartition(t, rootDir, ctrl)
 		mp.objExtentDelTree = nil
 		mp.runObjExtentDelTreeGCWorker()
 		require.Equal(t, int32(1), atomic.LoadInt32(&sleptDelTreeBackoff))
@@ -464,22 +531,24 @@ func TestRunObjExtentDelTreeGCWorker_entryGuards(t *testing.T) {
 
 	t.Run("not leader at entry", func(t *testing.T) {
 		atomic.StoreInt32(&sleptDelTreeBackoff, 0)
-		mp := newTestMetaPartition(rootDir, ctrl)
-		raft := raftstoremock.NewMockPartition(ctrl)
-		raft.EXPECT().Status().Return(&raftstore.PartitionStatus{RestoringSnapshot: false}).AnyTimes()
-		raft.EXPECT().LeaderTerm().Return(uint64(2), uint64(1)).AnyTimes()
-		mp.raftPartition = raft
+		mp := newTestMetaPartition(t, rootDir, ctrl, func(ctrl *gomock.Controller, mp *metaPartition) {
+			raft := raftstoremock.NewMockPartition(ctrl)
+			raft.EXPECT().Status().Return(&raftstore.PartitionStatus{RestoringSnapshot: false}).AnyTimes()
+			raft.EXPECT().LeaderTerm().Return(uint64(2), uint64(1)).AnyTimes()
+			mp.raftPartition = raft
+		})
 		mp.runObjExtentDelTreeGCWorker()
 		require.Equal(t, int32(1), atomic.LoadInt32(&sleptDelTreeBackoff))
 	})
 
 	t.Run("empty tree sleeps minute", func(t *testing.T) {
 		atomic.StoreInt32(&sleptMinute, 0)
-		mp := newTestMetaPartition(rootDir, ctrl)
-		raft := raftstoremock.NewMockPartition(ctrl)
-		raft.EXPECT().Status().Return(&raftstore.PartitionStatus{RestoringSnapshot: false}).AnyTimes()
-		raft.EXPECT().LeaderTerm().Return(uint64(1), uint64(1)).AnyTimes()
-		mp.raftPartition = raft
+		mp := newTestMetaPartition(t, rootDir, ctrl, func(ctrl *gomock.Controller, mp *metaPartition) {
+			raft := raftstoremock.NewMockPartition(ctrl)
+			raft.EXPECT().Status().Return(&raftstore.PartitionStatus{RestoringSnapshot: false}).AnyTimes()
+			raft.EXPECT().LeaderTerm().Return(uint64(1), uint64(1)).AnyTimes()
+			mp.raftPartition = raft
+		})
 		mp.runObjExtentDelTreeGCWorker()
 		require.Equal(t, int32(1), atomic.LoadInt32(&sleptMinute))
 	})
@@ -492,7 +561,7 @@ func TestRunObjExtentDelTreeGCWorker_stopAndNotLeaderInLoop(t *testing.T) {
 
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	mp := newTestMetaPartition(rootDir, ctrl)
+	mp := newTestMetaPartition(t, rootDir, ctrl)
 	mp.blobClientWrapper = &BlobStoreClientWrapper{blobClient: &blobstore.BlobStoreClient{}}
 	mp.objExtentDelTree.EnqueueFromApply(1, 1700000000, 1, []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 1)})
 
@@ -512,7 +581,7 @@ func TestRunObjExtentDelTreeGCWorker_stopAndNotLeaderInLoop(t *testing.T) {
 		func(_ *blobstore.BlobStoreClient, _ []proto.ObjExtentKey) error { return errors.New("fail") })
 	mp.runObjExtentDelTreeGCWorker()
 
-	mp2 := newTestMetaPartition(rootDir, ctrl)
+	mp2 := newTestMetaPartition(t, rootDir, ctrl)
 	mp2.blobClientWrapper = &BlobStoreClientWrapper{blobClient: &blobstore.BlobStoreClient{}}
 	mp2.objExtentDelTree.EnqueueFromApply(2, 1700000000, 2, []proto.ObjExtentKey{createTestObjExtentKey(0, 2, 2)})
 	close(mp2.stopC)
@@ -526,7 +595,7 @@ func TestRunObjExtentDelTreeGCOnce_ReturnsDeleteOrSubmitError(t *testing.T) {
 
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	mp := newTestMetaPartition(rootDir, ctrl)
+	mp := newTestMetaPartition(t, rootDir, ctrl)
 	mp.blobClientWrapper = &BlobStoreClientWrapper{blobClient: &blobstore.BlobStoreClient{}}
 	mp.objExtentDelTree.EnqueueFromApply(1, 1700000000, 1, []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 1)})
 
@@ -560,7 +629,7 @@ func TestRunObjExtentDelTreeGCOnce_PunishAppliedReturnsNil(t *testing.T) {
 
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	mp := newTestMetaPartition(rootDir, ctrl)
+	mp := newTestMetaPartition(t, rootDir, ctrl)
 	mp.blobClientWrapper = &BlobStoreClientWrapper{blobClient: &blobstore.BlobStoreClient{}}
 	mp.objExtentDelTree.EnqueueFromApply(1, 1700000000, 1, []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 1)})
 
@@ -584,8 +653,10 @@ func TestRunObjExtentDelTreeGCOnce_PunishAppliedReturnsNil(t *testing.T) {
 	require.NoError(t, onceErr, "submit clears err after successful punish")
 	require.Equal(t, int32(0), atomic.LoadInt32(&slept), "Once does not sleep")
 	require.Equal(t, 1, mp.objExtentDelTree.Len())
+
 	peek := mp.objExtentDelTree.PeekFirstN(1)
-	require.GreaterOrEqual(t, peek.Items[0].TsMs, int64(1_700_000_000_000)+objExtentDelGcPenaltyMs-1)
+	require.Len(t, peek.Items, 1)
+	require.Equal(t, int64(1_700_000_000_000)+objExtentDelGcPenaltyMs, peek.Items[0].TsMs)
 }
 
 func TestRunObjExtentDelTreeGCWorker_errorBackoffInLoop(t *testing.T) {
@@ -595,7 +666,7 @@ func TestRunObjExtentDelTreeGCWorker_errorBackoffInLoop(t *testing.T) {
 
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	mp := newTestMetaPartition(rootDir, ctrl)
+	mp := newTestMetaPartition(t, rootDir, ctrl)
 	mp.blobClientWrapper = &BlobStoreClientWrapper{blobClient: &blobstore.BlobStoreClient{}}
 	mp.objExtentDelTree.EnqueueFromApply(1, 1700000000, 1, []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 1)})
 
@@ -630,7 +701,7 @@ func TestApply_objExtentGcFsmOps(t *testing.T) {
 
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	mp := newTestMetaPartition(rootDir, ctrl)
+	mp := newTestMetaPartition(t, rootDir, ctrl)
 
 	oek := createTestObjExtentKey(0, 1024, 1)
 	mp.objExtentDelTree.EnqueueFromApply(42, 1700000000, 7, []proto.ObjExtentKey{oek})
@@ -669,7 +740,7 @@ func TestObjExtentDelTreeEnqueue(t *testing.T) {
 
 	t.Run("queueFullRejectsEnqueue", func(t *testing.T) {
 		defer swapDelTreeMaxItemLimitRaw(1)()
-		mp := newTestMetaPartition(rootDir, nil)
+		mp := newTestMetaPartition(t, rootDir, nil)
 		mp.enqueueObjExtentDelWrap(42, 1700000000, 7, []proto.ObjExtentKey{createTestObjExtentKey(0, 1024, 1)})
 		require.Equal(t, 1, mp.objExtentDelTree.Len())
 
@@ -679,7 +750,7 @@ func TestObjExtentDelTreeEnqueue(t *testing.T) {
 
 	t.Run("queueFullAudit", func(t *testing.T) {
 		defer swapDelTreeMaxItemLimitRaw(1)()
-		mp := newTestMetaPartition(rootDir, nil)
+		mp := newTestMetaPartition(t, rootDir, nil)
 		mp.enqueueObjExtentDelWrap(42, 1700000000, 7, []proto.ObjExtentKey{createTestObjExtentKey(0, 1024, 1)})
 
 		dropped := []proto.ObjExtentKey{
@@ -703,7 +774,7 @@ func TestObjExtentDelTreeEnqueue(t *testing.T) {
 	})
 
 	t.Run("detachRemovesPartition", func(t *testing.T) {
-		mp := newTestMetaPartition(rootDir, nil)
+		mp := newTestMetaPartition(t, rootDir, nil)
 		mp.manager.partitions[mp.config.PartitionId] = mp
 		mp.objExtentDelTree.EnqueueFromApply(1, 0, 1, []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 1)})
 		require.NoError(t, mp.manager.detachPartition(mp.config.PartitionId))
@@ -713,7 +784,7 @@ func TestObjExtentDelTreeEnqueue(t *testing.T) {
 
 	t.Run("enqueueNoLimitWhenMaxIsZero", func(t *testing.T) {
 		defer swapDelTreeMaxItemLimit(0)()
-		mp := newTestMetaPartition(rootDir, nil)
+		mp := newTestMetaPartition(t, rootDir, nil)
 		for i := 0; i < 3; i++ {
 			mp.enqueueObjExtentDelWrap(uint64(100+i), 1700000000, uint64(i), []proto.ObjExtentKey{createTestObjExtentKey(0, 1, uint64(i+1))})
 		}

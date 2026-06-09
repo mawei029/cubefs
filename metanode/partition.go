@@ -1290,7 +1290,7 @@ func (mp *metaPartition) LoadSnapshot(snapshotPath string) (err error) {
 		loadFuncs = append(loadFuncs, mp.loadUniqChecker)
 	}
 
-	if crc_count == CRC_COUNT_MULTI_VER {
+	if crc_count >= CRC_COUNT_MULTI_VER {
 		if err = mp.loadMultiVer(snapshotPath, crcs[CRC_COUNT_MULTI_VER-1]); err != nil {
 			return
 		}

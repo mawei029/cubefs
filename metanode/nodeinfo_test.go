@@ -95,7 +95,7 @@ func TestDelTreeMaxItemLimitZeroIgnoresEnqueueCap(t *testing.T) {
 	rootDir, err := os.MkdirTemp("", "del_tree_limit_off")
 	require.NoError(t, err)
 	defer os.RemoveAll(rootDir)
-	mp := newTestMetaPartition(rootDir, nil)
+	mp := newTestMetaPartition(t, rootDir, nil)
 	mp.manager = newMetaPartitionTestManager()
 	for i := 0; i < 3; i++ {
 		mp.enqueueObjExtentDelWrap(uint64(100+i), 0, uint64(i), []proto.ObjExtentKey{createTestObjExtentKey(0, 1, uint64(i+1))})

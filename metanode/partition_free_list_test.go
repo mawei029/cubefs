@@ -84,7 +84,7 @@ func TestStartFreeList_StartObjExtentDelTreeGCInvoked(t *testing.T) {
 	rootDir, err := os.MkdirTemp("", "start_free_list")
 	require.NoError(t, err)
 	defer os.RemoveAll(rootDir)
-	mp := newTestMetaPartition(rootDir, nil)
+	mp := newTestMetaPartition(t, rootDir, nil)
 	err = mp.startFreeList()
 	require.NoError(t, err)
 	close(mp.stopC)

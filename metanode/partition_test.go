@@ -1274,6 +1274,44 @@ func newMemMPForDelTreeSnapshotTest(t *testing.T) *metaPartition {
 	return mp
 }
 
+func TestLoadSnapshot_loadsMultiVerWithObjExtentDelCRCCount(t *testing.T) {
+	mp := newMemMPForDelTreeSnapshotTest(t)
+	expectedVer := []*proto.VolVersionInfo{
+		{Ver: 20, Status: proto.VersionNormal},
+		{Ver: 30, Status: proto.VersionNormal},
+	}
+	mp.multiVersionList.VerList = expectedVer
+	mp.verSeq = 30
+
+	snap, err := mp.GetSnapShot()
+	require.NoError(t, err)
+	msg := &storeMsg{
+		snap:         snap,
+		applyIndex:   mp.GetAppliedID(),
+		uniqId:       mp.GetUniqId(),
+		uniqChecker:  mp.uniqChecker,
+		multiVerList: expectedVer,
+	}
+	require.NoError(t, mp.store(msg))
+	snap.Close()
+
+	snapshotPath := path.Join(mp.config.RootDir, snapshotDir)
+	signData, err := os.ReadFile(path.Join(snapshotPath, SnapshotSign))
+	require.NoError(t, err)
+	require.Equal(t, CRC_COUNT_OBJ_EXTENT_DEL, strings.Count(string(signData), " ")+1)
+
+	mp2 := newMemMPForDelTreeSnapshotTest(t)
+	mp2.config.RootDir = mp.config.RootDir
+	require.NoError(t, mp2.initObjects(true))
+	require.Empty(t, mp2.multiVersionList.VerList)
+
+	require.NoError(t, mp2.LoadSnapshot(snapshotPath))
+	require.Len(t, mp2.multiVersionList.VerList, 2)
+	require.Equal(t, uint64(20), mp2.multiVersionList.VerList[0].Ver)
+	require.Equal(t, uint64(30), mp2.multiVersionList.VerList[1].Ver)
+	require.Equal(t, uint64(30), mp2.verSeq)
+}
+
 func TestDeletedObjExtentsSnapshotRoundTrip(t *testing.T) {
 	mp := newMemMPForDelTreeSnapshotTest(t)
 
