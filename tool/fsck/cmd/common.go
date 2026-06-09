@@ -34,15 +34,16 @@ var (
 )
 
 const (
-	inodeDumpFileName          string = "inode.dump"
-	dentryDumpFileName         string = "dentry.dump"
-	obsoleteInodeDumpFileName  string = "inode.dump.obsolete"
-	obsoleteDentryDumpFileName string = "dentry.dump.obsolete"
-	pathDumpFileName           string = "path.dump"
-	normalDir                  string = "normal"
-	migrateDir                 string = "migrate"
-	beforeTimeFile             string = "before_time"
-	verifyInfoFile             string = "verify_info"
+	inodeDumpFileName              string = "inode.dump"
+	dentryDumpFileName             string = "dentry.dump"
+	obsoleteInodeDumpFileName      string = "inode.dump.obsolete"
+	obsoleteInodeDumpBloomFileName string = "inode.dump.obsolete.bloom"
+	obsoleteDentryDumpFileName     string = "dentry.dump.obsolete"
+	pathDumpFileName               string = "path.dump"
+	normalDir                      string = "normal"
+	migrateDir                     string = "migrate"
+	beforeTimeFile                 string = "before_time"
+	verifyInfoFile                 string = "verify_info"
 )
 
 type Inode struct {
@@ -53,6 +54,7 @@ type Inode struct {
 	AccessTime int64
 	ModifyTime int64
 	NLink      uint32
+	Flag       uint32
 
 	Dens  []*Dentry
 	Valid bool

@@ -604,5 +604,8 @@ func unmarshalValue(val []byte, i *Inode) (err error) {
 	if err = binary.Read(buff, binary.BigEndian, &i.NLink); err != nil {
 		return
 	}
+	if err = binary.Read(buff, binary.BigEndian, &i.Flag); err != nil {
+		return
+	}
 	return
 }

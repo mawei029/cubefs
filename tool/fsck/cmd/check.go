@@ -28,8 +28,10 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/bits-and-blooms/bloom/v3"
 	"github.com/cubefs/cubefs/metanode"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/master"
@@ -40,16 +42,65 @@ import (
 const (
 	InodeCheckOpt int = 1 << iota
 	DentryCheckOpt
+
+	orphanBloomPhase1Concurrency = 3
 )
 
 var (
 	mpCheckLog      *os.File
-	checkHTTPClient = &http.Client{}
+	checkHTTPClient = &http.Client{Timeout: 30 * time.Minute}
 )
 
 type MpMap struct {
 	Imap map[uint64]*metanode.Inode
 	Dmap map[string]*metanode.Dentry
+}
+
+// Concurrency limit related variables and functions (referenced from gc.go)
+var (
+	orphanCheckHostLimit = make(map[string]chan struct{})
+	orphanCheckCntLimit  = 3 // Maximum 3 concurrent requests per host
+	orphanCheckHostLk    = sync.RWMutex{}
+)
+
+func setOrphanCheckHostCntLimit(cnt int) {
+	orphanCheckHostLk.Lock()
+	defer orphanCheckHostLk.Unlock()
+	// Clear old channels
+	for k := range orphanCheckHostLimit {
+		delete(orphanCheckHostLimit, k)
+	}
+	orphanCheckCntLimit = cnt
+}
+
+func getOrphanCheckToken(host string) {
+	orphanCheckHostLk.Lock()
+	ch, ok := orphanCheckHostLimit[host]
+	if !ok {
+		ch = make(chan struct{}, orphanCheckCntLimit)
+		orphanCheckHostLimit[host] = ch
+	}
+	orphanCheckHostLk.Unlock()
+
+	ch <- struct{}{}
+}
+
+func releaseOrphanCheckToken(host string) {
+	orphanCheckHostLk.RLock()
+	defer orphanCheckHostLk.RUnlock()
+
+	ch, ok := orphanCheckHostLimit[host]
+	if !ok {
+		log.Printf("Warning: channel not found for host %s, cannot release token", host)
+		return
+	}
+
+	select {
+	case <-ch:
+		return
+	default:
+		log.Printf("Warning: no token in channel for host %s", host)
+	}
 }
 
 func newCheckCmd() *cobra.Command {
@@ -64,6 +115,7 @@ func newCheckCmd() *cobra.Command {
 		newCheckDentryCmd(),
 		newCheckBothCmd(),
 		newCheckMpCmd(),
+		newCheckOrphanBloomCmd(),
 	)
 
 	return c
@@ -942,4 +994,389 @@ func exportToFile(fp *os.File, cmdline string) error {
 	}
 	_, err = fp.WriteString("\n")
 	return err
+}
+
+// newCheckOrphanBloomCmd creates a command to find inodes not referenced by any dentry.
+func newCheckOrphanBloomCmd() *cobra.Command {
+	c := &cobra.Command{
+		Use:   "orphan-bloom",
+		Short: "approximately find inodes not referenced by dentries using bloom filter",
+		Long: `Approximately find inodes not referenced by any dentry using bloom filter.
+
+This command is memory efficient but approximate. Bloom filter false positives
+can cause real orphan inodes to be missed from the result. Do not use
+inode.dump.obsolete.bloom as the only input for automatic inode deletion.
+Missing some cleanup candidates is an accepted trade-off for lower memory usage
+and faster initial assessment.
+
+This command checks dentry references only. It does not verify whether the
+dentry path is reachable from root inode 1, so the result is not equivalent to
+"check inode" root-reachability analysis.`,
+		Run: func(cmd *cobra.Command, args []string) {
+			if err := CheckOrphanInodesWithBloom(); err != nil {
+				fmt.Println(err)
+				os.Exit(1)
+			}
+		},
+	}
+	return c
+}
+
+// CheckOrphanInodesWithBloom uses a bloom filter to stream inodes not referenced by any dentry.
+// It does not validate whether a dentry is reachable from the root inode.
+func CheckOrphanInodesWithBloom() (err error) {
+	if VolName == "" || MasterAddr == "" {
+		return fmt.Errorf("missing required parameters: master(%v) vol(%v)", MasterAddr, VolName)
+	}
+
+	// Get all meta partitions
+	mps, err := getMetaPartitions(MasterAddr, VolName)
+	if err != nil {
+		return fmt.Errorf("failed to get meta partitions: %v", err)
+	}
+
+	if len(mps) == 0 {
+		return fmt.Errorf("no meta partitions found")
+	}
+
+	// Calculate total inode count from InodeCount of each partition (for bloom filter initialization)
+	// More accurate than fixed "10 million per partition" estimate, more reasonable bloom filter memory usage
+	var totalInodeEstimate uint64
+	for _, mp := range mps {
+		totalInodeEstimate += mp.InodeCount
+	}
+	estimatedInodeCount := uint(totalInodeEstimate)
+	if estimatedInodeCount < 1000000 {
+		estimatedInodeCount = 1000000 // Minimum 1 million
+	}
+
+	m, k := bloom.EstimateParameters(estimatedInodeCount, 0.001)
+	// Create bloom filter with false positive rate of 0.001 (0.1%)
+	// Bloom filter size is automatically calculated based on element count and false positive rate
+	bloomFilter := bloom.New(m, k)
+	estFPR := bloom.EstimateFalsePositiveRate(m, k, estimatedInodeCount)
+	estimatedMissUpperBound := uint64(float64(estimatedInodeCount) * estFPR)
+	fmt.Printf("Bloom filter: capacity=%d, m=%d, k=%d, estimated FPR=%.4f\n", estimatedInodeCount, m, k, estFPR)
+	fmt.Printf("Bloom false positives may miss orphan inodes; estimated missed-orphan upper bound is about %d when capacity is accurate\n", estimatedMissUpperBound)
+	fmt.Printf("WARNING: result is approximate, not equivalent to check inode, and must not be the only basis for automatic deletion\n")
+
+	fmt.Printf("Starting orphan inode check (using bloom filter, total inodes: %d)\n", estimatedInodeCount)
+	fmt.Printf("Meta Partition count: %d\n", len(mps))
+
+	// Set concurrency limit per host (referenced from gc.go, limit to 3)
+	setOrphanCheckHostCntLimit(3)
+
+	// Phase 1: Stream all dentries and add their child inode IDs to the bloom filter.
+	fmt.Println("Phase 1: Scanning dentries, building referenced inode set...")
+	dentryCount := uint64(0)
+	referencedInodeCount := uint64(0)
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(mps))
+	phase1Limit := make(chan struct{}, orphanBloomPhase1Concurrency)
+
+	for _, mp := range mps {
+		mp := mp
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			phase1Limit <- struct{}{}
+			defer func() {
+				<-phase1Limit
+			}()
+			count, refCount, localBloom, e := streamDentriesToBloom(mp, m, k)
+			if e != nil {
+				errChan <- fmt.Errorf("failed to process dentries for partition %d: %v", mp.PartitionID, e)
+				return
+			}
+			mu.Lock()
+			e = bloomFilter.Merge(localBloom)
+			mu.Unlock()
+			if e != nil {
+				errChan <- fmt.Errorf("failed to merge bloom filter for partition %d: %v", mp.PartitionID, e)
+				return
+			}
+			atomic.AddUint64(&dentryCount, count)
+			atomic.AddUint64(&referencedInodeCount, refCount)
+		}()
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	// Check for errors
+	for e := range errChan {
+		if err == nil {
+			err = e
+		} else {
+			err = fmt.Errorf("%v; %v", err, e)
+		}
+	}
+	if err != nil {
+		return err
+	}
+
+	// Root inode (ID=1) may not appear as a dentry child, so add it explicitly.
+	var rootInodeBuf [8]byte
+	bloomFilter.Add(uint64ToBytes(&rootInodeBuf, 1))
+	referencedInodeCount++
+	if referencedInodeCount > uint64(estimatedInodeCount) {
+		fmt.Printf("WARNING: referenced inode count %d exceeds bloom capacity estimate %d; actual FPR may be higher and more orphan inodes may be missed\n", referencedInodeCount, estimatedInodeCount)
+	}
+
+	fmt.Printf("Phase 1 completed: processed %d dentries, found %d referenced inodes\n", dentryCount, referencedInodeCount)
+
+	// Phase 2: Stream all inodes and check for orphans
+	fmt.Println("Phase 2: Scanning inodes, finding orphans...")
+	orphanCount := uint64(0)
+	totalInodeCount := uint64(0)
+	orphanCountNLinkZero := uint64(0)    // Count of orphan inodes with NLink==0
+	orphanCountNLinkNonZero := uint64(0) // Count of orphan inodes with NLink!=0
+	totalSizeNLinkZero := uint64(0)      // Total size of orphan inodes with NLink==0
+	totalSizeNLinkNonZero := uint64(0)   // Total size of orphan inodes with NLink!=0
+
+	// Statistics for orphan inodes with access time older than one month (for priority deletion)
+	oneMonthAgo := time.Now().AddDate(0, -1, 0).Unix() // Timestamp of one month ago
+	orphanCountNLinkZeroOldAccess := uint64(0)         // Count of orphan inodes with NLink==0 and access time older than one month
+	orphanCountNLinkNonZeroOldAccess := uint64(0)      // Count of orphan inodes with NLink!=0 and access time older than one month
+	totalSizeNLinkZeroOldAccess := uint64(0)           // Total size of orphan inodes with NLink==0 and access time older than one month
+	totalSizeNLinkNonZeroOldAccess := uint64(0)        // Total size of orphan inodes with NLink!=0 and access time older than one month
+
+	// Use a distinct output file because this check is reference-based, not root-reachability-based.
+	dirPath := fmt.Sprintf("_export_%s", VolName)
+	outputFile := fmt.Sprintf("%s/%s", dirPath, obsoleteInodeDumpBloomFileName)
+	if err = os.MkdirAll(dirPath, 0o666); err != nil {
+		return fmt.Errorf("failed to create output directory: %v", err)
+	}
+
+	outFile, err := os.Create(outputFile)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %v", err)
+	}
+
+	writer := bufio.NewWriter(outFile)
+	outputClosed := false
+	defer func() {
+		if !outputClosed {
+			_ = writer.Flush()
+			_ = outFile.Close()
+		}
+	}()
+
+	// Stream process inodes for each partition
+	// Note: Sequential processing is used here instead of concurrent due to shared writer
+	// If concurrency is needed, create temporary files for each partition and merge at the end
+	for _, mp := range mps {
+		count, orphan, cntZero, cntNonZero, szZero, szNonZero, cntZeroOld, cntNonZeroOld, szZeroOld, szNonZeroOld, e := streamInodesCheckOrphan(mp, bloomFilter, writer, oneMonthAgo)
+		if e != nil {
+			if err == nil {
+				err = fmt.Errorf("failed to process inodes for partition %d: %v", mp.PartitionID, e)
+			} else {
+				err = fmt.Errorf("%v; failed to process inodes for partition %d: %v", err, mp.PartitionID, e)
+			}
+			continue
+		}
+		atomic.AddUint64(&totalInodeCount, count)
+		atomic.AddUint64(&orphanCount, orphan)
+		atomic.AddUint64(&orphanCountNLinkZero, cntZero)
+		atomic.AddUint64(&orphanCountNLinkNonZero, cntNonZero)
+		atomic.AddUint64(&totalSizeNLinkZero, szZero)
+		atomic.AddUint64(&totalSizeNLinkNonZero, szNonZero)
+		atomic.AddUint64(&orphanCountNLinkZeroOldAccess, cntZeroOld)
+		atomic.AddUint64(&orphanCountNLinkNonZeroOldAccess, cntNonZeroOld)
+		atomic.AddUint64(&totalSizeNLinkZeroOldAccess, szZeroOld)
+		atomic.AddUint64(&totalSizeNLinkNonZeroOldAccess, szNonZeroOld)
+	}
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Phase 2 failed, result file is incomplete and invalid: %s\n", outputFile)
+		if flushErr := writer.Flush(); flushErr != nil {
+			err = fmt.Errorf("%v; failed to flush incomplete result file: %v", err, flushErr)
+		}
+		if closeErr := outFile.Close(); closeErr != nil {
+			err = fmt.Errorf("%v; failed to close incomplete result file: %v", err, closeErr)
+		}
+		outputClosed = true
+		if removeErr := os.Remove(outputFile); removeErr != nil && !os.IsNotExist(removeErr) {
+			return fmt.Errorf("%v; incomplete result file %s is invalid and failed to remove: %v", err, outputFile, removeErr)
+		}
+		fmt.Fprintf(os.Stderr, "Removed incomplete result file: %s\n", outputFile)
+		return err
+	}
+
+	fmt.Printf("\nCheck completed!\n")
+	fmt.Printf("Total inode count: %d\n", totalInodeCount)
+	fmt.Printf("Orphan inode count: %d\n", orphanCount)
+	fmt.Printf("Orphan inodes with NLink==0: %d, Total size: %d bytes\n", orphanCountNLinkZero, totalSizeNLinkZero)
+	fmt.Printf("Orphan inodes with NLink!=0: %d, Total size: %d bytes\n", orphanCountNLinkNonZero, totalSizeNLinkNonZero)
+	fmt.Printf("\n[Orphan inodes with access time older than one month (priority for deletion)]\n")
+	fmt.Printf("Orphan inodes with NLink==0 and access time older than one month: %d, Total size: %d bytes\n", orphanCountNLinkZeroOldAccess, totalSizeNLinkZeroOldAccess)
+	fmt.Printf("Orphan inodes with NLink!=0 and access time older than one month: %d, Total size: %d bytes\n", orphanCountNLinkNonZeroOldAccess, totalSizeNLinkNonZeroOldAccess)
+	fmt.Printf("Results saved to: %s\n", outputFile)
+
+	return nil
+}
+
+// streamDentriesToBloom streams dentries and adds child inode IDs to a local bloom filter.
+func streamDentriesToBloom(mp *proto.MetaPartitionView, bloomM, bloomK uint) (dentryCount, referencedInodeCount uint64, bloomFilter *bloom.BloomFilter, err error) {
+	host := strings.Split(mp.LeaderAddr, ":")[0]
+	// Get token to limit concurrency (referenced from gc.go)
+	getOrphanCheckToken(host)
+	defer releaseOrphanCheckToken(host)
+
+	url := fmt.Sprintf("http://%s:%s/getDentrySnapshot?pid=%d", host, MetaPort, mp.PartitionID)
+	resp, err := checkHTTPClient.Get(url)
+	if err != nil {
+		return 0, 0, nil, fmt.Errorf("failed to get dentry snapshot: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return 0, 0, nil, fmt.Errorf("invalid status code: %v", resp.StatusCode)
+	}
+
+	reader := bufio.NewReaderSize(resp.Body, 4*1024*1024)
+	dentryBuf := make([]byte, 4)
+	var inodeIDBuf [8]byte
+	bloomFilter = bloom.New(bloomM, bloomK)
+	seenInodes := make(map[uint64]bool) // Used for deduplication to avoid adding duplicate inodes to bloom filter
+
+	for {
+		dentryBuf = dentryBuf[:4]
+		// Read 4-byte length header
+		_, err = io.ReadFull(reader, dentryBuf)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return 0, 0, nil, fmt.Errorf("failed to read dentry length: %v", err)
+		}
+
+		length := binary.BigEndian.Uint32(dentryBuf)
+
+		// Read dentry data
+		if uint32(cap(dentryBuf)) >= length {
+			dentryBuf = dentryBuf[:length]
+		} else {
+			dentryBuf = make([]byte, length)
+		}
+		_, err = io.ReadFull(reader, dentryBuf)
+		if err != nil {
+			return 0, 0, nil, fmt.Errorf("failed to read dentry data: %v", err)
+		}
+
+		den := &Dentry{}
+		if err = decodeDentry(dentryBuf, den); err != nil {
+			return 0, 0, nil, fmt.Errorf("failed to decode dentry: %v", err)
+		}
+
+		dentryCount++
+
+		// Add the dentry child inode ID to bloom filter (deduplication).
+		if !seenInodes[den.Inode] {
+			bloomFilter.Add(uint64ToBytes(&inodeIDBuf, den.Inode))
+			seenInodes[den.Inode] = true
+			referencedInodeCount++
+		}
+	}
+
+	return dentryCount, referencedInodeCount, bloomFilter, nil
+}
+
+// streamInodesCheckOrphan streams inodes and writes those not referenced by any dentry.
+func streamInodesCheckOrphan(mp *proto.MetaPartitionView, bloomFilter *bloom.BloomFilter, writer *bufio.Writer, oneMonthAgo int64) (totalCount, orphanCount, orphanCountNLinkZero, orphanCountNLinkNonZero, sizeNLinkZero, sizeNLinkNonZero, orphanCountNLinkZeroOldAccess, orphanCountNLinkNonZeroOldAccess, sizeNLinkZeroOldAccess, sizeNLinkNonZeroOldAccess uint64, err error) {
+	host := strings.Split(mp.LeaderAddr, ":")[0]
+	// Get token to limit concurrency (referenced from gc.go)
+	getOrphanCheckToken(host)
+	defer releaseOrphanCheckToken(host)
+
+	url := fmt.Sprintf("http://%s:%s/getInodeSnapshot?pid=%d", host, MetaPort, mp.PartitionID)
+	resp, err := checkHTTPClient.Get(url)
+	if err != nil {
+		return 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, fmt.Errorf("failed to get inode snapshot: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, fmt.Errorf("invalid status code: %v", resp.StatusCode)
+	}
+
+	reader := bufio.NewReaderSize(resp.Body, 4*1024*1024)
+	inoBuf := make([]byte, 4)
+	var inodeIDBuf [8]byte
+
+	for {
+		inoBuf = inoBuf[:4]
+		// Read 4-byte length header
+		_, err = io.ReadFull(reader, inoBuf)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, fmt.Errorf("failed to read inode length: %v", err)
+		}
+
+		length := binary.BigEndian.Uint32(inoBuf)
+
+		// Read inode data
+		if uint32(cap(inoBuf)) >= length {
+			inoBuf = inoBuf[:length]
+		} else {
+			inoBuf = make([]byte, length)
+		}
+		_, err = io.ReadFull(reader, inoBuf)
+		if err != nil {
+			return 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, fmt.Errorf("failed to read inode data: %v", err)
+		}
+
+		inode := &Inode{Dens: make([]*Dentry, 0)}
+		if err = decodeInode(inoBuf, inode); err != nil {
+			return 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, fmt.Errorf("failed to decode inode: %v", err)
+		}
+
+		totalCount++
+
+		// Root inode (ID=1) is always reachable, skip
+		if inode.Inode == 1 {
+			continue
+		}
+
+		// Check if inode is in bloom filter (i.e., if it is referenced).
+		isReferenced := bloomFilter.Test(uint64ToBytes(&inodeIDBuf, inode.Inode))
+
+		if !isReferenced {
+			// This is an orphan inode, count and accumulate size by NLink
+			isOldAccess := inode.AccessTime > 0 && inode.AccessTime < oneMonthAgo // Access time is older than one month
+
+			if inode.NLink == 0 {
+				orphanCountNLinkZero++
+				sizeNLinkZero += inode.Size
+				if isOldAccess {
+					orphanCountNLinkZeroOldAccess++
+					sizeNLinkZeroOldAccess += inode.Size
+				}
+			} else {
+				orphanCountNLinkNonZero++
+				sizeNLinkNonZero += inode.Size
+				if isOldAccess {
+					orphanCountNLinkNonZeroOldAccess++
+					sizeNLinkNonZeroOldAccess += inode.Size
+				}
+			}
+			orphanCount++
+			line := inode.String() + "\n"
+			if _, err = writer.WriteString(line); err != nil {
+				return 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, fmt.Errorf("failed to write to file: %v", err)
+			}
+		}
+	}
+
+	return totalCount, orphanCount, orphanCountNLinkZero, orphanCountNLinkNonZero, sizeNLinkZero, sizeNLinkNonZero, orphanCountNLinkZeroOldAccess, orphanCountNLinkNonZeroOldAccess, sizeNLinkZeroOldAccess, sizeNLinkNonZeroOldAccess, nil
+}
+
+// uint64ToBytes writes v into buf and returns buf as bytes for bloom hashing.
+func uint64ToBytes(buf *[8]byte, v uint64) []byte {
+	binary.BigEndian.PutUint64(buf[:], v)
+	return buf[:]
 }
