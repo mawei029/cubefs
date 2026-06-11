@@ -1113,6 +1113,7 @@ func (mp *metaPartition) fsmExtentsTruncateV2(dbHandle interface{}, req *proto.T
 	i.HybridCloudExtents.sortedEks = NewSortedObjExtentsFromObjEks(finalEks)
 	i.Size = req.Size
 	i.Generation++
+	i.ModifyTime = req.Timestamp
 	if err = mp.inodeTree.Put(dbHandle, i); err != nil {
 		log.LogErrorf("[fsmExtentsTruncateV2] mpId(%v) ino(%v) Put err: %v", mpId, inoId, err)
 		resp.Status = proto.OpErr
