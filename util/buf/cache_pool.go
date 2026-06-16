@@ -1,55 +1,78 @@
 package buf
 
 import (
-	"context"
 	"sync"
 	"sync/atomic"
-
-	"github.com/cubefs/cubefs/util"
-	"github.com/cubefs/cubefs/util/log"
-	"golang.org/x/time/rate"
 )
 
-var (
-	cacheTotalLimit int64
-	cacheRateLimit  = rate.NewLimiter(rate.Limit(16), 16)
-	cacheCount      int64
-	CachePool       *FileCachePool
-)
+const DefaultEbsWriteCacheLimit int64 = 512 // 512 × 8MB = 4GB by default
+
+var CachePool *FileCachePool
+
+type FileCachePool struct {
+	pool       *sync.Pool
+	blockSize  int
+	totalLimit int64
+	count      int64
+	mu         sync.Mutex
+	wait       sync.Cond
+}
 
 func newWriterCachePool(blockSize int) *sync.Pool {
 	return &sync.Pool{
 		New: func() interface{} {
-			if atomic.LoadInt64(&cacheCount) >= cacheTotalLimit {
-				ctx := context.Background()
-				cacheRateLimit.Wait(ctx)
-			}
 			return make([]byte, blockSize)
 		},
 	}
 }
 
-type FileCachePool struct {
-	pool *sync.Pool
+func newFileCachePool(blockSize int, blockLimit int64) *FileCachePool {
+	p := &FileCachePool{
+		pool:       newWriterCachePool(blockSize),
+		blockSize:  blockSize,
+		totalLimit: blockLimit,
+	}
+	p.wait.L = &p.mu
+	return p
 }
 
-func InitCachePool(blockSize int) {
+// InitCachePool configures the EC/Blob write buffer pool.
+// blockLimit is the max number of outstanding blocks (default DefaultEbsWriteCacheLimit when <= 0).
+func InitCachePool(blockSize int, blockLimit int64) {
 	if blockSize == 0 {
 		return
 	}
-	CachePool = &FileCachePool{}
-	cacheTotalLimit = int64((4 * util.GB) / blockSize)
-	CachePool.pool = newWriterCachePool(blockSize)
+	if blockLimit <= 0 {
+		blockLimit = DefaultEbsWriteCacheLimit
+	}
+	CachePool = newFileCachePool(blockSize, blockLimit)
 }
 
+// Get borrows one block buffer; blocks when outstanding buffers reach totalLimit.
 func (fileCachePool *FileCachePool) Get() []byte {
-	atomic.AddInt64(&cacheCount, 1)
+	if fileCachePool == nil {
+		return nil
+	}
+
+	fileCachePool.mu.Lock()
+	for atomic.LoadInt64(&fileCachePool.count) >= fileCachePool.totalLimit {
+		fileCachePool.wait.Wait()
+	}
+	atomic.AddInt64(&fileCachePool.count, 1)
+	fileCachePool.mu.Unlock()
+
 	return fileCachePool.pool.Get().([]byte)
 }
 
 func (fileCachePool *FileCachePool) Put(data []byte) {
-	log.LogInfof("action[FileCachePool.put] %v", fileCachePool)
-	log.LogInfof("action[FileCachePool.put] pool %v", fileCachePool.pool)
-	atomic.AddInt64(&cacheCount, -1)
-	fileCachePool.pool.Put(data) // nolint: staticcheck
+	if fileCachePool == nil || data == nil {
+		return
+	}
+
+	fileCachePool.mu.Lock()
+	atomic.AddInt64(&fileCachePool.count, -1)
+	fileCachePool.wait.Signal()
+	fileCachePool.mu.Unlock()
+
+	fileCachePool.pool.Put(data[:fileCachePool.blockSize]) // nolint: staticcheck
 }

@@ -505,7 +505,8 @@ func main() {
 	proto.InitBufferPoolEx(opt.BuffersTotalLimit, int(opt.BufferChanSize))
 	log.LogInfof("InitBufferPoolEx: total limit %d, chan size %d", opt.BuffersTotalLimit, opt.BufferChanSize)
 	if proto.IsCold(opt.VolType) || proto.IsStorageClassBlobStore(opt.VolStorageClass) {
-		buf.InitCachePool(opt.EbsBlockSize)
+		buf.InitCachePool(opt.EbsBlockSize, opt.EbsBufferCacheLimit)
+		log.LogInfof("InitCachePool: blockSize %d, blockLimit %d", opt.EbsBlockSize, opt.EbsBufferCacheLimit)
 	}
 	if opt.EnableBcache {
 		buf.InitbCachePool(bcache.MaxBlockSize)
@@ -1095,6 +1096,7 @@ func parseMountOption(cfg *config.Config) (*proto.MountOptions, error) {
 	opt.MetaSendTimeout = GlobalMountOptions[proto.MetaSendTimeout].GetInt64()
 
 	opt.BuffersTotalLimit = GlobalMountOptions[proto.BuffersTotalLimit].GetInt64()
+	opt.EbsBufferCacheLimit = GlobalMountOptions[proto.EbsBufferCacheLimit].GetInt64()
 	opt.BufferChanSize = GlobalMountOptions[proto.BufferChanSize].GetInt64()
 	opt.MetaSendTimeout = GlobalMountOptions[proto.MetaSendTimeout].GetInt64()
 	opt.MaxStreamerLimit = GlobalMountOptions[proto.MaxStreamerLimit].GetInt64()
@@ -1151,6 +1153,9 @@ func parseMountOption(cfg *config.Config) (*proto.MountOptions, error) {
 
 	if opt.BuffersTotalLimit < 0 {
 		return nil, errors.New(fmt.Sprintf("invalid fields, BuffersTotalLimit(%v) must larger or equal than 0", opt.BuffersTotalLimit))
+	}
+	if opt.EbsBufferCacheLimit < 0 {
+		return nil, errors.New(fmt.Sprintf("invalid fields, EbsBufferCacheLimit(%v) must larger or equal than 0", opt.EbsBufferCacheLimit))
 	}
 
 	if opt.FileSystemName == "" {

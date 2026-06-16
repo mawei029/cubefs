@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/brahma-adshonor/gohook"
@@ -80,7 +81,7 @@ func init() {
 		ECStreamer:      streamer,
 	}
 
-	buf.InitCachePool(8388608)
+	buf.InitCachePool(8388608, 512)
 	writer = NewWriter(config)
 }
 
@@ -152,6 +153,13 @@ func TestWriter_TruncateV2FromExtents_no_shrink_when_target_ge_current(t *testin
 }
 
 func TestWriter_doBufferWrite_(t *testing.T) {
+	buf.InitCachePool(8388608, 512)
+	writer.buf = nil
+	writer.bufPooled = false
+	writer.blockPosition = 0
+	writer.fileOffset = 0
+	t.Cleanup(func() { writer.FreeCache() })
+
 	// write data to buffer,not write to ebs when len(buffer)<BlockSize
 	ctx := context.Background()
 	testCases := []struct {
@@ -301,7 +309,12 @@ func TestBufferWrite(t *testing.T) {
 		panic(fmt.Sprintf("Hook advance instance method failed:%s", err.Error()))
 	}
 	writer.ecStreamer.mw = mw
-	writer.buf = buf.CachePool.Get()
+	writer.buf = nil
+	writer.bufPooled = false
+	writer.blockPosition = 0
+	writer.fileOffset = 0
+	writer.allocateCache()
+	t.Cleanup(func() { writer.FreeCache() })
 
 	writer.doBufferWrite(ctx, data, offset)
 }
@@ -658,7 +671,7 @@ func TestWriterCoverageMoreLowFunctions(t *testing.T) {
 
 	t.Run("writeFromReader and flushWithoutPool and freecache", func(t *testing.T) {
 		t.Skip("需完整 EBS mock 链，暂由 writer_dirty / ec_streamer 增量单测覆盖 flush 路径")
-		buf.InitCachePool(8)
+		buf.InitCachePool(8, 0)
 		s := mustTestECStreamerWithEbsc(2, &BlobStoreClient{}, 8)
 		s.mw = &meta.MetaWrapper{}
 		w := s.fWriter
@@ -815,10 +828,12 @@ func TestWriter_flushExt_empty_dirty_updates_meta_only(t *testing.T) {
 }
 
 func TestWriter_tryOverWrite_pwrite_at_offset(t *testing.T) {
+	buf.InitCachePool(8<<20, 512)
 	s := mustTestECStreamer(80, nil, nil)
 	w := s.Writer()
 	w.fileOffset = 0
 	w.blockPosition = 0
+	t.Cleanup(func() { w.FreeCache() })
 
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
@@ -1131,4 +1146,171 @@ func TestWriter_flushExt_tailHole_usesOverwriteReqs(t *testing.T) {
 	require.NoError(t, w.flushExt(st.ino, ctx, false))
 	require.Equal(t, 0, flushCalls, "tail-hole write must not use append-only flush path")
 	require.Equal(t, 1, overwriteCalls, "tail-hole write must use overwrite path")
+}
+
+func TestNewWriter_noWriteBufOnCreate(t *testing.T) {
+	buf.InitCachePool(1024, 4)
+	st := mustTestECStreamer(410, nil, nil)
+	w := NewWriter(ClientConfig{ECStreamer: st, LimitManager: newTestLimitManager()})
+	require.Nil(t, w.buf)
+}
+
+func TestWriter_allocateCache_borrowsFromPool(t *testing.T) {
+	const blockSize = 256
+	buf.InitCachePool(blockSize, 4)
+	st := mustTestECStreamerWithEbsc(411, &BlobStoreClient{}, blockSize)
+	w := st.fWriter
+	require.Nil(t, w.buf)
+	require.False(t, w.bufPooled)
+
+	w.allocateCache()
+	require.NotNil(t, w.buf)
+	require.Equal(t, 256, cap(w.buf))
+	require.True(t, w.bufPooled)
+
+	w.FreeCache()
+	require.Nil(t, w.buf)
+	require.False(t, w.bufPooled)
+}
+
+func TestWriter_releaseWriteBuf_afterNotifyCompleteFlushMeta(t *testing.T) {
+	const blockSize = 128
+	buf.InitCachePool(blockSize, 1)
+	st := mustTestECStreamerWithEbsc(412, &BlobStoreClient{}, blockSize)
+	w := st.fWriter
+	w.allocateCache()
+	require.True(t, w.bufPooled)
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyPrivateMethod(reflect.TypeOf(st), "updateMetaInfo",
+		func(_ *ECStreamer, _ *uint64) error { return nil })
+
+	acquired := make(chan []byte, 1)
+	go func() {
+		acquired <- buf.CachePool.Get()
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("second Get should block while pooled buf is held")
+	default:
+	}
+
+	require.NoError(t, w.notifyCompleteFlushMeta())
+	require.Nil(t, w.buf)
+	require.False(t, w.bufPooled)
+
+	select {
+	case b := <-acquired:
+		buf.CachePool.Put(b)
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked Get did not wake after notifyCompleteFlushMeta released pool block")
+	}
+}
+
+func TestWriter_releaseWriteBuf_skipsDirtyBuffer(t *testing.T) {
+	const blockSize = 128
+	buf.InitCachePool(blockSize, 4)
+	st := mustTestECStreamerWithEbsc(413, &BlobStoreClient{}, blockSize)
+	w := st.fWriter
+	w.allocateCache()
+	w.blockPosition = 8
+	require.True(t, w.bufPooled)
+
+	w.releaseWriteBuf()
+	require.NotNil(t, w.buf)
+	require.True(t, w.bufPooled)
+
+	w.blockPosition = 0
+	w.releaseWriteBuf()
+	require.Nil(t, w.buf)
+	require.False(t, w.bufPooled)
+}
+
+func TestWriter_notifyCompleteFlushMeta_discardsHeapBuf(t *testing.T) {
+	const blockSize = 64
+	buf.InitCachePool(blockSize, 1)
+	st := mustTestECStreamerWithEbsc(414, &BlobStoreClient{}, blockSize)
+	w := st.fWriter
+	w.buf = append([]byte(nil), []byte("heap")...)
+	w.bufPooled = false
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyPrivateMethod(reflect.TypeOf(st), "updateMetaInfo",
+		func(_ *ECStreamer, _ *uint64) error { return nil })
+
+	require.NoError(t, w.notifyCompleteFlushMeta())
+	require.Nil(t, w.buf)
+	require.False(t, w.bufPooled)
+
+	// Pool count must stay balanced: a lone Get should not block at limit 1.
+	b := buf.CachePool.Get()
+	buf.CachePool.Put(b)
+}
+
+func TestWriter_WriteFromReader_setsBufPooledFalse(t *testing.T) {
+	const blockSize = 64
+	buf.InitCachePool(blockSize, 4)
+	s := mustTestECStreamerWithEbsc(417, &BlobStoreClient{}, blockSize)
+	s.mw = &meta.MetaWrapper{}
+	w := s.fWriter
+	w.allocateCache()
+	require.True(t, w.bufPooled)
+	t.Cleanup(func() { w.FreeCache() })
+
+	err := gohook.HookMethod(w.ecStreamer.ebsc, "Write", MockEbscWriteTrue, nil)
+	require.NoError(t, err)
+	defer gohook.UnHookMethod(w.ecStreamer.ebsc, "Write")
+	err = gohook.HookMethod(w.ecStreamer.mw, "AppendObjExtentKeys", MockAppendObjExtentKeysTrue, nil)
+	require.NoError(t, err)
+	defer gohook.UnHookMethod(w.ecStreamer.mw, "AppendObjExtentKeys")
+
+	_, err = w.WriteFromReader(context.Background(), strings.NewReader("x"), nil)
+	require.NoError(t, err)
+	require.False(t, w.bufPooled)
+}
+
+func TestWriter_FreeCache_heapBufNoPoolPut(t *testing.T) {
+	const blockSize = 64
+	buf.InitCachePool(blockSize, 1)
+	st := mustTestECStreamerWithEbsc(415, &BlobStoreClient{}, blockSize)
+	w := st.fWriter
+	w.buf = append([]byte(nil), make([]byte, 128)...)
+	w.bufPooled = false
+
+	w.FreeCache()
+	require.Nil(t, w.buf)
+
+	b := buf.CachePool.Get()
+	buf.CachePool.Put(b)
+}
+
+func TestWriter_doParallelWrite_releasesPooledBufAfterFlush(t *testing.T) {
+	const blockSize = 16
+	buf.InitCachePool(blockSize, 1)
+	s := mustTestECStreamerWithEbsc(416, &BlobStoreClient{}, blockSize)
+	s.mw = &meta.MetaWrapper{}
+	w := s.fWriter
+	seedDirtyForTest(s)
+
+	err := gohook.HookMethod(w.ecStreamer.ebsc, "Write", MockEbscWriteTrue, nil)
+	require.NoError(t, err)
+	defer gohook.UnHookMethod(w.ecStreamer.ebsc, "Write")
+	err = gohook.HookMethod(w.ecStreamer.mw, "AppendObjExtentKeys", MockAppendObjExtentKeysTrue, nil)
+	require.NoError(t, err)
+	defer gohook.UnHookMethod(w.ecStreamer.mw, "AppendObjExtentKeys")
+
+	_, err = w.doBufferWrite(context.Background(), []byte("hello"), 0)
+	require.NoError(t, err)
+	require.True(t, w.bufPooled)
+	require.NotNil(t, w.buf)
+
+	_, err = w.doParallelWrite(context.Background(), []byte("sync"), 5)
+	require.NoError(t, err)
+	require.Nil(t, w.buf)
+	require.False(t, w.bufPooled)
+
+	b := buf.CachePool.Get()
+	buf.CachePool.Put(b)
 }

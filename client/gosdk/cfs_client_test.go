@@ -12,7 +12,9 @@ import (
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/blobstore"
 	"github.com/cubefs/cubefs/sdk/data/stream"
+	masterSDK "github.com/cubefs/cubefs/sdk/master"
 	"github.com/cubefs/cubefs/sdk/meta"
+	"github.com/cubefs/cubefs/util/buf"
 	"github.com/stretchr/testify/require"
 )
 
@@ -423,4 +425,46 @@ func TestClient_Close_closesOec(t *testing.T) {
 	patches.ApplyMethod(reflect.TypeOf(c.ec), "Close", func(_ *stream.ExtentClient) error { return nil })
 	c.Close()
 	require.True(t, closed)
+}
+
+func TestClient_loadConfFromMaster_initCachePool(t *testing.T) {
+	const objBlockSize = 1 << 23
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	mc := masterSDK.NewMasterClient([]string{"127.0.0.1:1"}, false)
+	patches.ApplyFunc(masterSDK.NewMasterClient, func(_ []string, _ bool) *masterSDK.MasterClient {
+		return mc
+	})
+	admin := mc.AdminAPI()
+	patches.ApplyMethod(reflect.TypeOf(admin), "GetVolumeSimpleInfo",
+		func(_ *masterSDK.AdminAPI, vol string) (*proto.SimpleVolView, error) {
+			require.Equal(t, "cold-vol", vol)
+			return &proto.SimpleVolView{
+				VolType:             proto.VolumeTypeCold,
+				ObjBlockSize:        objBlockSize,
+				VolStorageClass:     proto.StorageClass_BlobStore,
+				AllowedStorageClass: []uint32{proto.StorageClass_BlobStore},
+			}, nil
+		})
+	patches.ApplyMethod(reflect.TypeOf(admin), "GetClusterInfo",
+		func(_ *masterSDK.AdminAPI) (*proto.ClusterInfo, error) {
+			return &proto.ClusterInfo{
+				EbsAddr:             "http://ebs",
+				ServicePath:         "/svc",
+				Cluster:             "cluster1",
+				DirChildrenNumLimit: proto.DefaultDirChildrenNumLimit,
+			}, nil
+		})
+
+	c := &Client{cfg: Config{VolName: "cold-vol"}}
+	require.NoError(t, c.loadConfFromMaster([]string{"127.0.0.1:1"}))
+	require.Equal(t, objBlockSize, c.ebsBlockSize)
+	require.Equal(t, proto.VolumeTypeCold, c.volType)
+	require.NotNil(t, buf.CachePool)
+
+	b := buf.CachePool.Get()
+	require.Equal(t, objBlockSize, len(b))
+	require.Equal(t, objBlockSize, cap(b))
+	buf.CachePool.Put(b)
 }

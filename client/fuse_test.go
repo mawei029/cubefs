@@ -110,3 +110,38 @@ func TestParseMountOptionHDDAccCache(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "private-topo", opt.HDDAccCache)
 }
+
+func TestParseMountOptionEbsBufferCacheLimit(t *testing.T) {
+	savedOptions := append([]proto.MountOption(nil), GlobalMountOptions...)
+	t.Cleanup(func() {
+		GlobalMountOptions = savedOptions
+	})
+
+	newConfig := func() *config.Config {
+		cfg := config.NewConfig()
+		cfg.SetString("mountPoint", t.TempDir())
+		cfg.SetString("volName", "testvol")
+		cfg.SetString("owner", "test-owner")
+		cfg.SetString("masterAddr", "127.0.0.1:17010")
+		return cfg
+	}
+
+	GlobalMountOptions = append([]proto.MountOption(nil), savedOptions...)
+	opt, err := parseMountOption(newConfig())
+	require.NoError(t, err)
+	require.Equal(t, int64(512), opt.EbsBufferCacheLimit)
+
+	GlobalMountOptions = append([]proto.MountOption(nil), savedOptions...)
+	cfg := newConfig()
+	cfg.SetNewVal("ebsBufferCacheLimit", "256")
+	opt, err = parseMountOption(cfg)
+	require.NoError(t, err)
+	require.Equal(t, int64(256), opt.EbsBufferCacheLimit)
+
+	GlobalMountOptions = append([]proto.MountOption(nil), savedOptions...)
+	cfg = newConfig()
+	cfg.SetNewVal("ebsBufferCacheLimit", "-1")
+	_, err = parseMountOption(cfg)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "EbsBufferCacheLimit")
+}

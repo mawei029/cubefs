@@ -109,6 +109,7 @@ const (
 	PoolId
 	MetaRegion
 	ExtentHandlerMaxRetryTime
+	EbsBufferCacheLimit
 	MaxMountOption
 )
 
@@ -184,6 +185,7 @@ func InitMountOptions(opts []MountOption) {
 	opts[EbsEndpoint] = MountOption{"ebsEndpoint", "Ebs service address", "", ""}
 	opts[EbsServerPath] = MountOption{"ebsServerPath", "Ebs service path", "", ""}
 	opts[EbsBlockSize] = MountOption{"ebsBlockSize", "Ebs object size", "", ""}
+	opts[EbsBufferCacheLimit] = MountOption{"ebsBufferCacheLimit", "EC/Blob buffer cache block limit (512 x ebsBlockSize = 4GB default)", "", int64(512)}
 	// opts[EnableBcache] = MountOption{"enableBcache", "Enable block cache", "", false}
 	opts[BcacheDir] = MountOption{"bcacheDir", "block cache dir", "", ""}
 	opts[ReadThreads] = MountOption{"readThreads", "Cold volume read threads", "", int64(10)}
@@ -206,7 +208,7 @@ func InitMountOptions(opts []MountOption) {
 	opts[BcacheOnlyForNotSSD] = MountOption{"enableBcacheOnlyForNotSSD", "Enable block cache only for not ssd", "", false}
 
 	opts[AheadReadEnable] = MountOption{"aheadReadEnable", "enable ahead read", "", false}
-	opts[AheadReadTotalMemGB] = MountOption{"aheadReadTotalMemGB", "ahead read total mem(GB)", "", int64(10)}
+	opts[AheadReadTotalMemGB] = MountOption{"aheadReadTotalMemGB", "ahead read total mem(GB)", "", int64(4)}
 	opts[AheadReadBlockTimeOut] = MountOption{"aheadReadBlockTimeOut", "ahead read block expiration time", "", int64(3)}
 	opts[AheadReadWindowCnt] = MountOption{"aheadReadWindowCnt", "ahead read window block count", "", int64(8)}
 	opts[MinReadAheadSize] = MountOption{"minReadAheadSize", "minimum file size to trigger ahead read (bytes); -1 means use master volume config", "", int64(-1)}
@@ -383,6 +385,7 @@ type MountOptions struct {
 	EbsEndpoint             string
 	EbsServicePath          string
 	EbsBlockSize            int
+	EbsBufferCacheLimit     int64
 	EnableBcache            bool
 	BcacheOnlyForNotSSD     bool
 	BcacheDir               string

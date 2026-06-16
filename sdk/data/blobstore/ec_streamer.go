@@ -472,9 +472,6 @@ func (s *ECStreamer) commitFileSize(size uint64) {
 			w.fileOffset = tail
 		}
 		w.resetBuffer()
-		if len(w.buf) > 0 {
-			w.resetBufferWithoutPool()
-		}
 	}
 	s.cleanDirty()
 }

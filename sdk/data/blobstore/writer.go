@@ -68,6 +68,7 @@ type Writer struct {
 	buf           []byte // buffer for write operations, size is blockSize
 	fileOffset    int    // logical file offset of current write position (file end). The logical write pointer of the current buffered session (the exclusive end of the written range); Flush using [fileOffset-bufferSize, fileOffset].
 	blockPosition int    // physical block offset of current write position (buffer end). Current filled length within the 8 MB block; reaching BlockSize triggers flushExt, then reset to zero
+	bufPooled     bool   // writer.buf borrowed from buf.CachePool (Get/Put paired)
 	limitManager  *manager.LimitManager
 	ecStreamer    *ECStreamer // required (see NewWriter)
 }
@@ -82,7 +83,6 @@ func NewWriter(config ClientConfig) (writer *Writer) {
 	writer.wConcurrency = config.WConcurrency
 	writer.wg = sync.WaitGroup{}
 	writer.once = sync.Once{}
-	writer.allocateCache()
 	writer.limitManager = config.LimitManager
 	writer.ecStreamer = config.ECStreamer
 
@@ -99,9 +99,6 @@ func (writer *Writer) notifyAfterWrite() {
 // notifyCompleteFlushMeta after EBS/meta commit: resetBuffer → updateMetaInfo → cleanDirty.
 func (writer *Writer) notifyCompleteFlushMeta() error {
 	writer.resetBuffer()
-	if len(writer.buf) > 0 {
-		writer.resetBufferWithoutPool()
-	}
 	if err := writer.ecStreamer.updateMetaInfo(nil); err != nil {
 		return err
 	}
@@ -122,6 +119,7 @@ func (writer *Writer) WriteWithoutPool(ctx context.Context, offset int, data []b
 		log.LogErrorf("Writer WriteWithoutPool: writer is nil")
 		return 0, fmt.Errorf("writer is not opened yet")
 	}
+	writer.bufPooled = false
 	log.LogDebugf("TRACE blobStore WriteWithoutPool Enter: ino(%v) offset(%v) len(%v) fileSize(%v)",
 		writer.ecStreamer.Inode(), offset, len(data), writer.CacheFileSize())
 
@@ -209,9 +207,7 @@ func (writer *Writer) tryOverWrite(ctx context.Context, offset int, data []byte,
 	}
 
 	writer.ecStreamer.markDirty()
-	if buf.CachePool != nil && writer.buf == nil {
-		writer.allocateCache()
-	}
+	writer.allocateCache()
 	writer.reshapeBufForCopyPath()
 
 	remainSize, position, notFlushSize := len(data), 0, 0
@@ -298,6 +294,7 @@ func (writer *Writer) doParallelWrite(ctx context.Context, data []byte, offset i
 		}
 	}
 
+	writer.bufPooled = false
 	wSlices := writer.prepareWriteSlice(offset, data)
 	log.LogDebugf("TRACE blobStore prepareWriteSlice: wSlices(%v)", wSlices)
 	sliceSize := len(wSlices)
@@ -342,6 +339,7 @@ func (writer *Writer) WriteFromReader(ctx context.Context, reader io.Reader, h h
 		leftToWrite int
 	)
 	defer buf.ClodVolWriteBufPool.Put(tmp) // nolint: staticcheck
+	writer.bufPooled = false
 
 	writer.fileOffset = 0
 	writer.err = make(chan *wSliceErr)
@@ -510,10 +508,8 @@ func (writer *Writer) doBufferWrite(ctx context.Context, data []byte, offset int
 	writer.fileOffset = offset
 	dataSize := len(data)
 	position := 0
+	writer.allocateCache()
 	log.LogDebugf("TRACE blobStore doBufferWrite: ino(%v) writer.buf.len(%v) writer.blocksize(%v)", writer.ecStreamer.Inode(), len(writer.buf), writer.ecStreamer.BlockSize())
-	if buf.CachePool != nil && writer.buf == nil {
-		writer.allocateCache()
-	}
 
 	// New buffer block may bump inode generation when blockPosition resets to 0.
 	if writer.blockPosition == 0 {
@@ -705,6 +701,14 @@ func (writer *Writer) reshapeBufForCopyPath() {
 func (writer *Writer) resetBuffer() {
 	// writer.buf = writer.buf[:0]
 	writer.blockPosition = 0
+	if writer.bufPooled {
+		if len(writer.buf) > 0 {
+			writer.resetBufferWithoutPool()
+		}
+		writer.releaseWriteBuf()
+	} else {
+		writer.buf = nil
+	}
 }
 
 // Dirty state: ECStreamer.isDirty(); bufferDirtyLen counts bytes pending flush only.
@@ -1056,26 +1060,49 @@ func (writer *Writer) TruncateV2FromExtents(ctx context.Context, targetSize uint
 }
 
 func (writer *Writer) FreeCache() {
-	if writer == nil {
-		log.LogErrorf("Writer.FreeCache: writer nil")
-		return
-	}
-	if buf.CachePool == nil {
+	if writer == nil || buf.CachePool == nil {
 		return
 	}
 	writer.once.Do(func() {
-		tmpBuf := writer.buf
+		if writer.buf == nil {
+			return
+		}
+		if writer.bufPooled && buf.CachePool != nil {
+			tmpBuf := writer.buf
+			writer.buf = nil
+			writer.blockPosition = 0
+			buf.CachePool.Put(tmpBuf)
+			writer.bufPooled = false
+			return
+		}
 		writer.buf = nil
 		writer.blockPosition = 0
-		if tmpBuf != nil {
-			buf.CachePool.Put(tmpBuf)
-		}
 	})
 }
 
 func (writer *Writer) allocateCache() {
-	if buf.CachePool == nil {
+	if writer == nil || buf.CachePool == nil {
+		return
+	}
+	if writer.buf != nil && cap(writer.buf) >= writer.ecStreamer.BlockSize() {
+		writer.reshapeBufForCopyPath()
 		return
 	}
 	writer.buf = buf.CachePool.Get()
+	writer.bufPooled = true
+}
+
+// releaseWriteBuf returns an idle pooled block after flush/sync when no dirty bytes remain.
+func (writer *Writer) releaseWriteBuf() {
+	if writer == nil || writer.buf == nil || buf.CachePool == nil || !writer.bufPooled {
+		return
+	}
+	if writer.blockPosition != 0 || writer.bufferDirtyLen() > 0 {
+		log.LogWarnf("releaseWriteBuf: blockPosition(%v) bufferDirtyLen(%v)", writer.blockPosition, writer.bufferDirtyLen())
+		return
+	}
+	tmp := writer.buf
+	writer.buf = nil
+	writer.bufPooled = false
+	buf.CachePool.Put(tmp)
 }

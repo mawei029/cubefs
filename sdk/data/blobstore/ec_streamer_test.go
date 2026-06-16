@@ -9,9 +9,12 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/require"
+
+	"github.com/cubefs/cubefs/util/buf"
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/meta"
@@ -222,6 +225,49 @@ func TestECStreamer_commitFileSize_discards_buffer_and_cleans_dirty(t *testing.T
 	require.False(t, s.isDirty())
 	require.Equal(t, 0, w.bufferDirtyLen())
 	require.Equal(t, uint64(150), atomic.LoadUint64(&s.fileSize))
+}
+
+func TestECStreamer_commitFileSize_releasesPooledBuf(t *testing.T) {
+	const blockSize = 64
+	buf.InitCachePool(blockSize, 1)
+	s := mustTestECStreamerWithEbsc(171, &BlobStoreClient{}, blockSize)
+	w := s.fWriter
+	w.allocateCache()
+	require.True(t, w.bufPooled)
+
+	acquired := make(chan []byte, 1)
+	go func() {
+		acquired <- buf.CachePool.Get()
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("second Get should block while pooled buf is held")
+	default:
+	}
+
+	commitLogicalSizeForTest(s, 32)
+	require.Nil(t, w.buf)
+	require.False(t, w.bufPooled)
+
+	select {
+	case b := <-acquired:
+		buf.CachePool.Put(b)
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked Get did not wake after commitFileSize released pool block")
+	}
+}
+
+func TestECStreamer_commitFileSize_discardsHeapBuf(t *testing.T) {
+	const blockSize = 64
+	buf.InitCachePool(blockSize, 4)
+	s := mustTestECStreamerWithEbsc(172, &BlobStoreClient{}, blockSize)
+	w := s.fWriter
+	w.buf = append([]byte(nil), []byte("heap")...)
+	w.bufPooled = false
+
+	commitLogicalSizeForTest(s, 32)
+	require.Nil(t, w.buf)
+	require.False(t, w.bufPooled)
 }
 
 func TestECStreamer_truncateV2_same_size_dirty_only_meta(t *testing.T) {
