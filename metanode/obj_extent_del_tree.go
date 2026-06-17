@@ -138,6 +138,15 @@ func (ot *objExtentDelTree) EnqueueFromApply(inode uint64, modifyTimeSec int64, 
 
 // PeekFirstN returns up to n items with smallest keys (copies for caller; tree unchanged).
 func (ot *objExtentDelTree) PeekFirstN(n int) batchObjExtentDelItems {
+	return ot.peekFirstDueN(n, 0)
+}
+
+// PeekFirstDueN returns up to n items with smallest keys and TsMs <= nowMs.
+func (ot *objExtentDelTree) PeekFirstDueN(n int, nowMs int64) batchObjExtentDelItems {
+	return ot.peekFirstDueN(n, nowMs)
+}
+
+func (ot *objExtentDelTree) peekFirstDueN(n int, nowMs int64) batchObjExtentDelItems {
 	if ot == nil || n <= 0 {
 		return batchObjExtentDelItems{}
 	}
@@ -151,11 +160,32 @@ func (ot *objExtentDelTree) PeekFirstN(n int) batchObjExtentDelItems {
 			return false
 		}
 		// snapshot; do not expose in-tree pointer to caller。
-		cp := it.(*objExtentDelItem).CopyItem()
-		out.Items = append(out.Items, cp)
+		item := it.(*objExtentDelItem)
+		if nowMs != 0 && item.TsMs > nowMs {
+			return false
+		}
+		out.Items = append(out.Items, item.CopyItem())
 		return true
 	})
 	return out
+}
+
+// EarliestTsMs returns the TsMs of the btree minimum key, or 0 when empty.
+func (ot *objExtentDelTree) EarliestTsMs() int64 {
+	if ot == nil {
+		return 0
+	}
+	ot.mu.Lock()
+	defer ot.mu.Unlock()
+	if ot.t == nil || ot.t.Len() == 0 {
+		return 0
+	}
+	var minTs int64
+	ot.t.Ascend(func(it BtreeItem) bool {
+		minTs = it.(*objExtentDelItem).TsMs
+		return false
+	})
+	return minTs
 }
 
 func (ot *objExtentDelTree) ApplyDequeuePayload(val []byte) error {
@@ -177,7 +207,7 @@ func (ot *objExtentDelTree) ApplyDequeuePayload(val []byte) error {
 	return nil
 }
 
-// ApplyPunishPayload deletes old keys and re-inserts with newTsMs and RaftIdx=applyIndex.
+// ApplyPunishPayload re-schedules items by old btree keys (payload carries keys + newTsMs only).
 func (ot *objExtentDelTree) ApplyPunishPayload(val []byte, applyIndex uint64) error {
 	if ot == nil {
 		return nil
@@ -191,8 +221,14 @@ func (ot *objExtentDelTree) ApplyPunishPayload(val []byte, applyIndex uint64) er
 
 	ot.mu.Lock()
 	defer ot.mu.Unlock()
-	for _, it := range batch.Items {
-		ot.objExtentDelPunishReplace(applyIndex, it, batch.NewTime)
+	for _, key := range batch.Items {
+		prev := ot.t.Get(key.keyItem())
+		if prev == nil {
+			log.LogWarnf("action[ApplyPunishPayload] key not found: TsMs(%v) inode(%v) raftIdx(%v)",
+				key.TsMs, key.Inode, key.RaftIdx)
+			continue
+		}
+		ot.objExtentDelPunishReplace(applyIndex, prev.(*objExtentDelItem), batch.NewTime)
 	}
 	return nil
 }
@@ -308,7 +344,7 @@ func (ot *objExtentDelTree) objExtentDelPunishReplace(raftIdx uint64, item *objE
 	oldKey := item.keyItem()
 	ot.t.Delete(oldKey)
 
-	// defensive programming: no oeks to delete: Abnormal/Damaged Load, missing/empty oeks should be rejected by UnmarshalPunish
+	// defensive programming: no oeks to delete (missing/damaged btree entry or empty item).
 	if len(oeks) == 0 {
 		log.LogErrorf("action[objExtentDelPunishReplace] inode[%v] item[%v] no oeks to delete",
 			item.Inode, item.keyItem())
@@ -356,19 +392,7 @@ func (b *batchObjExtentDelItems) MarshalDequeue(buf *bytes.Buffer) error {
 		return err
 	}
 
-	for _, it := range b.Items {
-		if err := binary.Write(buf, binary.BigEndian, it.TsMs); err != nil {
-			return err
-		}
-		if err := binary.Write(buf, binary.BigEndian, it.Inode); err != nil {
-			return err
-		}
-		if err := binary.Write(buf, binary.BigEndian, it.RaftIdx); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return b.marshalBatchItems(buf)
 }
 
 func (b *batchObjExtentDelItems) UnmarshalDequeue(data []byte) error {
@@ -382,6 +406,51 @@ func (b *batchObjExtentDelItems) UnmarshalDequeue(data []byte) error {
 		return err
 	}
 
+	return b.unmarshalBatchItems(data, br, ver, cnt)
+}
+
+// MarshalPunish encodes punish payload: version, cnt, newTsMs, then per item old btree key (TsMs, Inode, RaftIdx).
+func (b *batchObjExtentDelItems) MarshalPunish(buf *bytes.Buffer, newTsMs int64) error {
+	buf.Reset()
+	b.NewTime = newTsMs
+	if err := b.writeBatchItemsPunishHeader(buf); err != nil {
+		return err
+	}
+
+	return b.marshalBatchItems(buf)
+}
+
+// UnmarshalPunish decodes punish payload produced by MarshalPunish.
+func (b *batchObjExtentDelItems) UnmarshalPunish(data []byte) error {
+	if len(data) < minObjExtentDelPayload {
+		return ErrDelPayloadTooShort
+	}
+
+	br := bytes.NewReader(data)
+	ver, cnt, err := b.readBatchItemsPunishHeader(br)
+	if err != nil {
+		return err
+	}
+
+	return b.unmarshalBatchItems(data, br, ver, cnt)
+}
+
+func (b *batchObjExtentDelItems) marshalBatchItems(buf *bytes.Buffer) error {
+	for _, it := range b.Items {
+		if err := binary.Write(buf, binary.BigEndian, it.TsMs); err != nil {
+			return err
+		}
+		if err := binary.Write(buf, binary.BigEndian, it.Inode); err != nil {
+			return err
+		}
+		if err := binary.Write(buf, binary.BigEndian, it.RaftIdx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *batchObjExtentDelItems) unmarshalBatchItems(data []byte, br *bytes.Reader, ver uint32, cnt uint32) error {
 	switch ver {
 	case objExtentDelVersion1:
 		b.Items = make([]*objExtentDelItem, 0, cnt)
@@ -400,111 +469,7 @@ func (b *batchObjExtentDelItems) UnmarshalDequeue(data []byte) error {
 		}
 		return nil
 	default:
-		log.LogErrorf("dequeue: unsupported version %d", ver)
-		return ErrDelTreeUnsupported
-	}
-}
-
-// MarshalPunish encodes punish payload: version, cnt, newTsMs, then per item (old key, nOeks, oeks...).
-func (b *batchObjExtentDelItems) MarshalPunish(buf *bytes.Buffer, newTsMs int64) error {
-	buf.Reset()
-	b.NewTime = newTsMs
-	if err := b.writeBatchItemsPunishHeader(buf); err != nil {
-		return err
-	}
-
-	for _, it := range b.Items {
-		if err := binary.Write(buf, binary.BigEndian, it.TsMs); err != nil {
-			return err
-		}
-		if err := binary.Write(buf, binary.BigEndian, it.Inode); err != nil {
-			return err
-		}
-		if err := binary.Write(buf, binary.BigEndian, it.RaftIdx); err != nil {
-			return err
-		}
-
-		if err := binary.Write(buf, binary.BigEndian, uint32(len(it.Oeks))); err != nil {
-			return err
-		}
-		for j := range it.Oeks {
-			ob, err := it.Oeks[j].MarshalBinary()
-			if err != nil {
-				return err
-			}
-			if err := binary.Write(buf, binary.BigEndian, uint32(len(ob))); err != nil {
-				return err
-			}
-			if _, err := buf.Write(ob); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-// UnmarshalPunish decodes punish payload produced by MarshalPunish.
-func (b *batchObjExtentDelItems) UnmarshalPunish(data []byte) error {
-	if len(data) < minObjExtentDelPayload {
-		return ErrDelPayloadTooShort
-	}
-
-	br := bytes.NewReader(data)
-	ver, cnt, err := b.readBatchItemsPunishHeader(br)
-	if err != nil {
-		return err
-	}
-
-	switch ver {
-	case objExtentDelVersion1:
-		for i := uint32(0); i < cnt; i++ {
-			var oldTs int64
-			var inode, oldIdx uint64
-			if err := binary.Read(br, binary.BigEndian, &oldTs); err != nil {
-				return err
-			}
-			if err := binary.Read(br, binary.BigEndian, &inode); err != nil {
-				return err
-			}
-			if err := binary.Read(br, binary.BigEndian, &oldIdx); err != nil {
-				return err
-			}
-			var nOeks uint32
-			if err := binary.Read(br, binary.BigEndian, &nOeks); err != nil {
-				return err
-			}
-
-			if nOeks == 0 {
-				log.LogErrorf("umarshal punish item, invalid oek count: %d", nOeks)
-				return ErrDelTreeUnsupported
-			}
-
-			oeks := make([]proto.ObjExtentKey, 0, nOeks)
-			for j := uint32(0); j < nOeks; j++ {
-				var oekLen uint32
-				if err := binary.Read(br, binary.BigEndian, &oekLen); err != nil {
-					return err
-				}
-				ob := make([]byte, oekLen)
-				if _, err := io.ReadFull(br, ob); err != nil {
-					return err
-				}
-				var oek proto.ObjExtentKey
-				if err := oek.UnmarshalBinary(bytes.NewBuffer(ob)); err != nil {
-					return err
-				}
-				oeks = append(oeks, oek)
-			}
-			b.Items = append(b.Items, &objExtentDelItem{
-				TsMs:    oldTs,
-				Inode:   inode,
-				RaftIdx: oldIdx,
-				Oeks:    oeks,
-			})
-		}
-		return nil
-	default:
-		log.LogErrorf("action[UnmarshalPunish] punish decode: unsupported version %d", ver)
+		log.LogErrorf("unmarshal batch items: unsupported version %d", ver)
 		return ErrDelTreeUnsupported
 	}
 }

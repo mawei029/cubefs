@@ -486,7 +486,7 @@ func (mp *metaPartition) deleteExtentsFromList(fileList *synclist.SyncList) {
 
 const (
 	objExtentDelTreeGcBatch = 32
-	objExtentDelGcPenaltyMs = int64(60_000)
+	objExtentDelGcPenaltyMs = int64(60_000) // 60s backoff after EBS delete failure
 )
 
 // startObjExtentDelTreeGC runs a background worker (like deleteWorker) that drains objExtentDelTree on the leader.
@@ -509,7 +509,8 @@ func (mp *metaPartition) startObjExtentDelTreeGC() {
 	}()
 }
 
-// runObjExtentDelTreeGCWorker loops runObjExtentDelTreeGCOnce until the pending tree is empty, then sleeps when idle.
+// runObjExtentDelTreeGCWorker drains due items from objExtentDelTree on the leader.
+// Punish requeue only updates TsMs in the btree (via Raft); this single worker sleeps until due.
 func (mp *metaPartition) runObjExtentDelTreeGCWorker() {
 	if mp.objExtentDelTree == nil || mp.raftPartition == nil {
 		time.Sleep(AsyncDeleteInterval)
@@ -537,8 +538,15 @@ func (mp *metaPartition) runObjExtentDelTreeGCWorker() {
 		if _, ok := mp.IsLeader(); !ok {
 			return
 		}
+
 		// Prevent busy-waiting/spin-waiting/busy-looping
-		// No dequeue progress (EBS/punish failure, encode/submit error): backoff to avoid a tight loop.
+		nowMs := time.Now().UnixMilli()
+		if nextDue := mp.objExtentDelTree.EarliestTsMs(); nextDue > nowMs {
+			time.Sleep(AsyncDeleteInterval)
+			continue
+		}
+
+		// No dequeue progress (encode/submit error): backoff to avoid a tight loop.
 		if err := mp.runObjExtentDelTreeGCOnce(); err != nil {
 			time.Sleep(AsyncDeleteInterval)
 		}
@@ -563,7 +571,7 @@ func (mp *metaPartition) runObjExtentDelTreeGCOnce() (err error) {
 		return
 	}
 
-	items := mp.objExtentDelTree.PeekFirstN(objExtentDelTreeGcBatch)
+	items := mp.objExtentDelTree.PeekFirstDueN(objExtentDelTreeGcBatch, time.Now().UnixMilli())
 	if len(items.Items) == 0 {
 		return
 	}
@@ -589,10 +597,15 @@ func (mp *metaPartition) runObjExtentDelTreeGCOnce() (err error) {
 			return encErr
 		}
 
-		if _, err = mp.submit(opFSMObjExtentGcPunishRequeue, append([]byte(nil), encBuf.Bytes()...)); err != nil {
-			log.LogErrorf("[runObjExtentDelTreeGCOnce] mp(%v) submit punish: %v", mp.config.PartitionId, err)
+		if _, submitErr := mp.submit(opFSMObjExtentGcPunishRequeue, append([]byte(nil), encBuf.Bytes()...)); submitErr != nil {
+			log.LogErrorf("[runObjExtentDelTreeGCOnce] mp(%v) submit punish: %v", mp.config.PartitionId, submitErr)
+			return submitErr
 		}
-		return err
+		// now don't work, may be EBS is wrong, wait for EBS to recover.
+		time.Sleep(AsyncDeleteInterval) // 10s
+
+		// Punish persisted; worker backs off via EarliestTsMs until new TsMs is due.
+		return nil
 	}
 
 	if encErr := items.MarshalDequeue(&encBuf.Buffer); encErr != nil {

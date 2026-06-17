@@ -221,7 +221,7 @@ func TestRunObjExtentDelTreeGCOnce_PunishRequeue(t *testing.T) {
 	mp.blobClientWrapper = &BlobStoreClientWrapper{blobClient: &blobstore.BlobStoreClient{}}
 
 	oek := createTestObjExtentKey(0, 1024, 1)
-	mp.objExtentDelTree.EnqueueFromApply(99, 1700000001, 3, []proto.ObjExtentKey{oek})
+	mp.objExtentDelTree.EnqueueFromApply(99, 1700000000, 3, []proto.ObjExtentKey{oek})
 	require.Equal(t, 1, mp.objExtentDelTree.Len())
 
 	patches := gomonkey.NewPatches()
@@ -467,8 +467,8 @@ func TestRunObjExtentDelTreeGCOnce_ItemsEmptyAndSubmitErrors(t *testing.T) {
 	t.Run("peek returns empty", func(t *testing.T) {
 		patches := gomonkey.NewPatches()
 		defer patches.Reset()
-		patches.ApplyMethod(reflect.TypeOf(mp.objExtentDelTree), "PeekFirstN",
-			func(_ *objExtentDelTree, _ int) batchObjExtentDelItems { return batchObjExtentDelItems{} })
+		patches.ApplyMethod(reflect.TypeOf(mp.objExtentDelTree), "PeekFirstDueN",
+			func(_ *objExtentDelTree, _ int, _ int64) batchObjExtentDelItems { return batchObjExtentDelItems{} })
 		mp.runObjExtentDelTreeGCOnce()
 	})
 
@@ -622,6 +622,45 @@ func TestRunObjExtentDelTreeGCOnce_ReturnsDeleteOrSubmitError(t *testing.T) {
 	require.Equal(t, 1, mp.objExtentDelTree.Len())
 }
 
+func TestRunObjExtentDelTreeGCWorker_waitsUntilPunishDue(t *testing.T) {
+	rootDir, err := os.MkdirTemp("", "obj_extent_worker_due")
+	require.NoError(t, err)
+	defer os.RemoveAll(rootDir)
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mp := newTestMetaPartition(t, rootDir, ctrl)
+	mp.blobClientWrapper = &BlobStoreClientWrapper{blobClient: &blobstore.BlobStoreClient{}}
+	mp.objExtentDelTree.EnqueueFromApply(1, 1700000000, 1, []proto.ObjExtentKey{createTestObjExtentKey(0, 1, 1)})
+
+	const fixedNow = int64(1_700_000_000_000)
+	var deleteCalls int32
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyFunc(time.Now, func() time.Time { return time.UnixMilli(fixedNow) })
+	patches.ApplyMethod(reflect.TypeOf(&blobstore.BlobStoreClient{}), "Delete",
+		func(_ *blobstore.BlobStoreClient, _ []proto.ObjExtentKey) error {
+			atomic.AddInt32(&deleteCalls, 1)
+			return errors.New("delete failed")
+		})
+
+	stop := make(chan bool)
+	mp.stopC = stop
+	patches.ApplyFunc(time.Sleep, func(d time.Duration) {
+		if d > 0 {
+			select {
+			case <-stop:
+			default:
+				close(stop)
+			}
+		}
+	})
+
+	mp.runObjExtentDelTreeGCWorker()
+	require.Equal(t, int32(1), atomic.LoadInt32(&deleteCalls), "must not retry delete before punish due time")
+	require.Equal(t, int64(fixedNow)+objExtentDelGcPenaltyMs, mp.objExtentDelTree.EarliestTsMs())
+}
+
 func TestRunObjExtentDelTreeGCOnce_PunishAppliedReturnsNil(t *testing.T) {
 	rootDir, err := os.MkdirTemp("", "obj_extent_once_punish_ok")
 	require.NoError(t, err)
@@ -651,7 +690,7 @@ func TestRunObjExtentDelTreeGCOnce_PunishAppliedReturnsNil(t *testing.T) {
 
 	onceErr := mp.runObjExtentDelTreeGCOnce()
 	require.NoError(t, onceErr, "submit clears err after successful punish")
-	require.Equal(t, int32(0), atomic.LoadInt32(&slept), "Once does not sleep")
+	require.Equal(t, int32(1), atomic.LoadInt32(&slept), "Once sleeps after punish to avoid same worker round re-entry")
 	require.Equal(t, 1, mp.objExtentDelTree.Len())
 
 	peek := mp.objExtentDelTree.PeekFirstN(1)

@@ -144,6 +144,10 @@ type ObjExtentDelTreeAPI interface {
 	GetTree() *BTree
 	EnqueueFromApply(inode uint64, modifyTimeSec int64, raftApplyIndex uint64, oeks []proto.ObjExtentKey)
 	PeekFirstN(n int) batchObjExtentDelItems
+	// PeekFirstDueN returns up to n items with TsMs <= nowMs (punish backoff gate for GC worker).
+	PeekFirstDueN(n int, nowMs int64) batchObjExtentDelItems
+	// EarliestTsMs is the smallest schedule time in the tree; 0 when empty.
+	EarliestTsMs() int64
 	ApplyDequeuePayload(val []byte) error
 	ApplyPunishPayload(val []byte, applyIndex uint64) error
 }
