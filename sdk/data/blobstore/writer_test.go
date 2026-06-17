@@ -114,7 +114,7 @@ func TestNewWriter_panicsWithoutECStreamer(t *testing.T) {
 func TestWriter_TruncateV2_NilReturnsError(t *testing.T) {
 	w := newNilWriter()
 	ctx := context.Background()
-	_, _, err := w.TruncateV2(ctx, 100)
+	_, _, err := truncateV2ForTest(w, ctx, 100)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "nil")
 }
@@ -296,6 +296,7 @@ func TestNewWriter(t *testing.T) {
 	}
 	w := NewWriter(config)
 	_ = w.String()
+	require.NotNil(t, w)
 }
 
 func TestBufferWrite(t *testing.T) {
@@ -606,7 +607,7 @@ func TestWriterSetFileSizeAndTruncateV2GrowNoShrink(t *testing.T) {
 	s.ebsc = &BlobStoreClient{}
 	seedStreamerExtentsForTest(s, 20, []proto.ObjExtentKey{{FileOffset: 0, Size: 20}})
 
-	newExt, toDel, err := w.TruncateV2(context.Background(), 25)
+	newExt, toDel, err := truncateV2ForTest(w, context.Background(), 25)
 	require.NoError(t, err)
 	require.True(t, newExt.IsEmpty())
 	require.True(t, toDel.IsEmpty())

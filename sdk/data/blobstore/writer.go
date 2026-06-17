@@ -1071,6 +1071,7 @@ func (writer *Writer) TruncateV2FromExtents(ctx context.Context, targetSize uint
 	return writer.ecStreamer.Ebsc().TruncateV2Extents(ctx, writer.ecStreamer.Volume(), objExtents, targetSize)
 }
 
+// only called by EvictStream/CloseStream/Forget, fallback/safeguard guarantee
 func (writer *Writer) FreeCache() {
 	if writer == nil || buf.CachePool == nil {
 		return
@@ -1092,6 +1093,9 @@ func (writer *Writer) FreeCache() {
 	})
 }
 
+// allocateCache allocates a new block from the cache pool.
+// If the current block is not empty and has enough capacity, it will be reshaped to match the block size.
+// Otherwise, it will be allocated from the cache pool. The block will be marked as pooled and the block position will be set to 0.
 func (writer *Writer) allocateCache() {
 	if writer == nil || buf.CachePool == nil {
 		return

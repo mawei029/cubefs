@@ -202,3 +202,47 @@ func TestParseMountOptionEbsConfigInvalid(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "ParseEbsClientConfig failed")
 }
+
+func TestParseMountOptionEbsConfigCLIOverride(t *testing.T) {
+	savedOptions := append([]proto.MountOption(nil), GlobalMountOptions...)
+	t.Cleanup(func() {
+		GlobalMountOptions = savedOptions
+	})
+
+	cfg := config.NewConfig()
+	cfg.SetString("mountPoint", t.TempDir())
+	cfg.SetString("volName", "testvol")
+	cfg.SetString("owner", "test-owner")
+	cfg.SetString("masterAddr", "127.0.0.1:17010")
+	cfg.SetNewVal("ebs_config", map[string]interface{}{
+		"host_try_times": 10,
+	})
+	cfg.SetString("ebsConfig", `{"host_try_times":40,"fail_retry_interval_s":30}`)
+
+	GlobalMountOptions = append([]proto.MountOption(nil), savedOptions...)
+	opt, err := parseMountOption(cfg)
+	require.NoError(t, err)
+	require.NotNil(t, opt.EbsConfig.HostTryTimes)
+	require.Equal(t, 40, *opt.EbsConfig.HostTryTimes)
+	require.NotNil(t, opt.EbsConfig.FailRetryIntervalS)
+	require.Equal(t, 30, *opt.EbsConfig.FailRetryIntervalS)
+}
+
+func TestParseMountOptionEbsConfigCLIInvalidJSON(t *testing.T) {
+	savedOptions := append([]proto.MountOption(nil), GlobalMountOptions...)
+	t.Cleanup(func() {
+		GlobalMountOptions = savedOptions
+	})
+
+	cfg := config.NewConfig()
+	cfg.SetString("mountPoint", t.TempDir())
+	cfg.SetString("volName", "testvol")
+	cfg.SetString("owner", "test-owner")
+	cfg.SetString("masterAddr", "127.0.0.1:17010")
+	cfg.SetString("ebsConfig", `{invalid`)
+
+	GlobalMountOptions = append([]proto.MountOption(nil), savedOptions...)
+	_, err := parseMountOption(cfg)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "ParseEbsClientJson failed")
+}

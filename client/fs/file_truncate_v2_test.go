@@ -17,7 +17,7 @@ import (
 	"github.com/cubefs/cubefs/sdk/meta"
 )
 
-// registerOecTestStreamer 向 oec 注入测试用 ECStreamer（ECExtentClient.SetStreamer；不经过 OpenStreamWithArgs/refCnt）。
+// registerOecTestStreamer 向 oec 注入测试用 ECStreamer（SetStreamerForTest；不经过 OpenStreamWithArgs/refCnt）。
 func registerOecTestStreamer(s *Super, ino uint64, r *blobstore.Reader, w *blobstore.Writer) {
 	var st *blobstore.ECStreamer
 	args := blobstore.ECStreamOpenArgs{Ino: ino}
@@ -29,14 +29,14 @@ func registerOecTestStreamer(s *Super, ino uint64, r *blobstore.Reader, w *blobs
 	default:
 		return
 	}
-	s.oec.SetStreamer(ino, st)
+	injectOECStreamer(s.oec, ino, st)
 }
 
 func newBlobFileForTruncateTest() (*File, *blobstore.Writer) {
 	w := &blobstore.Writer{}
 	oec := blobstore.NewObjExtentClient(blobstore.ObjExtentConfig{})
 	s, _ := blobstore.NewECStreamer(blobstore.ECStreamOpenArgs{Ino: 100, Mw: &meta.MetaWrapper{}}, nil, w)
-	oec.SetStreamer(100, s)
+	injectOECStreamer(oec, 100, s)
 	f := &File{
 		super: &Super{
 			mw:  &meta.MetaWrapper{},

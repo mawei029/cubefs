@@ -1,6 +1,8 @@
 package blobstore
 
 import (
+	"context"
+	"fmt"
 	"sync/atomic"
 
 	"github.com/brahma-adshonor/gohook"
@@ -105,4 +107,75 @@ func testWriterWithMwEbsc(ino uint64, ebsc *BlobStoreClient) (*ECStreamer, *Writ
 		s.ebsc = &BlobStoreClient{}
 	}
 	return s, s.fWriter
+}
+
+func setStreamerForTest(c *ECExtentClient, ino uint64, s *ECStreamer) {
+	if c == nil || s == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.streamers[ino] = s
+}
+
+func needsReadViewSyncForTest(c *ECExtentClient, ino uint64) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	s := c.streamers[ino]
+	c.mu.RUnlock()
+	if s == nil {
+		return false
+	}
+	return s.isDirty()
+}
+
+func ensureReaderForTest(s *ECStreamer, cfg ClientConfig) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fReader == nil {
+		cfg.ECStreamer = s
+		s.fReader = NewReader(cfg)
+	}
+}
+
+func ensureWriterForTest(s *ECStreamer, cfg ClientConfig) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fWriter == nil {
+		cfg.ECStreamer = s
+		s.fWriter = NewWriter(cfg)
+	}
+}
+
+func truncateV2ForTest(w *Writer, ctx context.Context, targetSize uint64) (proto.ObjExtentKey, proto.ObjExtentKey, error) {
+	if w == nil || w.ecStreamer == nil || w.ecStreamer.mw == nil || w.ecStreamer.ebsc == nil {
+		return proto.ObjExtentKey{}, proto.ObjExtentKey{}, fmt.Errorf("Writer.TruncateV2: writer/mw/ebsc nil")
+	}
+	objExtents := w.ecStreamer.OeksLocked()
+	currentSize := w.ecStreamer.fileSizeView()
+	return w.TruncateV2FromExtents(ctx, targetSize, currentSize, objExtents)
+}
+
+// flushAndFreeCacheForTest runs writer Flush then drops IO caches (UT for CloseStream-adjacent path).
+func flushAndFreeCacheForTest(s *ECStreamer, ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if w := s.fWriter; w != nil {
+		if err := w.Flush(s.ino, ctx); err != nil {
+			return err
+		}
+	}
+	s.dropIOCachesLocked()
+	return s.updateMetaInfo(nil)
 }

@@ -78,17 +78,6 @@ func (s *ECStreamer) Flush(ctx context.Context) error {
 	return s.updateMetaInfo(nil)
 }
 
-// FlushAndFreeCache runs Flush then FreeCache; used before re-Open on same ino to drain old writer buffer.
-func (s *ECStreamer) FlushAndFreeCache(ctx context.Context) error {
-	if err := s.Flush(ctx); err != nil {
-		return err
-	}
-	if w := s.fWriter; w != nil {
-		w.FreeCache()
-	}
-	return nil
-}
-
 func (s *ECStreamer) Volume() string {
 	return s.volName
 }
@@ -134,24 +123,6 @@ func (s *ECStreamer) String() string {
 	return fmt.Sprintf("ECStreamer{ino(%v), ref(%v), dirty(%v), fileSize(%v), inoVer(%v), addr(%p)}",
 		s.ino, atomic.LoadInt32(&s.refCnt), s.isDirty(),
 		atomic.LoadUint64(&s.fileSize), atomic.LoadUint64(&s.inoVersion), s)
-}
-
-func (s *ECStreamer) NewReader(cfg ClientConfig) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.fReader == nil {
-		cfg.ECStreamer = s
-		s.fReader = NewReader(cfg)
-	}
-}
-
-func (s *ECStreamer) NewWriter(cfg ClientConfig) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.fWriter == nil {
-		cfg.ECStreamer = s
-		s.fWriter = NewWriter(cfg)
-	}
 }
 
 func (s *ECStreamer) Reader() *Reader {

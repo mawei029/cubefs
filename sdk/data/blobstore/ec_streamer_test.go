@@ -35,8 +35,8 @@ func TestECStreamer_Accessors_and_NewReaderWriter(t *testing.T) {
 	require.NotNil(t, s.Writer())
 
 	cfg := ClientConfig{VolName: "v", VolType: 1, BlockSize: 4096, Ino: 7, Mw: &meta.MetaWrapper{}, ECStreamer: s}
-	s.NewReader(cfg)
-	s.NewWriter(cfg)
+	ensureReaderForTest(s, cfg)
+	ensureWriterForTest(s, cfg)
 	require.NotNil(t, s.Reader())
 	require.NotNil(t, s.Writer())
 }
@@ -94,9 +94,9 @@ func TestECStreamer_Read_get_extents_error(t *testing.T) {
 func TestECStreamer_NewReader_idempotent(t *testing.T) {
 	s := mustTestECStreamer(30, nil, nil)
 	cfg := ClientConfig{VolName: "v", Ino: 30, Mw: &meta.MetaWrapper{}, ECStreamer: s}
-	s.NewReader(cfg)
+	ensureReaderForTest(s, cfg)
 	first := s.Reader()
-	s.NewReader(cfg)
+	ensureReaderForTest(s, cfg)
 	require.Same(t, first, s.Reader())
 }
 
@@ -129,7 +129,7 @@ func TestECStreamer_FlushAndFreeCache(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 	patches.ApplyMethod(reflect.TypeOf(s.fWriter), "FreeCache", func(_ *Writer) {})
-	require.NoError(t, s.FlushAndFreeCache(context.Background()))
+	require.NoError(t, flushAndFreeCacheForTest(s, context.Background()))
 }
 
 func TestECStreamer_Flush_writer_flush_error(t *testing.T) {

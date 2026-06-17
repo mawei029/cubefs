@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"strings"
 
 	"github.com/cubefs/cubefs/blobstore/api/access"
 	blog "github.com/cubefs/cubefs/blobstore/util/log"
@@ -72,6 +73,24 @@ func ParseEbsClientConfig(cfg *config.Config) (EbsClientConfig, error) {
 	if err := json.Unmarshal(raw, &patch); err != nil {
 		return EbsClientConfig{}, err
 	}
+	mergeEbsClientConfig(&ec, patch)
+	return ec, nil
+}
+
+// ParseEbsClientJson parses a JSON object string and merges it onto DefaultEbsClientConfig.
+func ParseEbsClientJson(jsonStr string) (EbsClientConfig, error) {
+	ec := DefaultEbsClientConfig()
+
+	jsonStr = strings.TrimSpace(jsonStr)
+	if jsonStr == "" {
+		return ec, nil
+	}
+
+	var patch EbsClientConfig
+	if err := json.Unmarshal([]byte(jsonStr), &patch); err != nil {
+		return EbsClientConfig{}, err
+	}
+
 	mergeEbsClientConfig(&ec, patch)
 	return ec, nil
 }

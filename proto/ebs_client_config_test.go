@@ -194,3 +194,19 @@ func TestEbsClientConfigToAccessConfigRequiresConsul(t *testing.T) {
 	_, err := ec.ToAccessConfig("", "/tmp/log")
 	require.Error(t, err)
 }
+
+func TestParseEbsClientJsonPartialOverride(t *testing.T) {
+	ec, err := ParseEbsClientJson(`{"host_try_times":40,"fail_retry_interval_s":60}`)
+	require.NoError(t, err)
+	require.NotNil(t, ec.HostTryTimes)
+	require.Equal(t, 40, *ec.HostTryTimes)
+	require.NotNil(t, ec.FailRetryIntervalS)
+	require.Equal(t, 60, *ec.FailRetryIntervalS)
+	require.NotNil(t, ec.MaxSizePutOnce)
+	require.Equal(t, int64(8388608), *ec.MaxSizePutOnce)
+
+	ec, err = ParseEbsClientJson("")
+	require.NoError(t, err)
+	def := DefaultEbsClientConfig()
+	require.Equal(t, *def.MaxSizePutOnce, *ec.MaxSizePutOnce)
+}

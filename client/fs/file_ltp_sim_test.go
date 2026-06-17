@@ -70,7 +70,7 @@ func ltpRegisterOecTestStreamer(s *Super, ino uint64, r *blobstore.Reader, w *bl
 	default:
 		return
 	}
-	s.oec.SetStreamer(ino, st)
+	injectOECStreamer(s.oec, ino, st)
 }
 
 func ltpRegisterOecTestStreamerWithLogicalView(s *Super, ino uint64, r *blobstore.Reader, w *blobstore.Writer, fileSize, inoGen uint64) {
@@ -90,7 +90,7 @@ func ltpRegisterOecTestStreamerWithLogicalView(s *Super, ino uint64, r *blobstor
 	default:
 		return
 	}
-	s.oec.SetStreamer(ino, st)
+	injectOECStreamer(s.oec, ino, st)
 }
 
 func ExportPatchOecWriterForMisc(patches *gomonkey.Patches, w *blobstore.Writer) {

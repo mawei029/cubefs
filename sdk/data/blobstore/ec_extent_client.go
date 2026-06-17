@@ -117,18 +117,6 @@ func (c *ECExtentClient) OpenStreamWithArgs(args ECStreamOpenArgs) (err error) {
 	return nil
 }
 
-// SetStreamer maps ino to ECStreamer (no refCnt change, no open snapshot merge).
-// Test injection only; production must use OpenStreamWithArgs for consistent refCnt lifecycle.
-func (c *ECExtentClient) SetStreamer(ino uint64, s *ECStreamer) {
-	if c == nil || s == nil {
-		log.LogErrorf("ECExtentClient SetStreamer: c is nil or s is nil, ino(%v)", ino)
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.streamers[ino] = s
-}
-
 // CloseStream decrements refCnt and flushes dirty writer data on every close (aligned with replica Streamer.release).
 // Map entry removed only in EvictStream. refCnt==0 after decrement: dropIOCaches + resetExtentsOnce; RW kept for re-Open.
 // On Flush failure refCnt is rolled back; negative refCnt logs Warn and still attempts Flush.
@@ -362,20 +350,6 @@ func (c *ECExtentClient) RefreshExtentsCache(ino uint64) error {
 	}
 
 	return s.RefreshExtentsCache()
-}
-
-// NeedsReadViewSync is true when read must sync (dirty==1); false when clean.
-func (c *ECExtentClient) NeedsReadViewSync(ino uint64) bool {
-	c.mu.RLock()
-	s, ok := c.streamers[ino]
-	c.mu.RUnlock()
-	if s == nil {
-		if ok {
-			log.LogErrorf("ECExtentClient NeedsReadViewSync: streamer not found, ino(%v)", ino)
-		}
-		return false
-	}
-	return s.isDirty()
 }
 
 // OpenStream is not supported on Blob/EC; use OpenStreamWithArgs (always returns ENOTSUP).

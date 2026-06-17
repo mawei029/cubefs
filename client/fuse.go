@@ -1146,6 +1146,7 @@ func parseMountOption(cfg *config.Config) (*proto.MountOptions, error) {
 	opt.FuseServeThreads = GlobalMountOptions[proto.FuseServeThreads].GetInt64()
 	opt.PoolId = GlobalMountOptions[proto.PoolId].GetUint8()
 	opt.MetaRegion = GlobalMountOptions[proto.MetaRegion].GetString()
+	ebsConfigJson := GlobalMountOptions[proto.EbsConfig].GetString()
 
 	if opt.MountPoint == "" || opt.Volname == "" || opt.Owner == "" || opt.Master == "" {
 		return nil, errors.New(fmt.Sprintf("invalid config file: lack of mandatory fields, mountPoint(%v), volName(%v), owner(%v), masterAddr(%v)", opt.MountPoint, opt.Volname, opt.Owner, opt.Master))
@@ -1170,12 +1171,19 @@ func parseMountOption(cfg *config.Config) (*proto.MountOptions, error) {
 		return nil, errors.New(fmt.Sprintf("RequestTimeout(%v) must larger than ClientOpTimeOut(%v)", opt.RequestTimeout, opt.ClientOpTimeOut))
 	}
 
-	opt.Config = cfg
-	opt.EbsConfig, err = proto.ParseEbsClientConfig(cfg)
-	if err != nil {
-		return nil, errors.Trace(err, "ParseEbsClientConfig failed")
+	if ebsConfigJson != "" {
+		opt.EbsConfig, err = proto.ParseEbsClientJson(ebsConfigJson)
+		if err != nil {
+			return nil, errors.Trace(err, "ParseEbsClientJson failed")
+		}
+	} else {
+		opt.EbsConfig, err = proto.ParseEbsClientConfig(cfg)
+		if err != nil {
+			return nil, errors.Trace(err, "ParseEbsClientConfig failed")
+		}
 	}
 
+	opt.Config = cfg
 	return opt, nil
 }
 

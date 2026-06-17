@@ -25,6 +25,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/require"
@@ -34,6 +35,15 @@ import (
 	"github.com/cubefs/cubefs/sdk/data/stream"
 	"github.com/cubefs/cubefs/sdk/meta"
 )
+
+func injectOECStreamer(c *blobstore.ECExtentClient, ino uint64, st *blobstore.ECStreamer) {
+	if c == nil || st == nil {
+		return
+	}
+	field := reflect.ValueOf(c).Elem().FieldByName("streamers")
+	m := reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem()
+	m.SetMapIndex(reflect.ValueOf(ino), reflect.ValueOf(st))
+}
 
 func newTestVolumeForOEC(t *testing.T) *Volume {
 	t.Helper()
@@ -52,7 +62,7 @@ func newTestVolumeForOEC(t *testing.T) *Volume {
 func registerOecWriterForVolume(s *Volume, ino uint64, w *blobstore.Writer) {
 	args := blobstore.ECStreamOpenArgs{Ino: ino, FileSize: 0, InodeGeneration: 0}
 	st, _ := blobstore.NewECStreamer(args, nil, w)
-	s.oec.SetStreamer(ino, st)
+	injectOECStreamer(s.oec, ino, st)
 }
 
 // TestVolume_oecStreamLifecycle mirrors ec OpenStream/CloseStream scope used by PutObject/readFile.
@@ -138,7 +148,7 @@ func TestVolume_readFile_useOEC(t *testing.T) {
 	r := &blobstore.Reader{}
 	args := blobstore.ECStreamOpenArgs{Ino: ino}
 	st, _ := blobstore.NewECStreamer(args, r, nil)
-	v.oec.SetStreamer(ino, st)
+	injectOECStreamer(v.oec, ino, st)
 
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
@@ -407,5 +417,5 @@ func TestVolume_CopyFile_useOECPath(t *testing.T) {
 func registerOecReaderForVolume(s *Volume, ino uint64, r *blobstore.Reader) {
 	args := blobstore.ECStreamOpenArgs{Ino: ino, FileSize: 4, InodeGeneration: 0}
 	st, _ := blobstore.NewECStreamer(args, r, nil)
-	s.oec.SetStreamer(ino, st)
+	injectOECStreamer(s.oec, ino, st)
 }
