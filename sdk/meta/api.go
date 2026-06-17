@@ -1667,7 +1667,11 @@ func (mw *MetaWrapper) AppendObjExtentKeysWithCheck(inode uint64, newExtents, di
 	}
 
 	status, err := mw.appendObjExtentKeysWithCheck(mp, inode, newExtents, discardExtents)
-	if err != nil || status != statusOK {
+	if err != nil {
+		log.LogErrorf("AppendObjExtentKeysWithCheckBatch: inode(%v) newExtents(%v) discardExtents(%v) err(%v) status(%v)", inode, newExtents, discardExtents, err, status)
+		return err
+	}
+	if status != statusOK {
 		log.LogErrorf("AppendObjExtentKeysWithCheckBatch: inode(%v) newExtents(%v) discardExtents(%v) err(%v) status(%v)", inode, newExtents, discardExtents, err, status)
 		return statusToErrno(status)
 	}
@@ -1683,7 +1687,11 @@ func (mw *MetaWrapper) AppendObjExtentKeys(inode uint64, eks []proto.ObjExtentKe
 	}
 
 	status, err := mw.appendObjExtentKeys(mp, inode, eks)
-	if err != nil || status != statusOK {
+	if err != nil {
+		log.LogErrorf("AppendObjExtentKeys: inode(%v) objextentKeys(%v) err(%v) status(%v)", inode, eks, err, status)
+		return err
+	}
+	if status != statusOK {
 		log.LogErrorf("AppendObjExtentKeys: inode(%v) objextentKeys(%v) err(%v) status(%v)", inode, eks, err, status)
 		return statusToErrno(status)
 	}
@@ -1766,7 +1774,12 @@ func (mw *MetaWrapper) TruncateV2(inode, size uint64, fullPath string, newObjExt
 	}
 
 	status, err := mw.truncateV2(mp, inode, size, fullPath, newObjExtent, toDeleteFrom)
-	if err != nil || status != statusOK {
+	if err != nil {
+		log.LogErrorf("TruncateV2: inode(%v) size(%v) fullPath(%v) newObjExtent(%v) toDeleteFrom(%v) err(%v) status(%v)", inode, size, fullPath, newObjExtent, toDeleteFrom, err, status)
+		return err
+	}
+	if status != statusOK {
+		log.LogErrorf("TruncateV2: inode(%v) size(%v) fullPath(%v) newObjExtent(%v) toDeleteFrom(%v) err(%v) status(%v)", inode, size, fullPath, newObjExtent, toDeleteFrom, err, status)
 		return statusToErrno(status)
 	}
 	return nil

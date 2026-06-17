@@ -1101,9 +1101,11 @@ func (mp *metaPartition) fsmExtentsTruncateV2(dbHandle interface{}, req *proto.T
 
 	// Step 2: get oeks from inode, and check truncate conflict.
 	eksInInode := copyObjExtentsFromInode(i)
-	status, finalEks, toEnqueue := mp.checkTruncateV2Conflict(req, eksInInode)
+	status, finalEks, toEnqueue := mp.checkTruncateV2Conflict(req, eksInInode, i.Size)
 	if status != proto.OpOk {
 		resp.Status = status
+		log.LogErrorf("[fsmExtentsTruncateV2] mpId(%v) ino(%v) checkTruncateV2Conflict status(%v) req(%v)",
+			mp.config.PartitionId, req.Inode, status, *req)
 		return
 	}
 
@@ -1129,37 +1131,53 @@ func (mp *metaPartition) fsmExtentsTruncateV2(dbHandle interface{}, req *proto.T
 	return
 }
 
-func (mp *metaPartition) checkTruncateV2Conflict(req *proto.TruncateRequest, eksInInode []proto.ObjExtentKey) (status uint8, finalEks, toEnqueue []proto.ObjExtentKey) {
+// checkTruncateV2Conflict validates TruncateV2 against current inode oeks before FSM apply.
+// Returns OpOk when the request matches first-apply or idempotent replay; toEnqueue lists oeks for async EBS GC.
+func (mp *metaPartition) checkTruncateV2Conflict(req *proto.TruncateRequest, eksInInode []proto.ObjExtentKey, inodeSize uint64) (status uint8, finalEks, toEnqueue []proto.ObjExtentKey) {
+	target := req.Size
+
+	// Case A: memory inode has no obj extents.
 	if len(eksInInode) == 0 {
+		// A1 idempotent replay: empty oeks and inode already at target (target==inodeSize); stale ToDelete/New ignored.
+		if target == inodeSize {
+			log.LogWarnf("[checkTruncateV2Conflict] mpId(%v) ino(%v) already deleted, target(%v) req.NewObjExtent(%v) req.ToDelete(%v)",
+				mp.config.PartitionId, req.Inode, target, req.NewObjExtent, req.ToDelete)
+			return proto.OpOk, nil, nil
+		}
+		// A2 conflict: partial/tail plan on empty oeks while inode is not yet at target (stale or invalid client plan).
 		if !req.NewObjExtent.IsEmpty() || !req.ToDelete.IsEmpty() {
 			return proto.OpConflictExtentsErr, nil, nil
 		}
+		// A3 ok: logical grow only (size-only truncate on empty file).
 		return proto.OpOk, nil, nil
 	}
 
-	target := req.Size
 	lastEk := eksInInode[len(eksInInode)-1]
 
+	// Case B: no ToDelete: logical hole (size-only truncate, extents unchanged);illegal shorten (target < last extent end);NewObjExtent without anchor (partial plan incomplete)
 	if req.ToDelete.IsEmpty() {
+		// B1 conflict: partial New without anchor (client must send ToDelete for partial truncate).
 		if !req.NewObjExtent.IsEmpty() {
 			return proto.OpConflictExtentsErr, nil, nil
 		}
+		// B2 conflict: shrink without a delete plan.
 		if target < lastEk.FileOffset+lastEk.Size {
 			return proto.OpConflictExtentsErr, nil, nil
 		}
-		// all empty and target is ok: no conflict, no need to shrink
+		// B3 all empty and target is ok: no conflict, no need to shrink
 		return proto.OpOk, eksInInode, toEnqueue
 	}
 
+	// Case C: has ToDelete: partial truncate or tail sweep (anchor present);partial truncate idempotent replay;first apply;tail already deleted (idempotent replay);conflict;build finalEks + toEnqueue
 	delIdx := -1
 	extent := proto.ObjExtentKey{}
 	for i, ek := range eksInInode {
+		// C1 idempotent replay: last oek already equals NewObjExtent from a prior partial apply.
 		if !req.NewObjExtent.IsEmpty() && ek.IsEquals(&req.NewObjExtent) && i == len(eksInInode)-1 {
-			log.LogWarnf("[checkTruncateV2Conflict] mpId(%v) ino(%v) already deleted, target(%v) req.NewObjExtent(%v)",
-				mp.config.PartitionId, req.Inode, target, req.NewObjExtent)
+			log.LogWarnf("[checkTruncateV2Conflict] mpId(%v) ino(%v) already deleted, target(%v) req.NewObjExtent(%v) req.ToDelete(%v)",
+				mp.config.PartitionId, req.Inode, target, req.NewObjExtent, req.ToDelete)
 			return proto.OpOk, eksInInode[:i+1], toEnqueue
 		}
-
 		if ek.FileOffset == req.ToDelete.FileOffset {
 			extent = ek
 			delIdx = i
@@ -1167,24 +1185,25 @@ func (mp *metaPartition) checkTruncateV2Conflict(req *proto.TruncateRequest, eks
 		}
 	}
 
-	// when not delete, target may be is zero
+	// C2 first apply: anchor found, size matches, target within anchor span.
 	status = proto.OpConflictExtentsErr
-	if extent.FileOffset == req.ToDelete.FileOffset && extent.Size == req.ToDelete.Size && target <= extent.FileOffset+extent.Size {
+	if extent.FileOffset == req.ToDelete.FileOffset && extent.Size == req.ToDelete.Size &&
+		target <= extent.FileOffset+extent.Size && req.ToDelete.Crc == extent.Crc {
+		// now, it's matched anchor. we found the toDelete, so we can delete the extent
 		status = proto.OpOk
 	}
 
 	if status != proto.OpOk {
-		// when already deleted
-		if req.NewObjExtent.IsEmpty() {
-			if extent.IsEmpty() && lastEk.FileOffset+lastEk.Size <= target {
-				log.LogWarnf("[checkTruncateV2Conflict] mpId(%v) ino(%v) already deleted, target(%v) lastEk(%v)", mp.config.PartitionId, req.Inode, target, lastEk)
-				return proto.OpOk, eksInInode, toEnqueue
-			}
+		// C3 idempotent replay: tail already removed, target covers remaining prefix (no New).
+		if req.NewObjExtent.IsEmpty() && extent.IsEmpty() && lastEk.FileOffset+lastEk.Size <= target {
+			log.LogWarnf("[checkTruncateV2Conflict] mpId(%v) ino(%v) already deleted, target(%v) lastEk(%v)", mp.config.PartitionId, req.Inode, target, lastEk)
+			return proto.OpOk, eksInInode, toEnqueue
 		}
+		// C4 conflict: anchor mismatch, overshoot target, or stale partial plan.
 		return status, nil, nil
 	}
 
-	// replace the extent with the new extent, and return will be deleted extents(toEnqueue)
+	// C5 apply: prefix before anchor + optional NewObjExtent; sweep tail from anchor into toEnqueue.
 	finalEks = make([]proto.ObjExtentKey, 0, delIdx+1)
 	if delIdx >= 0 {
 		toEnqueue = append(toEnqueue, eksInInode[delIdx:]...)
@@ -1194,7 +1213,7 @@ func (mp *metaPartition) checkTruncateV2Conflict(req *proto.TruncateRequest, eks
 		}
 	}
 
-	return status, finalEks, toEnqueue
+	return status, finalEks, toEnqueue // ok
 }
 
 func (mp *metaPartition) fsmEvictInode(dbHandle interface{}, ino *Inode) (resp *InodeResponse, err error) {
