@@ -442,7 +442,7 @@ func newEbsClient(ci *proto.ClusterInfo, cfg *config.Config) (err error) {
 		Logger: &access.Logger{
 			Filename: path.Join(cfg.GetString("logDir"), "ebs.log"),
 		},
-	})
+	}, 0)
 	return err
 }
 

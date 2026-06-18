@@ -37,6 +37,7 @@ import (
 
 func newSafeBlobStoreClientForTest() *BlobStoreClient {
 	return &BlobStoreClient{
+		maxTimeoutSec: EbsMaxTimeout,
 		client: &fakeAccessAPI{
 			getFn: func(_ context.Context, args *access.GetArgs) (io.ReadCloser, error) {
 				return io.NopCloser(strings.NewReader(strings.Repeat("x", int(args.ReadSize)))), nil

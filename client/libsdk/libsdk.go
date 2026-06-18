@@ -1542,7 +1542,7 @@ func (c *client) start() (err error) {
 			MaxSizePutOnce: MaxSizePutOnce,
 			Logger:         ebsLogger,
 			LogLevel:       ebsLogLevel,
-		}); err != nil {
+		}, 0); err != nil {
 			return
 		}
 	}

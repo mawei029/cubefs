@@ -9,6 +9,7 @@ import (
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/bits-and-blooms/bitset"
+	"github.com/cubefs/cubefs/blobstore/api/access"
 	"github.com/cubefs/cubefs/client/fs"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/blobstore"
@@ -450,4 +451,37 @@ func TestClient_loadConfFromMaster_initCachePool(t *testing.T) {
 	require.Equal(t, objBlockSize, len(b))
 	require.Equal(t, objBlockSize, cap(b))
 	buf.CachePool.Put(b)
+}
+
+func TestClientStartNewEbsClientDefaultTimeout(t *testing.T) {
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	gotTimeout := -1
+	patches.ApplyFunc(blobstore.NewEbsClient, func(_ access.Config, maxTimeoutSec int) (*blobstore.BlobStoreClient, error) {
+		gotTimeout = maxTimeoutSec
+		return &blobstore.BlobStoreClient{}, nil
+	})
+	patches.ApplyPrivateMethod(reflect.TypeOf(&client{}), "loadConfFromMaster", func(c *client, _ []string) error {
+		c.ebsEndpoint = "127.0.0.1:1"
+		return nil
+	})
+	patches.ApplyPrivateMethod(reflect.TypeOf(&client{}), "checkPermission", func(_ *client) error {
+		return nil
+	})
+	patches.ApplyFunc(meta.NewMetaWrapper, func(_ *meta.MetaConfig) (*meta.MetaWrapper, error) {
+		return &meta.MetaWrapper{}, nil
+	})
+	patches.ApplyFunc(stream.NewExtentClient, func(_ *stream.ExtentConfig) (*stream.ExtentClient, error) {
+		return &stream.ExtentClient{}, nil
+	})
+	patches.ApplyFunc(blobstore.NewObjExtentClient, func(_ blobstore.ObjExtentConfig) *blobstore.ECExtentClient {
+		return &blobstore.ECExtentClient{}
+	})
+
+	c := newClient()
+	c.masterAddr = "127.0.0.1:1"
+	c.volName = "test-vol"
+	require.NoError(t, c.start())
+	require.Equal(t, 0, gotTimeout)
 }

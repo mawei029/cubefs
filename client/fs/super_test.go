@@ -17,6 +17,7 @@ import (
 	"unsafe"
 
 	"github.com/agiledragon/gomonkey/v2"
+	"github.com/cubefs/cubefs/blobstore/api/access"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/blobstore"
 	"github.com/cubefs/cubefs/sdk/data/stream"
@@ -557,6 +558,7 @@ func TestNewSuper_CoversInitBranches(t *testing.T) {
 		AheadReadBlockTimeOut:               1,
 		AheadReadWindowCnt:                  1,
 		MinReadAheadSize:                    1,
+		StreamRetryTimeout:                  180,
 		VolStorageClass:                     proto.StorageClass_Replica_HDD,
 		VolAllowedStorageClass:              []uint32{proto.StorageClass_Replica_HDD},
 		EnableTransaction:                   "off",
@@ -564,11 +566,37 @@ func TestNewSuper_CoversInitBranches(t *testing.T) {
 		TrashDeleteExpiredDirGoroutineLimit: 1,
 	})
 	require.NoError(t, err)
+	require.Equal(t, 180, s.streamRetryTimeout)
 	require.NotNil(t, s.ebsc)
 	require.NotNil(t, s.oec)
 	require.NotNil(t, s.runningMonitor)
 	close(s.closeC)
 	s.runningMonitor.Stop()
+}
+
+func TestGetBlobStoreClientPassesStreamRetryTimeout(t *testing.T) {
+	const wantTimeout = 180
+	s := &Super{
+		ebsc:               make(map[uint8]*blobstore.BlobStoreClient),
+		logpath:            t.TempDir(),
+		streamRetryTimeout: wantTimeout,
+		poolCache: map[uint8]*proto.StoragePoolInfo{
+			1: {Id: 1, ECAddr: "127.0.0.1:1"},
+		},
+	}
+
+	gotTimeout := -1
+	patches := gomonkey.ApplyFunc(blobstore.NewEbsClient, func(_ access.Config, maxTimeoutSec int) (*blobstore.BlobStoreClient, error) {
+		gotTimeout = maxTimeoutSec
+		return &blobstore.BlobStoreClient{}, nil
+	})
+	defer patches.Reset()
+
+	cli, err := s.getBlobStoreClient(1)
+	require.NoError(t, err)
+	require.NotNil(t, cli)
+	require.Equal(t, wantTimeout, gotTimeout)
+	require.Same(t, cli, s.ebsc[1])
 }
 
 func TestSuper_scheduleFlush_idleWriterTriggersOecFlush(t *testing.T) {

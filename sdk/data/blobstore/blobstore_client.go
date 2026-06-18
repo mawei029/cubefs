@@ -46,7 +46,7 @@ const (
 )
 
 func safeEbsRetrySleep(ctx context.Context, retryInterval time.Duration) (time.Duration, error) {
-	// 1.2x: 100ms * 12/10 = 120ms
+	// 1.2X + random ; 1.2x: 100ms * 12/10 = 120ms
 	retryInterval = retryInterval*12/10 + time.Duration(rand.Int63n(int64(retryInterval)))
 	if retryInterval > EbsMaxSleepInterval {
 		retryInterval = EbsMaxSleepInterval
@@ -56,6 +56,7 @@ func safeEbsRetrySleep(ctx context.Context, retryInterval time.Duration) (time.D
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
+		log.LogWarnf("TRACE Ebs RetrySleep ctx done, retryInterval(%v), err(%v)", retryInterval, ctx.Err())
 		return 0, ctx.Err()
 	case <-timer.C:
 		return retryInterval, nil
@@ -64,13 +65,19 @@ func safeEbsRetrySleep(ctx context.Context, retryInterval time.Duration) (time.D
 
 // BlobStoreClient wraps blobstore access API for Reader/Writer EBS I/O.
 type BlobStoreClient struct {
-	client access.API
+	client        access.API
+	maxTimeoutSec time.Duration // from config streamRetryTimeout
 }
 
-func NewEbsClient(cfg access.Config) (*BlobStoreClient, error) {
+func NewEbsClient(cfg access.Config, maxTimeoutSec int) (*BlobStoreClient, error) {
 	cli, err := access.New(cfg)
+	if maxTimeoutSec <= 0 || maxTimeoutSec >= 600 {
+		maxTimeoutSec = int(EbsMaxTimeout.Seconds())
+	}
+
 	return &BlobStoreClient{
-		client: cli,
+		client:        cli,
+		maxTimeoutSec: time.Duration(maxTimeoutSec) * time.Second,
 	}, err
 }
 
@@ -134,10 +141,11 @@ func (ebs *BlobStoreClient) Read(ctx context.Context, volName string, buf []byte
 		code := rpc.DetectStatusCode(err)
 		if code == blobberr.CodeBidNotFound || code == blobberr.CodeShardMarkDeleted {
 			// Old location was deleted or bid does not exist: retrying on same location is meaningless; let upper layer RefreshExtents fetch a new key.
+			log.LogWarnf("TRACE Ebs Read non-retryable err, oek(%v), err(%v), requestId(%v)", oek, err, requestId)
 			return 0, err
 		}
 
-		if time.Since(start) > EbsMaxTimeout {
+		if time.Since(start) > ebs.maxTimeoutSec {
 			log.LogWarnf("TRACE Ebs Read timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds())
 			err = errors.New(fmt.Sprintf("Ebs Read timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds()))
 			break
@@ -191,7 +199,7 @@ func (ebs *BlobStoreClient) Write(ctx context.Context, volName string, data []by
 			break
 		}
 
-		if time.Since(start) > EbsMaxTimeout {
+		if time.Since(start) > ebs.maxTimeoutSec {
 			log.LogWarnf("TRACE Ebs write timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds())
 			err = errors.New(fmt.Sprintf("Ebs write timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds()))
 			break
@@ -223,7 +231,7 @@ func (ebs *BlobStoreClient) Delete(oeks []proto.ObjExtentKey) (err error) {
 		stat.EndStat("ebs-delete", err, bgTime, 1)
 	}()
 
-	ctx, cancel := context.WithTimeout(context.TODO(), EbsMaxTimeout)
+	ctx, cancel := context.WithTimeout(context.TODO(), time.Second*3) // Delete: only send to kafka, 3 seconds is enough
 	defer cancel()
 
 	locs := make([]ebsproto.Location, 0)
@@ -267,7 +275,7 @@ func (ebs *BlobStoreClient) Delete(oeks []proto.ObjExtentKey) (err error) {
 			break
 		}
 
-		if time.Since(start) > EbsMaxTimeout {
+		if time.Since(start) > ebs.maxTimeoutSec {
 			log.LogWarnf("TRACE Ebs Delete timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds())
 			err = errors.New(fmt.Sprintf("Ebs Delete timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds()))
 			break
@@ -375,7 +383,7 @@ func (ebs *BlobStoreClient) Put(ctx context.Context, volName string, f io.Reader
 				break
 			}
 
-			if time.Since(start) > EbsMaxTimeout {
+			if time.Since(start) > ebs.maxTimeoutSec {
 				log.LogWarnf("TRACE Ebs Put timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds())
 				err = errors.New(fmt.Sprintf("Ebs Put timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds()))
 				break
@@ -490,10 +498,11 @@ func (ebs *BlobStoreClient) Get(ctx context.Context, volName string, offset uint
 		code := rpc.DetectStatusCode(err)
 		if code == blobberr.CodeBidNotFound || code == blobberr.CodeShardMarkDeleted {
 			// Old location was deleted or bid does not exist: retrying on same location is meaningless; let upper layer RefreshExtents fetch a new key.
-			break
+			log.LogWarnf("TRACE Ebs Get non-retryable err, oek(%v), err(%v), requestId(%v)", oek, err, requestId)
+			return nil, err
 		}
 
-		if time.Since(start) > EbsMaxTimeout {
+		if time.Since(start) > ebs.maxTimeoutSec {
 			log.LogWarnf("TRACE Ebs Get timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds())
 			err = errors.New(fmt.Sprintf("Ebs Get timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds()))
 			break

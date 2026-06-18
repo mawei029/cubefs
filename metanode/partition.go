@@ -505,7 +505,7 @@ func (ew *BlobStoreClientWrapper) getBlobStoreClient() (blobClient *blobstore.Bl
 		return nil, create, err
 	}
 
-	blobClient, err = blobstore.NewEbsClient(*(ew.cfg))
+	blobClient, err = blobstore.NewEbsClient(*(ew.cfg), 0)
 	if err != nil {
 		err = fmt.Errorf("addr(%v) create blobstore client err: %v", ew.cfg.Consul.Address, err.Error())
 		ew.lastTryCreateTime = time.Now().Unix()

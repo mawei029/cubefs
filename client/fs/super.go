@@ -130,9 +130,10 @@ type Super struct {
 
 	negativeDentryCache sync.Map // string (parentIno/name) -> *negativeDentryEntry
 	// same mount flags as stream ahead-read; used by blobstore.Reader to prefetch EbsBlockSize bytes
-	aheadReadEnable   bool
-	minReadAheadSize  uint64
-	aheadReadTotalMem int64
+	aheadReadEnable    bool
+	minReadAheadSize   uint64
+	aheadReadTotalMem  int64
+	streamRetryTimeout int
 }
 
 // BlobStoreAheadReadForReader returns mount ahead-read flags for blobstore.Reader.
@@ -382,6 +383,7 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 	// Matches ExtentConfig prefetch flags for BlobStoreAheadReadForReader and cold InodeGet reader setup.
 	s.aheadReadEnable = opt.AheadReadEnable
 	s.aheadReadTotalMem = opt.AheadReadTotalMem
+	s.streamRetryTimeout = opt.StreamRetryTimeout
 	if opt.MinReadAheadSize > 0 {
 		s.minReadAheadSize = uint64(opt.MinReadAheadSize)
 	} else {
@@ -557,7 +559,7 @@ func (s *Super) getBlobStoreClient(poolId uint8) (*blobstore.BlobStoreClient, er
 			Filename: path.Join(s.logpath, "client/ebs.log"),
 		},
 		LogLevel: log.GetBlobLogLevel(),
-	})
+	}, s.streamRetryTimeout)
 	if err != nil {
 		log.LogErrorf("[getBlobStoreClient] create blobstore client err: %v", err)
 		return nil, errors.Trace(err, "NewEbsClient failed!")

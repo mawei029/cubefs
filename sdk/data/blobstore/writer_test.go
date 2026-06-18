@@ -57,7 +57,7 @@ func init() {
 		MaxSizePutOnce: 1 << 20,
 	}
 
-	blobStoreClient, _ := NewEbsClient(cfg)
+	blobStoreClient, _ := NewEbsClient(cfg, 0)
 
 	streamer, _ := NewECStreamer(ECStreamOpenArgs{
 		VolName:   "testVolume",

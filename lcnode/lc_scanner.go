@@ -119,7 +119,7 @@ func NewS3Scanner(adminTask *proto.AdminTask, l *LcNode) (*LcScanner, error) {
 				Filename: path.Join(l.logDir, "ebs.log"),
 			},
 		}
-		if ebsClient, err = blobstore.NewEbsClient(ebsConfig); err != nil {
+		if ebsClient, err = blobstore.NewEbsClient(ebsConfig, 0); err != nil {
 			log.LogErrorf("NewEbsClient err: %v, rule id: %v", err, scanner.rule.ID)
 			return nil, err
 		}
