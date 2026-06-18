@@ -60,7 +60,7 @@ func TestNew(t *testing.T) {
 		// rs_ := rs
 		pool.Execute(&rs, func(param *rwSlice) {
 			// syslog.Printf("pool.Execute rs = %v", rs_)
-			time.Sleep(1 * time.Second)
+			time.Sleep(100 * time.Millisecond)
 			wg.Done()
 		})
 	}

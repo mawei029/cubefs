@@ -20,6 +20,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"math/rand"
 	"sort"
 	"time"
 
@@ -38,11 +39,28 @@ import (
 )
 
 const (
-	// MaxRetryTimes is the max retry count after the first failure for each EBS call (total requests = 1 + MaxRetryTimes); retry interval starts from RetrySleepInterval and doubles each attempt.
-	MaxRetryTimes      = 4
-	RetrySleepInterval = 100 * time.Millisecond
-	SendTimeLimit      = 20 * 1000 // ms
+	EbsMaxRetryTimes    = 200
+	EbsRetryInterval    = 100 * time.Millisecond
+	EbsMaxSleepInterval = 30 * time.Second
+	EbsMaxTimeout       = 10 * time.Minute
 )
+
+func safeEbsRetrySleep(ctx context.Context, retryInterval time.Duration) (time.Duration, error) {
+	// 1.2x: 100ms * 12/10 = 120ms
+	retryInterval = retryInterval*12/10 + time.Duration(rand.Int63n(int64(retryInterval)))
+	if retryInterval > EbsMaxSleepInterval {
+		retryInterval = EbsMaxSleepInterval
+	}
+
+	timer := time.NewTimer(retryInterval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-timer.C:
+		return retryInterval, nil
+	}
+}
 
 // BlobStoreClient wraps blobstore access API for Reader/Writer EBS I/O.
 type BlobStoreClient struct {
@@ -89,43 +107,59 @@ func (ebs *BlobStoreClient) Read(ctx context.Context, volName string, buf []byte
 		SliceSize: oek.BlobSize,
 		Slices:    sliceInfos,
 	}
-	// Retry in loop when access.Get fails.
+
 	log.LogDebugf("TRACE Ebs Read,oek(%v) loc(%v)", oek, loc)
 	var body io.ReadCloser
-	defer func() {
+	doCloseBodyFn := func() {
 		if body != nil {
 			body.Close()
+			body = nil
 		}
-	}()
-	for attempt, backoff := 0, RetrySleepInterval; attempt <= MaxRetryTimes; attempt, backoff = attempt+1, backoff*2 {
+	}
+	defer doCloseBodyFn()
+
+	var sleepErr error
+	retryInterval := EbsRetryInterval
+	for attempt := 0; attempt < EbsMaxRetryTimes; attempt++ {
 		body, err = ebs.client.Get(ctx, &access.GetArgs{Location: loc, Offset: offset, ReadSize: size})
 		if err == nil {
-			break
+			readN, err = io.ReadFull(body, buf)
+			doCloseBodyFn()
+			if err == nil {
+				break
+			}
 		}
+		doCloseBodyFn()
+
 		code := rpc.DetectStatusCode(err)
 		if code == blobberr.CodeBidNotFound || code == blobberr.CodeShardMarkDeleted {
 			// Old location was deleted or bid does not exist: retrying on same location is meaningless; let upper layer RefreshExtents fetch a new key.
+			return 0, err
+		}
+
+		if time.Since(start) > EbsMaxTimeout {
+			log.LogWarnf("TRACE Ebs Read timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds())
+			err = errors.New(fmt.Sprintf("Ebs Read timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds()))
 			break
 		}
-		log.LogWarnf("TRACE Ebs Read,oek(%v), err(%v), requestId(%v), retry(%v)/%v", oek, err, requestId, attempt, MaxRetryTimes)
-		if attempt == MaxRetryTimes {
+
+		log.LogWarnf("TRACE Ebs Read, oek(%v), err(%v), requestId(%v), retry(%v)/%v cost(%v)ms",
+			oek, err, requestId, attempt, EbsMaxRetryTimes, time.Since(start).Milliseconds())
+
+		retryInterval, sleepErr = safeEbsRetrySleep(ctx, retryInterval)
+		if sleepErr != nil {
+			err = sleepErr
 			break
 		}
-		time.Sleep(backoff)
 	}
+
+	elapsed := time.Since(start)
 	if err != nil {
-		log.LogErrorf("[ecBlob] EBS Get fail vol(%v) locOff(%v) readSz(%v) status(%v) oekFileOff(%v) err(%v) reqId(%v)",
-			volName, offset, size, rpc.DetectStatusCode(err), oek.FileOffset, err, requestId)
+		log.LogErrorf("[ecBlob] EBS Read fail vol(%v) locOff(%v) want(%v) status(%v) oekFileOff(%v) err(%v) reqId(%v) consume(%v)ns",
+			volName, offset, size, rpc.DetectStatusCode(err), oek.FileOffset, err, requestId, elapsed.Nanoseconds())
 		return 0, err
 	}
 
-	readN, err = io.ReadFull(body, buf)
-	if err != nil {
-		log.LogErrorf("[ecBlob] EBS ReadFull fail vol(%v) want(%v) oekFileOff(%v) err(%v) reqId(%v)",
-			volName, size, oek.FileOffset, err, requestId)
-		return 0, err
-	}
-	elapsed := time.Since(start)
 	log.LogDebugf("TRACE Ebs Read Exit requestId(%v) requestReadSize(%v) readN(%v) bufLen(%v) oek(%v) cost(%v)ns, (%v)ms",
 		requestId, size, readN, len(buf), oek, elapsed.Nanoseconds(), elapsed.Milliseconds())
 	return readN, nil
@@ -145,7 +179,10 @@ func (ebs *BlobStoreClient) Write(ctx context.Context, volName string, data []by
 	defer func() {
 		metric.SetWithLabels(err, map[string]string{exporter.Vol: volName})
 	}()
-	for attempt, backoff := 0, RetrySleepInterval; attempt <= MaxRetryTimes; attempt, backoff = attempt+1, backoff*2 {
+
+	var sleepErr error
+	retryInterval := EbsRetryInterval
+	for attempt := 0; attempt < EbsMaxRetryTimes; attempt++ {
 		location, _, err = ebs.client.Put(ctx, &access.PutArgs{
 			Size: int64(size),
 			Body: bytes.NewReader(data),
@@ -153,23 +190,30 @@ func (ebs *BlobStoreClient) Write(ctx context.Context, volName string, data []by
 		if err == nil {
 			break
 		}
-		log.LogWarnf("TRACE Ebs write, err(%v), requestId(%v), retry(%v)/%v", err, requestId, attempt, MaxRetryTimes)
-		if attempt == MaxRetryTimes {
+
+		if time.Since(start) > EbsMaxTimeout {
+			log.LogWarnf("TRACE Ebs write timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds())
+			err = errors.New(fmt.Sprintf("Ebs write timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds()))
 			break
 		}
-		if time.Since(start) > time.Duration(SendTimeLimit)*time.Millisecond {
-			log.LogWarnf("TRACE Ebs write timeout requestId(%v) time(%v)", requestId, time.Since(start))
-			err = errors.New(fmt.Sprintf("Ebs write timeout requestId(%v) time(%v)", requestId, time.Since(start)))
+
+		log.LogWarnf("TRACE Ebs write, err(%v), requestId(%v), retry(%v)/%v cost(%v)ms",
+			err, requestId, attempt, EbsMaxRetryTimes, retryInterval.Milliseconds())
+
+		retryInterval, sleepErr = safeEbsRetrySleep(ctx, retryInterval)
+		if sleepErr != nil {
+			err = sleepErr
 			break
 		}
-		time.Sleep(backoff)
-	}
-	if err != nil {
-		log.LogErrorf("TRACE Ebs write,err(%v),requestId(%v)", err.Error(), requestId)
-		return location, err
 	}
 	elapsed := time.Since(start)
-	log.LogDebugf("TRACE Ebs Write Exit,requestId(%v)  len(%v) consume(%v)ns", requestId, len(data), elapsed.Nanoseconds())
+
+	if err != nil {
+		log.LogErrorf("TRACE Ebs write,err(%v),requestId(%v), cost(%v)ms", err.Error(), requestId, elapsed.Milliseconds())
+		return location, err
+	}
+
+	log.LogDebugf("TRACE Ebs Write Exit,requestId(%v)  len(%v) cost(%v)ms", requestId, len(data), elapsed.Milliseconds())
 	return location, nil
 }
 
@@ -179,7 +223,7 @@ func (ebs *BlobStoreClient) Delete(oeks []proto.ObjExtentKey) (err error) {
 		stat.EndStat("ebs-delete", err, bgTime, 1)
 	}()
 
-	ctx, cancel := context.WithTimeout(context.TODO(), time.Second*3)
+	ctx, cancel := context.WithTimeout(context.TODO(), EbsMaxTimeout)
 	defer cancel()
 
 	locs := make([]ebsproto.Location, 0)
@@ -215,8 +259,31 @@ func (ebs *BlobStoreClient) Delete(oeks []proto.ObjExtentKey) (err error) {
 		metric.SetWithLabels(err, map[string]string{})
 	}()
 
+	var sleepErr error
+	retryInterval := EbsRetryInterval
+	for attempt := 0; attempt < EbsMaxRetryTimes; attempt++ {
+		_, err = ebs.client.Delete(ctx, &access.DeleteArgs{Locations: locs})
+		if err == nil {
+			break
+		}
+
+		if time.Since(start) > EbsMaxTimeout {
+			log.LogWarnf("TRACE Ebs Delete timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds())
+			err = errors.New(fmt.Sprintf("Ebs Delete timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds()))
+			break
+		}
+
+		log.LogWarnf("TRACE Ebs Delete, locs(%v), err(%v), requestId(%v), retry(%v)/%v cost(%v)ms",
+			locs, err, requestId, attempt, EbsMaxRetryTimes, time.Since(start).Milliseconds())
+
+		retryInterval, sleepErr = safeEbsRetrySleep(ctx, retryInterval)
+		if sleepErr != nil {
+			err = sleepErr
+			break
+		}
+	}
 	elapsed := time.Since(start)
-	_, err = ebs.client.Delete(ctx, &access.DeleteArgs{Locations: locs})
+
 	if err != nil {
 		// call ebs-access delete, just send delete msg to kafka, so we don't need to check the error code(CodeBidNotFound/CodeShardMarkDeleted)
 		log.LogErrorf("[EbsDelete] Ebs delete error, id(%v), consume(%v)ns, err(%v)", requestId, elapsed.Nanoseconds(), err.Error())
@@ -224,7 +291,6 @@ func (ebs *BlobStoreClient) Delete(oeks []proto.ObjExtentKey) (err error) {
 	}
 
 	log.LogDebugf("Ebs delete Exit,requestId(%v)  len(%v) consume(%v)ns", requestId, len(oeks), elapsed.Nanoseconds())
-
 	return err
 }
 
@@ -288,15 +354,44 @@ func (ebs *BlobStoreClient) Put(ctx context.Context, volName string, f io.Reader
 			putSize = rest
 		}
 		rest -= putSize
+
 		var location ebsproto.Location
 		var hash access.HashSumMap
-		location, hash, err = ebs.client.Put(ctx, &access.PutArgs{
-			Size:   int64(putSize),
-			Hashes: access.HashAlgMD5,
-			Body:   f,
-		})
+		chunk := make([]byte, putSize)
+		if _, err = io.ReadFull(io.LimitReader(f, int64(putSize)), chunk); err != nil {
+			log.LogErrorf("TRACE Ebs Put, read chunk err(%v), requestId(%v)", err, requestId)
+			return
+		}
+
+		var sleepErr error
+		retryInterval := EbsRetryInterval
+		for attempt := 0; attempt < EbsMaxRetryTimes; attempt++ {
+			location, hash, err = ebs.client.Put(ctx, &access.PutArgs{
+				Size:   int64(putSize),
+				Hashes: access.HashAlgMD5,
+				Body:   bytes.NewReader(chunk),
+			})
+			if err == nil {
+				break
+			}
+
+			if time.Since(start) > EbsMaxTimeout {
+				log.LogWarnf("TRACE Ebs Put timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds())
+				err = errors.New(fmt.Sprintf("Ebs Put timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds()))
+				break
+			}
+
+			log.LogWarnf("TRACE Ebs Put, err(%v), requestId(%v), retry(%v)/%v cost(%v)ms",
+				err, requestId, attempt, EbsMaxRetryTimes, retryInterval.Milliseconds())
+
+			retryInterval, sleepErr = safeEbsRetrySleep(ctx, retryInterval)
+			if sleepErr != nil {
+				err = sleepErr
+				break
+			}
+		}
 		if err != nil {
-			log.LogErrorf("TRACE Ebs Put, err(%v),requestId(%v)", err.Error(), requestId)
+			log.LogErrorf("TRACE Ebs Put, err(%v), requestId(%v)", err.Error(), requestId)
 			return
 		}
 
@@ -375,26 +470,51 @@ func (ebs *BlobStoreClient) Get(ctx context.Context, volName string, offset uint
 	}
 	log.LogDebugf("TRACE Ebs Read, oek(%v) loc(%v)", oek, loc)
 	defer func() {
-		if body != nil {
+		if err != nil && body != nil {
 			body.Close()
 		}
 	}()
-	for attempt, backoff := 0, RetrySleepInterval; attempt <= MaxRetryTimes; attempt, backoff = attempt+1, backoff*2 {
+
+	var sleepErr error
+	retryInterval := EbsRetryInterval
+	for attempt := 0; attempt < EbsMaxRetryTimes; attempt++ {
 		body, err = ebs.client.Get(ctx, &access.GetArgs{Location: loc, Offset: offset, ReadSize: size})
 		if err == nil {
 			break
 		}
-		log.LogWarnf("TRACE Ebs Read, oek(%v), err(%v), requestId(%v), retry(%v)/%v", oek, err, requestId, attempt, MaxRetryTimes)
-		if attempt == MaxRetryTimes {
+		if body != nil {
+			body.Close()
+			body = nil
+		}
+
+		code := rpc.DetectStatusCode(err)
+		if code == blobberr.CodeBidNotFound || code == blobberr.CodeShardMarkDeleted {
+			// Old location was deleted or bid does not exist: retrying on same location is meaningless; let upper layer RefreshExtents fetch a new key.
 			break
 		}
-		time.Sleep(backoff)
+
+		if time.Since(start) > EbsMaxTimeout {
+			log.LogWarnf("TRACE Ebs Get timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds())
+			err = errors.New(fmt.Sprintf("Ebs Get timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds()))
+			break
+		}
+
+		log.LogWarnf("TRACE Ebs Get, oek(%v), err(%v), requestId(%v), retry(%v)/%v cost(%v)ms",
+			oek, err, requestId, attempt, EbsMaxRetryTimes, time.Since(start).Milliseconds())
+
+		retryInterval, sleepErr = safeEbsRetrySleep(ctx, retryInterval)
+		if sleepErr != nil {
+			err = sleepErr
+			break
+		}
 	}
+
+	elapsed := time.Since(start)
 	if err != nil {
-		log.LogErrorf("TRACE Ebs Read, oek(%v), err(%v), requestId(%v)", oek, err, requestId)
+		log.LogErrorf("TRACE Ebs Get, oek(%v), err(%v), requestId(%v) consume(%v)ns", oek, err, requestId, elapsed.Nanoseconds())
 		return
 	}
-	elapsed := time.Since(start)
+
 	log.LogDebugf("TRACE Ebs Read Exit, oek(%v) size(%v), consume(%v)ns", oek, size, elapsed.Nanoseconds())
 	return
 }
@@ -467,6 +587,8 @@ func (ebs *BlobStoreClient) ApplyTruncateReqs(ctx context.Context, volName strin
 	}
 	if uint64(readN) != keepSize {
 		log.LogWarnf("ApplyTruncateReqs: read short extent(%v) want(%v) readN(%v)", toDeleteFrom, keepSize, readN)
+		return proto.ObjExtentKey{}, proto.ObjExtentKey{},
+			fmt.Errorf("ApplyTruncateReqs: read short want(%v) got(%v)", keepSize, readN)
 	}
 	newOeks, _, err := ebs.Put(ctx, volName, bytes.NewReader(buf), uint64(len(buf)))
 	if err != nil {

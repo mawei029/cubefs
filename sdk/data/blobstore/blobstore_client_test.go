@@ -23,11 +23,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/require"
@@ -41,6 +43,30 @@ import (
 )
 
 var dataCache []byte
+
+var testMainPatches *gomonkey.Patches
+
+func mockSafeEbsRetrySleep(ctx context.Context, retryInterval time.Duration) (time.Duration, error) {
+	retryInterval = retryInterval*12/10 + retryInterval/2
+	if retryInterval > EbsMaxSleepInterval {
+		retryInterval = EbsMaxSleepInterval
+	}
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	default:
+		return retryInterval, nil
+	}
+}
+
+func TestMain(m *testing.M) {
+	// EbsMaxRetryTimes=200 with exponential backoff; skip real sleep in retry-branch tests.
+	testMainPatches = gomonkey.NewPatches()
+	testMainPatches.ApplyFunc(safeEbsRetrySleep, mockSafeEbsRetrySleep)
+	code := m.Run()
+	testMainPatches.Reset()
+	os.Exit(code)
+}
 
 type fakeAccessAPI struct {
 	putFn    func(context.Context, *access.PutArgs) (proto.Location, access.HashSumMap, error)
@@ -467,6 +493,35 @@ func TestApplyTruncateReqs_DeleteError(t *testing.T) {
 	require.Equal(t, uint64(0), toDel.FileOffset)
 }
 
+type alwaysFailReader struct{}
+
+func (alwaysFailReader) Read([]byte) (int, error) {
+	return 0, io.ErrUnexpectedEOF
+}
+
+type trackCloseReader struct {
+	io.Reader
+	closed bool
+}
+
+func (r *trackCloseReader) Close() error {
+	r.closed = true
+	return nil
+}
+
+func putSuccessFn(args *access.PutArgs) (proto.Location, access.HashSumMap, error) {
+	sum := md5.Sum([]byte("abc"))
+	return proto.Location{
+			ClusterID: 1,
+			Size_:     uint64(args.Size),
+			CodeMode:  1,
+			SliceSize: uint32(args.Size),
+			Slices:    []proto.Slice{{MinSliceID: 1, Vid: 1, Count: 1}},
+		},
+		access.HashSumMap{access.HashAlgMD5: sum[:]},
+		nil
+}
+
 func TestBlobStoreClientReadRetryBranches(t *testing.T) {
 	oek := cproto.ObjExtentKey{Cid: 1, CodeMode: 1, Size: 4, BlobSize: 4, Blobs: []cproto.Blob{{MinBid: 1, Count: 1, Vid: 1}}, BlobsLen: 1}
 	buf := make([]byte, 4)
@@ -510,6 +565,82 @@ func TestBlobStoreClientReadRetryBranches(t *testing.T) {
 		require.Equal(t, 4, n)
 		require.GreaterOrEqual(t, attempt, 2)
 	})
+
+	t.Run("readfull retry then success", func(t *testing.T) {
+		attempt := 0
+		ebs := &BlobStoreClient{client: &fakeAccessAPI{
+			getFn: func(context.Context, *access.GetArgs) (io.ReadCloser, error) {
+				attempt++
+				if attempt == 1 {
+					return io.NopCloser(strings.NewReader("x")), nil
+				}
+				return io.NopCloser(strings.NewReader("abcd")), nil
+			},
+		}}
+		n, err := ebs.Read(context.Background(), "v", buf, 0, 4, oek)
+		require.NoError(t, err)
+		require.Equal(t, 4, n)
+		require.Equal(t, 2, attempt)
+	})
+
+	t.Run("shard mark deleted no retry", func(t *testing.T) {
+		attempt := 0
+		ebs := &BlobStoreClient{client: &fakeAccessAPI{
+			getFn: func(context.Context, *access.GetArgs) (io.ReadCloser, error) {
+				attempt++
+				return nil, blobberr.ErrShardMarkDeleted
+			},
+		}}
+		_, err := ebs.Read(context.Background(), "v", buf, 0, 4, oek)
+		require.Error(t, err)
+		require.Equal(t, 1, attempt)
+	})
+
+	t.Run("read timeout", func(t *testing.T) {
+		patches := gomonkey.ApplyFunc(time.Since, func(time.Time) time.Duration {
+			return EbsMaxTimeout + time.Second
+		})
+		defer patches.Reset()
+
+		ebs := &BlobStoreClient{client: &fakeAccessAPI{
+			getFn: func(context.Context, *access.GetArgs) (io.ReadCloser, error) {
+				return nil, io.ErrClosedPipe
+			},
+		}}
+		_, err := ebs.Read(context.Background(), "v", buf, 0, 4, oek)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "Ebs Read timeout")
+	})
+
+	t.Run("read ctx canceled during retry", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		attempt := 0
+		ebs := &BlobStoreClient{client: &fakeAccessAPI{
+			getFn: func(context.Context, *access.GetArgs) (io.ReadCloser, error) {
+				attempt++
+				if attempt == 1 {
+					cancel()
+				}
+				return nil, io.ErrClosedPipe
+			},
+		}}
+		_, err := ebs.Read(ctx, "v", buf, 0, 4, oek)
+		require.Error(t, err)
+		require.ErrorIs(t, err, context.Canceled)
+	})
+
+	t.Run("read max fail on readfull", func(t *testing.T) {
+		attempt := 0
+		ebs := &BlobStoreClient{client: &fakeAccessAPI{
+			getFn: func(context.Context, *access.GetArgs) (io.ReadCloser, error) {
+				attempt++
+				return io.NopCloser(strings.NewReader("x")), nil
+			},
+		}}
+		_, err := ebs.Read(context.Background(), "v", buf, 0, 4, oek)
+		require.Error(t, err)
+		require.Equal(t, EbsMaxRetryTimes, attempt)
+	})
 }
 
 func TestBlobStoreClientWriteAndGetRetryBranches(t *testing.T) {
@@ -523,7 +654,40 @@ func TestBlobStoreClientWriteAndGetRetryBranches(t *testing.T) {
 		}}
 		_, err := ebs.Write(context.Background(), "v", []byte("abcd"), 4)
 		require.Error(t, err)
-		require.Equal(t, MaxRetryTimes+1, attempt)
+		require.Equal(t, EbsMaxRetryTimes, attempt)
+	})
+
+	t.Run("write timeout", func(t *testing.T) {
+		patches := gomonkey.ApplyFunc(time.Since, func(time.Time) time.Duration {
+			return EbsMaxTimeout + time.Second
+		})
+		defer patches.Reset()
+
+		ebs := &BlobStoreClient{client: &fakeAccessAPI{
+			putFn: func(context.Context, *access.PutArgs) (proto.Location, access.HashSumMap, error) {
+				return proto.Location{}, nil, io.ErrClosedPipe
+			},
+		}}
+		_, err := ebs.Write(context.Background(), "v", []byte("abcd"), 4)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "Ebs write timeout")
+	})
+
+	t.Run("write ctx canceled during retry", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		attempt := 0
+		ebs := &BlobStoreClient{client: &fakeAccessAPI{
+			putFn: func(context.Context, *access.PutArgs) (proto.Location, access.HashSumMap, error) {
+				attempt++
+				if attempt == 1 {
+					cancel()
+				}
+				return proto.Location{}, nil, io.ErrClosedPipe
+			},
+		}}
+		_, err := ebs.Write(ctx, "v", []byte("abcd"), 4)
+		require.Error(t, err)
+		require.ErrorIs(t, err, context.Canceled)
 	})
 
 	t.Run("get retry then success", func(t *testing.T) {
@@ -556,7 +720,83 @@ func TestBlobStoreClientWriteAndGetRetryBranches(t *testing.T) {
 		}}
 		_, err := ebs.Get(context.Background(), "v", 0, 4, oek)
 		require.Error(t, err)
-		require.Equal(t, MaxRetryTimes+1, attempt)
+		require.Equal(t, EbsMaxRetryTimes, attempt)
+	})
+
+	t.Run("get bid not found no retry", func(t *testing.T) {
+		attempt := 0
+		oek := cproto.ObjExtentKey{Cid: 1, CodeMode: 1, Size: 4, BlobSize: 4, Blobs: []cproto.Blob{{MinBid: 1, Count: 1, Vid: 1}}, BlobsLen: 1}
+		ebs := &BlobStoreClient{client: &fakeAccessAPI{
+			getFn: func(context.Context, *access.GetArgs) (io.ReadCloser, error) {
+				attempt++
+				return nil, blobberr.ErrNoSuchBid
+			},
+		}}
+		_, err := ebs.Get(context.Background(), "v", 0, 4, oek)
+		require.Error(t, err)
+		require.Equal(t, 1, attempt)
+	})
+
+	t.Run("get shard mark deleted no retry", func(t *testing.T) {
+		attempt := 0
+		oek := cproto.ObjExtentKey{Cid: 1, CodeMode: 1, Size: 4, BlobSize: 4, Blobs: []cproto.Blob{{MinBid: 1, Count: 1, Vid: 1}}, BlobsLen: 1}
+		ebs := &BlobStoreClient{client: &fakeAccessAPI{
+			getFn: func(context.Context, *access.GetArgs) (io.ReadCloser, error) {
+				attempt++
+				return nil, blobberr.ErrShardMarkDeleted
+			},
+		}}
+		_, err := ebs.Get(context.Background(), "v", 0, 4, oek)
+		require.Error(t, err)
+		require.Equal(t, 1, attempt)
+	})
+
+	t.Run("get timeout", func(t *testing.T) {
+		patches := gomonkey.ApplyFunc(time.Since, func(time.Time) time.Duration {
+			return EbsMaxTimeout + time.Second
+		})
+		defer patches.Reset()
+
+		oek := cproto.ObjExtentKey{Cid: 1, CodeMode: 1, Size: 4, BlobSize: 4, Blobs: []cproto.Blob{{MinBid: 1, Count: 1, Vid: 1}}, BlobsLen: 1}
+		ebs := &BlobStoreClient{client: &fakeAccessAPI{
+			getFn: func(context.Context, *access.GetArgs) (io.ReadCloser, error) {
+				return nil, io.ErrClosedPipe
+			},
+		}}
+		_, err := ebs.Get(context.Background(), "v", 0, 4, oek)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "Ebs Get timeout")
+	})
+
+	t.Run("get ctx canceled during retry", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		attempt := 0
+		oek := cproto.ObjExtentKey{Cid: 1, CodeMode: 1, Size: 4, BlobSize: 4, Blobs: []cproto.Blob{{MinBid: 1, Count: 1, Vid: 1}}, BlobsLen: 1}
+		ebs := &BlobStoreClient{client: &fakeAccessAPI{
+			getFn: func(context.Context, *access.GetArgs) (io.ReadCloser, error) {
+				attempt++
+				if attempt == 1 {
+					cancel()
+				}
+				return nil, io.ErrClosedPipe
+			},
+		}}
+		_, err := ebs.Get(ctx, "v", 0, 4, oek)
+		require.Error(t, err)
+		require.ErrorIs(t, err, context.Canceled)
+	})
+
+	t.Run("get closes body when get returns body and error", func(t *testing.T) {
+		oek := cproto.ObjExtentKey{Cid: 1, CodeMode: 1, Size: 4, BlobSize: 4, Blobs: []cproto.Blob{{MinBid: 1, Count: 1, Vid: 1}}, BlobsLen: 1}
+		tr := &trackCloseReader{Reader: strings.NewReader("x")}
+		ebs := &BlobStoreClient{client: &fakeAccessAPI{
+			getFn: func(context.Context, *access.GetArgs) (io.ReadCloser, error) {
+				return tr, io.ErrClosedPipe
+			},
+		}}
+		_, err := ebs.Get(context.Background(), "v", 0, 4, oek)
+		require.Error(t, err)
+		require.True(t, tr.closed)
 	})
 }
 
@@ -570,7 +810,7 @@ func TestApplyTruncateReqs_MoreBranches(t *testing.T) {
 		require.True(t, del.IsEmpty())
 	})
 
-	t.Run("read short and put error", func(t *testing.T) {
+	t.Run("read short returns error", func(t *testing.T) {
 		ebs := &BlobStoreClient{}
 		req := truncateReq{
 			KeepExtent:  cproto.ObjExtentKey{FileOffset: 100, Size: 2},
@@ -578,16 +818,20 @@ func TestApplyTruncateReqs_MoreBranches(t *testing.T) {
 		}
 		patches := gomonkey.NewPatches()
 		defer patches.Reset()
+		putCalled := false
 		patches.ApplyMethod(reflect.TypeOf(ebs), "Read",
 			func(_ *BlobStoreClient, _ context.Context, _ string, _ []byte, _ uint64, _ uint64, _ cproto.ObjExtentKey) (int, error) {
-				return 2, nil
+				return 1, nil
 			})
 		patches.ApplyMethod(reflect.TypeOf(ebs), "Put",
 			func(_ *BlobStoreClient, _ context.Context, _ string, _ io.Reader, _ uint64) ([]cproto.ObjExtentKey, [][]byte, error) {
+				putCalled = true
 				return nil, nil, io.ErrClosedPipe
 			})
 		out, del, err := ebs.ApplyTruncateReqs(context.Background(), "v", req)
 		require.Error(t, err)
+		require.Contains(t, err.Error(), "read short want(2) got(1)")
+		require.False(t, putCalled)
 		require.True(t, out.IsEmpty())
 		require.True(t, del.IsEmpty())
 	})
@@ -890,6 +1134,126 @@ func TestBlobStoreClientPutDeleteAndLocationBranches(t *testing.T) {
 		require.Equal(t, uint64(3), oeks[0].Size)
 	})
 
+	t.Run("put retry then success", func(t *testing.T) {
+		attempt := 0
+		ebs := &BlobStoreClient{client: &fakeAccessAPI{
+			putFn: func(_ context.Context, args *access.PutArgs) (proto.Location, access.HashSumMap, error) {
+				attempt++
+				if attempt == 1 {
+					return proto.Location{}, nil, io.ErrClosedPipe
+				}
+				return putSuccessFn(args)
+			},
+		}}
+		oeks, _, err := ebs.Put(context.Background(), "v", strings.NewReader("abc"), 3)
+		require.NoError(t, err)
+		require.Len(t, oeks, 1)
+		require.Equal(t, 2, attempt)
+	})
+
+	t.Run("put read fail", func(t *testing.T) {
+		ebs := &BlobStoreClient{client: &fakeAccessAPI{
+			putFn: func(context.Context, *access.PutArgs) (proto.Location, access.HashSumMap, error) {
+				t.Fatal("put should not be called when read fails")
+				return proto.Location{}, nil, nil
+			},
+		}}
+		_, _, err := ebs.Put(context.Background(), "v", alwaysFailReader{}, 3)
+		require.Error(t, err)
+	})
+
+	t.Run("put put max fail", func(t *testing.T) {
+		attempt := 0
+		ebs := &BlobStoreClient{client: &fakeAccessAPI{
+			putFn: func(context.Context, *access.PutArgs) (proto.Location, access.HashSumMap, error) {
+				attempt++
+				return proto.Location{}, nil, io.ErrClosedPipe
+			},
+		}}
+		_, _, err := ebs.Put(context.Background(), "v", strings.NewReader("abc"), 3)
+		require.Error(t, err)
+		require.Equal(t, EbsMaxRetryTimes, attempt)
+	})
+
+	t.Run("put put timeout", func(t *testing.T) {
+		patches := gomonkey.ApplyFunc(time.Since, func(time.Time) time.Duration {
+			return EbsMaxTimeout + time.Second
+		})
+		defer patches.Reset()
+
+		ebs := &BlobStoreClient{client: &fakeAccessAPI{
+			putFn: func(context.Context, *access.PutArgs) (proto.Location, access.HashSumMap, error) {
+				return proto.Location{}, nil, io.ErrClosedPipe
+			},
+		}}
+		_, _, err := ebs.Put(context.Background(), "v", strings.NewReader("abc"), 3)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "Ebs Put timeout")
+	})
+
+	t.Run("put ctx canceled during retry", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		attempt := 0
+		ebs := &BlobStoreClient{client: &fakeAccessAPI{
+			putFn: func(context.Context, *access.PutArgs) (proto.Location, access.HashSumMap, error) {
+				attempt++
+				if attempt == 1 {
+					cancel()
+				}
+				return proto.Location{}, nil, io.ErrClosedPipe
+			},
+		}}
+		_, _, err := ebs.Put(ctx, "v", strings.NewReader("abc"), 3)
+		require.Error(t, err)
+		require.ErrorIs(t, err, context.Canceled)
+	})
+
+	t.Run("delete retry then success", func(t *testing.T) {
+		attempt := 0
+		ebs := &BlobStoreClient{client: &fakeAccessAPI{
+			deleteFn: func(_ context.Context, args *access.DeleteArgs) ([]proto.Location, error) {
+				attempt++
+				if attempt == 1 {
+					return nil, io.ErrClosedPipe
+				}
+				require.Len(t, args.Locations, 1)
+				return nil, nil
+			},
+		}}
+		err := ebs.Delete([]cproto.ObjExtentKey{{Cid: 1, Size: 1, Blobs: []cproto.Blob{{MinBid: 1, Count: 1, Vid: 1}}}})
+		require.NoError(t, err)
+		require.Equal(t, 2, attempt)
+	})
+
+	t.Run("delete retry max fail", func(t *testing.T) {
+		attempt := 0
+		ebs := &BlobStoreClient{client: &fakeAccessAPI{
+			deleteFn: func(context.Context, *access.DeleteArgs) ([]proto.Location, error) {
+				attempt++
+				return nil, io.ErrClosedPipe
+			},
+		}}
+		err := ebs.Delete([]cproto.ObjExtentKey{{Cid: 1, Size: 1, Blobs: []cproto.Blob{{MinBid: 1, Count: 1, Vid: 1}}}})
+		require.Error(t, err)
+		require.Equal(t, EbsMaxRetryTimes, attempt)
+	})
+
+	t.Run("delete timeout", func(t *testing.T) {
+		patches := gomonkey.ApplyFunc(time.Since, func(time.Time) time.Duration {
+			return EbsMaxTimeout + time.Second
+		})
+		defer patches.Reset()
+
+		ebs := &BlobStoreClient{client: &fakeAccessAPI{
+			deleteFn: func(context.Context, *access.DeleteArgs) ([]proto.Location, error) {
+				return nil, io.ErrClosedPipe
+			},
+		}}
+		err := ebs.Delete([]cproto.ObjExtentKey{{Cid: 1, Size: 1, Blobs: []cproto.Blob{{MinBid: 1, Count: 1, Vid: 1}}}})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "Ebs Delete timeout")
+	})
+
 	t.Run("delete success", func(t *testing.T) {
 		called := false
 		ebs := &BlobStoreClient{client: &fakeAccessAPI{
@@ -915,5 +1279,33 @@ func TestBlobStoreClientPutDeleteAndLocationBranches(t *testing.T) {
 		require.Equal(t, uint64(5), oek.FileOffset)
 		require.Len(t, oek.Blobs, 1)
 		require.Equal(t, uint64(10), oek.Blobs[0].MinBid)
+	})
+}
+
+func TestZSafeEbsRetrySleepReal(t *testing.T) {
+	testMainPatches.Reset()
+	defer testMainPatches.ApplyFunc(safeEbsRetrySleep, mockSafeEbsRetrySleep)
+
+	t.Run("ctx already canceled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err := safeEbsRetrySleep(ctx, EbsRetryInterval)
+		require.ErrorIs(t, err, context.Canceled)
+	})
+
+	t.Run("returns increased interval", func(t *testing.T) {
+		next, err := safeEbsRetrySleep(context.Background(), EbsRetryInterval)
+		require.NoError(t, err)
+		require.Greater(t, next, EbsRetryInterval)
+	})
+
+	t.Run("ctx canceled while waiting", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			cancel()
+		}()
+		_, err := safeEbsRetrySleep(ctx, time.Second)
+		require.ErrorIs(t, err, context.Canceled)
 	})
 }
