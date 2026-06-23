@@ -147,7 +147,7 @@ func (ebs *BlobStoreClient) Read(ctx context.Context, volName string, buf []byte
 
 		if time.Since(start) > ebs.maxTimeoutSec {
 			log.LogWarnf("TRACE Ebs Read timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds())
-			err = errors.New(fmt.Sprintf("Ebs Read timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds()))
+			err = errors.Trace(err, "Ebs Read timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds())
 			break
 		}
 
@@ -201,7 +201,7 @@ func (ebs *BlobStoreClient) Write(ctx context.Context, volName string, data []by
 
 		if time.Since(start) > ebs.maxTimeoutSec {
 			log.LogWarnf("TRACE Ebs write timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds())
-			err = errors.New(fmt.Sprintf("Ebs write timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds()))
+			err = errors.Trace(err, "Ebs write timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds())
 			break
 		}
 
@@ -277,7 +277,7 @@ func (ebs *BlobStoreClient) Delete(oeks []proto.ObjExtentKey) (err error) {
 
 		if time.Since(start) > ebs.maxTimeoutSec {
 			log.LogWarnf("TRACE Ebs Delete timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds())
-			err = errors.New(fmt.Sprintf("Ebs Delete timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds()))
+			err = errors.Trace(err, "Ebs Delete timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds())
 			break
 		}
 
@@ -336,12 +336,16 @@ func createOPMetricBySize(size uint64, tag string) string {
 	return tag + "1G_"
 }
 
+// Put writes data to blobstore and returns the object extent key and md5 hash.
+// now, only used in lc_transition.go TransitionMgr.migrateToEbs
+// so, we don't need to retry here, just return the error directly
 func (ebs *BlobStoreClient) Put(ctx context.Context, volName string, f io.Reader, size uint64) (oek []proto.ObjExtentKey, md5 [][]byte, err error) {
 	bgTime := stat.BeginStat()
 	defer func() {
 		stat.EndStat("ebs-write", err, bgTime, 1)
 	}()
 
+	// TODO: need retry on up-layer TransitionMgr.migrateToEbs
 	requestId := uuid.New().String()
 	log.LogDebugf("TRACE Ebs Put Enter, requestId(%v)  len(%v)", requestId, size)
 	start := time.Now()
@@ -362,42 +366,13 @@ func (ebs *BlobStoreClient) Put(ctx context.Context, volName string, f io.Reader
 			putSize = rest
 		}
 		rest -= putSize
-
 		var location ebsproto.Location
 		var hash access.HashSumMap
-		chunk := make([]byte, putSize)
-		if _, err = io.ReadFull(io.LimitReader(f, int64(putSize)), chunk); err != nil {
-			log.LogErrorf("TRACE Ebs Put, read chunk err(%v), requestId(%v)", err, requestId)
-			return
-		}
-
-		var sleepErr error
-		retryInterval := EbsRetryInterval
-		for attempt := 0; attempt < EbsMaxRetryTimes; attempt++ {
-			location, hash, err = ebs.client.Put(ctx, &access.PutArgs{
-				Size:   int64(putSize),
-				Hashes: access.HashAlgMD5,
-				Body:   bytes.NewReader(chunk),
-			})
-			if err == nil {
-				break
-			}
-
-			if time.Since(start) > ebs.maxTimeoutSec {
-				log.LogWarnf("TRACE Ebs Put timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds())
-				err = errors.New(fmt.Sprintf("Ebs Put timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds()))
-				break
-			}
-
-			log.LogWarnf("TRACE Ebs Put, err(%v), requestId(%v), retry(%v)/%v cost(%v)ms",
-				err, requestId, attempt, EbsMaxRetryTimes, retryInterval.Milliseconds())
-
-			retryInterval, sleepErr = safeEbsRetrySleep(ctx, retryInterval)
-			if sleepErr != nil {
-				err = sleepErr
-				break
-			}
-		}
+		location, hash, err = ebs.client.Put(ctx, &access.PutArgs{
+			Size:   int64(putSize),
+			Hashes: access.HashAlgMD5,
+			Body:   f,
+		})
 		if err != nil {
 			log.LogErrorf("TRACE Ebs Put, err(%v), requestId(%v)", err.Error(), requestId)
 			return
@@ -504,7 +479,7 @@ func (ebs *BlobStoreClient) Get(ctx context.Context, volName string, offset uint
 
 		if time.Since(start) > ebs.maxTimeoutSec {
 			log.LogWarnf("TRACE Ebs Get timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds())
-			err = errors.New(fmt.Sprintf("Ebs Get timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds()))
+			err = errors.Trace(err, "Ebs Get timeout requestId(%v) cost(%v)ms", requestId, time.Since(start).Milliseconds())
 			break
 		}
 

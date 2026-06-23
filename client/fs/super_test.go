@@ -586,7 +586,9 @@ func TestGetBlobStoreClientPassesStreamRetryTimeout(t *testing.T) {
 	}
 
 	gotTimeout := -1
-	patches := gomonkey.ApplyFunc(blobstore.NewEbsClient, func(_ access.Config, maxTimeoutSec int) (*blobstore.BlobStoreClient, error) {
+	var gotAccessCfg access.Config
+	patches := gomonkey.ApplyFunc(blobstore.NewEbsClient, func(cfg access.Config, maxTimeoutSec int) (*blobstore.BlobStoreClient, error) {
+		gotAccessCfg = cfg
 		gotTimeout = maxTimeoutSec
 		return &blobstore.BlobStoreClient{}, nil
 	})
@@ -596,6 +598,11 @@ func TestGetBlobStoreClientPassesStreamRetryTimeout(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, cli)
 	require.Equal(t, wantTimeout, gotTimeout)
+	require.Equal(t, 60, gotAccessCfg.ServiceIntervalS)
+	require.Equal(t, -1, gotAccessCfg.FailRetryIntervalS)
+	require.Equal(t, 6, gotAccessCfg.MaxHostRetry)
+	require.Equal(t, int64(6000), gotAccessCfg.BodyBaseTimeoutMs)
+	require.Equal(t, float64(2), gotAccessCfg.BodyBandwidthMBPs)
 	require.Same(t, cli, s.ebsc[1])
 }
 

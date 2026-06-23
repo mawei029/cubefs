@@ -549,6 +549,7 @@ func (s *Super) getBlobStoreClient(poolId uint8) (*blobstore.BlobStoreClient, er
 	}
 
 	log.LogWarnf("getBlobStoreClient: create blobstore client for pool(%v)", pool.String())
+	// super.getBlobStoreClient  → blobstore.NewEbsClient(access.Config{ConnMode: NoLimitConnMode, ...})  → access.New(cfg)	→ getClient(&cfg, hosts)	  → cfg.ConnMode.getConfig(...)   //  ConnMode to rpc.Config	→ rpc.NewLbClient → rpc.NewClient(&cfg.Config)	→ doWithCtx() // raw body timeout
 	ebsc, err := blobstore.NewEbsClient(access.Config{
 		ConnMode: access.NoLimitConnMode,
 		Consul: access.ConsulConfig{
@@ -558,7 +559,14 @@ func (s *Super) getBlobStoreClient(poolId uint8) (*blobstore.BlobStoreClient, er
 		Logger: &access.Logger{
 			Filename: path.Join(s.logpath, "client/ebs.log"),
 		},
-		LogLevel: log.GetBlobLogLevel(),
+		LogLevel:           log.GetBlobLogLevel(),
+		ServiceIntervalS:   60,   // 1 minute. interval seconds for discovering service hosts, at least 5 seconds and default is 5 minutes. Default is 300s.
+		FailRetryIntervalS: -1,   // -1 means remove failed hosts will not work. Failure retry interval, default value is 300s, if FailRetryIntervalS < 0, remove failed hosts will not work. Default is 300s.
+		MaxHostRetry:       6,    // 0 means all hosts. max retry hosts of access, default all hosts. Default is 10.
+		BodyBaseTimeoutMs:  6000, // if access.NoLimitConnMode, it's invalid. 6 seconds. Default is 30000ms.
+		BodyBandwidthMBPs:  2,    // if access.NoLimitConnMode, it's invalid. body Minimum Speed: timeout = ContentLength/BodyBandwidthMBPs + BodyBaseTimeoutMs. Default is 10MBps.
+		// HostTryTimes:       0,    // if FailRetryIntervalS <0. it's invalid. HostTryTimes 0 means no retry. Number of host failure retries. Default is 3.
+		// MaxFailsPeriodS:    5,    // if FailRetryIntervalS <0. it's invalid. MaxFailsPeriodS 5 seconds. Within MaxFailsPeriodS, if the number of failures is greater than or equal to MaxFails, the host is considered disconnected. Default is 10s.
 	}, s.streamRetryTimeout)
 	if err != nil {
 		log.LogErrorf("[getBlobStoreClient] create blobstore client err: %v", err)
