@@ -1314,3 +1314,90 @@ func TestWriter_doParallelWrite_releasesPooledBufAfterFlush(t *testing.T) {
 	b := buf.CachePool.Get()
 	buf.CachePool.Put(b)
 }
+
+func TestWriter_doBufferWrite_flushMidWriteReallocatesBuf(t *testing.T) {
+	const blockSize = 16
+	buf.InitCachePool(blockSize, 4)
+	s := mustTestECStreamerWithEbsc(418, &BlobStoreClient{}, blockSize)
+	s.mw = &meta.MetaWrapper{}
+	w := s.fWriter
+	t.Cleanup(func() { w.FreeCache() })
+
+	w.allocateCache()
+	w.reshapeBufForCopyPath()
+	w.blockPosition = blockSize - 2
+	w.fileOffset = w.blockPosition
+	s.raiseFileSize(uint64(w.fileOffset))
+	seedStreamerExtentsForTest(s, uint64(w.fileOffset), nil)
+
+	err := gohook.HookMethod(w.ecStreamer.ebsc, "Write", MockEbscWriteTrue, nil)
+	require.NoError(t, err)
+	defer gohook.UnHookMethod(w.ecStreamer.ebsc, "Write")
+	err = gohook.HookMethod(w.ecStreamer.mw, "AppendObjExtentKeys", MockAppendObjExtentKeysTrue, nil)
+	require.NoError(t, err)
+	defer gohook.UnHookMethod(w.ecStreamer.mw, "AppendObjExtentKeys")
+
+	const tailWrite = 6
+	n, err := w.doBufferWrite(context.Background(), make([]byte, tailWrite), w.fileOffset)
+	require.NoError(t, err)
+	require.Equal(t, tailWrite, n)
+	require.Equal(t, blockSize+tailWrite-2, w.fileOffset)
+	require.Equal(t, tailWrite-2, w.blockPosition)
+	require.NotNil(t, w.buf)
+	require.Equal(t, blockSize, len(w.buf))
+	require.True(t, w.bufPooled)
+}
+
+func TestWriter_prepareBufForNextCopyBlock_reallocatesAfterFlush(t *testing.T) {
+	const blockSize = 16
+	buf.InitCachePool(blockSize, 4)
+	s := mustTestECStreamerWithEbsc(420, &BlobStoreClient{}, blockSize)
+	w := s.fWriter
+	t.Cleanup(func() { w.FreeCache() })
+
+	atomic.StoreUint32(&s.dirty, 0)
+	w.buf = nil
+	w.bufPooled = false
+	w.blockPosition = 0
+
+	w.prepareBufForNextCopyBlock()
+
+	require.True(t, s.isDirty())
+	require.NotNil(t, w.buf)
+	require.Equal(t, blockSize, len(w.buf))
+	require.True(t, w.bufPooled)
+	require.Equal(t, 0, w.blockPosition)
+}
+
+func TestWriter_tryOverWrite_flushMidWriteReallocatesBuf(t *testing.T) {
+	const blockSize = 16
+	buf.InitCachePool(blockSize, 4)
+	s := mustTestECStreamerWithEbsc(419, &BlobStoreClient{}, blockSize)
+	s.mw = &meta.MetaWrapper{}
+	w := s.fWriter
+	t.Cleanup(func() { w.FreeCache() })
+
+	w.allocateCache()
+	w.reshapeBufForCopyPath()
+	w.blockPosition = blockSize - 2
+	w.fileOffset = w.blockPosition
+	s.raiseFileSize(uint64(w.fileOffset))
+	seedStreamerExtentsForTest(s, uint64(w.fileOffset), nil)
+
+	err := gohook.HookMethod(w.ecStreamer.ebsc, "Write", MockEbscWriteTrue, nil)
+	require.NoError(t, err)
+	defer gohook.UnHookMethod(w.ecStreamer.ebsc, "Write")
+	err = gohook.HookMethod(w.ecStreamer.mw, "AppendObjExtentKeys", MockAppendObjExtentKeysTrue, nil)
+	require.NoError(t, err)
+	defer gohook.UnHookMethod(w.ecStreamer.mw, "AppendObjExtentKeys")
+	err = gohook.HookMethod(w.ecStreamer.mw, "AppendObjExtentKeysWithCheck", MockAppendObjExtentKeysWithCheckTrue, nil)
+	require.NoError(t, err)
+	defer gohook.UnHookMethod(w.ecStreamer.mw, "AppendObjExtentKeysWithCheck")
+
+	const tailWrite = 6
+	n, err := w.tryOverWrite(context.Background(), w.fileOffset, make([]byte, tailWrite), 0)
+	require.NoError(t, err)
+	require.Equal(t, tailWrite, n)
+	require.Equal(t, 0, w.blockPosition)
+	require.Nil(t, w.buf)
+}

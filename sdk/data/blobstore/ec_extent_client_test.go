@@ -136,18 +136,30 @@ func TestECExtentClient_NeedsReadViewSync(t *testing.T) {
 
 func TestECExtentClient_CloseStream_negative_ref_reset(t *testing.T) {
 	c := NewObjExtentClient(ObjExtentConfig{})
-	s := mustTestECStreamer(4, nil, nil)
+	s := mustTestECStreamerWithEbsc(4, nil, 16)
 	atomic.StoreInt32(&s.refCnt, 0)
 	c.SetStreamer(4, s)
+	r := s.fReader
+	r.preReadLimiter = &blobPreReadLimiter{maxBytes: 256}
+	r.readBuf = make([]byte, 16)
+	r.prefetchReserved = 16
+
+	var flushCalls int32
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 	patches.ApplyMethod(reflect.TypeOf((*ECStreamer)(nil)), "Flush",
-		func(_ *ECStreamer, _ context.Context) error { return nil })
+		func(_ *ECStreamer, _ context.Context) error {
+			atomic.AddInt32(&flushCalls, 1)
+			return nil
+		})
 	s.mu.Lock()
 	atomic.StoreInt32(&s.refCnt, -2)
 	s.mu.Unlock()
 	require.NoError(t, c.CloseStream(4))
 	require.Equal(t, int32(0), atomic.LoadInt32(&s.refCnt))
+	require.Equal(t, int32(1), atomic.LoadInt32(&flushCalls))
+	require.Nil(t, r.readBuf)
+	require.Equal(t, int64(0), r.prefetchReserved)
 }
 
 func TestECExtentClient_CloseStream_teardown_err_rollback(t *testing.T) {
@@ -290,11 +302,56 @@ func TestECExtentClient_args_toClientConfig(t *testing.T) {
 
 func TestECExtentClient_CloseStream_ref_gt_zero(t *testing.T) {
 	c := NewObjExtentClient(ObjExtentConfig{})
-	s := mustTestECStreamer(54, nil, nil)
+	s := mustTestECStreamerWithEbsc(54, nil, 16)
 	atomic.StoreInt32(&s.refCnt, 2)
 	c.SetStreamer(54, s)
+	r := s.fReader
+	r.readBuf = make([]byte, 32)
+	r.prefetchReserved = 32
+
+	var flushCalls int32
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf((*ECStreamer)(nil)), "Flush",
+		func(_ *ECStreamer, _ context.Context) error {
+			atomic.AddInt32(&flushCalls, 1)
+			return nil
+		})
+
+	var onceRuns int32
+	s.mu.Lock()
+	s.once.Do(func() { atomic.AddInt32(&onceRuns, 1) })
+	s.once.Do(func() { atomic.AddInt32(&onceRuns, 1) })
+	s.mu.Unlock()
+	require.Equal(t, int32(1), onceRuns)
+
 	require.NoError(t, c.CloseStream(54))
 	require.Equal(t, int32(1), atomic.LoadInt32(&s.refCnt))
+	require.Equal(t, int32(1), atomic.LoadInt32(&flushCalls))
+	require.NotNil(t, c.GetStreamer(54))
+	require.NotNil(t, r.readBuf)
+	require.Equal(t, int64(32), r.prefetchReserved)
+
+	onceRuns = 0
+	s.mu.Lock()
+	s.once.Do(func() { atomic.AddInt32(&onceRuns, 1) })
+	s.mu.Unlock()
+	require.Equal(t, int32(0), onceRuns)
+}
+
+func TestECExtentClient_CloseStream_ref_gt_zero_flush_err_rollback(t *testing.T) {
+	c := NewObjExtentClient(ObjExtentConfig{})
+	s := mustTestECStreamer(56, nil, nil)
+	atomic.StoreInt32(&s.refCnt, 2)
+	c.SetStreamer(56, s)
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf((*ECStreamer)(nil)), "Flush",
+		func(_ *ECStreamer, _ context.Context) error { return errors.New("flush on partial close") })
+
+	require.Error(t, c.CloseStream(56))
+	require.Equal(t, int32(2), atomic.LoadInt32(&s.refCnt))
 }
 
 func TestECExtentClient_Read_nil_stream(t *testing.T) {

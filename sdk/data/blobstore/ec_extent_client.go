@@ -72,7 +72,7 @@ func (a ECStreamOpenArgs) toClientConfig(s *ECStreamer) ClientConfig {
 // ECExtentClient is per-inode EC/Blob stream registry, lifecycle aligned with replica ExtentClient:
 //
 //	OpenStreamWithArgs — refCnt++ (NewECStreamer if needed)
-//	CloseStream        — refCnt--; at zero: Flush + dropIOCaches + resetExtentsOnce, map entry and RW kept
+//	CloseStream        — refCnt--; always Flush; at zero: dropIOCaches + resetExtentsOnce, map entry and RW kept
 //	EvictStream        — CloseReaderWriter and delete map entry only when refCnt==0
 //	Close              — EvictStream all inodes (unmount/exit)
 type ECExtentClient struct {
@@ -129,8 +129,8 @@ func (c *ECExtentClient) SetStreamer(ino uint64, s *ECStreamer) {
 	c.streamers[ino] = s
 }
 
-// CloseStream decrements refCnt; map entry removed only in EvictStream.
-// refCnt>0: return; refCnt==0: Flush, dropIOCaches, resetExtentsOnce; RW objects kept for re-Open.
+// CloseStream decrements refCnt and flushes dirty writer data on every close (aligned with replica Streamer.release).
+// Map entry removed only in EvictStream. refCnt==0 after decrement: dropIOCaches + resetExtentsOnce; RW kept for re-Open.
 // On Flush failure refCnt is rolled back; negative refCnt logs Warn and still attempts Flush.
 func (c *ECExtentClient) CloseStream(ino uint64) error {
 	c.mu.Lock()
@@ -145,22 +145,22 @@ func (c *ECExtentClient) CloseStream(ino uint64) error {
 	}
 
 	n := atomic.AddInt32(&s.refCnt, -1)
-	if n > 0 {
-		if log.EnableDebug() {
-			log.LogDebugf("ECExtentClient CloseStream: ref not zero, ino(%v) ref(%v)", ino, n)
-		}
-		return nil
-	}
 	if n < 0 {
 		log.LogWarnf("ECExtentClient CloseStream: negative ref detected, ino(%v) ref(%v), force flush", ino, n)
 		atomic.StoreInt32(&s.refCnt, 0)
 		// Same as n==0: best-effort Flush and dropIOCaches to avoid stale dirty data
+		n = 0
 	}
 
 	if err := s.Flush(context.Background()); err != nil {
 		atomic.AddInt32(&s.refCnt, 1)
 		log.LogErrorf("ECExtentClient CloseStream: flush streamer failed, ino(%v) err(%v)", ino, err)
 		return err
+	}
+
+	if n > 0 {
+		log.LogDebugf("ECExtentClient CloseStream: ref not zero, ino(%v) ref(%v)", ino, n)
+		return nil
 	}
 
 	s.mu.Lock()

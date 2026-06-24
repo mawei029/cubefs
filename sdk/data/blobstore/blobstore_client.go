@@ -74,6 +74,7 @@ func NewEbsClient(cfg access.Config, maxTimeoutSec int) (*BlobStoreClient, error
 	if maxTimeoutSec <= 0 || maxTimeoutSec >= 600 {
 		maxTimeoutSec = int(EbsMaxTimeout.Seconds())
 	}
+	log.LogWarnf("TRACE NewEbsClient, cfg(%+v), maxTimeoutSec(%v)", cfg, maxTimeoutSec)
 
 	return &BlobStoreClient{
 		client:        cli,

@@ -254,7 +254,10 @@ func (writer *Writer) tryOverWrite(ctx context.Context, offset int, data []byte,
 				writer.blockPosition -= freeSize
 				return 0, err
 			}
-			// After successful flush, blockPosition is reset to 0 (in flushExt -> resetBuffer). buffer is empty and ready for next chunk
+			// After successful flush, blockPosition is reset to 0 (in flushExt -> resetBuffer). buffer is empty and dirty is reset, ready for next chunk
+			if remainSize > 0 {
+				writer.prepareBufForNextCopyBlock()
+			}
 		}
 	}
 
@@ -502,14 +505,12 @@ func (writer *Writer) doBufferWriteWithoutPool(ctx context.Context, data []byte,
 }
 
 func (writer *Writer) doBufferWrite(ctx context.Context, data []byte, offset int) (size int, err error) {
-	log.LogDebugf("TRACE blobStore doBufferWrite Enter: ino(%v) offset(%v) len(%v)", writer.ecStreamer.Inode(), offset, len(data))
-
 	writer.ecStreamer.markDirty()
 	writer.fileOffset = offset
 	dataSize := len(data)
 	position := 0
 	writer.allocateCache()
-	log.LogDebugf("TRACE blobStore doBufferWrite: ino(%v) writer.buf.len(%v) writer.blocksize(%v)", writer.ecStreamer.Inode(), len(writer.buf), writer.ecStreamer.BlockSize())
+	log.LogDebugf("TRACE blobStore doBufferWrite Enter: ino(%v) offset(%v) len(%v) writer.buf.len(%v) writer.blocksize(%v)", writer.ecStreamer.Inode(), offset, len(data), len(writer.buf), writer.ecStreamer.BlockSize())
 
 	// New buffer block may bump inode generation when blockPosition resets to 0.
 	if writer.blockPosition == 0 {
@@ -527,14 +528,14 @@ func (writer *Writer) doBufferWrite(ctx context.Context, data []byte, offset int
 		if dataSize < freeSize {
 			freeSize = dataSize
 		}
-		log.LogDebugf("TRACE blobStore doBufferWrite: ino(%v) writer.fileSize(%v) writer.fileOffset(%v) writer.blockPosition(%v) position(%v) freeSize(%v)",
-			writer.ecStreamer.Inode(), writer.CacheFileSize(), writer.fileOffset, writer.blockPosition, position, freeSize)
+		log.LogDebugf("TRACE blobStore doBufferWrite: ino(%v) writer.fileSize(%v) writer.fileOffset(%v) writer.blockPosition(%v) position(%v) freeSize(%v) len.buf(%v)",
+			writer.ecStreamer.Inode(), writer.CacheFileSize(), writer.fileOffset, writer.blockPosition, position, freeSize, len(writer.buf))
 		if writer.buf == nil || len(writer.buf) < writer.blockPosition+freeSize {
 			log.LogErrorf("doBufferWrite: buf too short ino(%v) bufLen(%v) needEnd(%v)", writer.ecStreamer.Inode(), len(writer.buf), writer.blockPosition+freeSize)
 			return 0, syscall.EINVAL
 		}
 		copy(writer.buf[writer.blockPosition:], data[position:position+freeSize])
-		log.LogDebugf("TRACE blobStore doBufferWrite:ino(%v) writer.buf.len(%v)", writer.ecStreamer.Inode(), len(writer.buf))
+
 		position += freeSize
 		writer.blockPosition += freeSize
 		dataSize -= freeSize
@@ -551,6 +552,10 @@ func (writer *Writer) doBufferWrite(ctx context.Context, data []byte, offset int
 				writer.blockPosition -= freeSize
 				log.LogWarnf("doBufferWrite: flush error ino(%v) fileOffset(%v) blockPosition(%v) freeSize(%v)", writer.ecStreamer.Inode(), writer.fileOffset, writer.blockPosition, freeSize)
 				return
+			}
+			// After successful flush, blockPosition/buffer/dirty are reset, ready for next chunk
+			if dataSize > 0 {
+				writer.prepareBufForNextCopyBlock()
 			}
 		}
 	}
@@ -678,6 +683,13 @@ func (writer *Writer) resetBufferWithoutPool() {
 	// len(buf) must match blockSize; after [:0] without clearing blockPosition,
 	// tryOverWrite/doBufferWrite may panic on copy(buf[blockPosition:]) (LTP rwtest multi-fd).
 	writer.blockPosition = 0
+}
+
+// prepareBufForNextCopyBlock re-borrows a pooled block after flushExt releases buf mid write loop.
+func (writer *Writer) prepareBufForNextCopyBlock() {
+	writer.ecStreamer.markDirty()
+	writer.allocateCache()
+	writer.reshapeBufForCopyPath()
 }
 
 // reshapeBufForCopyPath: doBufferWrite/tryOverWrite need len(buf)==blockSize pooled block; flushWithoutPool
