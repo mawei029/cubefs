@@ -145,3 +145,60 @@ func TestParseMountOptionEbsBufferCacheLimit(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "EbsBufferCacheLimit")
 }
+
+func TestParseMountOptionEbsConfig(t *testing.T) {
+	savedOptions := append([]proto.MountOption(nil), GlobalMountOptions...)
+	t.Cleanup(func() {
+		GlobalMountOptions = savedOptions
+	})
+
+	newConfig := func() *config.Config {
+		cfg := config.NewConfig()
+		cfg.SetString("mountPoint", t.TempDir())
+		cfg.SetString("volName", "testvol")
+		cfg.SetString("owner", "test-owner")
+		cfg.SetString("masterAddr", "127.0.0.1:17010")
+		return cfg
+	}
+
+	GlobalMountOptions = append([]proto.MountOption(nil), savedOptions...)
+	cfg := newConfig()
+	opt, err := parseMountOption(cfg)
+	require.NoError(t, err)
+	require.Same(t, cfg, opt.Config)
+	require.NotNil(t, opt.EbsConfig.LogLevel)
+	require.Equal(t, -1, *opt.EbsConfig.FailRetryIntervalS)
+
+	GlobalMountOptions = append([]proto.MountOption(nil), savedOptions...)
+	cfg = newConfig()
+	cfg.SetNewVal("ebs_config", map[string]interface{}{
+		"consul_address":        "10.0.0.2:8500",
+		"fail_retry_interval_s": 30,
+	})
+	opt, err = parseMountOption(cfg)
+	require.NoError(t, err)
+	require.Equal(t, "10.0.0.2:8500", opt.EbsConfig.ConsulAddress)
+	require.NotNil(t, opt.EbsConfig.FailRetryIntervalS)
+	require.Equal(t, 30, *opt.EbsConfig.FailRetryIntervalS)
+}
+
+func TestParseMountOptionEbsConfigInvalid(t *testing.T) {
+	savedOptions := append([]proto.MountOption(nil), GlobalMountOptions...)
+	t.Cleanup(func() {
+		GlobalMountOptions = savedOptions
+	})
+
+	cfg := config.NewConfig()
+	cfg.SetString("mountPoint", t.TempDir())
+	cfg.SetString("volName", "testvol")
+	cfg.SetString("owner", "test-owner")
+	cfg.SetString("masterAddr", "127.0.0.1:17010")
+	cfg.SetNewVal("ebs_config", map[string]interface{}{
+		"conn_mode": "invalid",
+	})
+
+	GlobalMountOptions = append([]proto.MountOption(nil), savedOptions...)
+	_, err := parseMountOption(cfg)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "ParseEbsClientConfig failed")
+}

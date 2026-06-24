@@ -580,8 +580,9 @@ func TestGetBlobStoreClientPassesStreamRetryTimeout(t *testing.T) {
 		ebsc:               make(map[uint8]*blobstore.BlobStoreClient),
 		logpath:            t.TempDir(),
 		streamRetryTimeout: wantTimeout,
+		ebsConfig:          proto.DefaultEbsClientConfig(),
 		poolCache: map[uint8]*proto.StoragePoolInfo{
-			1: {Id: 1, ECAddr: "127.0.0.1:1"},
+			1: {Id: 1, ECAddr: "127.0.0.1:8500"},
 		},
 	}
 
@@ -598,12 +599,143 @@ func TestGetBlobStoreClientPassesStreamRetryTimeout(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, cli)
 	require.Equal(t, wantTimeout, gotTimeout)
+	require.Equal(t, "127.0.0.1:8500", gotAccessCfg.Consul.Address)
+	require.Equal(t, access.NoLimitConnMode, gotAccessCfg.ConnMode)
 	require.Equal(t, 60, gotAccessCfg.ServiceIntervalS)
 	require.Equal(t, -1, gotAccessCfg.FailRetryIntervalS)
+	require.Equal(t, int64(8388608), gotAccessCfg.MaxSizePutOnce)
 	require.Equal(t, 6, gotAccessCfg.MaxHostRetry)
 	require.Equal(t, int64(6000), gotAccessCfg.BodyBaseTimeoutMs)
 	require.Equal(t, float64(2), gotAccessCfg.BodyBandwidthMBPs)
 	require.Same(t, cli, s.ebsc[1])
+}
+
+func TestGetBlobStoreClientConsulAddressOverridesPoolECAddr(t *testing.T) {
+	ec := proto.DefaultEbsClientConfig()
+	ec.ConsulAddress = "10.52.128.57:8500"
+
+	s := &Super{
+		ebsc:      make(map[uint8]*blobstore.BlobStoreClient),
+		logpath:   t.TempDir(),
+		ebsConfig: ec,
+		poolCache: map[uint8]*proto.StoragePoolInfo{
+			1: {Id: 1, ECAddr: "127.0.0.1:9999"},
+		},
+	}
+
+	var gotConsul string
+	patches := gomonkey.ApplyFunc(blobstore.NewEbsClient, func(cfg access.Config, _ int) (*blobstore.BlobStoreClient, error) {
+		gotConsul = cfg.Consul.Address
+		return &blobstore.BlobStoreClient{}, nil
+	})
+	defer patches.Reset()
+
+	_, err := s.getBlobStoreClient(1)
+	require.NoError(t, err)
+	require.Equal(t, "10.52.128.57:8500", gotConsul)
+}
+
+func TestGetBlobStoreClientToAccessConfigError(t *testing.T) {
+	ec := proto.EbsClientConfig{}
+	s := &Super{
+		ebsc:      make(map[uint8]*blobstore.BlobStoreClient),
+		logpath:   t.TempDir(),
+		ebsConfig: ec,
+		poolCache: map[uint8]*proto.StoragePoolInfo{
+			1: {Id: 1, ECAddr: ""},
+		},
+	}
+
+	_, err := s.getBlobStoreClient(1)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "ToAccessConfig failed")
+}
+
+func TestNewSuperStoresEbsConfigFromMountOptions(t *testing.T) {
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	mw := &meta.MetaWrapper{}
+	mc := masterSDK.NewMasterClient([]string{"127.0.0.1:1"}, false)
+	patches.ApplyFunc(meta.NewMetaWrapper, func(_ *meta.MetaConfig) (*meta.MetaWrapper, error) {
+		return mw, nil
+	})
+	patches.ApplyMethod(reflect.TypeOf(mw), "GetRootIno",
+		func(_ *meta.MetaWrapper, _ string) (uint64, error) { return 1, nil })
+	{
+		v := reflect.ValueOf(mw).Elem()
+		mcField := v.FieldByName("mc")
+		reflect.NewAt(mcField.Type(), unsafe.Pointer(mcField.UnsafeAddr())).Elem().Set(reflect.ValueOf(mc))
+		clusterField := v.FieldByName("cluster")
+		reflect.NewAt(clusterField.Type(), unsafe.Pointer(clusterField.UnsafeAddr())).Elem().SetString("test-cluster")
+	}
+
+	admin := mc.AdminAPI()
+	patches.ApplyMethod(reflect.TypeOf(admin), "GetVolumeSimpleInfo",
+		func(_ *masterSDK.AdminAPI, _ string) (*proto.SimpleVolView, error) {
+			return &proto.SimpleVolView{
+				ObjBlockSize:        4096,
+				VolType:             proto.VolumeTypeHot,
+				VolStorageClass:     proto.StorageClass_Replica_HDD,
+				AllowedStorageClass: []uint32{proto.StorageClass_Replica_HDD},
+			}, nil
+		})
+	patches.ApplyMethod(reflect.TypeOf(admin), "GetClusterInfo",
+		func(_ *masterSDK.AdminAPI) (*proto.ClusterInfo, error) {
+			return &proto.ClusterInfo{
+				EbsAddr:             "http://127.0.0.1:8080",
+				ServicePath:         "/svc",
+				Cluster:             "test-cluster",
+				DirChildrenNumLimit: proto.DefaultDirChildrenNumLimit,
+			}, nil
+		})
+	patches.ApplyMethod(reflect.TypeOf(admin), "ListStoragePools",
+		func(_ *masterSDK.AdminAPI) ([]*proto.StoragePoolInfo, error) { return nil, nil })
+	patches.ApplyFunc(stream.NewExtentClient, func(_ *stream.ExtentConfig) (*stream.ExtentClient, error) {
+		ec := &stream.ExtentClient{}
+		ev := reflect.ValueOf(ec).Elem()
+		mvField := ev.FieldByName("multiVerMgr")
+		reflect.NewAt(mvField.Type(), unsafe.Pointer(mvField.UnsafeAddr())).Elem().Set(reflect.ValueOf(&stream.MultiVerMgr{}))
+		dwField := ev.FieldByName("dataWrapper")
+		reflect.NewAt(dwField.Type(), unsafe.Pointer(dwField.UnsafeAddr())).Elem().Set(reflect.ValueOf(&wrapper.Wrapper{}))
+		return ec, nil
+	})
+
+	custom := proto.DefaultEbsClientConfig()
+	hostTry := 40
+	custom.HostTryTimes = &hostTry
+
+	s, err := NewSuper(&proto.MountOptions{
+		Volname:                             "vol",
+		Owner:                               "owner",
+		Master:                              "127.0.0.1:1",
+		MountPoint:                          "/mnt/cubefs",
+		SubDir:                              "/",
+		InodeLruLimit:                       1024,
+		ReadThreads:                         1,
+		WriteThreads:                        1,
+		VolType:                             proto.VolumeTypeHot,
+		EbsBlockSize:                        4096,
+		ClientOpTimeOut:                     1,
+		MetaCacheAcceleration:               false,
+		StopWarmMeta:                        true,
+		AheadReadEnable:                     true,
+		AheadReadTotalMem:                   1024,
+		AheadReadBlockTimeOut:               1,
+		AheadReadWindowCnt:                  1,
+		MinReadAheadSize:                    0,
+		VolStorageClass:                     proto.StorageClass_Replica_HDD,
+		VolAllowedStorageClass:              []uint32{proto.StorageClass_Replica_HDD},
+		EnableTransaction:                   "off",
+		TrashRebuildGoroutineLimit:          1,
+		TrashDeleteExpiredDirGoroutineLimit: 1,
+		EbsConfig:                           custom,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, s.ebsConfig.HostTryTimes)
+	require.Equal(t, 40, *s.ebsConfig.HostTryTimes)
+	close(s.closeC)
+	s.runningMonitor.Stop()
 }
 
 func TestSuper_scheduleFlush_idleWriterTriggersOecFlush(t *testing.T) {

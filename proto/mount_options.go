@@ -446,4 +446,5 @@ type MountOptions struct {
 	MinReadAheadSize      int64
 	PoolId                uint8
 	MetaRegion            string // Meta region for creating inodes, empty means use volume default region
+	EbsConfig             EbsClientConfig
 }

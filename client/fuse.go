@@ -1170,6 +1170,12 @@ func parseMountOption(cfg *config.Config) (*proto.MountOptions, error) {
 		return nil, errors.New(fmt.Sprintf("RequestTimeout(%v) must larger than ClientOpTimeOut(%v)", opt.RequestTimeout, opt.ClientOpTimeOut))
 	}
 
+	opt.Config = cfg
+	opt.EbsConfig, err = proto.ParseEbsClientConfig(cfg)
+	if err != nil {
+		return nil, errors.Trace(err, "ParseEbsClientConfig failed")
+	}
+
 	return opt, nil
 }
 
