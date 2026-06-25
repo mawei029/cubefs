@@ -589,7 +589,7 @@ func (mp *metaPartition) ObjExtentsList(req *proto.GetExtentsRequest, p *Packet)
 
 // ExtentsTruncate truncates an extent.
 func (mp *metaPartition) ExtentsTruncate(req *ExtentsTruncateReq, p *Packet, remoteAddr string) (err error) {
-	fileSize := uint64(0)
+	fileSize := uint64(req.Size)
 	start := time.Now()
 	if mp.IsEnableAuditLog() {
 		defer func() {

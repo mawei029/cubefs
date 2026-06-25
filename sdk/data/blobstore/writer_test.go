@@ -468,6 +468,18 @@ func TestComputeOverwriteReqs(t *testing.T) {
 	}
 }
 
+func TestComputeOverwriteReqs_exactExtentReplace(t *testing.T) {
+	const (
+		start = uint64(50)
+		end   = uint64(150)
+	)
+	old := proto.ObjExtentKey{FileOffset: 50, Size: 100, Cid: 7}
+	reqs := computeOverwriteReqs(start, end, []proto.ObjExtentKey{old})
+	require.Len(t, reqs, 1)
+	require.Equal(t, proto.ObjExtentKey{FileOffset: 50, Size: 100}, reqs[0].NewExtent)
+	require.Equal(t, old, reqs[0].DiscardExtent)
+}
+
 // TestTryOverWrite_Basic tests tryOverWrite with basic scenario (small data, no flush needed)
 
 func TestTryOverWrite_Basic(t *testing.T) {
@@ -525,8 +537,10 @@ func TestTryOverWrite_Basic(t *testing.T) {
 	size, err := testWriter.tryOverWrite(ctx, 0, data, flag)
 	require.NoError(t, err, "tryOverWrite failed")
 	require.Equal(t, len(data), size, "tryOverWrite returned wrong size.")
-	require.Equal(t, 0, testWriter.blockPosition, "tryOverWrite should flush trailing partial block and reset blockPosition.")
+	require.Equal(t, len(data), testWriter.blockPosition, "partial block stays buffered until next offset switch or flush")
 	require.Equal(t, len(data), testWriter.fileOffset, "tryOverWrite fileOffset incorrect.")
+	require.True(t, testWriter.ecStreamer.isDirty())
+	require.Equal(t, data, testWriter.buf[:len(data)])
 }
 
 // TestFlushExt_Basic tests flushExt with basic scenario (no existing extents)
@@ -960,6 +974,91 @@ func TestWriter_flushOverwriteReqs_new_and_merge(t *testing.T) {
 	})
 }
 
+func TestWriter_flushOverwriteReqs_exactExtentReplace(t *testing.T) {
+	ctx := context.Background()
+	st, w := testWriterWithMwEbsc(276, &BlobStoreClient{})
+	const extentSize = 100
+	old := proto.ObjExtentKey{FileOffset: 0, Size: extentSize, Cid: 11}
+	w.buf = make([]byte, extentSize)
+	for i := range w.buf {
+		w.buf[i] = 'n'
+	}
+
+	var readCalls int
+	var written []byte
+	var appendedNew, appendedDiscard proto.ObjExtentKey
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(w.ecStreamer.ebsc), "Read",
+		func(_ *BlobStoreClient, _ context.Context, _ string, data []byte, _, size uint64, oek proto.ObjExtentKey) (int, error) {
+			readCalls++
+			require.Equal(t, old, oek)
+			for i := range data {
+				data[i] = 'o'
+			}
+			return int(size), nil
+		})
+	patches.ApplyMethod(reflect.TypeOf(w.ecStreamer.ebsc), "Write",
+		func(ebs *BlobStoreClient, ctx context.Context, vol string, data []byte, l uint32) (proto2.Location, error) {
+			written = append([]byte(nil), data...)
+			return MockEbscWriteTrue(ebs, ctx, vol, data, l)
+		})
+	patches.ApplyMethod(reflect.TypeOf(w.ecStreamer.mw), "AppendObjExtentKeysWithCheck",
+		func(_ *meta.MetaWrapper, ino uint64, newEk, discardEk proto.ObjExtentKey) error {
+			require.Equal(t, st.ino, ino)
+			appendedNew = newEk
+			appendedDiscard = discardEk
+			return nil
+		})
+
+	reqs := []overwriteReq{
+		{NewExtent: proto.ObjExtentKey{FileOffset: 0, Size: extentSize}, DiscardExtent: old},
+	}
+	require.NoError(t, w.flushOverwriteReqs(ctx, st.ino, reqs, 0, extentSize))
+	require.Zero(t, readCalls, "exact replace must skip read-merge")
+	require.Len(t, written, extentSize)
+	for _, b := range written {
+		require.Equal(t, byte('n'), b)
+	}
+	require.Equal(t, uint64(0), appendedNew.FileOffset)
+	require.Equal(t, uint64(extentSize), appendedNew.Size)
+	require.Equal(t, old, appendedDiscard)
+}
+
+func TestWriter_flushOverwriteReqs_exactExtentReplace_metaFailNoDelete(t *testing.T) {
+	ctx := context.Background()
+	st, w := testWriterWithMwEbsc(278, &BlobStoreClient{})
+	const extentSize = 64
+	old := proto.ObjExtentKey{FileOffset: 0, Size: extentSize, Cid: 13}
+	w.buf = make([]byte, extentSize)
+
+	metaErr := errors.New("metanode append failed")
+	var deleteCalls int
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(w.ecStreamer.ebsc), "Write",
+		func(ebs *BlobStoreClient, ctx context.Context, vol string, data []byte, l uint32) (proto2.Location, error) {
+			return MockEbscWriteTrue(ebs, ctx, vol, data, l)
+		})
+	patches.ApplyMethod(reflect.TypeOf(w.ecStreamer.ebsc), "Delete",
+		func(_ *BlobStoreClient, _ []proto.ObjExtentKey) error {
+			deleteCalls++
+			return nil
+		})
+	patches.ApplyMethod(reflect.TypeOf(w.ecStreamer.mw), "AppendObjExtentKeysWithCheck",
+		func(_ *meta.MetaWrapper, _ uint64, _, _ proto.ObjExtentKey) error {
+			return metaErr
+		})
+
+	reqs := []overwriteReq{
+		{NewExtent: proto.ObjExtentKey{FileOffset: 0, Size: extentSize}, DiscardExtent: old},
+	}
+	err := w.flushOverwriteReqs(ctx, st.ino, reqs, 0, extentSize)
+	require.ErrorIs(t, err, metaErr)
+	require.Zero(t, deleteCalls, "must not delete old extent before meta commit succeeds")
+}
+
 // TestWriter_flushOverwriteReqs_ebsWritten_metaAppendFails_noRollback：EBS 已写入成功，metanode Append 失败；
 // 不回滚 blobstore 数据，直接向上返回错误（极低概率下允许孤儿 extent:旧数据和旧元数据都在且匹配，新数据没有元数据 / 元数据不一致 ）。
 func TestWriter_flushOverwriteReqs_ebsWritten_metaAppendFails_noRollback(t *testing.T) {
@@ -1049,6 +1148,62 @@ func TestWriter_flushExt_partial_overlap_path(t *testing.T) {
 
 	require.NoError(t, w.flushExt(st.ino, ctx, false))
 	require.False(t, st.isDirty())
+}
+
+func TestWriter_flushExt_exactExtentReplace(t *testing.T) {
+	ctx := context.Background()
+	st, w := testWriterWithMwEbsc(277, &BlobStoreClient{})
+	const extentSize = 100
+	old := proto.ObjExtentKey{FileOffset: 0, Size: extentSize, Cid: 12}
+	seedStreamerExtentsForTest(st, extentSize, []proto.ObjExtentKey{old})
+	seedDirtyForTest(st)
+
+	w.buf = make([]byte, extentSize)
+	for i := range w.buf {
+		w.buf[i] = 'n'
+	}
+	w.fileOffset = extentSize
+	w.blockPosition = extentSize
+
+	var readCalls int
+	var written []byte
+	var appendedDiscard proto.ObjExtentKey
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(w.ecStreamer.ebsc), "Read",
+		func(_ *BlobStoreClient, _ context.Context, _ string, data []byte, _, size uint64, oek proto.ObjExtentKey) (int, error) {
+			readCalls++
+			require.Equal(t, old, oek)
+			for i := range data {
+				data[i] = 'o'
+			}
+			return int(size), nil
+		})
+	patches.ApplyMethod(reflect.TypeOf(w.ecStreamer.ebsc), "Write",
+		func(ebs *BlobStoreClient, ctx context.Context, vol string, data []byte, l uint32) (proto2.Location, error) {
+			written = append([]byte(nil), data...)
+			return MockEbscWriteTrue(ebs, ctx, vol, data, l)
+		})
+	patches.ApplyMethod(reflect.TypeOf(w.ecStreamer.mw), "AppendObjExtentKeysWithCheck",
+		func(_ *meta.MetaWrapper, ino uint64, newEk, discardEk proto.ObjExtentKey) error {
+			require.Equal(t, st.ino, ino)
+			require.False(t, newEk.IsEmpty())
+			require.Equal(t, uint64(0), newEk.FileOffset)
+			require.Equal(t, uint64(extentSize), newEk.Size)
+			appendedDiscard = discardEk
+			return nil
+		})
+
+	require.NoError(t, w.flushExt(st.ino, ctx, false))
+	require.Zero(t, readCalls, "exact replace must skip read-merge")
+	require.Len(t, written, extentSize)
+	for _, b := range written {
+		require.Equal(t, byte('n'), b)
+	}
+	require.Equal(t, old, appendedDiscard)
+	require.False(t, st.isDirty())
+	require.Equal(t, 0, w.blockPosition)
 }
 
 func TestWriter_flushExt_tailAppend_usesFlush(t *testing.T) {
@@ -1349,6 +1504,66 @@ func TestWriter_doBufferWrite_flushMidWriteReallocatesBuf(t *testing.T) {
 	require.True(t, w.bufPooled)
 }
 
+func TestWriter_doBufferWrite_flushesPendingBufferWhenOffsetMismatch(t *testing.T) {
+	const blockSize = 16
+	buf.InitCachePool(blockSize, 4)
+	s := mustTestECStreamerWithEbsc(421, &BlobStoreClient{}, blockSize)
+	s.mw = &meta.MetaWrapper{}
+	w := s.fWriter
+	t.Cleanup(func() { w.FreeCache() })
+
+	// Simulate deferred partial buffer [10,17) left by random overwrite without final flush.
+	const bufStart = 10
+	const pending = 7
+	w.allocateCache()
+	w.reshapeBufForCopyPath()
+	w.blockPosition = pending
+	w.fileOffset = bufStart + pending
+	copy(w.buf[:pending], []byte("pending"))
+	seedDirtyForTest(s)
+	seedStreamerExtentsForTest(s, uint64(bufStart), []proto.ObjExtentKey{{FileOffset: 0, Size: bufStart}})
+	s.raiseFileSize(uint64(w.fileOffset))
+
+	t.Run("calls flushExt and appends at fileOffset", func(t *testing.T) {
+		var flushExtCalls int
+		patches := gomonkey.NewPatches()
+		t.Cleanup(func() { patches.Reset() })
+		patches.ApplyPrivateMethod(reflect.TypeOf(w), "flushExt",
+			func(_ *Writer, inode uint64, _ context.Context, flushFlag bool) error {
+				flushExtCalls++
+				require.Equal(t, s.ino, inode)
+				require.False(t, flushFlag)
+				w.blockPosition = 0
+				s.cleanDirty()
+				return nil
+			})
+
+		appendData := []byte("ab")
+		n, err := w.doBufferWrite(context.Background(), appendData, 0)
+		require.NoError(t, err)
+		require.Equal(t, 1, flushExtCalls, "must flush deferred buffer when append offset != fileOffset")
+		require.Equal(t, len(appendData), n)
+		require.Equal(t, w.fileOffset, bufStart+pending+len(appendData))
+	})
+
+	t.Run("flushExt error propagates", func(t *testing.T) {
+		w.blockPosition = pending
+		w.fileOffset = bufStart + pending
+		seedDirtyForTest(s)
+
+		flushErr := errors.New("flushExt failed")
+		patches := gomonkey.NewPatches()
+		t.Cleanup(func() { patches.Reset() })
+		patches.ApplyPrivateMethod(reflect.TypeOf(w), "flushExt",
+			func(_ *Writer, _ uint64, _ context.Context, _ bool) error {
+				return flushErr
+			})
+
+		_, err := w.doBufferWrite(context.Background(), []byte("x"), 0)
+		require.ErrorIs(t, err, flushErr)
+	})
+}
+
 func TestWriter_prepareBufForNextCopyBlock_reallocatesAfterFlush(t *testing.T) {
 	const blockSize = 16
 	buf.InitCachePool(blockSize, 4)
@@ -1399,6 +1614,8 @@ func TestWriter_tryOverWrite_flushMidWriteReallocatesBuf(t *testing.T) {
 	n, err := w.tryOverWrite(context.Background(), w.fileOffset, make([]byte, tailWrite), 0)
 	require.NoError(t, err)
 	require.Equal(t, tailWrite, n)
-	require.Equal(t, 0, w.blockPosition)
-	require.Nil(t, w.buf)
+	require.Equal(t, tailWrite-2, w.blockPosition, "full block flushed; trailing partial remains in buffer")
+	require.Equal(t, blockSize+tailWrite-2, w.fileOffset)
+	require.NotNil(t, w.buf)
+	require.True(t, w.bufPooled)
 }
