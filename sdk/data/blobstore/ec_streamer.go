@@ -134,7 +134,7 @@ func (s *ECStreamer) HasObjExtents() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	return s.oeks != nil && s.oeks.items != nil && len(s.oeks.items) > 0
+	return s.oeks != nil && len(s.oeks.items) > 0
 }
 
 // String for debug logs; reads atomic fields and ino without s.mu.

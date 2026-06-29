@@ -35,8 +35,6 @@ import (
 
 const (
 	MaxBufferSize = 512 * util.MB
-	// slowOpInfoThreshold logs one LogInfof when an op exceeds this duration (LTP/rwtest diagnostics).
-	slowOpInfoThreshold = 10 * time.Second
 )
 
 var errPutNoKeys = errors.New("ebs put returned no extent keys")
@@ -626,9 +624,9 @@ func (writer *Writer) writeSlice(ctx context.Context, wSlice *rwSlice, wg bool) 
 	log.LogDebugf("TRACE blobStore,writeSlice to ebs. ino(%v) fileOffset(%v) len(%v)", writer.ecStreamer.Inode(), wSlice.fileOffset, wSlice.size)
 	t0 := time.Now()
 	location, err := writer.ecStreamer.Ebsc().Write(ctx, writer.ecStreamer.Volume(), wSlice.Data, wSlice.size)
-	if d := time.Since(t0); d >= slowOpInfoThreshold {
-		log.LogInfof("blobstore slow ebsc.Write ino(%v) fileOff(%v) size(%v) dur(%v) err(%v)",
-			writer.ecStreamer.Inode(), wSlice.fileOffset, wSlice.size, d, err)
+	if log.EnableDebug() {
+		log.LogDebugf("blobstore slow ebsc.Write ino(%v) fileOff(%v) size(%v) cost(%v)us err(%v)",
+			writer.ecStreamer.Inode(), wSlice.fileOffset, wSlice.size, time.Since(t0).Microseconds(), err)
 	}
 	if err != nil {
 		if wg {
