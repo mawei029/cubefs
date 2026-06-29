@@ -240,7 +240,7 @@ func (reader *Reader) Read(ctx context.Context, buf []byte, offset int, size int
 	fuseReqSize := size
 
 	// Logical read bound (includes unflushed writer tail); dirty sync is done in ECStreamer.Read before this call.
-	fileSize := reader.ecStreamer.fileSizeView()
+	fileSize := reader.ecStreamer.fileSizeViewLocked()
 
 	// Same as replica Streamer.read: offset >= logical tail returns n=0, err=nil (POSIX EOF); caller buf unchanged.
 	if uint64(offset) >= fileSize {

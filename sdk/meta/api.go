@@ -1668,11 +1668,11 @@ func (mw *MetaWrapper) AppendObjExtentKeysWithCheck(inode uint64, newExtents, di
 
 	status, err := mw.appendObjExtentKeysWithCheck(mp, inode, newExtents, discardExtents)
 	if err != nil {
-		log.LogErrorf("AppendObjExtentKeysWithCheckBatch: inode(%v) newExtents(%v) discardExtents(%v) err(%v) status(%v)", inode, newExtents, discardExtents, err, status)
+		log.LogErrorf("AppendObjExtentKeysWithCheckBatch: inode(%v) mpId(%v) leader(%v) members(%v) newExtents(%v) discardExtents(%v) err(%v) status(%v)", inode, mp.PartitionID, mp.LeaderAddr, mp.Members, newExtents, discardExtents, err, status)
 		return err
 	}
 	if status != statusOK {
-		log.LogErrorf("AppendObjExtentKeysWithCheckBatch: inode(%v) newExtents(%v) discardExtents(%v) err(%v) status(%v)", inode, newExtents, discardExtents, err, status)
+		log.LogErrorf("AppendObjExtentKeysWithCheckBatch: inode(%v) mpId(%v) leader(%v) members(%v) newExtents(%v) discardExtents(%v) err(%v) status(%v)", inode, mp.PartitionID, mp.LeaderAddr, mp.Members, newExtents, discardExtents, err, status)
 		return statusToErrno(status)
 	}
 	log.LogDebugf("AppendObjExtentKeysWithCheckBatch: ino(%v) newExtents(%v)", inode, newExtents)
@@ -1688,11 +1688,11 @@ func (mw *MetaWrapper) AppendObjExtentKeys(inode uint64, eks []proto.ObjExtentKe
 
 	status, err := mw.appendObjExtentKeys(mp, inode, eks)
 	if err != nil {
-		log.LogErrorf("AppendObjExtentKeys: inode(%v) objextentKeys(%v) err(%v) status(%v)", inode, eks, err, status)
+		log.LogErrorf("AppendObjExtentKeys: inode(%v) mpId(%v) leader(%v) members(%v) objextentKeys(%v) err(%v) status(%v)", inode, mp.PartitionID, mp.LeaderAddr, mp.Members, eks, err, status)
 		return err
 	}
 	if status != statusOK {
-		log.LogErrorf("AppendObjExtentKeys: inode(%v) objextentKeys(%v) err(%v) status(%v)", inode, eks, err, status)
+		log.LogErrorf("AppendObjExtentKeys: inode(%v) mpId(%v) leader(%v) members(%v) objextentKeys(%v) err(%v) status(%v)", inode, mp.PartitionID, mp.LeaderAddr, mp.Members, eks, err, status)
 		return statusToErrno(status)
 	}
 	log.LogDebugf("AppendObjExtentKeys: ino(%v) objextentKeys(%v)", inode, eks)
@@ -1739,7 +1739,8 @@ func (mw *MetaWrapper) GetObjExtents(inode uint64) (gen uint64, size uint64, ext
 
 	status, gen, size, extents, objExtents, err := mw.getObjExtents(mp, inode)
 	if err != nil || status != statusOK {
-		log.LogErrorf("GetObjExtents: ino(%v) err(%v) status(%v)", inode, err, status)
+		log.LogErrorf("GetObjExtents: ino(%v) mpId(%v) leader(%v) members(%v) err(%v) status(%v)",
+			inode, mp.PartitionID, mp.LeaderAddr, mp.Members, err, status)
 		return 0, 0, nil, nil, statusToErrno(status)
 	}
 	log.LogDebugf("GetObjExtents: ino(%v) gen(%v) size(%v) extents(%v) objextents(%v)", inode, gen, size, extents, objExtents)
@@ -1775,11 +1776,13 @@ func (mw *MetaWrapper) TruncateV2(inode, size uint64, fullPath string, newObjExt
 
 	status, err := mw.truncateV2(mp, inode, size, fullPath, newObjExtent, toDeleteFrom)
 	if err != nil {
-		log.LogErrorf("TruncateV2: inode(%v) size(%v) fullPath(%v) newObjExtent(%v) toDeleteFrom(%v) err(%v) status(%v)", inode, size, fullPath, newObjExtent, toDeleteFrom, err, status)
+		log.LogErrorf("TruncateV2: inode(%v) mpId(%v) leader(%v) members(%v) size(%v) fullPath(%v) newObjExtent(%v) toDeleteFrom(%v) err(%v) status(%v)",
+			inode, mp.PartitionID, mp.LeaderAddr, mp.Members, size, fullPath, newObjExtent, toDeleteFrom, err, status)
 		return err
 	}
 	if status != statusOK {
-		log.LogErrorf("TruncateV2: inode(%v) size(%v) fullPath(%v) newObjExtent(%v) toDeleteFrom(%v) err(%v) status(%v)", inode, size, fullPath, newObjExtent, toDeleteFrom, err, status)
+		log.LogErrorf("TruncateV2: inode(%v) mpId(%v) leader(%v) members(%v) size(%v) fullPath(%v) newObjExtent(%v) toDeleteFrom(%v) err(%v) status(%v)",
+			inode, mp.PartitionID, mp.LeaderAddr, mp.Members, size, fullPath, newObjExtent, toDeleteFrom, err, status)
 		return statusToErrno(status)
 	}
 	return nil

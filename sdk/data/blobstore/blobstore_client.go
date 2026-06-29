@@ -375,7 +375,8 @@ func (ebs *BlobStoreClient) Put(ctx context.Context, volName string, f io.Reader
 			Body:   f,
 		})
 		if err != nil {
-			log.LogErrorf("TRACE Ebs Put, err(%v), requestId(%v)", err.Error(), requestId)
+			log.LogErrorf("TRACE Ebs Put, vol(%v) size(%v) from(%v) err(%v) requestId(%v)",
+				volName, putSize, from, err.Error(), requestId)
 			return
 		}
 
@@ -567,7 +568,7 @@ func (ebs *BlobStoreClient) ApplyTruncateReqs(ctx context.Context, volName strin
 	buf := make([]byte, keepSize)
 	readN, err := ebs.Read(ctx, volName, buf, 0, keepSize, toDeleteFrom)
 	if err != nil {
-		log.LogErrorf("ApplyTruncateReqs: read extent (%v) keepSize(%v) err(%v)", toDeleteFrom, keepSize, err)
+		log.LogErrorf("ApplyTruncateReqs: vol(%v) read extent(%v) keepSize(%v) err(%v)", volName, toDeleteFrom, keepSize, err)
 		return proto.ObjExtentKey{}, proto.ObjExtentKey{}, err
 	}
 	if uint64(readN) != keepSize {
@@ -577,7 +578,8 @@ func (ebs *BlobStoreClient) ApplyTruncateReqs(ctx context.Context, volName strin
 	}
 	newOeks, _, err := ebs.Put(ctx, volName, bytes.NewReader(buf), uint64(len(buf)))
 	if err != nil {
-		log.LogErrorf("ApplyTruncateReqs: put truncated err(%v)", err)
+		log.LogErrorf("ApplyTruncateReqs: vol(%v) put truncated keep(%v) discardFrom(%v) size(%v) err(%v)",
+			volName, keepSome, toDeleteFrom, keepSize, err)
 		return proto.ObjExtentKey{}, proto.ObjExtentKey{}, err
 	}
 	if len(newOeks) == 0 {

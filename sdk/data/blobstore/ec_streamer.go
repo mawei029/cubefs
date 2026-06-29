@@ -221,7 +221,10 @@ func (s *ECStreamer) FileSizeView() (size int, gen uint64) {
 		log.LogWarnf("ECStreamer FileSizeView: s is nil")
 		return 0, 0
 	}
-	return int(s.fileSizeView()), atomic.LoadUint64(&s.inoVersion)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return int(s.fileSizeViewLocked()), atomic.LoadUint64(&s.inoVersion)
 }
 
 func (s *ECStreamer) CloseReaderWriter() error {
@@ -358,6 +361,7 @@ func (s *ECStreamer) updateMetaInfo(commitSize *uint64) error {
 	if commitSize != nil {
 		// Truncate/Setattr: clamp fileSize and trim writer tail (commitSize from truncateV2Locked).
 		s.commitFileSize(*commitSize)
+		atomic.StoreUint64(&s.inoVersion, gen)
 	} else {
 		lb := logicalReadBound(size, objExtents)
 		if !s.isDirty() {
@@ -419,10 +423,10 @@ func (s *ECStreamer) invalidateReaderPrefetchBuf() {
 	r.invalidateReadBuf()
 }
 
-// fileSizeView returns max(atomic fileSize, writer.fileOffset); use under mu or from Reader; avoid Writer() reentry.
-func (s *ECStreamer) fileSizeView() uint64 {
+// fileSizeViewLocked returns max(atomic fileSize, writer.fileOffset). Caller must hold s.mu.
+func (s *ECStreamer) fileSizeViewLocked() uint64 {
 	if s == nil {
-		log.LogWarnf("ECStreamer fileSizeView: s is nil")
+		log.LogWarnf("ECStreamer fileSizeViewLocked: s is nil")
 		return 0
 	}
 	sz := atomic.LoadUint64(&s.fileSize)

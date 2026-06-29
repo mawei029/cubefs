@@ -160,7 +160,7 @@ func truncateV2ForTest(w *Writer, ctx context.Context, targetSize uint64) (proto
 		return proto.ObjExtentKey{}, proto.ObjExtentKey{}, fmt.Errorf("Writer.TruncateV2: writer/mw/ebsc nil")
 	}
 	objExtents := w.ecStreamer.OeksLocked()
-	currentSize := w.ecStreamer.fileSizeView()
+	currentSize := w.ecStreamer.fileSizeViewLocked()
 	return w.TruncateV2FromExtents(ctx, targetSize, currentSize, objExtents)
 }
 

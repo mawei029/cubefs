@@ -109,8 +109,8 @@ func (writer *Writer) notifyCompleteFlushMeta() error {
 }
 
 func (writer *Writer) String() string {
-	return fmt.Sprintf("Writer{address(%v),volName(%v),ino(%v),blockSize(%v),fileSize(%v)},wConcurrency(%v)",
-		&writer, writer.ecStreamer.Volume(), writer.ecStreamer.Inode(), writer.ecStreamer.BlockSize(), writer.ecStreamer.fileSizeView(), writer.wConcurrency)
+	return fmt.Sprintf("Writer{address(%v),volName(%v),ino(%v),blockSize(%v)},wConcurrency(%v)",
+		&writer, writer.ecStreamer.Volume(), writer.ecStreamer.Inode(), writer.ecStreamer.BlockSize(), writer.wConcurrency)
 }
 
 func (writer *Writer) WriteWithoutPool(ctx context.Context, offset int, data []byte) (size int, err error) {
@@ -162,6 +162,15 @@ func (writer *Writer) Write(ctx context.Context, offset int, data []byte, flags 
 		return 0, syscall.EOPNOTSUPP
 	}
 
+	// Flush existing buffer data before starting new write at different offset
+	if offset != writer.fileOffset {
+		if err = writer.flushExt(writer.ecStreamer.Inode(), ctx, false); err != nil {
+			log.LogErrorf("TRACE blobStore flush error, ino(%v) offset(%v) len(%v) fileOffset(%v) flags(%v) err(%v)",
+				writer.ecStreamer.Inode(), offset, len(data), writer.fileOffset, flags, err)
+			return 0, err
+		}
+	}
+
 	// Case 2: Non-tail writes (overwrite or sparse) use tryOverWrite; flushExt refreshes meta inside.
 	if offset != writer.CacheFileSize() {
 		size, err = writer.tryOverWrite(ctx, offset, data, flags)
@@ -199,18 +208,8 @@ func (writer *Writer) tryOverWrite(ctx context.Context, offset int, data []byte,
 		return 0, fmt.Errorf("writer is not opened yet")
 	}
 
-	if offset != writer.fileOffset {
-		// Flush existing buffer data before starting new write at different offset
-		if err = writer.flushExt(writer.ecStreamer.Inode(), ctx, false); err != nil {
-			log.LogErrorf("TRACE blobStore tryOverWrite error, flush ext fail, ino(%v) offset(%v) len(%v) flags(%v) err(%v)",
-				writer.ecStreamer.Inode(), offset, len(data), flags, err)
-			return 0, err
-		}
-		// reset fileOffset to the new write position
-		writer.fileOffset = offset
-	}
-
 	writer.ecStreamer.markDirty()
+	writer.fileOffset = offset // reset fileOffset to the new write position
 	writer.allocateCache()
 	writer.reshapeBufForCopyPath()
 
@@ -491,14 +490,6 @@ func (writer *Writer) doBufferWriteWithoutPool(ctx context.Context, data []byte,
 }
 
 func (writer *Writer) doBufferWrite(ctx context.Context, data []byte, offset int) (size int, err error) {
-	if offset != writer.fileOffset {
-		if err = writer.flushExt(writer.ecStreamer.Inode(), ctx, false); err != nil {
-			log.LogErrorf("TRACE blobStore doBufferWrite error, flush ext fail, ino(%v) offset(%v) len(%v) err(%v)", writer.ecStreamer.Inode(), offset, len(data), err)
-			return 0, err
-		}
-		offset = writer.fileOffset
-	}
-
 	writer.ecStreamer.markDirty()
 	writer.fileOffset = offset
 	dataSize := len(data)
@@ -1031,7 +1022,7 @@ func (writer *Writer) flush(inode uint64, ctx context.Context, flushFlag bool) (
 }
 
 func (writer *Writer) CacheFileSize() int {
-	return int(writer.ecStreamer.fileSizeView())
+	return int(writer.ecStreamer.fileSizeViewLocked())
 }
 
 // TruncateV2 first flushes buffered data (Flush/flushExt), then calls GetObjExtents; otherwise truncate may operate on stale meta/ObjExtents view.
@@ -1046,7 +1037,7 @@ func (writer *Writer) TruncateV2(ctx context.Context, targetSize uint64,
 	}
 	// don't need to flush here, because the truncate is already done in the file.truncateV2 function
 	objExtents := writer.ecStreamer.OeksLocked()
-	currentSize := writer.ecStreamer.fileSizeView()
+	currentSize := writer.ecStreamer.fileSizeViewLocked()
 
 	return writer.TruncateV2FromExtents(ctx, targetSize, currentSize, objExtents)
 }

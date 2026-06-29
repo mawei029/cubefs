@@ -20,35 +20,56 @@ import (
 	"github.com/cubefs/cubefs/util/log"
 )
 
-func TestNewObjExtentClient_WithSharedLimitManager(t *testing.T) {
-	lm := manager.NewLimitManager(nil)
-	c := NewObjExtentClient(ObjExtentConfig{LimitManager: lm})
-	require.NotNil(t, c)
-	require.Equal(t, lm, c.LimitManager)
+func TestNewObjExtentClient(t *testing.T) {
+	t.Run("with_shared_limit_manager", func(t *testing.T) {
+		lm := manager.NewLimitManager(nil)
+		c := NewObjExtentClient(ObjExtentConfig{LimitManager: lm})
+		require.NotNil(t, c)
+		require.Equal(t, lm, c.LimitManager)
+	})
+	t.Run("default_limit_manager", func(t *testing.T) {
+		c := NewObjExtentClient(ObjExtentConfig{})
+		require.NotNil(t, c.LimitManager)
+	})
 }
 
-func TestNewObjExtentClient_default_limit_manager(t *testing.T) {
-	c := NewObjExtentClient(ObjExtentConfig{})
-	require.NotNil(t, c.LimitManager)
-}
-
-func TestECExtentClient_SetStreamerForTest_nil_client_noop(t *testing.T) {
-	var c *ECExtentClient
-	s := mustTestECStreamer(1, nil, nil)
-	setStreamerForTest(c, 1, s)
+func TestECExtentClient_SetStreamerForTest_nil(t *testing.T) {
+	t.Run("nil_client_noop", func(t *testing.T) {
+		var c *ECExtentClient
+		s := mustTestECStreamer(1, nil, nil)
+		setStreamerForTest(c, 1, s)
+	})
+	t.Run("nil_streamer_noop", func(t *testing.T) {
+		c := NewObjExtentClient(ObjExtentConfig{})
+		setStreamerForTest(c, 1, nil)
+	})
+	t.Run("nil_client_and_nil_streamer_safe", func(t *testing.T) {
+		c := NewObjExtentClient(ObjExtentConfig{})
+		setStreamerForTest(c, 1, nil)
+		var nilC *ECExtentClient
+		setStreamerForTest(nilC, 1, mustTestECStreamer(1, nil, nil))
+	})
 }
 
 func TestECExtentClient_OpenStream_ENOTSUP(t *testing.T) {
-	c := NewObjExtentClient(ObjExtentConfig{})
-	require.ErrorIs(t, c.OpenStream(1, true, false, "/x"), syscall.ENOTSUP)
-}
-
-func TestECExtentClient_OpenStream_debug_branch(t *testing.T) {
-	patches := gomonkey.NewPatches()
-	defer patches.Reset()
-	patches.ApplyFunc(log.EnableDebug, func() bool { return true })
-	c := NewObjExtentClient(ObjExtentConfig{})
-	require.ErrorIs(t, c.OpenStream(91, false, false, "/x"), syscall.ENOTSUP)
+	t.Run("plain", func(t *testing.T) {
+		c := NewObjExtentClient(ObjExtentConfig{})
+		require.ErrorIs(t, c.OpenStream(1, true, false, "/x"), syscall.ENOTSUP)
+	})
+	t.Run("debug_branch", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyFunc(log.EnableDebug, func() bool { return true })
+		c := NewObjExtentClient(ObjExtentConfig{})
+		require.ErrorIs(t, c.OpenStream(91, false, false, "/x"), syscall.ENOTSUP)
+	})
+	t.Run("legacy_debug", func(t *testing.T) {
+		c := NewObjExtentClient(ObjExtentConfig{})
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyFunc(log.EnableDebug, func() bool { return true })
+		require.ErrorIs(t, c.OpenStream(1, true, false, "/p"), syscall.ENOTSUP)
+	})
 }
 
 func TestECExtentClient_CloseStream_debug_ref_positive(t *testing.T) {
@@ -77,27 +98,40 @@ func TestECExtentClient_EvictStream_debug_log(t *testing.T) {
 	require.Nil(t, c.GetStreamer(93))
 }
 
-func TestECExtentClient_SetStreamerForTest_nil_noop(t *testing.T) {
-	c := NewObjExtentClient(ObjExtentConfig{})
-	setStreamerForTest(c, 1, nil)
-}
-
-func TestECExtentClient_ReadWriteFlush_Truncate_nil_stream(t *testing.T) {
-	c := NewObjExtentClient(ObjExtentConfig{})
-	_, err := c.Read(9, make([]byte, 1), 0, 1)
-	require.ErrorIs(t, err, syscall.EBADF)
-	_, err = c.Write(9, 0, []byte("x"), 0)
-	require.ErrorIs(t, err, syscall.EBADF)
-	require.ErrorIs(t, c.Flush(9), syscall.EBADF)
-	require.ErrorIs(t, c.Truncate(0, 9, 10, "/p"), syscall.EBADF)
-}
-
-func TestECExtentClient_Truncate_EBADF_no_writer(t *testing.T) {
-	c := NewObjExtentClient(ObjExtentConfig{})
-	s := mustTestECStreamer(200, nil, nil)
-	s.fWriter = nil
-	setStreamerForTest(c, 200, s)
-	require.ErrorIs(t, c.Truncate(0, 200, 10, "/p"), syscall.EBADF)
+func TestECExtentClient_EBADF_without_stream(t *testing.T) {
+	t.Run("read_write_flush_truncate", func(t *testing.T) {
+		c := NewObjExtentClient(ObjExtentConfig{})
+		_, err := c.Read(9, make([]byte, 1), 0, 1)
+		require.ErrorIs(t, err, syscall.EBADF)
+		_, err = c.Write(9, 0, []byte("x"), 0)
+		require.ErrorIs(t, err, syscall.EBADF)
+		require.ErrorIs(t, c.Flush(9), syscall.EBADF)
+		require.ErrorIs(t, c.Truncate(0, 9, 10, "/p"), syscall.EBADF)
+	})
+	t.Run("read_only", func(t *testing.T) {
+		c := NewObjExtentClient(ObjExtentConfig{})
+		_, err := c.Read(99, []byte{0}, 0, 1)
+		require.ErrorIs(t, err, syscall.EBADF)
+	})
+	t.Run("write_and_read", func(t *testing.T) {
+		c := NewObjExtentClient(ObjExtentConfig{})
+		_, err := c.Write(9, 0, []byte("x"), 0)
+		require.ErrorIs(t, err, syscall.EBADF)
+		_, err = c.Read(9, make([]byte, 1), 0, 1)
+		require.ErrorIs(t, err, syscall.EBADF)
+	})
+	t.Run("flush_and_truncate", func(t *testing.T) {
+		c := NewObjExtentClient(ObjExtentConfig{})
+		require.ErrorIs(t, c.Flush(8), syscall.EBADF)
+		require.ErrorIs(t, c.Truncate(0, 8, 10, "/p"), syscall.EBADF)
+	})
+	t.Run("truncate_no_writer", func(t *testing.T) {
+		c := NewObjExtentClient(ObjExtentConfig{})
+		s := mustTestECStreamer(200, nil, nil)
+		s.fWriter = nil
+		setStreamerForTest(c, 200, s)
+		require.ErrorIs(t, c.Truncate(0, 200, 10, "/p"), syscall.EBADF)
+	})
 }
 
 func TestECExtentClient_Read_nil_ctx(t *testing.T) {
@@ -276,7 +310,7 @@ func TestECExtentClient_OpenStreamWithArgs_merge_snapshot(t *testing.T) {
 	require.GreaterOrEqual(t, gen, uint64(2))
 }
 
-func TestECExtentClient_GetStreamer_Reader_Writer_missing_logs(t *testing.T) {
+func TestECExtentClient_GetStreamer_Reader_Writer_missing(t *testing.T) {
 	c := NewObjExtentClient(ObjExtentConfig{})
 	require.Nil(t, c.GetStreamer(999))
 	require.Nil(t, c.Reader(999))
@@ -355,12 +389,6 @@ func TestECExtentClient_CloseStream_ref_gt_zero_flush_err_rollback(t *testing.T)
 	require.Equal(t, int32(2), atomic.LoadInt32(&s.refCnt))
 }
 
-func TestECExtentClient_Read_nil_stream(t *testing.T) {
-	c := NewObjExtentClient(ObjExtentConfig{})
-	_, err := c.Read(99, []byte{0}, 0, 1)
-	require.ErrorIs(t, err, syscall.EBADF)
-}
-
 func TestECExtentClient_EvictStream_ok_delete(t *testing.T) {
 	c := NewObjExtentClient(ObjExtentConfig{})
 	s := mustTestECStreamer(60, nil, nil)
@@ -401,16 +429,33 @@ func TestECExtentClient_Close_evicts_all(t *testing.T) {
 }
 
 func TestECExtentClient_RefreshExtentsCache(t *testing.T) {
-	c := NewObjExtentClient(ObjExtentConfig{})
-	require.NoError(t, c.RefreshExtentsCache(404))
+	t.Run("missing_stream_noop", func(t *testing.T) {
+		c := NewObjExtentClient(ObjExtentConfig{})
+		require.NoError(t, c.RefreshExtentsCache(404))
+	})
+	t.Run("delegates_when_present", func(t *testing.T) {
+		c := NewObjExtentClient(ObjExtentConfig{})
+		s := mustTestECStreamer(405, nil, nil)
+		setStreamerForTest(c, 405, s)
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyMethod(reflect.TypeOf(s), "RefreshExtentsCache",
+			func(_ *ECStreamer) error { return nil })
+		require.NoError(t, c.RefreshExtentsCache(405))
+	})
+}
 
-	s := mustTestECStreamer(405, nil, nil)
-	setStreamerForTest(c, 405, s)
-	patches := gomonkey.NewPatches()
-	defer patches.Reset()
-	patches.ApplyMethod(reflect.TypeOf(s), "RefreshExtentsCache",
-		func(_ *ECStreamer) error { return nil })
-	require.NoError(t, c.RefreshExtentsCache(405))
+func TestECExtentClient_IsDirty(t *testing.T) {
+	c := NewObjExtentClient(ObjExtentConfig{})
+	require.False(t, c.IsDirty(99))
+
+	s := mustTestECStreamer(201, nil, nil)
+	setStreamerForTest(c, 201, s)
+	require.False(t, c.IsDirty(201))
+
+	s.markDirty()
+	require.True(t, c.IsDirty(201))
+	require.False(t, c.IsDirty(202))
 }
 
 func TestECExtentClient_FileSize(t *testing.T) {
@@ -430,14 +475,43 @@ func TestECExtentClient_FileSize(t *testing.T) {
 	require.Equal(t, uint64(7), gen)
 }
 
-func TestECExtentClient_CloseStream_missing_ino(t *testing.T) {
+func TestECExtentClient_FileSize_uses_max_of_meta_tail_and_writer_tail(t *testing.T) {
 	c := NewObjExtentClient(ObjExtentConfig{})
-	require.NoError(t, c.CloseStream(99999))
+	w := &Writer{fileOffset: 800}
+	s := mustTestECStreamer(203, nil, w)
+	atomic.StoreUint64(&s.fileSize, 500)
+	atomic.StoreUint64(&s.inoVersion, 9)
+	setStreamerForTest(c, 203, s)
+
+	sz, gen, ok := c.FileSize(203)
+	require.True(t, ok)
+	require.Equal(t, 800, sz)
+	require.Equal(t, uint64(9), gen)
 }
 
-func TestECExtentClient_EvictStream_missing_ino(t *testing.T) {
+func TestECExtentClient_FileSize_writer_tail_below_atomic_fileSize(t *testing.T) {
 	c := NewObjExtentClient(ObjExtentConfig{})
-	require.NoError(t, c.EvictStream(99998))
+	w := &Writer{fileOffset: 116736, blockPosition: 2048}
+	s := mustTestECStreamer(205, nil, w)
+	atomic.StoreUint64(&s.fileSize, 829440)
+	setStreamerForTest(c, 205, s)
+
+	sz, _, ok := c.FileSize(205)
+	require.True(t, ok)
+	require.Equal(t, 829440, sz)
+}
+
+func TestECExtentClient_missing_ino_noop(t *testing.T) {
+	c := NewObjExtentClient(ObjExtentConfig{})
+	t.Run("close_stream", func(t *testing.T) {
+		require.NoError(t, c.CloseStream(99999))
+	})
+	t.Run("evict_stream", func(t *testing.T) {
+		require.NoError(t, c.EvictStream(99998))
+	})
+	t.Run("obj_extent_client_close_stream", func(t *testing.T) {
+		require.NoError(t, c.CloseStream(404))
+	})
 }
 
 func TestECExtentClient_OpenStreamWithArgs_new_streamer_error(t *testing.T) {
@@ -451,50 +525,38 @@ func TestECExtentClient_OpenStreamWithArgs_new_streamer_error(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestECExtentClient_OpenStreamWithArgs_creates_streamer(t *testing.T) {
-	c := NewObjExtentClient(ObjExtentConfig{})
-	args := ECStreamOpenArgs{Ino: 77, VolName: "v", BlockSize: 4096, Mw: &meta.MetaWrapper{}}
-	require.NoError(t, c.OpenStreamWithArgs(args))
-	require.Equal(t, int32(1), c.RefCnt(77))
-	require.NotNil(t, c.GetStreamer(77))
+func TestECExtentClient_OpenStreamWithArgs_basic(t *testing.T) {
+	t.Run("creates_streamer", func(t *testing.T) {
+		c := NewObjExtentClient(ObjExtentConfig{})
+		args := ECStreamOpenArgs{Ino: 77, VolName: "v", BlockSize: 4096, Mw: &meta.MetaWrapper{}}
+		require.NoError(t, c.OpenStreamWithArgs(args))
+		require.Equal(t, int32(1), c.RefCnt(77))
+		require.NotNil(t, c.GetStreamer(77))
+	})
 }
 
-func TestECExtentClient_OpenStream_legacy_ENOTSUP(t *testing.T) {
+func TestECExtentClient_nil_streamer_in_map(t *testing.T) {
 	c := NewObjExtentClient(ObjExtentConfig{})
-	patches := gomonkey.NewPatches()
-	defer patches.Reset()
-	patches.ApplyFunc(log.EnableDebug, func() bool { return true })
-	require.ErrorIs(t, c.OpenStream(1, true, false, "/p"), syscall.ENOTSUP)
-}
-
-func TestECExtentClient_Write_and_Read_EBADF(t *testing.T) {
-	c := NewObjExtentClient(ObjExtentConfig{})
-	_, err := c.Write(9, 0, []byte("x"), 0)
-	require.ErrorIs(t, err, syscall.EBADF)
-	_, err = c.Read(9, make([]byte, 1), 0, 1)
-	require.ErrorIs(t, err, syscall.EBADF)
-}
-
-func TestECExtentClient_Flush_and_Truncate_EBADF(t *testing.T) {
-	c := NewObjExtentClient(ObjExtentConfig{})
-	require.ErrorIs(t, c.Flush(8), syscall.EBADF)
-	require.ErrorIs(t, c.Truncate(0, 8, 10, "/p"), syscall.EBADF)
-}
-
-func TestECExtentClient_needsReadViewSyncForTest_nil_streamer_in_map(t *testing.T) {
-	c := NewObjExtentClient(ObjExtentConfig{})
-	c.mu.Lock()
-	c.streamers[87] = nil
-	c.mu.Unlock()
-	require.False(t, needsReadViewSyncForTest(c, 87))
-}
-
-func TestECExtentClient_RefreshExtentsCache_nil_streamer_in_map(t *testing.T) {
-	c := NewObjExtentClient(ObjExtentConfig{})
-	c.mu.Lock()
-	c.streamers[88] = nil
-	c.mu.Unlock()
-	require.NoError(t, c.RefreshExtentsCache(88))
+	t.Run("needs_read_view_sync", func(t *testing.T) {
+		c.mu.Lock()
+		c.streamers[87] = nil
+		c.mu.Unlock()
+		require.False(t, needsReadViewSyncForTest(c, 87))
+	})
+	t.Run("refresh_extents_cache", func(t *testing.T) {
+		c.mu.Lock()
+		c.streamers[88] = nil
+		c.mu.Unlock()
+		require.NoError(t, c.RefreshExtentsCache(88))
+	})
+	t.Run("reader_writer_ref", func(t *testing.T) {
+		c.mu.Lock()
+		c.streamers[99] = nil
+		c.mu.Unlock()
+		require.Nil(t, c.Reader(99))
+		require.Nil(t, c.Writer(99))
+		require.Equal(t, int32(0), c.RefCnt(99))
+	})
 }
 
 func TestECExtentClient_NeedRefreshObjExtents(t *testing.T) {
@@ -535,12 +597,25 @@ func TestECExtentClient_Truncate_delegates(t *testing.T) {
 	require.NoError(t, c.Truncate(0, 89, 99, "/p"))
 }
 
-func TestECExtentClient_RefreshExtentsCache_no_stream_noop(t *testing.T) {
-	c := NewObjExtentClient(ObjExtentConfig{})
-	require.NoError(t, c.RefreshExtentsCache(404))
+func TestECExtentClient_EvictStream_ref_edges(t *testing.T) {
+	t.Run("ref_positive_keeps_streamer", func(t *testing.T) {
+		c := NewObjExtentClient(ObjExtentConfig{})
+		s := mustTestECStreamer(57, nil, nil)
+		atomic.StoreInt32(&s.refCnt, 2)
+		setStreamerForTest(c, 57, s)
+		require.NoError(t, c.EvictStream(57))
+		require.NotNil(t, c.GetStreamer(57))
+	})
+	t.Run("ref_zero_removes_streamer", func(t *testing.T) {
+		c := NewObjExtentClient(ObjExtentConfig{})
+		s := mustTestECStreamer(58, nil, nil)
+		setStreamerForTest(c, 58, s)
+		require.NoError(t, c.EvictStream(58))
+		require.Nil(t, c.GetStreamer(58))
+	})
 }
 
-func TestECExtentClient_CloseStream_negative_ref(t *testing.T) {
+func TestECExtentClient_CloseStream_zero_ref(t *testing.T) {
 	c := NewObjExtentClient(ObjExtentConfig{})
 	s := mustTestECStreamer(55, nil, nil)
 	atomic.StoreInt32(&s.refCnt, 0)
@@ -563,33 +638,6 @@ func TestECExtentClient_Write_delegates_to_streamer(t *testing.T) {
 	require.Equal(t, 2, n)
 }
 
-func TestECExtentClient_EvictStream_ref_positive_noop(t *testing.T) {
-	c := NewObjExtentClient(ObjExtentConfig{})
-	s := mustTestECStreamer(57, nil, nil)
-	atomic.StoreInt32(&s.refCnt, 2)
-	setStreamerForTest(c, 57, s)
-	require.NoError(t, c.EvictStream(57))
-	require.NotNil(t, c.GetStreamer(57))
-}
-
-func TestECExtentClient_EvictStream_removes_when_ref_zero(t *testing.T) {
-	c := NewObjExtentClient(ObjExtentConfig{})
-	s := mustTestECStreamer(58, nil, nil)
-	setStreamerForTest(c, 58, s)
-	require.NoError(t, c.EvictStream(58))
-	require.Nil(t, c.GetStreamer(58))
-}
-
-func TestECExtentClient_Reader_nil_streamer_in_map_logs(t *testing.T) {
-	c := NewObjExtentClient(ObjExtentConfig{})
-	c.mu.Lock()
-	c.streamers[99] = nil
-	c.mu.Unlock()
-	require.Nil(t, c.Reader(99))
-	require.Nil(t, c.Writer(99))
-	require.Equal(t, int32(0), c.RefCnt(99))
-}
-
 func TestECExtentClient_OpenStreamWithArgs_existing_streamer(t *testing.T) {
 	c := NewObjExtentClient(ObjExtentConfig{})
 	s := mustTestECStreamer(59, nil, nil)
@@ -606,13 +654,6 @@ func TestECExtentClient_Close_evicts_all_streamers(t *testing.T) {
 	require.NoError(t, c.Close())
 	require.Nil(t, c.GetStreamer(61))
 	require.Nil(t, c.GetStreamer(62))
-}
-
-func TestECExtentClient_SetStreamerForTest_nil_safe(t *testing.T) {
-	c := NewObjExtentClient(ObjExtentConfig{})
-	setStreamerForTest(c, 1, nil)
-	var nilC *ECExtentClient
-	setStreamerForTest(nilC, 1, mustTestECStreamer(1, nil, nil))
 }
 
 func TestObjExtentClient_FileSizeUsesStreamerSize(t *testing.T) {
@@ -687,11 +728,6 @@ func TestObjExtentClient_EvictStreamWritableRefBusyReturnsNil(t *testing.T) {
 
 	require.NoError(t, c.EvictStream(55))
 	require.NotNil(t, c.streamers[55])
-}
-
-func TestObjExtentClient_CloseStreamMissingIsNoop(t *testing.T) {
-	c := NewObjExtentClient(ObjExtentConfig{})
-	require.NoError(t, c.CloseStream(999))
 }
 
 func TestObjExtentClient_CloseEvictsAllStreams(t *testing.T) {

@@ -20,9 +20,21 @@ import (
 	"github.com/cubefs/cubefs/sdk/meta"
 )
 
-func TestECStreamer_String_nil_receiver(t *testing.T) {
-	var s *ECStreamer
-	require.Equal(t, "ECStreamer{nil}", s.String())
+func TestECStreamer_nil_receiver_edges(t *testing.T) {
+	t.Run("string", func(t *testing.T) {
+		var s *ECStreamer
+		require.Equal(t, "ECStreamer{nil}", s.String())
+	})
+	t.Run("file_size_view", func(t *testing.T) {
+		var s *ECStreamer
+		sz, gen := s.FileSizeView()
+		require.Equal(t, 0, sz)
+		require.Equal(t, uint64(0), gen)
+	})
+	t.Run("raise_file_size", func(t *testing.T) {
+		var s *ECStreamer
+		s.raiseFileSize(100)
+	})
 }
 
 func TestECStreamer_Accessors_and_NewReaderWriter(t *testing.T) {
@@ -52,30 +64,39 @@ func TestECStreamer_isDirty_and_FileSizeView(t *testing.T) {
 	require.True(t, s.isDirty())
 }
 
-func TestECStreamer_Flush_when_not_dirty(t *testing.T) {
-	s := mustTestECStreamer(11, nil, nil)
-	require.NoError(t, s.Flush(context.Background()))
+func TestECStreamer_Flush_short(t *testing.T) {
+	t.Run("not_dirty_noop", func(t *testing.T) {
+		s := mustTestECStreamer(11, nil, nil)
+		require.NoError(t, s.Flush(context.Background()))
+	})
+	t.Run("dirty_empty_buffer_cleans", func(t *testing.T) {
+		s := mustTestECStreamer(12, nil, nil)
+		seedDirtyForTest(s)
+		require.NoError(t, s.Flush(context.Background()))
+		require.False(t, s.isDirty())
+	})
+	t.Run("flush_and_free_cache", func(t *testing.T) {
+		s := mustTestECStreamer(26, nil, nil)
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyMethod(reflect.TypeOf(s.fWriter), "FreeCache", func(_ *Writer) {})
+		require.NoError(t, flushAndFreeCacheForTest(s, context.Background()))
+	})
 }
 
-func TestECStreamer_Flush_dirty_cleans_after_empty_buffer(t *testing.T) {
-	s := mustTestECStreamer(12, nil, nil)
-	seedDirtyForTest(s)
-	require.NoError(t, s.Flush(context.Background()))
-	require.False(t, s.isDirty())
-}
-
-func TestECStreamer_Read_reader_nil_EBADF(t *testing.T) {
-	s := mustTestECStreamer(13, nil, nil)
-	s.fReader = nil
-	_, err := s.Read(context.Background(), make([]byte, 2), 0, 1)
-	require.ErrorIs(t, err, syscall.EBADF)
-}
-
-func TestECStreamer_Read_zero_size(t *testing.T) {
-	s := mustTestECStreamer(28, nil, nil)
-	n, err := s.Read(context.Background(), make([]byte, 4), 0, 0)
-	require.NoError(t, err)
-	require.Equal(t, 0, n)
+func TestECStreamer_Read_short(t *testing.T) {
+	t.Run("reader_nil_EBADF", func(t *testing.T) {
+		s := mustTestECStreamer(13, nil, nil)
+		s.fReader = nil
+		_, err := s.Read(context.Background(), make([]byte, 2), 0, 1)
+		require.ErrorIs(t, err, syscall.EBADF)
+	})
+	t.Run("zero_size", func(t *testing.T) {
+		s := mustTestECStreamer(28, nil, nil)
+		n, err := s.Read(context.Background(), make([]byte, 4), 0, 0)
+		require.NoError(t, err)
+		require.Equal(t, 0, n)
+	})
 }
 
 func TestECStreamer_Read_get_extents_error(t *testing.T) {
@@ -124,14 +145,6 @@ func TestECStreamer_Read_dirty_flushes_before_read(t *testing.T) {
 	require.False(t, s.isDirty())
 }
 
-func TestECStreamer_FlushAndFreeCache(t *testing.T) {
-	s := mustTestECStreamer(26, nil, nil)
-	patches := gomonkey.NewPatches()
-	defer patches.Reset()
-	patches.ApplyMethod(reflect.TypeOf(s.fWriter), "FreeCache", func(_ *Writer) {})
-	require.NoError(t, flushAndFreeCacheForTest(s, context.Background()))
-}
-
 func TestECStreamer_Flush_writer_flush_error(t *testing.T) {
 	s := mustTestECStreamer(27, nil, nil)
 	patches := gomonkey.NewPatches()
@@ -154,11 +167,19 @@ func TestECStreamer_Write_delegates_to_writer(t *testing.T) {
 	require.Equal(t, 2, n)
 }
 
-func TestECStreamer_Write_writer_nil_EBADF(t *testing.T) {
-	s := mustTestECStreamer(14, nil, nil)
-	s.fWriter = nil
-	_, err := s.Write(context.Background(), 0, []byte("x"), 0)
-	require.ErrorIs(t, err, syscall.EBADF)
+func TestECStreamer_Write_short(t *testing.T) {
+	t.Run("writer_nil_EBADF", func(t *testing.T) {
+		s := mustTestECStreamer(14, nil, nil)
+		s.fWriter = nil
+		_, err := s.Write(context.Background(), 0, []byte("x"), 0)
+		require.ErrorIs(t, err, syscall.EBADF)
+	})
+	t.Run("empty_data", func(t *testing.T) {
+		s := mustTestECStreamer(34, nil, nil)
+		n, err := s.Write(context.Background(), 0, nil, 0)
+		require.NoError(t, err)
+		require.Equal(t, 0, n)
+	})
 }
 
 func TestECStreamer_updateMetaInfo_dirty_with_buffer_keeps_dirty(t *testing.T) {
@@ -197,6 +218,7 @@ func TestECStreamer_updateMetaInfo_with_commitSize(t *testing.T) {
 	require.NoError(t, s.updateMetaInfo(&commit))
 	require.False(t, s.isDirty())
 	require.Equal(t, uint64(60), atomic.LoadUint64(&s.fileSize))
+	require.Equal(t, uint64(3), atomic.LoadUint64(&s.inoVersion))
 	require.Equal(t, 60, w.fileOffset)
 }
 
@@ -385,10 +407,17 @@ func TestECStreamer_closeReaderWriterLocked_flush_err(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestECStreamer_Truncate_public_api(t *testing.T) {
-	s := mustTestECStreamer(29, nil, nil)
-	s.fWriter = nil
-	require.ErrorIs(t, s.Truncate(context.Background(), 10, "/p"), syscall.EBADF)
+func TestECStreamer_mergeInodeGen_and_Truncate(t *testing.T) {
+	t.Run("merge_inode_gen_zero_noop", func(t *testing.T) {
+		s := mustTestECStreamer(36, nil, nil)
+		s.mergeInodeGen(0)
+		require.Equal(t, uint64(0), atomic.LoadUint64(&s.inoVersion))
+	})
+	t.Run("truncate_public_api_no_writer", func(t *testing.T) {
+		s := mustTestECStreamer(29, nil, nil)
+		s.fWriter = nil
+		require.ErrorIs(t, s.Truncate(context.Background(), 10, "/p"), syscall.EBADF)
+	})
 }
 
 func TestECStreamer_flushExt_empty_dirty_only_meta(t *testing.T) {
@@ -432,13 +461,6 @@ func TestECStreamer_HasObjExtents(t *testing.T) {
 	require.True(t, s.HasObjExtents())
 }
 
-func TestECStreamer_Write_empty_data(t *testing.T) {
-	s := mustTestECStreamer(34, nil, nil)
-	n, err := s.Write(context.Background(), 0, nil, 0)
-	require.NoError(t, err)
-	require.Equal(t, 0, n)
-}
-
 func TestECStreamer_updateMetaInfo_dirty_with_buffer(t *testing.T) {
 	w := &Writer{fileOffset: 60, blockPosition: 5}
 	s := mustTestECStreamer(35, nil, w)
@@ -457,15 +479,52 @@ func TestECStreamer_updateMetaInfo_dirty_with_buffer(t *testing.T) {
 	require.Equal(t, uint64(60), atomic.LoadUint64(&s.fileSize))
 }
 
-func TestECStreamer_raiseFileSize_zero_lb_skipped(t *testing.T) {
-	s := mustTestECStreamer(32, nil, nil)
-	s.raiseFileSize(0)
-	require.Equal(t, uint64(0), atomic.LoadUint64(&s.fileSize))
+func TestECStreamer_updateMetaInfo_dirty_with_buffer_stale_meta_tail_capped(t *testing.T) {
+	w := &Writer{fileOffset: 952320, blockPosition: 2048}
+	s := mustTestECStreamer(38, nil, w)
+	atomic.StoreUint64(&s.fileSize, 952320)
+	seedDirtyForTest(s)
+	s.mw = &meta.MetaWrapper{}
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "GetObjExtents",
+		func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
+			return 9, 1038336, nil, []proto.ObjExtentKey{{FileOffset: 950272, Size: 2048}}, nil
+		})
+	patches.ApplyPrivateMethod(reflect.TypeOf(w), "bufferDirtyLen", func(_ *Writer) int { return 2048 })
+
+	require.NoError(t, s.updateMetaInfo(nil))
+	require.True(t, s.isDirty())
+	require.Equal(t, uint64(1038336), atomic.LoadUint64(&s.fileSize))
 }
 
-func TestECStreamer_raiseFileSize_nil_streamer(t *testing.T) {
-	var s *ECStreamer
-	s.raiseFileSize(100)
+func TestECStreamer_updateMetaInfo_dirty_with_buffer_middle_overwrite_keeps_tail(t *testing.T) {
+	w := &Writer{fileOffset: 116736, blockPosition: 2048}
+	s := mustTestECStreamer(39, nil, w)
+	atomic.StoreUint64(&s.fileSize, 829440)
+	seedDirtyForTest(s)
+	s.mw = &meta.MetaWrapper{}
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "GetObjExtents",
+		func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
+			return 9, 829440, nil, []proto.ObjExtentKey{{FileOffset: 0, Size: 829440}}, nil
+		})
+	patches.ApplyPrivateMethod(reflect.TypeOf(w), "bufferDirtyLen", func(_ *Writer) int { return 2048 })
+
+	require.NoError(t, s.updateMetaInfo(nil))
+	require.True(t, s.isDirty())
+	require.Equal(t, uint64(829440), atomic.LoadUint64(&s.fileSize))
+}
+
+func TestECStreamer_raiseFileSize_edges(t *testing.T) {
+	t.Run("zero_lb_skipped", func(t *testing.T) {
+		s := mustTestECStreamer(32, nil, nil)
+		s.raiseFileSize(0)
+		require.Equal(t, uint64(0), atomic.LoadUint64(&s.fileSize))
+	})
 }
 
 func TestECStreamer_updateMetaInfo_under_mu(t *testing.T) {
@@ -482,12 +541,6 @@ func TestECStreamer_updateMetaInfo_under_mu(t *testing.T) {
 	s.mu.Unlock()
 	require.NoError(t, err)
 	require.Equal(t, uint64(40), atomic.LoadUint64(&s.fileSize))
-}
-
-func TestECStreamer_mergeInodeGen_zero_noop(t *testing.T) {
-	s := mustTestECStreamer(36, nil, nil)
-	s.mergeInodeGen(0)
-	require.Equal(t, uint64(0), atomic.LoadUint64(&s.inoVersion))
 }
 
 func TestECStreamer_updateMetaInfo_dirty_without_buffer(t *testing.T) {
@@ -771,13 +824,6 @@ func TestECStreamer_truncateV2_shrink_truncateV2_error(t *testing.T) {
 	s.mu.Unlock()
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "truncate failed")
-}
-
-func TestECStreamer_FileSizeView_nil(t *testing.T) {
-	var s *ECStreamer
-	sz, gen := s.FileSizeView()
-	require.Equal(t, 0, sz)
-	require.Equal(t, uint64(0), gen)
 }
 
 func TestECStreamer_truncateV2_shrink_invalid_empty_delta(t *testing.T) {

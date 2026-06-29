@@ -248,6 +248,17 @@ func (c *ECExtentClient) RefCnt(ino uint64) int32 {
 	return atomic.LoadInt32(&s.refCnt)
 }
 
+// IsDirty reports whether an open stream has unflushed writer data for ino.
+func (c *ECExtentClient) IsDirty(ino uint64) bool {
+	c.mu.RLock()
+	s, ok := c.streamers[ino]
+	c.mu.RUnlock()
+	if s == nil || !ok {
+		return false
+	}
+	return s.isDirty()
+}
+
 // FileSize returns current logical tail and inoVersion; aligned with replica ExtentClient.FileSize.
 // For callers without inode merge rules; fstat/getattr use client/fs fileSizeVersion2.
 func (c *ECExtentClient) FileSize(ino uint64) (size int, gen uint64, valid bool) {

@@ -349,10 +349,18 @@ func TestComputeTruncateReqs_PartialSpan(t *testing.T) {
 	require.Equal(t, uint64(100), req.DiscardFrom.Size)
 }
 
-func TestComputeTruncateReqs_EmptyInput(t *testing.T) {
-	req := ComputeTruncateReqs(100, nil)
-	require.True(t, req.KeepExtent.IsEmpty())
-	require.True(t, req.DiscardFrom.IsEmpty())
+func TestComputeTruncateReqs_edge_cases(t *testing.T) {
+	t.Run("empty_input", func(t *testing.T) {
+		req := ComputeTruncateReqs(100, nil)
+		require.True(t, req.KeepExtent.IsEmpty())
+		require.True(t, req.DiscardFrom.IsEmpty())
+	})
+	t.Run("all_keep_no_discard", func(t *testing.T) {
+		eks := []cproto.ObjExtentKey{{FileOffset: 0, Size: 100}}
+		req := ComputeTruncateReqs(100, eks)
+		require.True(t, req.KeepExtent.IsEmpty())
+		require.True(t, req.DiscardFrom.IsEmpty())
+	})
 }
 
 func TestComputeTruncateReqs_tail_only_discard(t *testing.T) {
@@ -376,13 +384,6 @@ func TestComputeTruncateReqs_unsorted_input(t *testing.T) {
 	require.True(t, req.KeepExtent.IsEmpty())
 	require.Equal(t, uint64(100), req.DiscardFrom.FileOffset)
 	require.Equal(t, uint64(50), req.DiscardFrom.Size)
-}
-
-func TestComputeTruncateReqs_all_keep_no_discard(t *testing.T) {
-	eks := []cproto.ObjExtentKey{{FileOffset: 0, Size: 100}}
-	req := ComputeTruncateReqs(100, eks)
-	require.True(t, req.KeepExtent.IsEmpty())
-	require.True(t, req.DiscardFrom.IsEmpty())
 }
 
 func TestCreateOPMetric_and_createOPMetricBySize(t *testing.T) {

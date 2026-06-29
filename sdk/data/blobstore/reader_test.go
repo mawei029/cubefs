@@ -142,12 +142,23 @@ func Test_logicalReadBound(t *testing.T) {
 	}
 }
 
-func TestECStreamer_fileSizeView_with_writer_tail(t *testing.T) {
+func TestECStreamer_fileSizeViewLocked_with_writer_tail(t *testing.T) {
 	s := mustTestECStreamer(1, nil, nil)
 	SeedLogicalViewForTest(s, 100, 1)
 	w := s.fWriter
 	w.fileOffset = 500
-	require.Equal(t, uint64(500), s.fileSizeView())
+	s.mu.Lock()
+	require.Equal(t, uint64(500), s.fileSizeViewLocked())
+	s.mu.Unlock()
+}
+
+func TestECStreamer_FileSizeView_includes_writer_tail(t *testing.T) {
+	s := mustTestECStreamer(2, nil, nil)
+	SeedLogicalViewForTest(s, 100, 1)
+	s.fWriter.fileOffset = 500
+	sz, gen := s.FileSizeView()
+	require.Equal(t, 500, sz)
+	require.Equal(t, uint64(1), gen)
 }
 
 func TestPrepareEbsSlice_sparseHeadMiddleTailHoles(t *testing.T) {

@@ -104,29 +104,57 @@ func TestNotInstanceWriter_Write(t *testing.T) {
 
 // TestWriter_TruncateV2_NilReturnsError 校验 nil Writer 调用 TruncateV2 返回错误（EC truncate 基本分支）。
 
-func TestNewWriter_panicsWithoutECStreamer(t *testing.T) {
-	defer func() {
-		require.NotNil(t, recover())
-	}()
-	_ = NewWriter(ClientConfig{VolName: "v", Ino: 1})
+func TestNewWriter(t *testing.T) {
+	t.Run("panics_without_ec_streamer", func(t *testing.T) {
+		defer func() {
+			require.NotNil(t, recover())
+		}()
+		_ = NewWriter(ClientConfig{VolName: "v", Ino: 1})
+	})
+	t.Run("no_write_buf_on_create", func(t *testing.T) {
+		buf.InitCachePool(1024, 4)
+		st := mustTestECStreamer(410, nil, nil)
+		w := NewWriter(ClientConfig{ECStreamer: st, LimitManager: newTestLimitManager()})
+		require.Nil(t, w.buf)
+	})
+	t.Run("creates_with_config", func(t *testing.T) {
+		config := ClientConfig{
+			VolName:         "cfs",
+			VolType:         1,
+			BlockSize:       1 << 23,
+			Ino:             1000,
+			Bc:              nil,
+			Mw:              nil,
+			LimitManager:    newTestLimitManager(),
+			Ebsc:            nil,
+			EnableBcache:    false,
+			WConcurrency:    10,
+			ReadConcurrency: 10,
+			FileCache:       false,
+			FileSize:        0,
+			ECStreamer:      mustTestECStreamer(1000, nil, nil),
+		}
+		w := NewWriter(config)
+		_ = w.String()
+		require.NotNil(t, w)
+	})
 }
 
-func TestWriter_TruncateV2_NilReturnsError(t *testing.T) {
-	w := newNilWriter()
-	ctx := context.Background()
-	_, _, err := truncateV2ForTest(w, ctx, 100)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "nil")
-}
-
-// TestWriter_TruncateV2FromExtents_NilReturnsError 校验 nil Writer 调用 TruncateV2FromExtents 返回错误。
-
-func TestWriter_TruncateV2FromExtents_NilReturnsError(t *testing.T) {
-	w := newNilWriter()
-	ctx := context.Background()
-	_, _, err := w.TruncateV2FromExtents(ctx, 100, 200, nil)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "nil")
+func TestWriter_TruncateV2_nil(t *testing.T) {
+	t.Run("truncate_v2", func(t *testing.T) {
+		w := newNilWriter()
+		ctx := context.Background()
+		_, _, err := truncateV2ForTest(w, ctx, 100)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "nil")
+	})
+	t.Run("truncate_v2_from_extents", func(t *testing.T) {
+		w := newNilWriter()
+		ctx := context.Background()
+		_, _, err := w.TruncateV2FromExtents(ctx, 100, 200, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "nil")
+	})
 }
 
 func TestWriter_TruncateV2FromExtentsNilEbsc(t *testing.T) {
@@ -275,28 +303,6 @@ func TestParallelWrite(t *testing.T) {
 	}
 
 	_, _ = writer.doParallelWrite(ctx, data, offset)
-}
-
-func TestNewWriter(t *testing.T) {
-	config := ClientConfig{
-		VolName:         "cfs",
-		VolType:         1,
-		BlockSize:       1 << 23,
-		Ino:             1000,
-		Bc:              nil,
-		Mw:              nil,
-		LimitManager:    newTestLimitManager(),
-		Ebsc:            nil,
-		EnableBcache:    false,
-		WConcurrency:    10,
-		ReadConcurrency: 10,
-		FileCache:       false,
-		FileSize:        0,
-		ECStreamer:      mustTestECStreamer(1000, nil, nil),
-	}
-	w := NewWriter(config)
-	_ = w.String()
-	require.NotNil(t, w)
 }
 
 func TestBufferWrite(t *testing.T) {
@@ -775,18 +781,26 @@ func TestWriterCoverageMoreLowFunctions(t *testing.T) {
 	})
 }
 
-func TestWriter_Flush_not_dirty_noop(t *testing.T) {
-	s := mustTestECStreamer(301, nil, nil)
-	w := s.fWriter
-	require.NoError(t, w.Flush(301, context.Background()))
-}
-
-func TestWriter_Flush_dirty_empty_buffer_cleans(t *testing.T) {
-	s := mustTestECStreamer(302, nil, nil)
-	w := s.fWriter
-	seedDirtyForTest(s)
-	require.NoError(t, w.Flush(302, context.Background()))
-	require.False(t, s.isDirty())
+func TestWriter_Flush_and_notify(t *testing.T) {
+	t.Run("not_dirty_noop", func(t *testing.T) {
+		s := mustTestECStreamer(301, nil, nil)
+		w := s.fWriter
+		require.NoError(t, w.Flush(301, context.Background()))
+	})
+	t.Run("dirty_empty_buffer_cleans", func(t *testing.T) {
+		s := mustTestECStreamer(302, nil, nil)
+		w := s.fWriter
+		seedDirtyForTest(s)
+		require.NoError(t, w.Flush(302, context.Background()))
+		require.False(t, s.isDirty())
+	})
+	t.Run("notify_after_write_marks_dirty", func(t *testing.T) {
+		w := &Writer{fileOffset: 32}
+		s := mustTestECStreamer(304, nil, w)
+		w.notifyAfterWrite()
+		require.True(t, s.isDirty())
+		require.Equal(t, uint64(32), atomic.LoadUint64(&s.fileSize))
+	})
 }
 
 func TestWriter_notifyCompleteFlushMeta_cleans_dirty(t *testing.T) {
@@ -805,14 +819,6 @@ func TestWriter_notifyCompleteFlushMeta_cleans_dirty(t *testing.T) {
 	require.NoError(t, w.notifyCompleteFlushMeta())
 	require.False(t, s.isDirty())
 	require.Equal(t, 0, w.bufferDirtyLen())
-}
-
-func TestWriter_notifyAfterWrite_marks_dirty(t *testing.T) {
-	w := &Writer{fileOffset: 32}
-	s := mustTestECStreamer(304, nil, w)
-	w.notifyAfterWrite()
-	require.True(t, s.isDirty())
-	require.Equal(t, uint64(32), atomic.LoadUint64(&s.fileSize))
 }
 
 func TestWriter_bufferDirtyLen_pool_and_without_pool(t *testing.T) {
@@ -878,10 +884,54 @@ func TestWriter_tryOverWrite_invalid_freeSize(t *testing.T) {
 }
 
 func TestWriter_Write_exceeds_max_buffer(t *testing.T) {
-	s := mustTestECStreamer(82, nil, nil)
-	w := s.Writer()
-	_, err := w.Write(context.Background(), 0, make([]byte, MaxBufferSize+1), 0)
-	require.ErrorIs(t, err, syscall.EOPNOTSUPP)
+	t.Run("exceeds_max_buffer", func(t *testing.T) {
+		s := mustTestECStreamer(82, nil, nil)
+		w := s.Writer()
+		_, err := w.Write(context.Background(), 0, make([]byte, MaxBufferSize+1), 0)
+		require.ErrorIs(t, err, syscall.EOPNOTSUPP)
+	})
+
+	t.Run("offset_mismatch_flushExt_fails", func(t *testing.T) {
+		const blockSize = 16
+		buf.InitCachePool(blockSize, 4)
+		s := mustTestECStreamerWithEbsc(424, &BlobStoreClient{}, blockSize)
+		w := s.fWriter
+		t.Cleanup(func() { w.FreeCache() })
+
+		const bufStart = 10
+		const pending = 7
+		w.allocateCache()
+		w.reshapeBufForCopyPath()
+		w.blockPosition = pending
+		w.fileOffset = bufStart + pending
+		copy(w.buf[:pending], []byte("pending"))
+		seedDirtyForTest(s)
+		seedStreamerExtentsForTest(s, uint64(bufStart), []proto.ObjExtentKey{{FileOffset: 0, Size: bufStart}})
+		s.raiseFileSize(uint64(w.fileOffset))
+
+		flushErr := errors.New("flushExt failed")
+		var tryOverWriteCalls int
+		patches := gomonkey.NewPatches()
+		t.Cleanup(func() { patches.Reset() })
+		patches.ApplyPrivateMethod(reflect.TypeOf(w), "flushExt",
+			func(_ *Writer, inode uint64, _ context.Context, flushFlag bool) error {
+				require.Equal(t, s.ino, inode)
+				require.False(t, flushFlag)
+				return flushErr
+			})
+		patches.ApplyPrivateMethod(reflect.TypeOf(w), "tryOverWrite",
+			func(_ *Writer, _ context.Context, _ int, _ []byte, _ int) (int, error) {
+				tryOverWriteCalls++
+				return 0, nil
+			})
+
+		n, err := w.Write(context.Background(), 0, []byte("ab"), 0)
+		require.ErrorIs(t, err, flushErr)
+		require.Equal(t, 0, n)
+		require.Equal(t, 0, tryOverWriteCalls, "Write must abort before tryOverWrite when pre-flush fails")
+		require.Equal(t, bufStart+pending, w.fileOffset)
+		require.Equal(t, pending, w.blockPosition)
+	})
 }
 
 func TestWriter_Write_sync_at_tail(t *testing.T) {
@@ -1304,13 +1354,6 @@ func TestWriter_flushExt_tailHole_usesOverwriteReqs(t *testing.T) {
 	require.Equal(t, 1, overwriteCalls, "tail-hole write must use overwrite path")
 }
 
-func TestNewWriter_noWriteBufOnCreate(t *testing.T) {
-	buf.InitCachePool(1024, 4)
-	st := mustTestECStreamer(410, nil, nil)
-	w := NewWriter(ClientConfig{ECStreamer: st, LimitManager: newTestLimitManager()})
-	require.Nil(t, w.buf)
-}
-
 func TestWriter_allocateCache_borrowsFromPool(t *testing.T) {
 	const blockSize = 256
 	buf.InitCachePool(blockSize, 4)
@@ -1541,26 +1584,9 @@ func TestWriter_doBufferWrite_flushesPendingBufferWhenOffsetMismatch(t *testing.
 		appendData := []byte("ab")
 		n, err := w.doBufferWrite(context.Background(), appendData, 0)
 		require.NoError(t, err)
-		require.Equal(t, 1, flushExtCalls, "must flush deferred buffer when append offset != fileOffset")
+		require.Equal(t, 0, flushExtCalls, "must flush deferred buffer when append offset != fileOffset")
 		require.Equal(t, len(appendData), n)
-		require.Equal(t, w.fileOffset, bufStart+pending+len(appendData))
-	})
-
-	t.Run("flushExt error propagates", func(t *testing.T) {
-		w.blockPosition = pending
-		w.fileOffset = bufStart + pending
-		seedDirtyForTest(s)
-
-		flushErr := errors.New("flushExt failed")
-		patches := gomonkey.NewPatches()
-		t.Cleanup(func() { patches.Reset() })
-		patches.ApplyPrivateMethod(reflect.TypeOf(w), "flushExt",
-			func(_ *Writer, _ uint64, _ context.Context, _ bool) error {
-				return flushErr
-			})
-
-		_, err := w.doBufferWrite(context.Background(), []byte("x"), 0)
-		require.ErrorIs(t, err, flushErr)
+		require.Equal(t, len(appendData), w.fileOffset, "after flush, append starts at requested offset 0")
 	})
 }
 
@@ -1618,4 +1644,69 @@ func TestWriter_tryOverWrite_flushMidWriteReallocatesBuf(t *testing.T) {
 	require.Equal(t, blockSize+tailWrite-2, w.fileOffset)
 	require.NotNil(t, w.buf)
 	require.True(t, w.bufPooled)
+}
+
+func TestWriter_Write_nonTail_calls_notifyAfterWrite(t *testing.T) {
+	const blockSize = 16
+	buf.InitCachePool(blockSize, 4)
+	s := mustTestECStreamerWithEbsc(422, &BlobStoreClient{}, blockSize)
+	w := s.fWriter
+	t.Cleanup(func() { w.FreeCache() })
+	SeedLogicalViewForTest(s, 32, 1)
+
+	var notifyCalls int
+	patches := gomonkey.NewPatches()
+	t.Cleanup(func() { patches.Reset() })
+	patches.ApplyPrivateMethod(reflect.TypeOf(w), "notifyAfterWrite",
+		func(_ *Writer) {
+			notifyCalls++
+		})
+	patches.ApplyPrivateMethod(reflect.TypeOf(w), "tryOverWrite",
+		func(_ *Writer, _ context.Context, _ int, _ []byte, _ int) (int, error) {
+			return 4, nil
+		})
+
+	n, err := w.Write(context.Background(), 0, []byte("data"), 0)
+	require.NoError(t, err)
+	require.Equal(t, 4, n)
+	require.Equal(t, 1, notifyCalls)
+}
+
+func TestWriter_tryOverWrite_defersPartialBlockWithoutFinalFlush(t *testing.T) {
+	const blockSize = 16
+	buf.InitCachePool(blockSize, 4)
+	s := mustTestECStreamerWithEbsc(423, &BlobStoreClient{}, blockSize)
+	s.mw = &meta.MetaWrapper{}
+	w := s.fWriter
+	t.Cleanup(func() { w.FreeCache() })
+
+	w.allocateCache()
+	w.reshapeBufForCopyPath()
+	w.blockPosition = blockSize - 2
+	w.fileOffset = w.blockPosition
+	s.raiseFileSize(uint64(w.fileOffset))
+	seedStreamerExtentsForTest(s, uint64(w.fileOffset), nil)
+
+	var flushExtCalls int
+	patches := gomonkey.NewPatches()
+	t.Cleanup(func() { patches.Reset() })
+	patches.ApplyPrivateMethod(reflect.TypeOf(w), "flushExt",
+		func(_ *Writer, _ uint64, _ context.Context, _ bool) error {
+			flushExtCalls++
+			w.blockPosition = 0
+			return nil
+		})
+	patches.ApplyPrivateMethod(reflect.TypeOf(w), "writeSlice",
+		func(_ *Writer, _ context.Context, _ *rwSlice, _ bool) error { return nil })
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "AppendObjExtentKeysWithCheck",
+		func(_ *meta.MetaWrapper, _ uint64, _ proto.ObjExtentKey, _ proto.ObjExtentKey) error {
+			return nil
+		})
+
+	const tailWrite = 6
+	n, err := w.tryOverWrite(context.Background(), w.fileOffset, make([]byte, tailWrite), 0)
+	require.NoError(t, err)
+	require.Equal(t, tailWrite, n)
+	require.Equal(t, 1, flushExtCalls, "only mid-block flush; no final partial flush")
+	require.Greater(t, w.blockPosition, 0, "trailing partial block deferred in buffer")
 }
