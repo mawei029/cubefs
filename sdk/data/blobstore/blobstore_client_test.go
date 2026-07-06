@@ -459,6 +459,63 @@ func TestTruncateV2Extents_EmptyInput(t *testing.T) {
 	require.True(t, toDel.IsEmpty())
 }
 
+// TestTruncateV2Extents_ReadWriteRetryThenSuccess 走 TruncateV2Extents 完整链路：
+// partial shrink 触发 Read 旧尾段 + Write 新 extent；access Get/Put 各失败一次后由内置重试恢复并成功。
+func TestTruncateV2Extents_ReadWriteRetryThenSuccess(t *testing.T) {
+	const keepSize = uint64(10)
+	readData := strings.Repeat("a", int(keepSize))
+
+	var getAttempt, putAttempt int
+	ebs := testBlobStoreClient(&fakeAccessAPI{
+		getFn: func(_ context.Context, args *access.GetArgs) (io.ReadCloser, error) {
+			getAttempt++
+			if getAttempt == 1 {
+				return nil, io.ErrUnexpectedEOF
+			}
+			require.Equal(t, uint64(0), args.Offset)
+			require.Equal(t, keepSize, args.ReadSize)
+			return io.NopCloser(strings.NewReader(readData)), nil
+		},
+		putFn: func(_ context.Context, args *access.PutArgs) (proto.Location, access.HashSumMap, error) {
+			putAttempt++
+			if putAttempt == 1 {
+				return proto.Location{}, nil, io.ErrClosedPipe
+			}
+			body, err := io.ReadAll(args.Body)
+			require.NoError(t, err)
+			require.Equal(t, int(keepSize), len(body))
+			require.Equal(t, readData, string(body))
+			return proto.Location{
+				ClusterID: 42,
+				Size_:     keepSize,
+				CodeMode:  1,
+				SliceSize: 4,
+				Slices:    []proto.Slice{{MinSliceID: 100, Vid: 1, Count: 1}},
+			}, nil, nil
+		},
+	})
+
+	src := cproto.ObjExtentKey{
+		FileOffset: 0,
+		Size:       20,
+		Cid:        1,
+		CodeMode:   1,
+		BlobSize:   4,
+		Blobs:      []cproto.Blob{{MinBid: 1, Count: 1, Vid: 1}},
+		BlobsLen:   1,
+	}
+
+	newObj, delFrom, err := ebs.TruncateV2Extents(context.Background(), "vol", []cproto.ObjExtentKey{src}, keepSize)
+	require.NoError(t, err)
+	require.Equal(t, 2, getAttempt, "Read should retry once via access Get")
+	require.Equal(t, 2, putAttempt, "Write should retry once via access Put")
+	require.Equal(t, uint64(0), newObj.FileOffset)
+	require.Equal(t, keepSize, newObj.Size)
+	require.Equal(t, uint64(42), newObj.Cid)
+	require.Equal(t, src.FileOffset, delFrom.FileOffset)
+	require.Equal(t, src.Size, delFrom.Size)
+}
+
 func TestTruncateV2Extents_OnlyKeepNoEBS(t *testing.T) {
 	// 仅保留、无覆盖、无删除时，ApplyTruncateReqs 只返回 keep，不调 EBS
 	objExtents := []cproto.ObjExtentKey{
@@ -496,7 +553,7 @@ func TestApplyTruncateReqs_ReadError(t *testing.T) {
 	require.True(t, toDel.IsEmpty())
 }
 
-func TestApplyTruncateReqs_PutNoKeys(t *testing.T) {
+func TestApplyTruncateReqs_WriteNoKeys(t *testing.T) {
 	ebs := &BlobStoreClient{}
 	req := truncateReq{
 		KeepExtent:  cproto.ObjExtentKey{FileOffset: 0, Size: 10},
@@ -509,9 +566,9 @@ func TestApplyTruncateReqs_PutNoKeys(t *testing.T) {
 		func(_ *BlobStoreClient, _ context.Context, _ string, _ []byte, _ uint64, size uint64, _ cproto.ObjExtentKey) (int, error) {
 			return int(size), nil
 		})
-	patches.ApplyMethod(reflect.TypeOf(ebs), "Put",
-		func(_ *BlobStoreClient, _ context.Context, _ string, _ io.Reader, _ uint64) ([]cproto.ObjExtentKey, [][]byte, error) {
-			return nil, nil, nil
+	patches.ApplyMethod(reflect.TypeOf(ebs), "Write",
+		func(_ *BlobStoreClient, _ context.Context, _ string, _ []byte, _ uint32) (proto.Location, error) {
+			return proto.Location{}, nil
 		})
 	out, toDel, err := ebs.ApplyTruncateReqs(context.Background(), "vol", req)
 	require.ErrorIs(t, err, errPutNoKeys)
@@ -877,20 +934,20 @@ func TestApplyTruncateReqs_MoreBranches(t *testing.T) {
 		}
 		patches := gomonkey.NewPatches()
 		defer patches.Reset()
-		putCalled := false
+		writeCalled := false
 		patches.ApplyMethod(reflect.TypeOf(ebs), "Read",
 			func(_ *BlobStoreClient, _ context.Context, _ string, _ []byte, _ uint64, _ uint64, _ cproto.ObjExtentKey) (int, error) {
 				return 1, nil
 			})
-		patches.ApplyMethod(reflect.TypeOf(ebs), "Put",
-			func(_ *BlobStoreClient, _ context.Context, _ string, _ io.Reader, _ uint64) ([]cproto.ObjExtentKey, [][]byte, error) {
-				putCalled = true
-				return nil, nil, io.ErrClosedPipe
+		patches.ApplyMethod(reflect.TypeOf(ebs), "Write",
+			func(_ *BlobStoreClient, _ context.Context, _ string, _ []byte, _ uint32) (proto.Location, error) {
+				writeCalled = true
+				return proto.Location{}, io.ErrClosedPipe
 			})
 		out, del, err := ebs.ApplyTruncateReqs(context.Background(), "v", req)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "read short want(2) got(1)")
-		require.False(t, putCalled)
+		require.False(t, writeCalled)
 		require.True(t, out.IsEmpty())
 		require.True(t, del.IsEmpty())
 	})
@@ -910,9 +967,9 @@ func TestApplyTruncateReqs_MoreBranches(t *testing.T) {
 				require.Len(t, buf, 2)
 				return int(size), nil
 			})
-		patches.ApplyMethod(reflect.TypeOf(ebs), "Put",
-			func(_ *BlobStoreClient, _ context.Context, _ string, _ io.Reader, _ uint64) ([]cproto.ObjExtentKey, [][]byte, error) {
-				return []cproto.ObjExtentKey{{FileOffset: 0, Size: 2}}, nil, nil
+		patches.ApplyMethod(reflect.TypeOf(ebs), "Write",
+			func(_ *BlobStoreClient, _ context.Context, _ string, _ []byte, _ uint32) (proto.Location, error) {
+				return proto.Location{Size_: 2, Slices: []proto.Slice{{MinSliceID: 1, Vid: 1, Count: 1}}}, nil
 			})
 		out, del, err := ebs.ApplyTruncateReqs(context.Background(), "v", req)
 		require.NoError(t, err)
@@ -1037,15 +1094,15 @@ func TestTruncateV2Extents_MultiRoundConsistency(t *testing.T) {
 			func(_ *BlobStoreClient, _ context.Context, _ string, buf []byte, _ uint64, size uint64, _ cproto.ObjExtentKey) (int, error) {
 				return int(size), nil
 			})
-		p.ApplyMethod(reflect.TypeOf(ebs), "Put",
-			func(_ *BlobStoreClient, _ context.Context, _ string, r io.Reader, size uint64) ([]cproto.ObjExtentKey, [][]byte, error) {
-				_, err := io.Copy(io.Discard, r)
-				if err != nil {
-					return nil, nil, err
-				}
+		p.ApplyMethod(reflect.TypeOf(ebs), "Write",
+			func(_ *BlobStoreClient, _ context.Context, _ string, _ []byte, size uint32) (proto.Location, error) {
 				putCnt++
-				// FileOffset 由 ApplyTruncateReqs 在返回后覆写；此处占位 0。
-				return []cproto.ObjExtentKey{{FileOffset: 0, Size: size, Cid: uint64(9000 + putCnt)}}, nil, nil
+				return proto.Location{
+					ClusterID: proto.ClusterID(9000 + putCnt),
+					Size_:     uint64(size),
+					SliceSize: 4,
+					Slices:    []proto.Slice{{MinSliceID: 1, Vid: 1, Count: 1}},
+				}, nil
 			})
 		return ebs, func() { p.Reset() }
 	}

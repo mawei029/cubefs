@@ -565,6 +565,7 @@ func (ebs *BlobStoreClient) ApplyTruncateReqs(ctx context.Context, volName strin
 		return proto.ObjExtentKey{}, proto.ObjExtentKey{}, err
 	}
 
+	// do read with retry
 	buf := make([]byte, keepSize)
 	readN, err := ebs.Read(ctx, volName, buf, 0, keepSize, toDeleteFrom)
 	if err != nil {
@@ -576,17 +577,17 @@ func (ebs *BlobStoreClient) ApplyTruncateReqs(ctx context.Context, volName strin
 		return proto.ObjExtentKey{}, proto.ObjExtentKey{},
 			fmt.Errorf("ApplyTruncateReqs: read short want(%v) got(%v)", keepSize, readN)
 	}
-	newOeks, _, err := ebs.Put(ctx, volName, bytes.NewReader(buf), uint64(len(buf)))
+	// do write with retry
+	location, err := ebs.Write(ctx, volName, buf, uint32(keepSize))
 	if err != nil {
-		log.LogErrorf("ApplyTruncateReqs: vol(%v) put truncated keep(%v) discardFrom(%v) size(%v) err(%v)",
+		log.LogErrorf("ApplyTruncateReqs: vol(%v) write truncated keep(%v) discardFrom(%v) size(%v) err(%v)",
 			volName, keepSome, toDeleteFrom, keepSize, err)
 		return proto.ObjExtentKey{}, proto.ObjExtentKey{}, err
 	}
-	if len(newOeks) == 0 {
-		log.LogErrorf("ApplyTruncateReqs: put returned no keys")
+	if location.Size_ == 0 || len(location.Slices) == 0 {
+		log.LogErrorf("ApplyTruncateReqs: write returned empty location")
 		return proto.ObjExtentKey{}, proto.ObjExtentKey{}, errPutNoKeys //nolint:wrapcheck
 	}
-	newObjExtent = newOeks[0]
-	newObjExtent.FileOffset = keepSome.FileOffset
+	newObjExtent = locationToObjExtentKey(location, keepSome.FileOffset)
 	return newObjExtent, toDeleteFrom, nil
 }
