@@ -541,6 +541,22 @@ func TestECStreamer_updateMetaInfo_under_mu(t *testing.T) {
 	s.mu.Unlock()
 	require.NoError(t, err)
 	require.Equal(t, uint64(40), atomic.LoadUint64(&s.fileSize))
+
+	t.Run("sorts_unsorted_oeks", func(t *testing.T) {
+		s2 := mustTestECStreamer(331, nil, nil)
+		s2.mw = &meta.MetaWrapper{}
+		patches2 := gomonkey.NewPatches()
+		defer patches2.Reset()
+		patches2.ApplyMethod(reflect.TypeOf(s2.mw), "GetObjExtents",
+			func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
+				return 3, 80, nil, []proto.ObjExtentKey{{FileOffset: 40, Size: 20}, {FileOffset: 0, Size: 20}}, nil
+			})
+		s2.mu.Lock()
+		require.NoError(t, s2.updateMetaInfo(nil))
+		s2.mu.Unlock()
+		require.Equal(t, uint64(0), s2.oeks[0].FileOffset)
+		require.Equal(t, uint64(40), s2.oeks[1].FileOffset)
+	})
 }
 
 func TestECStreamer_updateMetaInfo_dirty_without_buffer(t *testing.T) {
@@ -862,6 +878,29 @@ func TestECStreamer_updateMetaInfo_getExtents_err(t *testing.T) {
 	err := s.updateMetaInfo(nil)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "meta down")
+}
+
+func TestECStreamer_updateMetaInfo_sorts_unsorted_oeks(t *testing.T) {
+	s := mustTestECStreamer(68, nil, nil)
+	s.mw = &meta.MetaWrapper{}
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	unsorted := []proto.ObjExtentKey{
+		{FileOffset: 200, Size: 50, Cid: 3},
+		{FileOffset: 0, Size: 100, Cid: 1},
+		{FileOffset: 100, Size: 50, Cid: 2},
+	}
+	patches.ApplyMethod(reflect.TypeOf(s.mw), "GetObjExtents",
+		func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
+			return 1, 250, nil, unsorted, nil
+		})
+
+	require.NoError(t, s.updateMetaInfo(nil))
+	require.Len(t, s.oeks, 3)
+	require.Equal(t, uint64(0), s.oeks[0].FileOffset)
+	require.Equal(t, uint64(100), s.oeks[1].FileOffset)
+	require.Equal(t, uint64(200), s.oeks[2].FileOffset)
+	require.Equal(t, uint64(250), atomic.LoadUint64(&s.fileSize))
 }
 
 func TestECStreamer_truncateV2_ENOENT_error_string_match(t *testing.T) {

@@ -935,9 +935,6 @@ func (writer *Writer) flushExt(inode uint64, ctx context.Context, flushFlag bool
 	}
 
 	objExtents := writer.ecStreamer.OeksLocked()
-	sort.Slice(objExtents, func(i, j int) bool {
-		return objExtents[i].FileOffset < objExtents[j].FileOffset
-	})
 
 	if writer.fileOffset < bufferSize {
 		err = fmt.Errorf("flushExt: inconsistent state ino(%v) fileOffset(%v) < bufferSize(%v)", inode, writer.fileOffset, bufferSize)
@@ -954,7 +951,7 @@ func (writer *Writer) flushExt(inode uint64, ctx context.Context, flushFlag bool
 	// Compute overwrite requests: determine which parts of buffer overlap with existing extents
 	// This generates a slice of requests, each specifying:
 	reqs := computeOverwriteReqs(start, end, objExtents)
-	log.LogDebugf("flushExt: ino(%v) start(%v) end(%v) reqsCount(%v) bufferSize(%v)", inode, start, end, len(reqs), bufferSize)
+	log.LogDebugf("flushExt: ino(%v) start(%v) end(%v) reqsCount(%v) bufferSize(%v) oldOeks(%v) newOeks(%v)", inode, start, end, len(reqs), bufferSize, objExtents, reqs)
 
 	lastExtentEnd := uint64(0)
 	if len(objExtents) > 0 {
@@ -1018,7 +1015,7 @@ func (writer *Writer) flush(inode uint64, ctx context.Context, flushFlag bool) (
 		log.LogErrorf("flush: slice write error,meta append ebsc extent keys fail,ino(%v) fileOffset(%v) len(%v) err(%v)", inode, wSlice.fileOffset, wSlice.size, err)
 		return
 	}
-	return writer.notifyCompleteFlushMeta()
+	return nil
 }
 
 func (writer *Writer) CacheFileSize() int {

@@ -25,6 +25,13 @@ type FileExtendInfo struct {
 	coldBlobReader *blobstore.Reader
 	coldBlobWriter *blobstore.Writer
 	flag           uint32
+
+	// Data-plane dispatch attrs (replica ec vs cold/Blob oec). They change only on
+	// migration, so the hot read/write path reads them from here instead of issuing a
+	// per-request InodeGet RPC. Set in NewFile/Open/Setattr; see getFileMeta.
+	metaCached       bool
+	cachedPoolId     uint8
+	cachedStorageCls uint32
 }
 
 func (d *Dir) getInfo() (*proto.InodeInfo, error) {
@@ -242,7 +249,12 @@ func (d *Dir) getOrCreateDcache(acceleration bool) *DentryCache {
 }
 
 func (f *File) getInfo() (*proto.InodeInfo, error) {
-	return f.super.InodeGet(f.ino)
+	info, err := f.super.InodeGet(f.ino)
+	if err != nil || info == nil {
+		return info, err
+	}
+	f.refreshFileMeta(info.PoolId, info.StorageClass)
+	return info, nil
 }
 
 func (f *File) getExtendInfo() (*FileExtendInfo, bool) {
@@ -367,6 +379,17 @@ func (f *File) removeParentDcacheEntry() {
 // Do not call while holding s.fslock (InodeGet may lock fslock again — scheduleFlush deadlock).
 // Otherwise self-deadlock with InodeGet (historical scheduleFlush issue).
 func (f *File) storageClass() uint32 {
+	// Prefer the data-plane cache (seeded in NewFile/Open/Setattr): it is unaffected by the
+	// per-write ic eviction, so hot-path callers like fileSizeVersion2 stay RPC-free. Storage
+	// class only changes on migration, which refreshes this cache.
+	if ei, ok := f.getExtendInfo(); ok && ei != nil {
+		ei.RLock()
+		cls, cached := ei.cachedStorageCls, ei.metaCached
+		ei.RUnlock()
+		if cached {
+			return cls
+		}
+	}
 	if info := f.super.ic.Get(f.ino); info != nil {
 		return info.StorageClass
 	}
@@ -375,4 +398,36 @@ func (f *File) storageClass() uint32 {
 		return 0
 	}
 	return info.StorageClass
+}
+
+// getFileMeta returns (poolId, inodeStorageClass) used to dispatch the data plane.
+// These change only on migration, so they are cached on the File (set in NewFile/Open/
+// Setattr) to keep the hot read/write path free of a per-request InodeGet RPC. On a
+// cache miss it falls back to a single InodeGet and backfills the cache.
+func (f *File) getFileMeta() (poolId uint8, storageClass uint32, err error) {
+	if ei, ok := f.getExtendInfo(); ok && ei != nil {
+		ei.RLock()
+		cached := ei.metaCached
+		poolId, storageClass = ei.cachedPoolId, ei.cachedStorageCls
+		ei.RUnlock()
+		if cached {
+			return poolId, storageClass, nil
+		}
+	}
+	info, err := f.getInfo()
+	if err != nil {
+		return 0, 0, err
+	}
+	return info.PoolId, info.StorageClass, nil
+}
+
+// refreshFileMeta caches data-plane dispatch attrs; called wherever a fresh InodeInfo is available.
+func (f *File) refreshFileMeta(poolId uint8, storageClass uint32) {
+	ei := f.getOrCreateExtendInfo()
+	if ei == nil {
+		return
+	}
+	ei.Lock()
+	ei.cachedPoolId, ei.cachedStorageCls, ei.metaCached = poolId, storageClass, true
+	ei.Unlock()
 }

@@ -7,8 +7,18 @@ import (
 	bazilfs "github.com/cubefs/cubefs/depends/bazil.org/fuse/fs"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/blobstore"
+	"github.com/cubefs/cubefs/sdk/data/stream"
 	"github.com/stretchr/testify/require"
 )
+
+func newSuperForFileMetaTest() *Super {
+	return &Super{
+		ic:                NewInodeCache(time.Hour, 64, true),
+		fileExtendInfoMap: make(map[uint64]*FileExtendInfo),
+		ec:                stream.NewTestExtentClient(nil),
+		oec:               blobstore.NewObjExtentClient(blobstore.ObjExtentConfig{}),
+	}
+}
 
 func TestCoverageDirExtendInfoStateFlow(t *testing.T) {
 	s := &Super{
@@ -83,4 +93,113 @@ func TestCoverageFileExtendInfoAndStorageClass(t *testing.T) {
 	f.deleteExtendInfo()
 	_, ok = f.getExtendInfo()
 	require.False(t, ok)
+}
+
+func TestFile_refreshFileMeta_setsDispatchCache(t *testing.T) {
+	s := newSuperForFileMetaTest()
+	f := &File{super: s, ino: 100}
+
+	f.refreshFileMeta(2, proto.StorageClass_Replica_SSD)
+
+	ei, ok := f.getExtendInfo()
+	require.True(t, ok)
+	require.NotNil(t, ei)
+	ei.RLock()
+	require.True(t, ei.metaCached)
+	require.Equal(t, uint8(2), ei.cachedPoolId)
+	require.Equal(t, uint32(proto.StorageClass_Replica_SSD), ei.cachedStorageCls)
+	ei.RUnlock()
+}
+
+func TestFile_refreshFileMeta_nilSuperNoop(t *testing.T) {
+	f := &File{ino: 101}
+	require.NotPanics(t, func() {
+		f.refreshFileMeta(1, proto.StorageClass_Replica_HDD)
+	})
+}
+
+func TestFile_getInfo_refreshesFileMetaCache(t *testing.T) {
+	s := newSuperForFileMetaTest()
+	const ino = uint64(110)
+	s.ic.Put(&proto.InodeInfo{
+		Inode:        ino,
+		PoolId:       4,
+		StorageClass: proto.StorageClass_BlobStore,
+	})
+	f := &File{super: s, ino: ino}
+
+	info, err := f.getInfo()
+	require.NoError(t, err)
+	require.Equal(t, uint8(4), info.PoolId)
+
+	ei, ok := f.getExtendInfo()
+	require.True(t, ok)
+	ei.RLock()
+	require.True(t, ei.metaCached)
+	require.Equal(t, uint8(4), ei.cachedPoolId)
+	require.Equal(t, uint32(proto.StorageClass_BlobStore), ei.cachedStorageCls)
+	ei.RUnlock()
+}
+
+func TestFile_dataPlaneMeta_cacheHit(t *testing.T) {
+	s := newSuperForFileMetaTest()
+	const ino = uint64(200)
+	f := &File{super: s, ino: ino}
+
+	f.refreshFileMeta(3, proto.StorageClass_Replica_HDD)
+	// No ic entry: a cache hit must not depend on InodeGet.
+	s.ic.Delete(ino)
+
+	poolId, storageCls, err := f.getFileMeta()
+	require.NoError(t, err)
+	require.Equal(t, uint8(3), poolId)
+	require.Equal(t, uint32(proto.StorageClass_Replica_HDD), storageCls)
+}
+
+func TestFile_dataPlaneMeta_cacheMiss_backfillsFromInodeCache(t *testing.T) {
+	s := newSuperForFileMetaTest()
+	const ino = uint64(201)
+	s.ic.Put(&proto.InodeInfo{
+		Inode:        ino,
+		PoolId:       5,
+		StorageClass: proto.StorageClass_BlobStore,
+	})
+	f := &File{super: s, ino: ino}
+
+	poolId, storageCls, err := f.getFileMeta()
+	require.NoError(t, err)
+	require.Equal(t, uint8(5), poolId)
+	require.Equal(t, uint32(proto.StorageClass_BlobStore), storageCls)
+
+	ei, ok := f.getExtendInfo()
+	require.True(t, ok)
+	ei.RLock()
+	require.True(t, ei.metaCached)
+	require.Equal(t, uint8(5), ei.cachedPoolId)
+	require.Equal(t, uint32(proto.StorageClass_BlobStore), ei.cachedStorageCls)
+	ei.RUnlock()
+
+	// Second call uses the extend-info cache without touching ic.
+	s.ic.Delete(ino)
+	poolId, storageCls, err = f.getFileMeta()
+	require.NoError(t, err)
+	require.Equal(t, uint8(5), poolId)
+	require.Equal(t, uint32(proto.StorageClass_BlobStore), storageCls)
+}
+
+func TestFile_dataPlaneMeta_cacheMiss_withExtendInfoNotCached(t *testing.T) {
+	s := newSuperForFileMetaTest()
+	const ino = uint64(202)
+	s.ic.Put(&proto.InodeInfo{
+		Inode:        ino,
+		PoolId:       7,
+		StorageClass: proto.StorageClass_Replica_SSD,
+	})
+	f := &File{super: s, ino: ino}
+	f.setFlag(1) // creates extend info with metaCached still false
+
+	poolId, storageCls, err := f.getFileMeta()
+	require.NoError(t, err)
+	require.Equal(t, uint8(7), poolId)
+	require.Equal(t, uint32(proto.StorageClass_Replica_SSD), storageCls)
 }

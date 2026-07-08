@@ -119,8 +119,8 @@ func (se *SortedObjExtents) Append(ek proto.ObjExtentKey) error {
 	}
 
 	// Return error for overlapping extent keys
-	return fmt.Errorf("extent keys overlap detected: new extent key must be appended to last position with offset [%d], new key: %s",
-		lastKey.FileOffset, ek.String())
+	return fmt.Errorf("extent keys overlap detected: new extent key must be appended to last position with offset[%d] and size[%d], new key: %s",
+		lastKey.FileOffset, lastKey.Size, ek.String())
 }
 
 // Clone creates a deep copy of the SortedObjExtents

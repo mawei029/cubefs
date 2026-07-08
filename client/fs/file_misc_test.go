@@ -126,7 +126,7 @@ func TestFile_fileSizeVersion2_ecBlob_invalidFileSize_usesWriterCache(t *testing
 		return &proto.InodeInfo{Inode: 16, Size: 100, Generation: 3}, nil
 	})
 
-	size, gen := f.fileSizeVersion2(f.ino)
+	size, gen := f.fileSizeVersion2(f.ino, f.storageClass())
 	// oec.FileSize 无效时冷卷回退 InodeGet.Size，不再合并孤立 Writer.CacheFileSize。
 	require.Equal(t, 100, size)
 	require.Equal(t, uint64(3), gen)
@@ -170,7 +170,7 @@ func TestFile_FilterSuffixAndFileSizeVersion2Fallback(t *testing.T) {
 	f.setColdBlobReaderWriter(nil, writer)
 	s.ic.Put(&proto.InodeInfo{Inode: f.ino, Size: 100, Generation: 9})
 
-	size, gen := f.fileSizeVersion2(f.ino)
+	size, gen := f.fileSizeVersion2(f.ino, f.storageClass())
 	require.Equal(t, 128, size)
 	require.Equal(t, uint64(9), gen)
 }

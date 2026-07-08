@@ -147,6 +147,8 @@ func NewFile(s *Super, i *proto.InodeInfo, flag uint32, pino uint64, filename st
 		name:      filename,
 	}
 	f.setFlag(flag)
+	// Seed data-plane dispatch cache so the hot read/write path avoids a per-request InodeGet RPC.
+	f.refreshFileMeta(i.PoolId, i.StorageClass)
 	// Get storage class from poolId if available, otherwise use existing StorageClass
 	if proto.IsStorageClassBlobStore(i.StorageClass) {
 		// Blob/EC: Reader/Writer attached on Open/Create via oec; here only store open flags.
@@ -200,7 +202,7 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 	log.LogDebugf("Attr: ino(%v) inode.size(%v) inode.gen(%v)", ino, info.Size, info.Generation)
 	// fstat size: replica and EC/Blob merge stream gen vs inode gen (gen>=inode.Generation); see replica_volume_read_and_fstat_flow_zh.md.
 	if !proto.IsSymlink(info.Mode) {
-		fileSize, gen := f.fileSizeVersion2(ino)
+		fileSize, gen := f.fileSizeVersion2(ino, info.StorageClass)
 		log.LogDebugf("Attr: stream fileSize(%v) stream.gen(%v)", fileSize, gen)
 		if gen >= info.Generation {
 			a.Size = uint64(fileSize)
@@ -273,6 +275,8 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 	if err != nil {
 		return nil, ParseError(err)
 	}
+	// Refresh data-plane dispatch cache on (re)open; covers migration since last open.
+	f.refreshFileMeta(info.PoolId, info.StorageClass)
 	if log.EnableDebug() {
 		log.LogDebugf("TRACE open ino(%v) info(%v) fullPath(%v)", ino, info, path.Join(f.getParentPath(), f.name))
 	}
@@ -338,7 +342,7 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 				return nil, ParseError(flushErr)
 			}
 		}
-		fileSize, _ := f.fileSizeVersion2(ino)
+		fileSize, _ := f.fileSizeVersion2(ino, info.StorageClass)
 
 		if err := f.openOECStream(info, uint32(req.Flags&0x0f), uint64(fileSize)); err != nil {
 			log.LogErrorf("Open: openOECStream ino(%v) err: %v", ino, err)
@@ -384,13 +388,13 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) (err error
 	//   | Hot or replica | ec.OpenStream     | ec.OpenStream*         | ec.CloseStream      | ec.EvictStream           |
 	//
 	// *Open: hot/replica use ec; cold/Blob use oec only (no ec.OpenStream on same inode).
-	info, getErr := f.getInfo()
+	poolId, storageClass, getErr := f.getFileMeta()
 	if getErr != nil {
-		log.LogWarnf("Release: getInfo ino(%v) err(%v)", ino, getErr)
+		log.LogWarnf("Release: getFileMeta ino(%v) err(%v)", ino, getErr)
 		return ParseError(getErr)
 	}
 
-	if proto.DataPlaneUsesBlobEC(f.super.volType, info.StorageClass) {
+	if proto.DataPlaneUsesBlobEC(f.super.volType, storageClass) {
 		if errOec = f.super.oec.CloseStream(ino); errOec != nil {
 			log.LogErrorf("Release: oec CloseStream ino(%v) req(%v) err(%v)", ino, req, errOec)
 			// oec.CloseStream rolls back refCnt on Flush failure; FreeCache writer buffer here, no Evict.
@@ -408,7 +412,7 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) (err error
 
 	if log.EnableDebug() {
 		elapsed := time.Since(start)
-		log.LogDebugf("TRACE FileRelease: ino(%v) req(%v) name(%v)(%v)ns", ino, req, path.Join(f.getParentPath(), f.name), elapsed.Nanoseconds())
+		log.LogDebugf("TRACE FileRelease: ino(%v) req(%v) poolId(%d) name(%v)(%v)ns", ino, req, poolId, path.Join(f.getParentPath(), f.name), elapsed.Nanoseconds())
 	}
 
 	return nil
@@ -424,15 +428,13 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 		f.super.runningMonitor.SubClientOp(runningStat, err)
 	}()
 
-	info, err := f.getInfo()
+	// Hot read path: read dispatch attrs from the File cache instead of a per-request InodeGet RPC.
+	poolId, storageClass, err := f.getFileMeta()
 	if err != nil {
 		return ParseError(err)
 	}
-	// Get storage class from poolId if available, otherwise use existing StorageClass
-	pool := f.getStorageClassByPoolId(info.PoolId)
-	storageClass := uint32(pool.StorageClass)
-	log.LogDebugf("TRACE Read enter: ino(%v) poolId(%v) storageClass(%v) offset(%v) filesize(%v) reqsize(%v) req(%v)",
-		f.ino, info.PoolId, storageClass, req.Offset, info.Size, req.Size, req)
+	log.LogDebugf("TRACE Read enter: ino(%v) poolId(%v) storageClass(%v) offset(%v) reqsize(%v) req(%v)",
+		f.ino, poolId, storageClass, req.Offset, req.Size, req)
 
 	start := time.Now()
 	metric := exporter.NewTPCnt("fileread")
@@ -445,7 +447,7 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 		f.super.ec.GetStreamer(f.ino).SetParentInode(f.parentIno)
 		// Use storageClass derived from poolId
 		size, err = f.super.ec.Read(f.ino, resp.Data[fuse.OutHeaderSize:], int(req.Offset),
-			req.Size, info.PoolId, false)
+			req.Size, poolId, false)
 	} else {
 		// Blob/EC read/fstat bounds use oec FileSizeView (includes unflushed writer); sync in ECStreamer.Read.
 		size, err = f.super.oec.Read(f.ino, resp.Data[fuse.OutHeaderSize:], int(req.Offset), req.Size)
@@ -462,12 +464,11 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 		return ParseError(err)
 	}
 
-	// last read request of file
-	if info.Size > uint64(req.Offset) && uint64(req.Offset+int64(req.Size)) >= info.Size {
-		// at least read bytes: info.Size - req.Offset
-		if size > 0 && uint64(size) < info.Size-uint64(req.Offset) {
-			log.LogWarnf("Read: error data size, ino(%v) offset(%v) filesize(%v) reqsize(%v) size(%v)\n", f.ino, req.Offset, info.Size, req.Size, size)
-		}
+	// last read request of file (diagnostic only; actual bounds come from ec/oec.Read).
+	// streamFileSize reuses the resolved storageClass and never issues an InodeGet RPC.
+	fileSize, _ := f.fileSizeVersion2(f.ino, storageClass)
+	if fileSize > int(req.Offset) && int(req.Offset)+(req.Size) >= fileSize && size > 0 && size < fileSize-int(req.Offset) {
+		log.LogWarnf("Read: error data size, ino(%v) offset(%v) filesize(%v) reqsize(%v) size(%v)\n", f.ino, req.Offset, fileSize, req.Size, size)
 	}
 
 	if size > req.Size {
@@ -506,16 +507,15 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 	f.super.BeginDirMutation(f.parentIno)
 	defer f.super.EndDirMutation(f.parentIno)
 
-	info, err := f.getInfo()
+	// Hot write path: read data-plane dispatch attrs from the File cache instead of a
+	// per-request InodeGet RPC. QuotaInfos is fetched lazily only when quota is enabled.
+	poolId, storageClass, err := f.getFileMeta()
 	if err != nil {
 		return ParseError(err)
 	}
-	// Get storage class from poolId if available, otherwise use existing StorageClass
-	pool := f.getStorageClassByPoolId(info.PoolId)
-	storageClass := uint32(pool.StorageClass)
 
-	log.LogDebugf("TRACE Write enter: ino(%v) poolId(%v) storageClass(%v) offset(%v) len(%v) flags(%v) fileflags(%v) quotaIds(%v) req(%v)",
-		ino, info.PoolId, storageClass, req.Offset, reqlen, req.Flags, req.FileFlags, info.QuotaInfos, req)
+	log.LogDebugf("TRACE Write enter: ino(%v) poolId(%v) storageClass(%v) offset(%v) len(%v) flags(%v) fileflags(%v) req(%v)",
+		ino, poolId, storageClass, req.Offset, reqlen, req.Flags, req.FileFlags, req)
 	if proto.IsHot(f.super.volType) || proto.IsStorageClassReplica(storageClass) {
 		filesize, _ := f.fileSize(ino)
 		if req.Offset > int64(filesize) && reqlen == 1 && req.Data[0] == 0 {
@@ -530,7 +530,7 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 			return
 		}
 	} else {
-		filesize, _ := f.fileSizeVersion2(ino)
+		filesize, _ := f.fileSizeVersion2(ino, storageClass)
 		if req.Offset > int64(filesize) && reqlen == 1 && req.Data[0] == 0 {
 			// Special case:posix_fallocate may degrade to writing one trailing zero byte when fallocate is unsupported; keep behavior aligned with Hot/Replica branch.
 			fullPath := path.Join(f.getParentPath(), f.name)
@@ -544,6 +544,9 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 		}
 	}
 
+	// Evict inode cache after write so stat/read see the new size/mtime. This no longer
+	// costs a per-write InodeGet RPC because the hot path reads dispatch attrs from the
+	// File cache (getFileMeta), not from ic.
 	defer func() {
 		f.super.ic.Delete(ino)
 	}()
@@ -580,6 +583,11 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 		if ok := f.super.ec.UidIsLimited(req.Uid); ok {
 			return ParseError(syscall.ENOSPC)
 		}
+		// Quota enabled only: fetch QuotaInfos here so the common (no-quota) write path stays RPC-free.
+		info, gerr := f.getInfo()
+		if gerr != nil {
+			return ParseError(gerr)
+		}
 		var quotaIds []uint32
 		for quotaId := range info.QuotaInfos {
 			quotaIds = append(quotaIds, quotaId)
@@ -594,8 +602,8 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 	if proto.IsStorageClassReplica(storageClass) {
 		f.super.ec.GetStreamer(ino).SetParentInode(f.parentIno)
 		// Use storageClass derived from poolId
-		if size, err = f.super.ec.Write(ino, int(req.Offset), req.Data, flags, checkFunc, pool.Id,
-			info.StorageClass, false, waitForFlush); err == ParseError(syscall.ENOSPC) {
+		if size, err = f.super.ec.Write(ino, int(req.Offset), req.Data, flags, checkFunc, poolId,
+			storageClass, false, waitForFlush); err == ParseError(syscall.ENOSPC) {
 			return
 		}
 	} else {
@@ -650,7 +658,7 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 	// Under RDWR we can call syncBlobReaderAfterMetaChange right after successful writes to align Reader immediately; this branch keeps it disabled,
 	// and read path relies on InodeGet + readAfterFlush ensureAlignedForRead on each Read to refresh ObjExtents.
 	elapsed := time.Since(start)
-	log.LogDebugf("TRACE Write: ino(%v) offset(%v) len(%v) flags(%v) fileflags(%v) req(%v) (%v) ",
+	log.LogDebugf("TRACE Write exit: ino(%v) offset(%v) len(%v) flags(%v) fileflags(%v) req(%v) (%v) ",
 		ino, req.Offset, reqlen, req.Flags, req.FileFlags, req, elapsed.String())
 	return nil
 }
@@ -683,13 +691,10 @@ func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) (err error) {
 		f.super.BeginDirMutation(f.parentIno)
 		defer f.super.EndDirMutation(f.parentIno)
 	}
-	info, infoErr := f.getInfo()
+	poolId, storageClass, infoErr := f.getFileMeta()
 	if infoErr != nil {
 		return ParseError(infoErr)
 	}
-	// Get storage class from poolId if available, otherwise use existing StorageClass
-	pool := f.getStorageClassByPoolId(info.PoolId)
-	storageClass := uint32(pool.StorageClass)
 
 	if proto.IsHot(f.super.volType) || proto.IsStorageClassReplica(storageClass) {
 		err = f.super.ec.Flush(f.ino)
@@ -717,7 +722,7 @@ func (f *File) Flush(ctx context.Context, req *fuse.FlushRequest) (err error) {
 	}
 
 	elapsed := time.Since(start)
-	log.LogDebugf("TRACE Flush: ino(%v) (%v)ns", f.ino, elapsed.Nanoseconds())
+	log.LogDebugf("TRACE Flush: ino(%v) poolId(%d) (%v)ns", f.ino, poolId, elapsed.Nanoseconds())
 
 	return nil
 }
@@ -742,13 +747,10 @@ func (f *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) (err error) {
 
 	log.LogDebugf("TRACE Fsync enter: ino(%v)", f.ino)
 	start := time.Now()
-	info, infoErr := f.getInfo()
+	poolId, storageClass, infoErr := f.getFileMeta()
 	if infoErr != nil {
 		return ParseError(infoErr)
 	}
-	// Get storage class from poolId if available, otherwise use existing StorageClass
-	pool := f.getStorageClassByPoolId(info.PoolId)
-	storageClass := uint32(pool.StorageClass)
 
 	if proto.IsHot(f.super.volType) || proto.IsStorageClassReplica(storageClass) {
 		err = f.super.ec.Flush(f.ino)
@@ -771,7 +773,7 @@ func (f *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) (err error) {
 
 	f.super.ic.Delete(f.ino)
 	elapsed := time.Since(start)
-	log.LogDebugf("TRACE Fsync: ino(%v) (%v)ns", f.ino, elapsed.Nanoseconds())
+	log.LogDebugf("TRACE Fsync: ino(%v) poolId(%d) (%v)ns", f.ino, poolId, elapsed.Nanoseconds())
 	return nil
 }
 
@@ -795,10 +797,8 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 	if err != nil {
 		return ParseError(err)
 	}
-	// Get storage class from poolId if available, otherwise use existing StorageClass
-	pool := f.getStorageClassByPoolId(info.PoolId)
-	storageClass := uint32(pool.StorageClass)
 
+	storageClass := info.StorageClass
 	openForWrite := false
 	if req.Flags&0x0f != syscall.O_RDONLY {
 		openForWrite = true
@@ -865,6 +865,8 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 		log.LogErrorf("Setattr: InodeGet failed, ino(%v) err(%v)", ino, err)
 		return ParseError(err)
 	}
+	// Truncate/migration may change poolId/class; refresh the data-plane dispatch cache.
+	f.refreshFileMeta(info.PoolId, info.StorageClass)
 
 	if req.Valid.Size() && (proto.IsHot(f.super.volType) || proto.IsStorageClassReplica(storageClass) ||
 		proto.IsStorageClassBlobStore(storageClass)) {
@@ -1051,9 +1053,9 @@ func (f *File) fileSize(ino uint64) (size int, gen uint64) {
 	return
 }
 
-func (f *File) fileSizeVersion2(ino uint64) (size int, gen uint64) {
+func (f *File) fileSizeVersion2(ino uint64, sc uint32) (size int, gen uint64) {
 	valid := false
-	if proto.IsHot(f.super.volType) || proto.IsStorageClassReplica(f.storageClass()) {
+	if proto.IsHot(f.super.volType) || proto.IsStorageClassReplica(sc) {
 		size, gen, valid = f.super.ec.FileSize(ino)
 		if !valid {
 			if info, err := f.super.InodeGet(ino); err == nil {

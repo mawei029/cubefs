@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -344,6 +345,9 @@ func (s *ECStreamer) updateMetaInfo(commitSize *uint64) error {
 
 	// must has mutex here, because oeks is used by reader and writer
 	s.oeks = objExtents
+	sort.Slice(s.oeks, func(i, j int) bool {
+		return s.oeks[i].FileOffset < s.oeks[j].FileOffset
+	})
 
 	// TODO: only use atomit.StoreUint64 for inoVersion and fileSize
 	// atomic.StoreUint64(&s.inoVersion, gen)

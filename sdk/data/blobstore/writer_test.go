@@ -739,6 +739,8 @@ func TestWriterCoverageMoreLowFunctions(t *testing.T) {
 		defer gohook.UnHookMethod(w.ecStreamer.mw, "AppendObjExtentKeys")
 
 		require.NoError(t, w.flush(w.ecStreamer.ino, context.Background(), true))
+		require.Equal(t, 4, w.blockPosition, "flush only persists buffer; reset is notifyCompleteFlushMeta")
+		require.NoError(t, w.notifyCompleteFlushMeta())
 		require.Equal(t, 0, w.blockPosition)
 	})
 

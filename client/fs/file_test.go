@@ -120,6 +120,18 @@ func TestGetStorageClassByPoolIdFromSuper(t *testing.T) {
 	require.Nil(t, getStorageClassByPoolIdFromSuper(s, 99))
 }
 
+func TestFile_getStorageClassByPoolId(t *testing.T) {
+	t.Parallel()
+	s := superForFileTest(t)
+	f := newTestFile(s, fileInodeInfoForMutationTest(90010), 1, "pool.txt")
+
+	got := f.getStorageClassByPoolId(0)
+	require.NotNil(t, got)
+	require.Equal(t, uint8(proto.StorageClass_Replica_HDD), got.StorageClass)
+
+	require.Nil(t, f.getStorageClassByPoolId(99))
+}
+
 func TestNewFile_replica_returnsFile(t *testing.T) {
 	t.Parallel()
 	s := superForFileTest(t)
