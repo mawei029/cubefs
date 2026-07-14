@@ -24,6 +24,7 @@ import (
 	"github.com/cubefs/cubefs/depends/bazil.org/fuse"
 	"github.com/cubefs/cubefs/depends/bazil.org/fuse/fuseutil"
 	"github.com/cubefs/cubefs/util"
+	logutil "github.com/cubefs/cubefs/util/log"
 	"github.com/cubefs/cubefs/util/stat"
 	"golang.org/x/net/context"
 	"golang.org/x/time/rate"
@@ -1402,6 +1403,11 @@ func (c *Server) serve(r fuse.Request) {
 	parentCtx := ctx
 	if c.context != nil {
 		ctx = c.context(ctx, r)
+	}
+
+	if logutil.EnableDebug() {
+		defer logutil.LogDebugf("TRACE fuse serve exit: header(%s) opName(%s) ", r.Hdr().String(), opName(r))
+		logutil.LogDebugf("TRACE fuse serve enter: req string(%s)", r.String())
 	}
 
 	req := &serveRequest{Request: r, cancel: cancel}
