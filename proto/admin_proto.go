@@ -1940,16 +1940,10 @@ func IsStorageClassBlobStore(storageClass uint32) bool {
 	return storageClass == StorageClass_BlobStore
 }
 
-// DataPlaneUsesBlobEC reports whether inode IO should use blobstore ECExtentClient (oec) instead of replica ec stream.
-// Replica storage class always uses ec; Blob always uses oec; otherwise cold volumes use oec and hot volumes use ec.
-func DataPlaneUsesBlobEC(volType int, storageClass uint32) bool {
-	if IsStorageClassReplica(storageClass) {
-		return false
-	}
-	if IsStorageClassBlobStore(storageClass) {
-		return true
-	}
-	return IsCold(volType)
+// IsDataUseBlobEC reports whether inode IO should use blobstore ECExtentClient (oec) instead of replica ec stream.
+// Replica storage class or Hot volume always uses ec; Blob or Cold volumes always uses oec
+func IsDataUseBlobEC(volType int, storageClass uint32) bool {
+	return IsCold(volType) || IsStorageClassBlobStore(storageClass)
 }
 
 func IsVolSupportStorageClass(allowedStorageClass []uint32, storeClass uint32) bool {

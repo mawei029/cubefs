@@ -78,18 +78,22 @@ func seedStreamerExtentsForTest(s *ECStreamer, metaSize uint64, oeks []proto.Obj
 }
 
 // mustTestECStreamerWithEbsc 构造带 Ebsc 的测试流，供 Reader.Read / Writer.TruncateV2 等单测打桩。
-func mustTestECStreamerWithEbsc(ino uint64, ebsc *BlobStoreClient, blockSize int) *ECStreamer {
+func mustTestECStreamerWithEbsc(ino uint64, ebsc *BlobStoreClient, blockSize int, args ...ECStreamOpenArgs) *ECStreamer {
+	var arg ECStreamOpenArgs
+	if len(args) > 0 {
+		arg = args[0]
+	}
+
 	if blockSize <= 0 {
 		blockSize = 8 << 20
 	}
-	args := ECStreamOpenArgs{
-		Ino:       ino,
-		BlockSize: blockSize,
-		Mw:        &meta.MetaWrapper{},
-		Ebsc:      ebsc,
-		VolName:   "vol",
-	}
-	s, err := NewECStreamer(args, nil, nil)
+	arg.Ino = ino
+	arg.BlockSize = blockSize
+	arg.Mw = &meta.MetaWrapper{}
+	arg.Ebsc = ebsc
+	arg.VolName = "vol"
+
+	s, err := NewECStreamer(arg, nil, nil)
 	if err != nil {
 		panic(err)
 	}

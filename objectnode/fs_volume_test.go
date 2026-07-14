@@ -395,8 +395,8 @@ func TestVolume_CopyFile_useOECPath(t *testing.T) {
 	patches.ApplyMethod(reflect.TypeOf(sv.mw), "XAttrGetAll_ll", func(_ *meta.MetaWrapper, _ uint64) (*proto.XAttrInfo, error) {
 		return &proto.XAttrInfo{XAttrs: map[string]string{}}, nil
 	})
-	patches.ApplyMethod(reflect.TypeOf(sr), "Read",
-		func(_ *blobstore.Reader, _ context.Context, buf []byte, _, _ int) (int, error) {
+	patches.ApplyMethod(reflect.TypeOf(sv.oec), "Read",
+		func(_ *blobstore.ECExtentClient, _ uint64, buf []byte, _, _ int) (int, error) {
 			copy(buf, []byte("data"))
 			return 4, io.EOF
 		})
@@ -418,4 +418,31 @@ func registerOecReaderForVolume(s *Volume, ino uint64, r *blobstore.Reader) {
 	args := blobstore.ECStreamOpenArgs{Ino: ino, FileSize: 4, InodeGeneration: 0}
 	st, _ := blobstore.NewECStreamer(args, r, nil)
 	injectOECStreamer(s.oec, ino, st)
+}
+
+func TestVolume_readEbs_2(t *testing.T) {
+	v := newTestVolumeForOEC(t)
+	t.Run("offset_at_or_past_eof", func(t *testing.T) {
+		var out bytes.Buffer
+		require.NoError(t, v.readEbs(1, 10, "/o", &out, 10, 5, 0))
+		require.Empty(t, out.Bytes())
+		require.NoError(t, v.readEbs(1, 10, "/o", &out, 11, 5, 0))
+		require.Empty(t, out.Bytes())
+	})
+	t.Run("range_clamped_via_oec_read", func(t *testing.T) {
+		ino := uint64(55)
+		registerOecReaderForVolume(v, ino, &blobstore.Reader{})
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyMethod(reflect.TypeOf(v.oec), "Read",
+			func(_ *blobstore.ECExtentClient, _ uint64, buf []byte, off, size int) (int, error) {
+				require.Equal(t, 8, off)
+				require.Equal(t, 2, size)
+				copy(buf, []byte("xy"))
+				return 2, nil
+			})
+		var out bytes.Buffer
+		require.NoError(t, v.readEbs(ino, 10, "/o", &out, 8, 10, 0))
+		require.Equal(t, "xy", out.String())
+	})
 }

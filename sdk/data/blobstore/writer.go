@@ -636,7 +636,7 @@ func (writer *Writer) writeSlice(ctx context.Context, wSlice *rwSlice, wg bool) 
 		}
 		return err
 	}
-	log.LogDebugf("TRACE blobStore,location(%v)", location)
+	log.LogDebugf("TRACE blobStore, ino(%v) location(%v)", writer.ecStreamer.Inode(), location)
 	blobs := make([]proto.Blob, 0)
 	for _, info := range location.Slices {
 		blob := proto.Blob{
@@ -656,7 +656,7 @@ func (writer *Writer) writeSlice(ctx context.Context, wSlice *rwSlice, wg bool) 
 		FileOffset: wSlice.fileOffset,
 		Crc:        location.Crc,
 	}
-	log.LogDebugf("TRACE blobStore,objExtentKey(%v)", wSlice.objExtentKey)
+	log.LogDebugf("TRACE blobStore, ino(%v) objExtentKey(%v)", writer.ecStreamer.Inode(), wSlice.objExtentKey)
 
 	if wg {
 		writer.err <- nil

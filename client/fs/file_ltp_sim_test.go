@@ -42,23 +42,6 @@ func ltpNewTestSuperForFile() *Super {
 	}
 }
 
-func ltpPatchOecWriterForMisc(patches *gomonkey.Patches, w *blobstore.Writer) {
-	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "Writer",
-		func(_ *blobstore.ECExtentClient, _ uint64) *blobstore.Writer {
-			return w
-		})
-}
-
-func ltpPatchOecReaderWriterForMisc(patches *gomonkey.Patches, r *blobstore.Reader, w *blobstore.Writer) {
-	t := reflect.TypeOf((*blobstore.ECExtentClient)(nil))
-	patches.ApplyMethod(t, "Reader", func(_ *blobstore.ECExtentClient, _ uint64) *blobstore.Reader {
-		return r
-	})
-	patches.ApplyMethod(t, "Writer", func(_ *blobstore.ECExtentClient, _ uint64) *blobstore.Writer {
-		return w
-	})
-}
-
 func ltpRegisterOecTestStreamer(s *Super, ino uint64, r *blobstore.Reader, w *blobstore.Writer) {
 	var st *blobstore.ECStreamer
 	args := blobstore.ECStreamOpenArgs{Ino: ino}
@@ -91,14 +74,6 @@ func ltpRegisterOecTestStreamerWithLogicalView(s *Super, ino uint64, r *blobstor
 		return
 	}
 	injectOECStreamer(s.oec, ino, st)
-}
-
-func ExportPatchOecWriterForMisc(patches *gomonkey.Patches, w *blobstore.Writer) {
-	ltpPatchOecWriterForMisc(patches, w)
-}
-
-func ExportPatchOecReaderWriterForMisc(patches *gomonkey.Patches, r *blobstore.Reader, w *blobstore.Writer) {
-	ltpPatchOecReaderWriterForMisc(patches, r, w)
 }
 
 func ExportRegisterOecTestStreamer(s *Super, ino uint64, r *blobstore.Reader, w *blobstore.Writer) {
@@ -144,7 +119,6 @@ func TestFile_LtpSim_blob_attr_raises_size_when_stream_matches_inode_gen(t *test
 	w := &blobstore.Writer{}
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
-	ExportPatchOecWriterForMisc(patches, w)
 	const inodeSize = 960512
 	const logicalMax = 0xeb000
 	gen := uint64(7)
@@ -167,7 +141,6 @@ func TestFile_LtpSim_blob_attr_ignores_stale_stream_when_inode_gen_newer(t *test
 	w := &blobstore.Writer{}
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
-	ExportPatchOecWriterForMisc(patches, w)
 	const inodeSize = 0xfa000
 	inodeGen := uint64(20)
 	staleStreamSize := uint64(1038336)
@@ -192,7 +165,6 @@ func TestFile_LtpSim_blob_read_does_not_extend_past_inode_when_stream_gen_stale(
 	r := &blobstore.Reader{}
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
-	ExportPatchOecReaderWriterForMisc(patches, r, w)
 	ExportRegisterOecTestStreamer(s, ExportFileIno(f), r, w)
 
 	const inodeSize = 0x39800
@@ -224,7 +196,6 @@ func TestFile_LtpSim_blob_read_extends_read_size_when_stream_gen_matches_inode(t
 	r := &blobstore.Reader{}
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
-	ExportPatchOecReaderWriterForMisc(patches, r, w)
 	ExportRegisterOecTestStreamer(s, ExportFileIno(f), r, w)
 
 	const inodeSize = 100_000
@@ -254,7 +225,6 @@ func TestFile_LtpSim_blob_fstat_after_write_sequence(t *testing.T) {
 	w := &blobstore.Writer{}
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
-	ExportPatchOecWriterForMisc(patches, w)
 	ExportRegisterOecTestStreamer(s, ExportFileIno(f), nil, w)
 	ExportSetFileFlag(f, syscall.O_RDWR)
 
@@ -316,7 +286,6 @@ func TestFile_LtpSim_ftest03_fstat_after_expand_trunc(t *testing.T) {
 	w := &blobstore.Writer{}
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
-	ExportPatchOecWriterForMisc(patches, w)
 	ExportRegisterOecTestStreamerWithLogicalView(s, ExportFileIno(f), nil, w, fileMax, 12)
 
 	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet", func(_ *Super, _ uint64) (*proto.InodeInfo, error) {

@@ -252,8 +252,8 @@ func TestBlobPreReadLimiterAndEnsurePrefetchBuf(t *testing.T) {
 	r := &Reader{ecStreamer: s, preReadLimiter: &blobPreReadLimiter{maxBytes: 4}}
 	assert.False(t, r.ensurePrefetchBuf())
 
-	s2 := mustTestECStreamerWithEbsc(2, nil, 16)
-	r2 := &Reader{ecStreamer: s2, preReadLimiter: &blobPreReadLimiter{maxBytes: 64}}
+	s2 := mustTestECStreamerWithEbsc(2, nil, 16, ECStreamOpenArgs{AheadWindowCnt: 1, PrefetchTotalMem: 64})
+	r2 := s2.Reader()
 	assert.True(t, r2.ensurePrefetchBuf())
 }
 

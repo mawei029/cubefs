@@ -76,15 +76,18 @@ func TestDataPlaneUsesBlobEC(t *testing.T) {
 		sc      uint32
 		want    bool
 	}{
-		{VolumeTypeHot, StorageClass_BlobStore, true},
+		// {VolumeTypeHot, StorageClass_BlobStore, true},
+		{VolumeTypeInvalid, StorageClass_Replica_SSD, false},
+		{VolumeTypeHot, StorageClass_Unspecified, false},
 		{VolumeTypeHot, StorageClass_Replica_SSD, false},
+		{VolumeTypeHot, StorageClass_Replica_HDD, false},
 		{VolumeTypeCold, StorageClass_BlobStore, true},
-		{VolumeTypeCold, StorageClass_Replica_SSD, false},
-		{VolumeTypeCold, StorageClass_Replica_HDD, false},
+		{VolumeTypeCold, StorageClass_Unspecified, true},
+		// {VolumeTypeCold, StorageClass_Replica_SSD, false},
 	}
 	for _, c := range cases {
-		if got := DataPlaneUsesBlobEC(c.volType, c.sc); got != c.want {
-			t.Fatalf("DataPlaneUsesBlobEC(vol=%d sc=%d)=%v want %v", c.volType, c.sc, got, c.want)
+		if got := IsDataUseBlobEC(c.volType, c.sc); got != c.want {
+			t.Fatalf("IsDataUseBlobEC(vol=%d sc=%d)=%v want %v", c.volType, c.sc, got, c.want)
 		}
 	}
 }

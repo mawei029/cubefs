@@ -1029,7 +1029,7 @@ func (c *Client) openOECStream(f *File, info *proto.InodeInfo, openFlags uint32,
 }
 
 func (c *Client) openStream(f *File, openForWrite bool, fullPath string) error {
-	if proto.DataPlaneUsesBlobEC(c.volType, f.storageClass) {
+	if proto.IsDataUseBlobEC(c.volType, f.storageClass) {
 		info := c.ic.Get(f.ino)
 		if info == nil {
 			var err error
@@ -1051,7 +1051,7 @@ func (c *Client) openStream(f *File, openForWrite bool, fullPath string) error {
 }
 
 func (c *Client) closeStream(f *File) error {
-	if proto.DataPlaneUsesBlobEC(c.volType, f.storageClass) {
+	if proto.IsDataUseBlobEC(c.volType, f.storageClass) {
 		if err := c.oec.CloseStream(f.ino); err != nil {
 			return err
 		}
@@ -1066,7 +1066,7 @@ func (c *Client) closeStream(f *File) error {
 }
 
 func (c *Client) truncate(f *File, size int) error {
-	if proto.DataPlaneUsesBlobEC(c.volType, f.storageClass) {
+	if proto.IsDataUseBlobEC(c.volType, f.storageClass) {
 		return c.oec.Truncate(f.pino, f.ino, uint64(size), f.path)
 	}
 	return c.ec.Truncate(c.mw, f.pino, f.ino, size, f.path)

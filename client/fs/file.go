@@ -126,6 +126,7 @@ func (f *File) buildECStreamOpenArgs(info *proto.InodeInfo, openFlags uint32, fi
 		AheadReadEnable:  aheadEn,
 		MinReadAheadSize: aheadMin,
 		PrefetchTotalMem: aheadTotalMem,
+		AheadWindowCnt:   f.super.aheadWindowCnt,
 	}, nil
 }
 
@@ -236,7 +237,7 @@ func (f *File) Forget() {
 	if DisableMetaCache {
 		f.super.ic.Delete(ino)
 		fullPath := f.getParentPath() + f.name
-		if proto.DataPlaneUsesBlobEC(f.super.volType, f.storageClass()) {
+		if proto.IsDataUseBlobEC(f.super.volType, f.storageClass()) {
 			// Evict oec only on cold/Blob; do not call ec.EvictStream.
 			if err := f.super.oec.EvictStream(ino); err != nil {
 				log.LogWarnf("Forget: oec EvictStream not ready, ino(%v) path(%v) err(%v)", ino, fullPath, err)
@@ -333,7 +334,7 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 		resp.Flags |= fuse.OpenKeepCache
 	}
 	// Cold/Blob: openOECStream (oec refCnt++); Flush existing stream first (oec only, not ec.OpenStream).
-	if proto.DataPlaneUsesBlobEC(f.super.volType, info.StorageClass) {
+	if proto.IsDataUseBlobEC(f.super.volType, info.StorageClass) {
 		log.LogDebugf("TRANCE open ino(%v) info(%v), poolId(%v)", ino, info, info.PoolId)
 
 		if s := f.super.oec.GetStreamer(ino); s != nil {
@@ -394,13 +395,11 @@ func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) (err error
 		return ParseError(getErr)
 	}
 
-	if proto.DataPlaneUsesBlobEC(f.super.volType, storageClass) {
+	if proto.IsDataUseBlobEC(f.super.volType, storageClass) {
 		if errOec = f.super.oec.CloseStream(ino); errOec != nil {
 			log.LogErrorf("Release: oec CloseStream ino(%v) req(%v) err(%v)", ino, req, errOec)
 			// oec.CloseStream rolls back refCnt on Flush failure; FreeCache writer buffer here, no Evict.
-			if w := f.super.oec.Writer(ino); w != nil {
-				w.FreeCache()
-			}
+			f.super.oec.FreeCache(ino)
 			return ParseError(errOec)
 		}
 	} else {
@@ -561,7 +560,7 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 		}
 		// Cold/Blob still set FlagsSyncWrite for writer sync path; do not clear waitForFlush,
 		// or FUSE returns success before durable write under O_SYNC/O_DIRECT (LTP rwtest/POSIX).
-		if proto.IsCold(f.super.volType) || proto.IsStorageClassBlobStore(storageClass) {
+		if proto.IsDataUseBlobEC(f.super.volType, storageClass) {
 			flags |= proto.FlagsSyncWrite
 		}
 	}
@@ -808,7 +807,7 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 	defer f.super.EndDirMutation(f.parentIno)
 
 	isCache := false
-	if proto.IsCold(f.super.volType) || proto.IsStorageClassBlobStore(storageClass) {
+	if proto.IsDataUseBlobEC(f.super.volType, storageClass) {
 		isCache = true
 	}
 
@@ -839,7 +838,7 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 			}
 			f.super.ic.Delete(ino)
 			f.super.ec.RefreshExtentsCache(ino)
-		case proto.IsStorageClassBlobStore(storageClass):
+		case proto.IsDataUseBlobEC(f.super.volType, storageClass):
 			if err := f.openOECStream(info, uint32(req.Flags&0x0f), info.Size); err != nil {
 				log.LogErrorf("Setattr: openOECStream ino(%v) size(%v) err(%v)", ino, req.Size, err)
 				return ParseError(err)

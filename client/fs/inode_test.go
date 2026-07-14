@@ -407,6 +407,19 @@ func TestLoadInodeInfo_metaNilInfo(t *testing.T) {
 	require.ErrorIs(t, err, fuse.ENOENT)
 }
 
+func TestLoadInodeInfo_incremental_after_aa4ae93(t *testing.T) {
+	t.Parallel()
+	s := superForDirMutationTest(t)
+	patches := gomonkey.ApplyMethod(reflect.TypeOf(&meta.MetaWrapper{}), "InodeGet_ll",
+		func(_ *meta.MetaWrapper, _ uint64, _ bool) (*proto.InodeInfo, error) {
+			return nil, syscall.ENOENT
+		})
+	t.Cleanup(patches.Reset)
+
+	_, err := s.LoadInodeInfo(60099)
+	require.ErrorIs(t, err, fuse.ENOENT)
+}
+
 func TestLoadInodeInfo_refreshExtentsErrorWhenMissingExtents(t *testing.T) {
 	t.Parallel()
 	const ino = uint64(60004)

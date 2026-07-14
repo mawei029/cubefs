@@ -44,6 +44,7 @@ type ECStreamOpenArgs struct {
 	AheadReadEnable  bool
 	MinReadAheadSize int
 	PrefetchTotalMem int64
+	AheadWindowCnt   int
 }
 
 func (a ECStreamOpenArgs) toClientConfig(s *ECStreamer) ClientConfig {
@@ -66,6 +67,7 @@ func (a ECStreamOpenArgs) toClientConfig(s *ECStreamer) ClientConfig {
 		AheadReadEnable:  a.AheadReadEnable,
 		MinReadAheadSize: a.MinReadAheadSize,
 		PrefetchTotalMem: a.PrefetchTotalMem,
+		AheadWindowCnt:   a.AheadWindowCnt,
 	}
 }
 
@@ -158,6 +160,19 @@ func (c *ECExtentClient) CloseStream(ino uint64) error {
 	return nil
 }
 
+func (c *ECExtentClient) FreeCache(ino uint64) {
+	c.mu.RLock()
+	s, ok := c.streamers[ino]
+	c.mu.RUnlock()
+	if s == nil || !ok {
+		return
+	}
+
+	s.mu.Lock()
+	s.dropIOCachesLocked()
+	s.mu.Unlock()
+}
+
 // EvictStream closes RW and deletes map entry when refCnt==0; refCnt>0 warns and returns nil (entry kept for Forget retry).
 func (c *ECExtentClient) EvictStream(ino uint64) error {
 	c.mu.Lock()
@@ -206,32 +221,6 @@ func (c *ECExtentClient) HasWriter(ino uint64) bool {
 	s, ok := c.streamers[ino]
 	c.mu.RUnlock()
 	return ok && s != nil && s.fWriter != nil
-}
-
-func (c *ECExtentClient) Reader(ino uint64) *Reader {
-	c.mu.RLock()
-	s, ok := c.streamers[ino]
-	c.mu.RUnlock()
-	if s == nil {
-		if ok {
-			log.LogErrorf("ECExtentClient GetStreamer: streamer not found, ino(%v)", ino)
-		}
-		return nil
-	}
-	return s.Reader()
-}
-
-func (c *ECExtentClient) Writer(ino uint64) *Writer {
-	c.mu.RLock()
-	s, ok := c.streamers[ino]
-	c.mu.RUnlock()
-	if s == nil {
-		if ok {
-			log.LogErrorf("ECExtentClient Writer: streamer not found, ino(%v)", ino)
-		}
-		return nil
-	}
-	return s.Writer()
 }
 
 // RefCnt matches replica ExtentClient.RefCnt.

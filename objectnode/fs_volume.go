@@ -717,7 +717,7 @@ func (v *Volume) PutObject(path string, reader io.Reader, opt *PutFileOption) (f
 
 	md5Hash := md5.New()
 	isCache := false
-	useOEC := proto.DataPlaneUsesBlobEC(v.volType, invisibleTempDataInode.StorageClass)
+	useOEC := proto.IsDataUseBlobEC(v.volType, invisibleTempDataInode.StorageClass)
 	if useOEC {
 		if err = v.openOECStream(invisibleTempDataInode.Inode, invisibleTempDataInode.PoolId); err != nil {
 			log.LogErrorf("PutObject: open oec stream fail: volume(%v) path(%v) inode(%v) err(%v)",
@@ -1086,7 +1086,7 @@ func (v *Volume) WritePart(path string, multipartId string, partId uint16, reade
 		md5Hash = md5.New()
 	)
 	isCache := false
-	useOEC := proto.DataPlaneUsesBlobEC(v.volType, tempInodeInfo.StorageClass)
+	useOEC := proto.IsDataUseBlobEC(v.volType, tempInodeInfo.StorageClass)
 	if useOEC {
 		if err = v.openOECStream(tempInodeInfo.Inode, tempInodeInfo.PoolId); err != nil {
 			log.LogErrorf("WritePart: open oec stream fail: volume(%v) path(%v) multipartID(%v) partID(%v) inode(%v) err(%v)",
@@ -1608,7 +1608,7 @@ func (v *Volume) loadUserDefinedMetadata(inode uint64) (metadata map[string]stri
 
 func (v *Volume) readFile(inode, inodeSize uint64, path string, writer io.Writer, offset, size uint64, storageClass uint32, poolId uint8) (err error) {
 	isCache := false
-	useOEC := proto.DataPlaneUsesBlobEC(v.volType, storageClass)
+	useOEC := proto.IsDataUseBlobEC(v.volType, storageClass)
 	if useOEC {
 		if err = v.openOECStream(inode, poolId); err != nil {
 			log.LogErrorf("readFile: open oec stream fail, inode(%v) err(%v)", inode, err)
@@ -1637,16 +1637,18 @@ func (v *Volume) readFile(inode, inodeSize uint64, path string, writer io.Writer
 }
 
 func (v *Volume) readEbs(inode, inodeSize uint64, path string, writer io.Writer, offset, size uint64, poolId uint8) error {
-	upper := size + offset
+	if offset >= inodeSize { // no data to read
+		return nil
+	}
+	upper := offset + size
 	if upper > inodeSize {
-		upper = inodeSize - offset
+		upper = inodeSize
 	}
 
 	ctx := context.Background()
 	_ = context.WithValue(ctx, "objectnode", 1) // nolint: staticcheck
 
-	ecStreamer := v.oec.GetStreamer(inode)
-	if ecStreamer == nil || !v.oec.HasReader(inode) {
+	if !v.oec.HasReader(inode) {
 		return fmt.Errorf("readEbs: no reader for inode(%v)", inode)
 	}
 	var n int
@@ -1668,7 +1670,7 @@ func (v *Volume) readEbs(inode, inodeSize uint64, path string, writer io.Writer,
 		if convErr != nil {
 			return convErr
 		}
-		n, err = ecStreamer.Read(ctx, tmp, off, readSize)
+		n, err = v.oec.Read(inode, tmp, off, readSize)
 		if err != nil && err != io.EOF {
 			log.LogErrorf("ReadFile: data read fail: volume(%v) path(%v) inode(%v) offset(%v) size(%v) err(%v)",
 				v.name, path, inode, offset, size, err)
@@ -2701,7 +2703,7 @@ func (v *Volume) CopyFile(sv *Volume, sourcePath, targetPath, metaDirective stri
 		return nil, syscall.EFBIG
 	}
 	isCache := false
-	srcUseOEC := proto.DataPlaneUsesBlobEC(sv.volType, sInodeInfo.StorageClass)
+	srcUseOEC := proto.IsDataUseBlobEC(sv.volType, sInodeInfo.StorageClass)
 	if srcUseOEC {
 		if err = sv.openOECStream(sInode, sInodeInfo.PoolId); err != nil {
 			log.LogErrorf("CopyFile: open source oec stream fail: volume(%v) path(%v) inode(%v) err(%v)",
@@ -2881,7 +2883,7 @@ func (v *Volume) CopyFile(sv *Volume, sourcePath, targetPath, metaDirective stri
 	}()
 
 	isCache = false
-	tgtUseOEC := proto.DataPlaneUsesBlobEC(v.volType, tInodeInfo.StorageClass)
+	tgtUseOEC := proto.IsDataUseBlobEC(v.volType, tInodeInfo.StorageClass)
 	if tgtUseOEC {
 		if err = v.openOECStream(tInodeInfo.Inode, tInodeInfo.PoolId); err != nil {
 			log.LogErrorf("CopyFile: open target oec stream fail: volume(%v) path(%v) inode(%v) err(%v)",
@@ -2920,25 +2922,21 @@ func (v *Volume) CopyFile(sv *Volume, sourcePath, targetPath, metaDirective stri
 		buf         = make([]byte, 2*util.BlockSize)
 	)
 
-	var sctx context.Context
-	var ebsReader *blobstore.Reader
 	var tctx context.Context
 	var ecStreamer *blobstore.ECStreamer
 	if srcUseOEC {
-		sctx = context.Background()
-		ebsReader = sv.oec.Reader(sInode)
-		if ebsReader == nil {
+		if !sv.oec.HasReader(sInode) {
 			err = fmt.Errorf("CopyFile: no source oec reader for inode(%v)", sInode)
 			return
 		}
 	}
 	if tgtUseOEC {
 		tctx = context.Background()
-		ecStreamer = v.oec.GetStreamer(tInodeInfo.Inode)
-		if ecStreamer == nil || !v.oec.HasWriter(tInodeInfo.Inode) {
+		if !v.oec.HasWriter(tInodeInfo.Inode) {
 			err = fmt.Errorf("CopyFile: no target oec writer for inode(%v)", tInodeInfo.Inode)
 			return
 		}
+		ecStreamer = v.oec.GetStreamer(tInodeInfo.Inode)
 	}
 
 	for {
@@ -2951,7 +2949,7 @@ func (v *Volume) CopyFile(sv *Volume, sourcePath, targetPath, metaDirective stri
 		}
 		buf = buf[:readSize]
 		if srcUseOEC {
-			readN, err = ebsReader.Read(sctx, buf, readOffset, readSize)
+			readN, err = sv.oec.Read(sInode, buf, readOffset, readSize)
 		} else {
 			readN, err = sv.ec.Read(sInode, buf, readOffset, readSize, sInodeInfo.PoolId, false)
 		}

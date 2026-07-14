@@ -18,9 +18,9 @@ import (
 	"context"
 	"crypto/md5"
 	"errors"
-	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -38,6 +38,19 @@ import (
 	"github.com/cubefs/cubefs/sdk/meta"
 	"github.com/cubefs/cubefs/util/buf"
 )
+
+// writer_test.go layout (top → bottom):
+//
+//  1. fixtures     — init(), shared writer, mocks
+//  2. lifecycle    — TestWriter_lifecycle
+//  3. truncate     — TestWriter_truncate
+//  4. write        — TestWriter_write (entry, guards, buffered / parallel / without-pool)
+//  5. tryOverWrite — TestWriter_tryOverWrite
+//  6. flush        — TestWriter_flush, TestWriter_flushExt
+//  7. overwrite    — TestWriter_flushOverwriteReqs, computeOverwriteReqs
+//  8. bufferPool   — TestWriter_bufferPool
+//  9. slice        — TestWriter_slice
+// 10. extended     — TestWriter_extended (error paths & coverage gaps)
 
 var writer *Writer
 
@@ -81,67 +94,90 @@ func init() {
 		ECStreamer:      streamer,
 	}
 
-	buf.InitCachePool(8388608, 512)
+	buf.InitCachePool(65536, 16)
 	writer = NewWriter(config)
 }
+
+// ---------- fixtures: nil writer ----------
 
 func newNilWriter() (writer *Writer) {
 	return nil
 }
 
-func TestNotInstanceWriter_Write(t *testing.T) {
-	writer := newNilWriter()
-	ctx := context.Background()
-	data := []byte{1, 2, 3}
-	var flag int
-	flag |= proto.FlagsAppend
-	_, err := writer.Write(ctx, 0, data, flag)
-	// expect err is not nil
-	if err == nil {
-		t.Fatalf("write is called by not instance writer.")
-	}
-}
+// ---------- 2. lifecycle ----------
 
-// TestWriter_TruncateV2_NilReturnsError 校验 nil Writer 调用 TruncateV2 返回错误（EC truncate 基本分支）。
-
-func TestNewWriter(t *testing.T) {
-	t.Run("panics_without_ec_streamer", func(t *testing.T) {
-		defer func() {
-			require.NotNil(t, recover())
-		}()
-		_ = NewWriter(ClientConfig{VolName: "v", Ino: 1})
-	})
-	t.Run("no_write_buf_on_create", func(t *testing.T) {
-		buf.InitCachePool(1024, 4)
-		st := mustTestECStreamer(410, nil, nil)
-		w := NewWriter(ClientConfig{ECStreamer: st, LimitManager: newTestLimitManager()})
-		require.Nil(t, w.buf)
-	})
-	t.Run("creates_with_config", func(t *testing.T) {
-		config := ClientConfig{
-			VolName:         "cfs",
-			VolType:         1,
-			BlockSize:       1 << 23,
-			Ino:             1000,
-			Bc:              nil,
-			Mw:              nil,
-			LimitManager:    newTestLimitManager(),
-			Ebsc:            nil,
-			EnableBcache:    false,
-			WConcurrency:    10,
-			ReadConcurrency: 10,
-			FileCache:       false,
-			FileSize:        0,
-			ECStreamer:      mustTestECStreamer(1000, nil, nil),
+func TestWriter_lifecycle(t *testing.T) {
+	t.Run("nil_writer_write", func(t *testing.T) {
+		writer := newNilWriter()
+		ctx := context.Background()
+		data := []byte{1, 2, 3}
+		var flag int
+		flag |= proto.FlagsAppend
+		_, err := writer.Write(ctx, 0, data, flag)
+		if err == nil {
+			t.Fatalf("write is called by not instance writer.")
 		}
-		w := NewWriter(config)
-		_ = w.String()
-		require.NotNil(t, w)
+	})
+
+	t.Run("NewWriter", func(t *testing.T) {
+		t.Run("panics_without_ec_streamer", func(t *testing.T) {
+			defer func() {
+				require.NotNil(t, recover())
+			}()
+			_ = NewWriter(ClientConfig{VolName: "v", Ino: 1})
+		})
+		t.Run("no_write_buf_on_create", func(t *testing.T) {
+			buf.InitCachePool(1024, 4)
+			st := mustTestECStreamer(410, nil, nil)
+			w := NewWriter(ClientConfig{ECStreamer: st, LimitManager: newTestLimitManager()})
+			require.Nil(t, w.buf)
+		})
+		t.Run("creates_with_config", func(t *testing.T) {
+			config := ClientConfig{
+				VolName:         "cfs",
+				VolType:         1,
+				BlockSize:       1 << 23,
+				Ino:             1000,
+				Bc:              nil,
+				Mw:              nil,
+				LimitManager:    newTestLimitManager(),
+				Ebsc:            nil,
+				EnableBcache:    false,
+				WConcurrency:    10,
+				ReadConcurrency: 10,
+				FileCache:       false,
+				FileSize:        0,
+				ECStreamer:      mustTestECStreamer(1000, nil, nil),
+			}
+			w := NewWriter(config)
+			_ = w.String()
+			require.NotNil(t, w)
+		})
+	})
+
+	t.Run("CacheFileSize", func(t *testing.T) {
+		for _, tc := range []struct {
+			fileSize   uint64
+			expectSize uint64
+		}{
+			{1, 1}, {10, 10}, {100, 100}, {1000, 1000},
+		} {
+			s := mustTestECStreamer(1001, nil, nil)
+			SeedLogicalViewForTest(s, tc.fileSize, 0)
+			require.Equal(t, tc.expectSize, uint64(s.fWriter.CacheFileSize()))
+		}
+	})
+
+	t.Run("rwSlice_String", func(t *testing.T) {
+		s := rwSlice{fileOffset: 1, size: 2, hole: true}
+		require.Contains(t, s.String(), "rwSlice{")
 	})
 }
 
-func TestWriter_TruncateV2_nil(t *testing.T) {
-	t.Run("truncate_v2", func(t *testing.T) {
+// ---------- 3. truncate ----------
+
+func TestWriter_truncate(t *testing.T) {
+	t.Run("nil_writer", func(t *testing.T) {
 		w := newNilWriter()
 		ctx := context.Background()
 		_, _, err := truncateV2ForTest(w, ctx, 100)
@@ -155,219 +191,211 @@ func TestWriter_TruncateV2_nil(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "nil")
 	})
+
+	t.Run("nil_ebsc", func(t *testing.T) {
+		s := mustTestECStreamer(1, nil, nil)
+		s.mw = &meta.MetaWrapper{}
+		s.ebsc = nil
+		_, _, err := s.fWriter.TruncateV2FromExtents(context.Background(), 10, 100, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "ebsc nil")
+	})
+
+	t.Run("no_shrink_when_target_ge_current", func(t *testing.T) {
+		s := mustTestECStreamerWithEbsc(265, &BlobStoreClient{}, 8<<20)
+		eks := []proto.ObjExtentKey{{FileOffset: 0, Size: 100}}
+		newEk, del, err := s.fWriter.TruncateV2FromExtents(context.Background(), 100, 100, eks)
+		require.NoError(t, err)
+		require.True(t, newEk.IsEmpty())
+		require.True(t, del.IsEmpty())
+
+		newEk, del, err = s.fWriter.TruncateV2FromExtents(context.Background(), 200, 100, eks)
+		require.NoError(t, err)
+		require.True(t, newEk.IsEmpty())
+		require.True(t, del.IsEmpty())
+	})
+
+	t.Run("grow_no_shrink_via_truncateV2", func(t *testing.T) {
+		s := mustTestECStreamer(1, nil, nil)
+		SeedLogicalViewForTest(s, 123, 0)
+		w := s.fWriter
+		require.Equal(t, 123, w.CacheFileSize())
+
+		mw := &meta.MetaWrapper{}
+		err := gohook.HookMethod(mw, "GetObjExtents", func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
+			return 1, 20, nil, []proto.ObjExtentKey{{FileOffset: 0, Size: 20}}, nil
+		}, nil)
+		require.NoError(t, err)
+		defer gohook.UnHookMethod(mw, "GetObjExtents")
+
+		s.mw = mw
+		s.ebsc = &BlobStoreClient{}
+		seedStreamerExtentsForTest(s, 20, []proto.ObjExtentKey{{FileOffset: 0, Size: 20}})
+
+		newExt, toDel, err := truncateV2ForTest(w, context.Background(), 25)
+		require.NoError(t, err)
+		require.True(t, newExt.IsEmpty())
+		require.True(t, toDel.IsEmpty())
+	})
+
+	t.Run("shrink_via_TruncateV2", func(t *testing.T) {
+		st, w := testWriterWithMwEbsc(500, &BlobStoreClient{})
+		SeedLogicalViewForTest(st, 100, 1)
+		seedStreamerExtentsForTest(st, 100, []proto.ObjExtentKey{{FileOffset: 0, Size: 100}})
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyMethod(reflect.TypeOf(w.ecStreamer.ebsc), "TruncateV2Extents",
+			func(_ *BlobStoreClient, _ context.Context, _ string, _ []proto.ObjExtentKey, ts uint64) (proto.ObjExtentKey, proto.ObjExtentKey, error) {
+				return proto.ObjExtentKey{FileOffset: 0, Size: ts}, proto.ObjExtentKey{FileOffset: ts, Size: 100 - ts}, nil
+			})
+		newEk, del, err := w.TruncateV2(context.Background(), 50)
+		require.NoError(t, err)
+		require.Equal(t, uint64(50), newEk.Size)
+		require.False(t, del.IsEmpty())
+	})
 }
 
-func TestWriter_TruncateV2FromExtentsNilEbsc(t *testing.T) {
-	s := mustTestECStreamer(1, nil, nil)
-	s.mw = &meta.MetaWrapper{}
-	s.ebsc = nil
-	_, _, err := s.fWriter.TruncateV2FromExtents(context.Background(), 10, 100, nil)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "ebsc nil")
-}
+// ---------- 9. slice ----------
 
-func TestWriter_TruncateV2FromExtents_no_shrink_when_target_ge_current(t *testing.T) {
-	s := mustTestECStreamerWithEbsc(265, &BlobStoreClient{}, 8<<20)
-	eks := []proto.ObjExtentKey{{FileOffset: 0, Size: 100}}
-	newEk, del, err := s.fWriter.TruncateV2FromExtents(context.Background(), 100, 100, eks)
-	require.NoError(t, err)
-	require.True(t, newEk.IsEmpty())
-	require.True(t, del.IsEmpty())
-
-	newEk, del, err = s.fWriter.TruncateV2FromExtents(context.Background(), 200, 100, eks)
-	require.NoError(t, err)
-	require.True(t, newEk.IsEmpty())
-	require.True(t, del.IsEmpty())
-}
-
-func TestWriter_doBufferWrite_(t *testing.T) {
-	buf.InitCachePool(8388608, 512)
-	writer.buf = nil
-	writer.bufPooled = false
-	writer.blockPosition = 0
-	writer.fileOffset = 0
-	t.Cleanup(func() { writer.FreeCache() })
-
-	// write data to buffer,not write to ebs when len(buffer)<BlockSize
-	ctx := context.Background()
-	testCases := []struct {
-		offset int
-		data   []byte
-		n      int
-	}{
-		{0, make([]byte, 1), 1},
-		{1, make([]byte, 10), 10},
-		{11, make([]byte, 100), 100},
-		{111, make([]byte, 1000), 1000},
-		{1111, make([]byte, 10000), 10000},
-		{11111, make([]byte, 100000), 100000},
-		{111111, make([]byte, 1000000), 1000000},
-		{1111111, make([]byte, 5000000), 5000000},
-	}
-	var flag int
-	flag |= proto.FlagsAppend
-	var fileSize int
-	for _, tc := range testCases {
-		n, err := writer.Write(ctx, tc.offset, tc.data, flag)
-		if n != tc.n || err != nil {
-			t.Fatalf("write fail. write n(%v),expect n(%v) err(%v)", n, tc.n, err)
+func TestWriter_slice(t *testing.T) {
+	t.Run("prepareWriteSlice_block_boundaries", func(t *testing.T) {
+		const bs = 1024
+		s := mustTestECStreamerWithEbsc(98, nil, bs)
+		w := s.fWriter
+		for _, tc := range []struct {
+			dataLen            int
+			expectSlices       int
+			expectSliceDateLen []int
+		}{
+			{100, 1, []int{100}},
+			{bs - 1, 1, []int{bs - 1}},
+			{bs, 1, []int{bs}},
+			{bs + 1, 2, []int{bs, 1}},
+			{bs * 2, 2, []int{bs, bs}},
+		} {
+			data := make([]byte, tc.dataLen)
+			wSlices := w.prepareWriteSlice(0, data)
+			lens := make([]int, 0, len(wSlices))
+			for _, sl := range wSlices {
+				lens = append(lens, len(sl.Data))
+			}
+			require.Equal(t, tc.expectSlices, len(wSlices))
+			require.Equal(t, tc.expectSliceDateLen, lens)
 		}
-		fileSize += tc.n
-	}
-	if writer.CacheFileSize() != fileSize {
-		t.Fatalf("write fail. fileSize is correct. fileSize:(%v),expect:(%v)", writer.CacheFileSize(), fileSize)
-	}
-}
+	})
 
-func TestWriter_prepareWriteSlice(t *testing.T) {
-	testCases := []struct {
-		offset             int
-		dataLen            int
-		expectSlices       int
-		expectSliceDateLen []int
-	}{
-		{0, 100, 1, []int{100}},
-		{0, 1<<23 - 1, 1, []int{1<<23 - 1}},
-		{0, 1 << 23, 1, []int{1 << 23}},
-		{0, 1<<23 + 1, 2, []int{1 << 23, 1}},
-		{0, 1 << 24, 2, []int{1 << 23, 1 << 23}},
-	}
-	for _, tc := range testCases {
-		data := make([]byte, tc.dataLen)
-		wSlices := writer.prepareWriteSlice(tc.offset, data)
-		actualSlices := len(wSlices)
-		actualSliceDateLen := make([]int, 0)
-		for _, wSlice := range wSlices {
-			actualSliceDateLen = append(actualSliceDateLen, len(wSlice.Data))
+	t.Run("prepareWriteSlice_small_block", func(t *testing.T) {
+		for _, tc := range []struct {
+			data             []byte
+			blockSize        int
+			expectSliceCount int
+		}{
+			{[]byte("hello world"), 10, 2},
+			{[]byte("hello world"), 100, 1},
+			{[]byte("0123456789012345678901234567890123456789"), 5, 8},
+			{[]byte("0123456789012345678901234567890123456789"), 15, 3},
+		} {
+			args := ECStreamOpenArgs{Ino: 99, BlockSize: tc.blockSize, Mw: &meta.MetaWrapper{}}
+			st, _ := NewECStreamer(args, nil, nil)
+			require.Equal(t, tc.expectSliceCount, len(st.fWriter.prepareWriteSlice(0, tc.data)))
 		}
-		if actualSlices != tc.expectSlices || !reflect.DeepEqual(actualSliceDateLen, tc.expectSliceDateLen) {
-			t.Fatalf("prepareWriteSlice fail. actualSlices(%v) expectSlices(%v) "+
-				"actualSliceDateLen(%v) expectSliceDateLen(%v)",
-				actualSlices, tc.expectSlices, actualSliceDateLen, tc.expectSliceDateLen)
+	})
+
+	t.Run("writeSlice", func(t *testing.T) {
+		for _, tc := range []struct {
+			wg           bool
+			ebsWriteFunc func(*BlobStoreClient, context.Context, string, []byte, uint32) (proto2.Location, error)
+			expectError  error
+		}{
+			{false, MockEbscWriteTrue, nil},
+			{false, MockEbscWriteFalse, syscall.EIO},
+			{true, MockEbscWriteTrue, nil},
+			{true, MockEbscWriteFalse, syscall.EIO},
+		} {
+			ebsc := &BlobStoreClient{}
+			require.NoError(t, gohook.HookMethod(ebsc, "Write", tc.ebsWriteFunc, nil))
+			writer.ecStreamer.ebsc = ebsc
+			wSlice := &rwSlice{
+				fileOffset: 0,
+				size:       100,
+				Data:       make([]byte, 100),
+			}
+			ctx := context.Background()
+			writer.err = make(chan *wSliceErr, 1)
+			writer.wg = sync.WaitGroup{}
+			writer.wg.Add(1)
+			if tc.wg {
+				go func() { <-writer.err }()
+			}
+			require.Equal(t, tc.expectError, writer.writeSlice(ctx, wSlice, tc.wg))
 		}
-	}
+	})
 }
 
-func TestPrepareWriteSlice(t *testing.T) {
-	testCase := []struct {
-		data             []byte
-		blockSize        int
-		expectSliceCount int
-	}{
-		{[]byte("hello world"), 10, 2},
-		{[]byte("hello world"), 100, 1},
-		{[]byte("0123456789012345678901234567890123456789"), 5, 8},
-		{[]byte("0123456789012345678901234567890123456789"), 15, 3},
-	}
-	for _, tc := range testCase {
-		args := ECStreamOpenArgs{Ino: 99, BlockSize: tc.blockSize, Mw: &meta.MetaWrapper{}}
-		st, _ := NewECStreamer(args, nil, nil)
-		sliceGot := st.fWriter.prepareWriteSlice(0, tc.data)
-		assert.Equal(t, tc.expectSliceCount, len(sliceGot))
-	}
-}
+// ---------- 4. write ----------
 
-func TestCacheFileSize(t *testing.T) {
-	testCase := []struct {
-		fileSize   uint64
-		expectSize uint64
-	}{
-		{1, 1},
-		{10, 10},
-		{100, 100},
-		{1000, 1000},
-	}
-	for _, tc := range testCase {
-		s := mustTestECStreamer(1001, nil, nil)
-		SeedLogicalViewForTest(s, tc.fileSize, 0)
-		gotSize := uint64(s.fWriter.CacheFileSize())
-		assert.Equal(t, tc.expectSize, gotSize)
-	}
-}
+func TestWriter_write(t *testing.T) {
+	t.Run("buffered_append_accumulates", func(t *testing.T) {
+		const blockSize = 4096
+		buf.InitCachePool(blockSize, 8)
+		s := mustTestECStreamerWithEbsc(1000, &BlobStoreClient{}, blockSize)
+		s.mw = &meta.MetaWrapper{}
+		w := s.fWriter
+		w.buf = nil
+		w.bufPooled = false
+		w.blockPosition = 0
+		w.fileOffset = 0
+		t.Cleanup(func() { w.FreeCache() })
 
-func TestParallelWrite(t *testing.T) {
-	ctx := context.Background()
-	data := []byte("Hello world")
-	offset := 0
-
-	writer.ecStreamer.cleanDirty()
-	writer.blockPosition = 0
-	mw := writer.ecStreamer.mw
-	if mw == nil {
-		mw = &meta.MetaWrapper{}
-		writer.ecStreamer.mw = mw
-	}
-	err := gohook.HookMethod(mw, "AppendObjExtentKeys", MockAppendObjExtentKeysTrue, nil)
-	if err != nil {
-		panic(fmt.Sprintf("Hook advance instance method failed:%s", err.Error()))
-	}
-
-	_, _ = writer.doParallelWrite(ctx, data, offset)
-}
-
-func TestBufferWrite(t *testing.T) {
-	ctx := context.Background()
-	data := []byte("Hello world")
-	offset := 0
-
-	mw := &meta.MetaWrapper{}
-	err := gohook.HookMethod(mw, "AppendObjExtentKeys", MockAppendObjExtentKeysTrue, nil)
-	if err != nil {
-		panic(fmt.Sprintf("Hook advance instance method failed:%s", err.Error()))
-	}
-	writer.ecStreamer.mw = mw
-	writer.buf = nil
-	writer.bufPooled = false
-	writer.blockPosition = 0
-	writer.fileOffset = 0
-	writer.allocateCache()
-	t.Cleanup(func() { writer.FreeCache() })
-
-	writer.doBufferWrite(ctx, data, offset)
-}
-
-func TestWriteSlice(t *testing.T) {
-	testCase := []struct {
-		wg           bool
-		ebsWriteFunc func(*BlobStoreClient, context.Context, string, []byte, uint32) (proto2.Location, error)
-		expectError  error
-	}{
-		{false, MockEbscWriteTrue, nil},
-		{false, MockEbscWriteFalse, syscall.EIO},
-		{true, MockEbscWriteTrue, nil},
-		{true, MockEbscWriteFalse, syscall.EIO},
-	}
-
-	for _, tc := range testCase {
-		ebsc := &BlobStoreClient{}
-		err := gohook.HookMethod(ebsc, "Write", tc.ebsWriteFunc, nil)
-		if err != nil {
-			panic(fmt.Sprintf("Hook advance instance method failed:%s", err.Error()))
-		}
-		writer.ecStreamer.ebsc = ebsc
-		wSlice := &rwSlice{
-			index:        0,
-			fileOffset:   0,
-			size:         100,
-			rOffset:      0,
-			rSize:        100,
-			read:         0,
-			Data:         make([]byte, 100),
-			objExtentKey: proto.ObjExtentKey{},
-		}
+		require.NoError(t, gohook.HookMethod(w.ecStreamer.ebsc, "Write", MockEbscWriteTrue, nil))
+		defer gohook.UnHookMethod(w.ecStreamer.ebsc, "Write")
+		require.NoError(t, gohook.HookMethod(w.ecStreamer.mw, "AppendObjExtentKeys", MockAppendObjExtentKeysTrue, nil))
+		defer gohook.UnHookMethod(w.ecStreamer.mw, "AppendObjExtentKeys")
 
 		ctx := context.Background()
-		writer.err = make(chan *wSliceErr)
-		writer.wg.Add(1)
-		if tc.wg {
-			go func() {
-				<-writer.err
-			}()
+		var flag int
+		flag |= proto.FlagsAppend
+		var fileSize int
+		for _, size := range []int{1, 10, 100, 500} {
+			data := make([]byte, size)
+			n, err := w.Write(ctx, w.fileOffset, data, flag)
+			require.NoError(t, err)
+			require.Equal(t, size, n)
+			fileSize += n
 		}
-		gotError := writer.writeSlice(ctx, wSlice, tc.wg)
-		assert.Equal(t, tc.expectError, gotError)
-	}
+		require.Equal(t, fileSize, w.CacheFileSize())
+	})
+
+	t.Run("parallel_write", func(t *testing.T) {
+		const blockSize = 16
+		s := mustTestECStreamerWithEbsc(360, &BlobStoreClient{}, blockSize)
+		s.mw = &meta.MetaWrapper{}
+		w := s.fWriter
+		require.NoError(t, gohook.HookMethod(w.ecStreamer.ebsc, "Write", MockEbscWriteTrue, nil))
+		defer gohook.UnHookMethod(w.ecStreamer.ebsc, "Write")
+		require.NoError(t, gohook.HookMethod(w.ecStreamer.mw, "AppendObjExtentKeys", MockAppendObjExtentKeysTrue, nil))
+		defer gohook.UnHookMethod(w.ecStreamer.mw, "AppendObjExtentKeys")
+		_, err := w.doParallelWrite(context.Background(), []byte("Hello world"), 0)
+		require.NoError(t, err)
+	})
+
+	t.Run("doBufferWrite_direct", func(t *testing.T) {
+		ctx := context.Background()
+		mw := &meta.MetaWrapper{}
+		require.NoError(t, gohook.HookMethod(mw, "AppendObjExtentKeys", MockAppendObjExtentKeysTrue, nil))
+		writer.ecStreamer.mw = mw
+		writer.buf = nil
+		writer.bufPooled = false
+		writer.blockPosition = 0
+		writer.fileOffset = 0
+		writer.allocateCache()
+		t.Cleanup(func() { writer.FreeCache() })
+		_, err := writer.doBufferWrite(ctx, []byte("Hello world"), 0)
+		require.NoError(t, err)
+	})
 }
+
+// ---------- mocks (EBS / meta) ----------
 
 func MockEbscWriteTrue(ebs *BlobStoreClient, ctx context.Context, volName string, data []byte, l uint32) (location proto2.Location, err error) {
 	loc := proto2.Location{
@@ -410,7 +438,7 @@ func MockAppendObjExtentKeysWithCheckTrue(mw *meta.MetaWrapper, inode uint64, ne
 	return nil
 }
 
-// TestComputeOverwriteReqs tests the computeOverwriteReqs function with basic scenarios
+// ---------- 7. overwrite (computeOverwriteReqs / flushOverwriteReqs) ----------
 
 func TestComputeOverwriteReqs(t *testing.T) {
 	// Create a simple writer for testing
@@ -486,7 +514,7 @@ func TestComputeOverwriteReqs_exactExtentReplace(t *testing.T) {
 	require.Equal(t, old, reqs[0].DiscardExtent)
 }
 
-// TestTryOverWrite_Basic tests tryOverWrite with basic scenario (small data, no flush needed)
+// ---------- 5. tryOverWrite ----------
 
 func TestTryOverWrite_Basic(t *testing.T) {
 	ctx := context.Background()
@@ -610,28 +638,7 @@ func TestWriterWrite_NewGuardBranches(t *testing.T) {
 	})
 }
 
-func TestWriterSetFileSizeAndTruncateV2GrowNoShrink(t *testing.T) {
-	s := mustTestECStreamer(1, nil, nil)
-	SeedLogicalViewForTest(s, 123, 0)
-	w := s.fWriter
-	require.Equal(t, 123, w.CacheFileSize())
-
-	mw := &meta.MetaWrapper{}
-	err := gohook.HookMethod(mw, "GetObjExtents", func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
-		return 1, 20, nil, []proto.ObjExtentKey{{FileOffset: 0, Size: 20}}, nil
-	}, nil)
-	require.NoError(t, err)
-	defer gohook.UnHookMethod(mw, "GetObjExtents")
-
-	s.mw = mw
-	s.ebsc = &BlobStoreClient{}
-	seedStreamerExtentsForTest(s, 20, []proto.ObjExtentKey{{FileOffset: 0, Size: 20}})
-
-	newExt, toDel, err := truncateV2ForTest(w, context.Background(), 25)
-	require.NoError(t, err)
-	require.True(t, newExt.IsEmpty())
-	require.True(t, toDel.IsEmpty())
-}
+// ---------- 6. flush (Flush / flushExt / notify) ----------
 
 func TestWriterCoverageAdditionalBranches(t *testing.T) {
 	t.Run("flush empty buffer returns nil", func(t *testing.T) {
@@ -1172,11 +1179,6 @@ func TestWriter_reshapeBufForCopyPath_branches(t *testing.T) {
 	require.Equal(t, w.ecStreamer.BlockSize(), len(w.buf))
 }
 
-func TestRwSlice_String(t *testing.T) {
-	s := rwSlice{fileOffset: 1, size: 2, hole: true}
-	require.Contains(t, s.String(), "rwSlice{")
-}
-
 func TestWriter_flushExt_partial_overlap_path(t *testing.T) {
 	ctx := context.Background()
 	st, w := testWriterWithMwEbsc(272, &BlobStoreClient{})
@@ -1356,6 +1358,8 @@ func TestWriter_flushExt_tailHole_usesOverwriteReqs(t *testing.T) {
 	require.Equal(t, 1, overwriteCalls, "tail-hole write must use overwrite path")
 }
 
+// ---------- 8. bufferPool ----------
+
 func TestWriter_allocateCache_borrowsFromPool(t *testing.T) {
 	const blockSize = 256
 	buf.InitCachePool(blockSize, 4)
@@ -1404,7 +1408,7 @@ func TestWriter_releaseWriteBuf_afterNotifyCompleteFlushMeta(t *testing.T) {
 	select {
 	case b := <-acquired:
 		buf.CachePool.Put(b)
-	case <-time.After(2 * time.Second):
+	case <-time.After(200 * time.Millisecond):
 		t.Fatal("blocked Get did not wake after notifyCompleteFlushMeta released pool block")
 	}
 }
@@ -1712,3 +1716,345 @@ func TestWriter_tryOverWrite_defersPartialBlockWithoutFinalFlush(t *testing.T) {
 	require.Equal(t, 1, flushExtCalls, "only mid-block flush; no final partial flush")
 	require.Greater(t, w.blockPosition, 0, "trailing partial block deferred in buffer")
 }
+
+// ---------- 10. extended (error paths & coverage gaps) ----------
+
+func TestWriter_extended(t *testing.T) {
+	t.Run("flushWithoutPool", func(t *testing.T) {
+		t.Run("success_via_FlushWithoutPool", func(t *testing.T) {
+			const blockSize = 16
+			st, w := testWriterWithMwEbsc(501, &BlobStoreClient{})
+			st.raiseFileSize(0)
+			w.buf = make([]byte, blockSize)
+			w.blockPosition = blockSize
+			w.fileOffset = blockSize
+
+			require.NoError(t, gohook.HookMethod(w.ecStreamer.ebsc, "Write", MockEbscWriteTrue, nil))
+			defer gohook.UnHookMethod(w.ecStreamer.ebsc, "Write")
+			require.NoError(t, gohook.HookMethod(w.ecStreamer.mw, "AppendObjExtentKeys", MockAppendObjExtentKeysTrue, nil))
+			defer gohook.UnHookMethod(w.ecStreamer.mw, "AppendObjExtentKeys")
+
+			require.NoError(t, w.FlushWithoutPool(st.ino, context.Background()))
+			require.Equal(t, 0, w.blockPosition)
+		})
+
+		t.Run("meta_fail_rollback_delete", func(t *testing.T) {
+			const blockSize = 16
+			st, w := testWriterWithMwEbsc(502, &BlobStoreClient{})
+			w.buf = make([]byte, blockSize)
+			w.blockPosition = blockSize
+			w.fileOffset = blockSize
+
+			require.NoError(t, gohook.HookMethod(w.ecStreamer.ebsc, "Write", MockEbscWriteTrue, nil))
+			defer gohook.UnHookMethod(w.ecStreamer.ebsc, "Write")
+			var deleteCalls int
+			patches := gomonkey.NewPatches()
+			defer patches.Reset()
+			patches.ApplyMethod(reflect.TypeOf(w.ecStreamer.ebsc), "Delete",
+				func(_ *BlobStoreClient, _ []proto.ObjExtentKey) error {
+					deleteCalls++
+					return nil
+				})
+			require.NoError(t, gohook.HookMethod(w.ecStreamer.mw, "AppendObjExtentKeys", MockAppendObjExtentKeysFalse, nil))
+			defer gohook.UnHookMethod(w.ecStreamer.mw, "AppendObjExtentKeys")
+
+			err := w.flushWithoutPool(st.ino, context.Background(), true)
+			require.Error(t, err)
+			require.Equal(t, 1, deleteCalls)
+		})
+	})
+
+	t.Run("writeWithoutPool", func(t *testing.T) {
+		t.Run("full_block_flush", func(t *testing.T) {
+			const blockSize = 16
+			st := mustTestECStreamerWithEbsc(503, &BlobStoreClient{}, blockSize)
+			w := st.fWriter
+			w.buf = nil
+			w.fileOffset = 0
+
+			require.NoError(t, gohook.HookMethod(w.ecStreamer.ebsc, "Write", MockEbscWriteTrue, nil))
+			defer gohook.UnHookMethod(w.ecStreamer.ebsc, "Write")
+			require.NoError(t, gohook.HookMethod(w.ecStreamer.mw, "AppendObjExtentKeys", MockAppendObjExtentKeysTrue, nil))
+			defer gohook.UnHookMethod(w.ecStreamer.mw, "AppendObjExtentKeys")
+
+			n, err := w.WriteWithoutPool(context.Background(), 0, make([]byte, blockSize))
+			require.NoError(t, err)
+			require.Equal(t, blockSize, n)
+		})
+
+		t.Run("flush_fail_rollback", func(t *testing.T) {
+			const blockSize = 8
+			st := mustTestECStreamerWithEbsc(504, &BlobStoreClient{}, blockSize)
+			w := st.fWriter
+			w.buf = nil
+			w.fileOffset = 0
+
+			patches := gomonkey.NewPatches()
+			defer patches.Reset()
+			patches.ApplyPrivateMethod(reflect.TypeOf(w), "flushWithoutPool",
+				func(_ *Writer, _ uint64, _ context.Context, _ bool) error {
+					return syscall.EIO
+				})
+
+			_, err := w.WriteWithoutPool(context.Background(), 0, make([]byte, blockSize))
+			require.ErrorIs(t, err, syscall.EIO)
+		})
+	})
+
+	t.Run("write_sync", func(t *testing.T) {
+		const blockSize = 16
+		s := mustTestECStreamerWithEbsc(505, &BlobStoreClient{}, blockSize)
+		s.mw = &meta.MetaWrapper{}
+		w := s.fWriter
+		metaErr := errors.New("update meta failed")
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyPrivateMethod(reflect.TypeOf(w), "doParallelWrite",
+			func(_ *Writer, _ context.Context, data []byte, _ int) (int, error) {
+				return len(data), nil
+			})
+		patches.ApplyPrivateMethod(reflect.TypeOf(s), "updateMetaInfo",
+			func(_ *ECStreamer, _ *uint64) error { return metaErr })
+
+		n, err := w.Write(context.Background(), 0, []byte("z"), proto.FlagsSyncWrite)
+		require.ErrorIs(t, err, metaErr)
+		require.Equal(t, 1, n)
+	})
+
+	t.Run("tryOverWrite_guards_and_flushExt_rollback", func(t *testing.T) {
+		var nilW *Writer
+		_, err := nilW.tryOverWrite(context.Background(), 0, []byte("x"), 0)
+		require.Error(t, err)
+
+		const blockSize = 8
+		s := mustTestECStreamerWithEbsc(506, &BlobStoreClient{}, blockSize)
+		w := s.fWriter
+		w.allocateCache()
+		w.reshapeBufForCopyPath()
+		w.buf = w.buf[:2]
+		_, err = w.tryOverWrite(context.Background(), 0, make([]byte, 10), 0)
+		require.ErrorIs(t, err, syscall.EINVAL)
+
+		w.buf = make([]byte, blockSize)
+		w.blockPosition = 0
+		w.fileOffset = 0
+		flushErr := errors.New("flushExt failed")
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyPrivateMethod(reflect.TypeOf(w), "flushExt",
+			func(_ *Writer, _ uint64, _ context.Context, _ bool) error { return flushErr })
+
+		_, err = w.tryOverWrite(context.Background(), 0, make([]byte, blockSize), 0)
+		require.ErrorIs(t, err, flushErr)
+	})
+
+	t.Run("doParallelWrite_dirty_pre_flush", func(t *testing.T) {
+		const blockSize = 16
+		s := mustTestECStreamerWithEbsc(507, &BlobStoreClient{}, blockSize)
+		s.mw = &meta.MetaWrapper{}
+		w := s.fWriter
+		seedDirtyForTest(s)
+		w.buf = make([]byte, 4)
+		w.blockPosition = 4
+		w.fileOffset = 104
+
+		var flushExtCalls int
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyPrivateMethod(reflect.TypeOf(w), "flushExt",
+			func(_ *Writer, _ uint64, _ context.Context, _ bool) error {
+				flushExtCalls++
+				s.cleanDirty()
+				return nil
+			})
+		require.NoError(t, gohook.HookMethod(w.ecStreamer.ebsc, "Write", MockEbscWriteTrue, nil))
+		defer gohook.UnHookMethod(w.ecStreamer.ebsc, "Write")
+		require.NoError(t, gohook.HookMethod(w.ecStreamer.mw, "AppendObjExtentKeys", MockAppendObjExtentKeysTrue, nil))
+		defer gohook.UnHookMethod(w.ecStreamer.mw, "AppendObjExtentKeys")
+
+		_, err := w.doParallelWrite(context.Background(), []byte("sync"), 104)
+		require.NoError(t, err)
+		require.Equal(t, 1, flushExtCalls)
+	})
+
+	t.Run("doParallelWrite_slice_and_meta_errors", func(t *testing.T) {
+		const blockSize = 16
+		s := mustTestECStreamerWithEbsc(5071, &BlobStoreClient{}, blockSize)
+		s.mw = &meta.MetaWrapper{}
+		w := s.fWriter
+
+		require.NoError(t, gohook.HookMethod(w.ecStreamer.ebsc, "Write", MockEbscWriteFalse, nil))
+		defer gohook.UnHookMethod(w.ecStreamer.ebsc, "Write")
+		_, err := w.doParallelWrite(context.Background(), []byte("bad"), 0)
+		require.Error(t, err)
+
+		require.NoError(t, gohook.HookMethod(w.ecStreamer.ebsc, "Write", MockEbscWriteTrue, nil))
+		require.NoError(t, gohook.HookMethod(w.ecStreamer.mw, "AppendObjExtentKeys", MockAppendObjExtentKeysFalse, nil))
+		defer gohook.UnHookMethod(w.ecStreamer.mw, "AppendObjExtentKeys")
+		_, err = w.doParallelWrite(context.Background(), []byte("ok"), 0)
+		require.Error(t, err)
+	})
+
+	t.Run("WriteFromReader_error_paths", func(t *testing.T) {
+		const blockSize = 16
+		s := mustTestECStreamerWithEbsc(508, &BlobStoreClient{}, blockSize)
+		s.mw = &meta.MetaWrapper{}
+		w := s.fWriter
+
+		_, err := w.WriteFromReader(context.Background(), &errReader{err: syscall.EIO}, nil)
+		require.Error(t, err)
+
+		require.NoError(t, gohook.HookMethod(w.ecStreamer.ebsc, "Write", MockEbscWriteTrue, nil))
+		defer gohook.UnHookMethod(w.ecStreamer.ebsc, "Write")
+		require.NoError(t, gohook.HookMethod(w.ecStreamer.mw, "AppendObjExtentKeys", MockAppendObjExtentKeysFalse, nil))
+		defer gohook.UnHookMethod(w.ecStreamer.mw, "AppendObjExtentKeys")
+		_, err = w.WriteFromReader(context.Background(), strings.NewReader("x"), nil)
+		require.Error(t, err)
+
+		require.NoError(t, gohook.HookMethod(w.ecStreamer.mw, "AppendObjExtentKeys", MockAppendObjExtentKeysTrue, nil))
+		metaErr := errors.New("notify meta fail")
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyPrivateMethod(reflect.TypeOf(s), "updateMetaInfo",
+			func(_ *ECStreamer, _ *uint64) error { return metaErr })
+		_, err = w.WriteFromReader(context.Background(), strings.NewReader("y"), nil)
+		require.ErrorIs(t, err, metaErr)
+	})
+
+	t.Run("doBufferWrite_invalid_freeSize", func(t *testing.T) {
+		const blockSize = 8
+		s := mustTestECStreamerWithEbsc(509, &BlobStoreClient{}, blockSize)
+		w := s.fWriter
+		w.allocateCache()
+		w.blockPosition = blockSize
+		w.fileOffset = blockSize
+		_, err := w.doBufferWrite(context.Background(), []byte("x"), blockSize)
+		require.ErrorIs(t, err, syscall.EINVAL)
+	})
+
+	t.Run("doBufferWrite_buf_too_short", func(t *testing.T) {
+		const blockSize = 8
+		s := mustTestECStreamerWithEbsc(5091, &BlobStoreClient{}, blockSize)
+		w := s.fWriter
+		w.allocateCache()
+		w.blockPosition = 0
+		w.fileOffset = 0
+		w.buf = w.buf[:2]
+		_, err := w.doBufferWrite(context.Background(), make([]byte, 10), 0)
+		require.ErrorIs(t, err, syscall.EINVAL)
+	})
+
+	t.Run("doBufferWrite_flushExt_rollback", func(t *testing.T) {
+		const blockSize = 8
+		s := mustTestECStreamerWithEbsc(5092, &BlobStoreClient{}, blockSize)
+		w := s.fWriter
+		w.allocateCache()
+		w.reshapeBufForCopyPath()
+		w.blockPosition = blockSize - 2
+		w.fileOffset = blockSize - 2
+		flushErr := errors.New("flushExt rollback")
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyPrivateMethod(reflect.TypeOf(w), "flushExt",
+			func(_ *Writer, _ uint64, _ context.Context, _ bool) error { return flushErr })
+		_, err := w.doBufferWrite(context.Background(), make([]byte, 4), w.fileOffset)
+		require.ErrorIs(t, err, flushErr)
+		require.Equal(t, blockSize-2, w.blockPosition)
+	})
+
+	t.Run("flush_and_flushExt_inconsistent_state", func(t *testing.T) {
+		st, w := testWriterWithMwEbsc(510, &BlobStoreClient{})
+		w.buf = make([]byte, 16)
+		w.blockPosition = 16
+		w.fileOffset = 8
+		err := w.flushExt(st.ino, context.Background(), false)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "inconsistent state")
+
+		err = w.flush(st.ino, context.Background(), true)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "inconsistent state")
+	})
+
+	t.Run("flush_meta_append_fails", func(t *testing.T) {
+		const blockSize = 16
+		st, w := testWriterWithMwEbsc(511, &BlobStoreClient{})
+		w.buf = make([]byte, blockSize)
+		w.blockPosition = blockSize
+		w.fileOffset = blockSize
+		require.NoError(t, gohook.HookMethod(w.ecStreamer.ebsc, "Write", MockEbscWriteTrue, nil))
+		defer gohook.UnHookMethod(w.ecStreamer.ebsc, "Write")
+		require.NoError(t, gohook.HookMethod(w.ecStreamer.mw, "AppendObjExtentKeys", MockAppendObjExtentKeysFalse, nil))
+		defer gohook.UnHookMethod(w.ecStreamer.mw, "AppendObjExtentKeys")
+		err := w.flush(st.ino, context.Background(), true)
+		require.Error(t, err)
+	})
+
+	t.Run("flushExt_flushOverwriteReqs_fails", func(t *testing.T) {
+		const blockSize = 16
+		st, w := testWriterWithMwEbsc(512, &BlobStoreClient{})
+		seedStreamerExtentsForTest(st, 200, []proto.ObjExtentKey{{FileOffset: 0, Size: 100}, {FileOffset: 200, Size: 100}})
+		seedDirtyForTest(st)
+		w.buf = make([]byte, blockSize)
+		w.blockPosition = blockSize
+		w.fileOffset = 140
+
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyPrivateMethod(reflect.TypeOf(w), "flushOverwriteReqs",
+			func(_ *Writer, _ context.Context, _ uint64, _ []overwriteReq, _ uint64, _ int) error {
+				return syscall.EIO
+			})
+		err := w.flushExt(st.ino, context.Background(), false)
+		require.Error(t, err)
+	})
+
+	t.Run("flushOverwriteReqs_writeSlice_fails", func(t *testing.T) {
+		st, w := testWriterWithMwEbsc(513, &BlobStoreClient{})
+		w.buf = make([]byte, 32)
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyPrivateMethod(reflect.TypeOf(w), "writeSlice",
+			func(_ *Writer, _ context.Context, _ *rwSlice, _ bool) error { return syscall.EIO })
+		reqs := []overwriteReq{{NewExtent: proto.ObjExtentKey{FileOffset: 0, Size: 8}}}
+		err := w.flushOverwriteReqs(context.Background(), st.ino, reqs, 0, 8)
+		require.Error(t, err)
+	})
+
+	t.Run("bufferDirtyLen_nil_and_releaseWriteBuf_dirty", func(t *testing.T) {
+		var nilW *Writer
+		require.Equal(t, 0, nilW.bufferDirtyLen())
+
+		const blockSize = 16
+		buf.InitCachePool(blockSize, 4)
+		st := mustTestECStreamerWithEbsc(514, &BlobStoreClient{}, blockSize)
+		w := st.fWriter
+		w.allocateCache()
+		w.blockPosition = 4
+		w.releaseWriteBuf()
+		require.NotNil(t, w.buf)
+	})
+
+	t.Run("FreeCache_and_allocateCache_nil_guards", func(t *testing.T) {
+		var nilW *Writer
+		nilW.FreeCache()
+		nilW.allocateCache()
+		require.NoError(t, nilW.FlushWithoutPool(1, context.Background()))
+	})
+
+	t.Run("notifyCompleteFlushMeta_updateMetaInfo_fails", func(t *testing.T) {
+		w := &Writer{fileOffset: 8}
+		s := mustTestECStreamer(515, nil, w)
+		metaErr := errors.New("meta refresh fail")
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patches.ApplyPrivateMethod(reflect.TypeOf(s), "updateMetaInfo",
+			func(_ *ECStreamer, _ *uint64) error { return metaErr })
+		err := w.notifyCompleteFlushMeta()
+		require.ErrorIs(t, err, metaErr)
+	})
+}
+
+type errReader struct{ err error }
+
+func (e *errReader) Read([]byte) (int, error) { return 0, e.err }

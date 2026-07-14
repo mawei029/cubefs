@@ -19,23 +19,6 @@ import (
 	"github.com/cubefs/cubefs/sdk/meta"
 )
 
-func patchOecWriterForMisc(patches *gomonkey.Patches, w *blobstore.Writer) {
-	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "Writer",
-		func(_ *blobstore.ECExtentClient, _ uint64) *blobstore.Writer {
-			return w
-		})
-}
-
-func patchOecReaderWriterForMisc(patches *gomonkey.Patches, r *blobstore.Reader, w *blobstore.Writer) {
-	t := reflect.TypeOf((*blobstore.ECExtentClient)(nil))
-	patches.ApplyMethod(t, "Reader", func(_ *blobstore.ECExtentClient, _ uint64) *blobstore.Reader {
-		return r
-	})
-	patches.ApplyMethod(t, "Writer", func(_ *blobstore.ECExtentClient, _ uint64) *blobstore.Writer {
-		return w
-	})
-}
-
 func newTestSuperForFile() *Super {
 	return &Super{
 		ic:                NewInodeCache(time.Hour, 64, true),
@@ -233,7 +216,6 @@ func TestFile_Write_BlobFallocatePath(t *testing.T) {
 
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
-	patchOecWriterForMisc(patches, writer)
 	registerOecTestStreamerWithLogicalView(s, 10, nil, writer, 10, 0)
 	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet", func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
 		return &proto.InodeInfo{Inode: 10, PoolId: 1, StorageClass: proto.StorageClass_BlobStore}, nil
@@ -271,7 +253,6 @@ func TestFile_Setattr_BlobTruncateAndSyncReaderWriter(t *testing.T) {
 
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
-	patchOecReaderWriterForMisc(patches, reader, writer)
 	registerOecTestStreamerWithLogicalView(s, 11, reader, writer, 32, 0)
 
 	callN := 0
@@ -350,7 +331,6 @@ func TestFile_Write_BlobAppendFlagPath(t *testing.T) {
 
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
-	patchOecWriterForMisc(patches, writer)
 	registerOecTestStreamer(s, 14, nil, writer)
 	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet", func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
 		return &proto.InodeInfo{Inode: 14, PoolId: 1, StorageClass: proto.StorageClass_BlobStore}, nil
@@ -420,7 +400,6 @@ func TestFile_Open_BlobFlushExistingWriterError(t *testing.T) {
 
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
-	patchOecWriterForMisc(patches, w)
 	registerOecTestStreamer(s, 30, nil, w)
 	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet", func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
 		return &proto.InodeInfo{Inode: 30, PoolId: 1, StorageClass: proto.StorageClass_BlobStore, Size: 0}, nil
@@ -539,6 +518,7 @@ func TestFile_BuildECStreamOpenArgsSuccess(t *testing.T) {
 	s.ebsc[3] = dummy
 	s.volname = "vn"
 	s.volType = 1
+	s.aheadWindowCnt = 3
 	f := &File{super: s, ino: 42}
 	args, err := f.buildECStreamOpenArgs(&proto.InodeInfo{PoolId: 3, Generation: 9, StorageClass: proto.StorageClass_BlobStore}, uint32(syscall.O_RDWR), 1000)
 	require.NoError(t, err)
@@ -547,7 +527,37 @@ func TestFile_BuildECStreamOpenArgsSuccess(t *testing.T) {
 	require.Equal(t, uint64(1000), args.FileSize)
 	require.Equal(t, uint64(9), args.InodeGeneration)
 	require.Equal(t, uint32(syscall.O_RDWR), args.OpenFlags)
+	require.Equal(t, 3, args.AheadWindowCnt)
 	require.Same(t, dummy, args.Ebsc)
+}
+
+func TestFile_Release_oecCloseFailCallsFreeCache(t *testing.T) {
+	s := newTestSuperForFile()
+	s.volType = proto.VolumeTypeCold
+	s.poolCache = map[uint8]*proto.StoragePoolInfo{
+		1: {Id: 1, StorageClass: uint8(proto.StorageClass_BlobStore)},
+	}
+	f := &File{super: s, ino: 88, parentIno: 1, name: "rel"}
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(s), "InodeGet", func(_ *Super, _ uint64) (*proto.InodeInfo, error) {
+		return &proto.InodeInfo{Inode: 88, PoolId: 1, StorageClass: proto.StorageClass_BlobStore}, nil
+	})
+	freeCacheCalled := false
+	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "CloseStream",
+		func(_ *blobstore.ECExtentClient, _ uint64) error {
+			return syscall.EIO
+		})
+	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "FreeCache",
+		func(_ *blobstore.ECExtentClient, ino uint64) {
+			require.Equal(t, uint64(88), ino)
+			freeCacheCalled = true
+		})
+
+	err := f.Release(context.Background(), &fuse.ReleaseRequest{})
+	require.Error(t, err)
+	require.True(t, freeCacheCalled)
 }
 
 func TestFile_OpenOECStreamPropagatesOpenStreamError(t *testing.T) {

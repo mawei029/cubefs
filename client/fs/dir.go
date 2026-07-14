@@ -269,7 +269,7 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 		openForWrite = true
 	}
 	isCache := false
-	if proto.DataPlaneUsesBlobEC(d.super.volType, info.StorageClass) {
+	if proto.IsDataUseBlobEC(d.super.volType, info.StorageClass) {
 		if err := child.(*File).openOECStream(info, uint32(req.Flags&0x0f), info.Size); err != nil {
 			log.LogErrorf("Create: openOECStream ino(%v) err(%v)", info.Inode, err)
 			return nil, nil, ParseError(err)

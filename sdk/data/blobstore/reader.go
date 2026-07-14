@@ -17,7 +17,6 @@ package blobstore
 import (
 	"context"
 	"fmt"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -81,6 +80,7 @@ type Reader struct {
 	// Semantics match replica AheadReadWindow; buffering lives in Reader, not stream.
 	aheadReadEnable  bool
 	minReadAheadSize uint64
+	aheadWindowCnt   int
 	readBuf          []byte
 	bufBaseOff       int   // file offset of valid data at readBuf[0] (prefetch block start)
 	bufValidLen      int   // valid bytes in readBuf[0:bufValidLen] (prefetch block end)
@@ -109,6 +109,7 @@ type ClientConfig struct {
 	PoolId          uint8
 
 	AheadReadEnable  bool
+	AheadWindowCnt   int
 	MinReadAheadSize int   // prefetch only if logical file size exceeds this (mount/stream policy)
 	PrefetchTotalMem int64 // global prefetch memory budget (same knob as AheadReadTotalMem)
 }
@@ -175,6 +176,10 @@ func NewReader(config ClientConfig) (reader *Reader) {
 
 	reader.limitManager = config.LimitManager
 	reader.aheadReadEnable = config.AheadReadEnable
+	reader.aheadWindowCnt = config.AheadWindowCnt
+	if reader.aheadWindowCnt < 0 {
+		reader.aheadWindowCnt = 1
+	}
 	mra := config.MinReadAheadSize
 	if mra < 0 {
 		mra = 0
@@ -182,6 +187,9 @@ func NewReader(config ClientConfig) (reader *Reader) {
 	reader.minReadAheadSize = uint64(mra)
 	reader.preReadLimiter = getBlobPreReadLimiter(config.PrefetchTotalMem)
 	reader.ecStreamer = config.ECStreamer
+
+	log.LogDebugf("blobstore NewReader: ino(%v) aheadReadEnable(%v) aheadWindowCnt(%v) minReadAheadSize(%v) prefetchTotalMem(%v)",
+		reader.ecStreamer.Inode(), reader.aheadReadEnable, reader.aheadWindowCnt, reader.minReadAheadSize, config.PrefetchTotalMem)
 	// readBuf is allocated lazily on first prefetch Read to avoid holding 2×EbsBlockSize per open file
 	// when the file turns out tiny or ahead-read is off after fileSize check.
 	return
@@ -192,7 +200,7 @@ func (reader *Reader) prefetchBufCap() int {
 	if reader.ecStreamer.BlockSize() <= 0 {
 		return 0
 	}
-	return reader.ecStreamer.BlockSize() * 2
+	return reader.ecStreamer.BlockSize() * reader.aheadWindowCnt
 }
 
 // ensurePrefetchBuf reserves readBuf and global budget; on failure Read falls back to per-call readEbsRange.
@@ -307,7 +315,7 @@ func (reader *Reader) Read(ctx context.Context, buf []byte, offset int, size int
 		}
 		ebsFetchSize = len(data)
 		if len(data) > len(reader.readBuf) {
-			log.LogInfof("extend reader Read prefetch buffer. ino(%v) offset(%v) fetchLen(%v) readBufLen(%v)", reader.ecStreamer.Inode(), offset, len(data), len(reader.readBuf))
+			log.LogDebugf("extend reader Read prefetch buffer. ino(%v) offset(%v) fetchLen(%v) readBufLen(%v)", reader.ecStreamer.Inode(), offset, len(data), len(reader.readBuf))
 			reader.readBuf = make([]byte, len(data))
 		}
 		copy(reader.readBuf, data)
@@ -326,7 +334,7 @@ func (reader *Reader) Read(ctx context.Context, buf []byte, offset int, size int
 		return 0, syscall.EIO
 	}
 	if size > reader.bufValidLen-(offset-reader.bufBaseOff) {
-		log.LogWarnf("reader Read prefetch buffer is too small. ino(%v) offset(%v) bufBaseOff(%v) bufValidLen(%v)", reader.ecStreamer.Inode(), offset, reader.bufBaseOff, reader.bufValidLen)
+		log.LogDebugf("reader Read prefetch buffer is too small. ino(%v) offset(%v) bufBaseOff(%v) bufValidLen(%v)", reader.ecStreamer.Inode(), offset, reader.bufBaseOff, reader.bufValidLen)
 		reader.invalidateReadBuf()
 		return normalReadFunc()
 	}
@@ -431,10 +439,7 @@ func (reader *Reader) prepareEbsSlice(offset int, size uint32, fileSize uint64) 
 	start := uint64(offset)
 	end := start + uint64(size)
 
-	keys := append([]proto.ObjExtentKey(nil), reader.ecStreamer.OeksLocked()...)
-	sort.Slice(keys, func(i, j int) bool {
-		return keys[i].FileOffset < keys[j].FileOffset
-	})
+	keys := reader.ecStreamer.OeksLocked()
 
 	chunks := make([]*rwSlice, 0)
 	cur := start
@@ -517,9 +522,9 @@ func (reader *Reader) readSliceRange(ctx context.Context, rs *rwSlice, errCh cha
 	var readN int
 
 	bgTime := stat.BeginStat()
-	stat.EndStat("CacheGet", nil, bgTime, 1)
 	metric := exporter.NewTPCnt("CacheGet")
 	defer func() {
+		stat.EndStat("CacheGet", nil, bgTime, 1)
 		metric.SetWithLabels(err, map[string]string{exporter.Vol: volume})
 	}()
 

@@ -15,6 +15,8 @@
 package fs
 
 import (
+	"errors"
+	"syscall"
 	"time"
 
 	"github.com/cubefs/cubefs/depends/bazil.org/fuse"
@@ -38,11 +40,16 @@ func (s *Super) InodeGet(ino uint64) (info *proto.InodeInfo, err error) {
 // LoadInodeInfo fetches inode metadata on cache miss, updates node caches, and refreshes extent cache when needed.
 func (s *Super) LoadInodeInfo(ino uint64) (info *proto.InodeInfo, err error) {
 	info, err = s.mw.InodeGet_ll(ino, false)
-	if err != nil || info == nil {
-		log.LogErrorf("InodeGet: ino(%v) err(%v) info(%v)", ino, err, info)
-		if err != nil {
-			return nil, ParseError(err)
+	if err != nil {
+		if errors.Is(err, syscall.ENOENT) {
+			log.LogWarnf("LoadInodeInfo: ino(%v) not exist: %v", ino, err)
+			return nil, fuse.ENOENT
 		}
+		log.LogErrorf("LoadInodeInfo: ino(%v) err(%v)", ino, err)
+		return nil, ParseError(err)
+	}
+	if info == nil {
+		log.LogWarnf("LoadInodeInfo: ino(%v) not exist: nil info", ino)
 		return nil, fuse.ENOENT
 	}
 	s.ic.Put(info)

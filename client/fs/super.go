@@ -131,6 +131,7 @@ type Super struct {
 	aheadReadEnable    bool
 	minReadAheadSize   uint64
 	aheadReadTotalMem  int64
+	aheadWindowCnt     int
 	streamRetryTimeout int
 	ebsConfig          proto.EbsClientConfig
 }
@@ -383,6 +384,7 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 	s.aheadReadEnable = opt.AheadReadEnable
 	s.aheadReadTotalMem = opt.AheadReadTotalMem
 	s.streamRetryTimeout = opt.StreamRetryTimeout
+	s.aheadWindowCnt = opt.AheadReadWindowCnt
 	s.ebsConfig = opt.EbsConfig
 	if opt.MinReadAheadSize > 0 {
 		s.minReadAheadSize = uint64(opt.MinReadAheadSize)

@@ -1767,7 +1767,7 @@ func (c *client) openRegularFile(f *file, absPath string) error {
 }
 
 func (c *client) openStream(f *file, fullPath string) error {
-	if proto.DataPlaneUsesBlobEC(c.volType, f.storageClass) {
+	if proto.IsDataUseBlobEC(c.volType, f.storageClass) {
 		info := c.ic.Get(f.ino)
 		if info == nil {
 			var err error
@@ -1789,7 +1789,7 @@ func (c *client) openStream(f *file, fullPath string) error {
 }
 
 func (c *client) closeStream(f *file) {
-	if proto.DataPlaneUsesBlobEC(c.volType, f.storageClass) {
+	if proto.IsDataUseBlobEC(c.volType, f.storageClass) {
 		_ = c.oec.CloseStream(f.ino)
 		_ = c.oec.EvictStream(f.ino)
 		return
@@ -1806,7 +1806,7 @@ func (c *client) flush(f *file) error {
 }
 
 func (c *client) truncate(f *file, size int) error {
-	if proto.DataPlaneUsesBlobEC(c.volType, f.storageClass) {
+	if proto.IsDataUseBlobEC(c.volType, f.storageClass) {
 		return c.oec.Truncate(f.pino, f.ino, uint64(size), f.path)
 	}
 	return c.ec.Truncate(c.mw, f.pino, f.ino, size, f.path)

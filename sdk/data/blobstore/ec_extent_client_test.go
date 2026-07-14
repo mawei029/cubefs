@@ -310,21 +310,13 @@ func TestECExtentClient_OpenStreamWithArgs_merge_snapshot(t *testing.T) {
 	require.GreaterOrEqual(t, gen, uint64(2))
 }
 
-func TestECExtentClient_GetStreamer_Reader_Writer_missing(t *testing.T) {
-	c := NewObjExtentClient(ObjExtentConfig{})
-	require.Nil(t, c.GetStreamer(999))
-	require.Nil(t, c.Reader(999))
-	require.Nil(t, c.Writer(999))
-	require.Equal(t, int32(0), c.RefCnt(999))
-}
-
 func TestECExtentClient_args_toClientConfig(t *testing.T) {
 	s := mustTestECStreamer(50, nil, nil)
 	args := ECStreamOpenArgs{
 		Ino: 50, OpenFlags: 0, PoolId: 2, FileSize: 9, InodeGeneration: 3,
 		VolName: "vn", VolType: 2, BlockSize: 8192, Ebsc: nil, Bc: nil, Mw: nil,
 		EnableBcache: true, WConcurrency: 3, ReadConcurrency: 4,
-		AheadReadEnable: true, MinReadAheadSize: 1, PrefetchTotalMem: 99,
+		AheadReadEnable: true, MinReadAheadSize: 1, PrefetchTotalMem: 99, AheadWindowCnt: 4,
 	}
 	cfg := args.toClientConfig(s)
 	require.Equal(t, "vn", cfg.VolName)
@@ -333,6 +325,23 @@ func TestECExtentClient_args_toClientConfig(t *testing.T) {
 	require.Equal(t, uint8(2), cfg.PoolId)
 	require.True(t, cfg.AheadReadEnable)
 	require.Equal(t, int64(99), cfg.PrefetchTotalMem)
+	require.Equal(t, 4, cfg.AheadWindowCnt)
+
+	t.Run("FreeCache_drops_reader_prefetch", func(t *testing.T) {
+		c := NewObjExtentClient(ObjExtentConfig{})
+		s := mustTestECStreamerWithEbsc(401, nil, 16)
+		r := s.fReader
+		r.readBuf = make([]byte, 16)
+		r.bufValidLen = 8
+		setStreamerForTest(c, 401, s)
+		c.FreeCache(401)
+		require.Nil(t, r.readBuf)
+		require.Equal(t, 0, r.bufValidLen)
+	})
+	t.Run("FreeCache_missing_stream_noop", func(t *testing.T) {
+		c := NewObjExtentClient(ObjExtentConfig{})
+		c.FreeCache(404)
+	})
 }
 
 func TestECExtentClient_CloseStream_ref_gt_zero(t *testing.T) {
@@ -548,14 +557,6 @@ func TestECExtentClient_nil_streamer_in_map(t *testing.T) {
 		c.streamers[88] = nil
 		c.mu.Unlock()
 		require.NoError(t, c.RefreshExtentsCache(88))
-	})
-	t.Run("reader_writer_ref", func(t *testing.T) {
-		c.mu.Lock()
-		c.streamers[99] = nil
-		c.mu.Unlock()
-		require.Nil(t, c.Reader(99))
-		require.Nil(t, c.Writer(99))
-		require.Equal(t, int32(0), c.RefCnt(99))
 	})
 }
 
