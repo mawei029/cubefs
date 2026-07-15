@@ -72,7 +72,7 @@ func seedStreamerExtentsForTest(s *ECStreamer, metaSize uint64, oeks []proto.Obj
 		return
 	}
 	s.mu.Lock()
-	s.oeks = append([]proto.ObjExtentKey(nil), oeks...)
+	s.oeks = NewReadOnlyOeks(oeks)
 	s.mu.Unlock()
 	atomic.StoreUint64(&s.fileSize, logicalReadBound(metaSize, oeks))
 }

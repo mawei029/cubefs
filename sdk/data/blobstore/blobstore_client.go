@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
-	"sort"
 	"time"
 
 	"github.com/cubefs/cubefs/blobstore/api/access"
@@ -508,10 +507,10 @@ func (ebs *BlobStoreClient) Get(ctx context.Context, volName string, offset uint
 // TruncateV2Extents truncates ObjExtentKey list by target size, reusing overwrite flow ComputeTruncateReqs + ApplyTruncateReqs:
 // keep extents fully before targetSize, delete-only extents fully after it, and for partial overlap do read -> trim -> write new -> delete old.
 // Returns deltas for meta TruncateV2: at most one NewObjExtent and one ToDelete anchor (first tail extent).
-func (ebs *BlobStoreClient) TruncateV2Extents(ctx context.Context, volName string, objExtentKeys []proto.ObjExtentKey, targetSize uint64,
+func (ebs *BlobStoreClient) TruncateV2Extents(ctx context.Context, volName string, objExtentKeys *ReadOnlyOeks, targetSize uint64,
 ) (newObjExtent proto.ObjExtentKey, toDeleteFrom proto.ObjExtentKey, err error) {
 	log.LogDebugf("TruncateV2Extents: volName(%v) objExtentKeys(%v) targetSize(%v)", volName, objExtentKeys, targetSize)
-	if len(objExtentKeys) == 0 {
+	if objExtentKeys.Len() == 0 {
 		return proto.ObjExtentKey{}, proto.ObjExtentKey{}, nil
 	}
 
@@ -520,14 +519,11 @@ func (ebs *BlobStoreClient) TruncateV2Extents(ctx context.Context, volName strin
 }
 
 // ComputeTruncateReqs computes truncate operations from targetSize and existing objExtents.
-// Reuse overwriteReq structure: each partially overlapped extent maps to one OverwriteReq (read old -> trim -> write new -> delete old).
-func ComputeTruncateReqs(targetSize uint64, objExtents []proto.ObjExtentKey) truncateReq {
-	eks := make([]proto.ObjExtentKey, len(objExtents))
-	copy(eks, objExtents)
-	sort.Slice(eks, func(i, j int) bool { return eks[i].FileOffset < eks[j].FileOffset })
-
+// objExtents must be sorted by FileOffset ascending (same contract as computeOverwriteReqs).
+func ComputeTruncateReqs(targetSize uint64, objExtents *ReadOnlyOeks) truncateReq {
 	var partialKeep, discardFrom proto.ObjExtentKey
-	for _, oek := range eks {
+	for i := 0; i < objExtents.Len(); i++ {
+		oek := objExtents.At(i)
 		end := oek.FileOffset + oek.Size
 		// all keep extents
 		if end <= targetSize {

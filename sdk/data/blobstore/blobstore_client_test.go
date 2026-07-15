@@ -311,7 +311,7 @@ func TestComputeOverwriteReqs_NoOverlap(t *testing.T) {
 	objExtents := []cproto.ObjExtentKey{
 		{FileOffset: 250, Size: 50},
 	}
-	reqs := computeOverwriteReqs(100, 200, objExtents)
+	reqs := computeOverwriteReqs(100, 200, NewReadOnlyOeks(objExtents))
 	require.Len(t, reqs, 1)
 	require.Equal(t, uint64(100), reqs[0].NewExtent.FileOffset)
 	require.Equal(t, uint64(100), reqs[0].NewExtent.Size)
@@ -323,7 +323,7 @@ func TestComputeOverwriteReqs_PartialOverlap(t *testing.T) {
 	objExtents := []cproto.ObjExtentKey{
 		{FileOffset: 50, Size: 100},
 	}
-	reqs := computeOverwriteReqs(100, 200, objExtents)
+	reqs := computeOverwriteReqs(100, 200, NewReadOnlyOeks(objExtents))
 	require.Len(t, reqs, 2)
 	require.Equal(t, uint64(100), reqs[0].NewExtent.FileOffset)
 	require.Equal(t, uint64(50), reqs[0].NewExtent.Size)
@@ -340,7 +340,7 @@ func TestComputeTruncateReqs_PartialSpan(t *testing.T) {
 		{FileOffset: 100, Size: 100},
 		{FileOffset: 200, Size: 50},
 	}
-	req := ComputeTruncateReqs(150, objExtents)
+	req := ComputeTruncateReqs(150, NewReadOnlyOeks(objExtents))
 	require.False(t, req.KeepExtent.IsEmpty())
 	require.Equal(t, uint64(100), req.KeepExtent.FileOffset)
 	require.Equal(t, uint64(50), req.KeepExtent.Size)
@@ -357,7 +357,7 @@ func TestComputeTruncateReqs_edge_cases(t *testing.T) {
 	})
 	t.Run("all_keep_no_discard", func(t *testing.T) {
 		eks := []cproto.ObjExtentKey{{FileOffset: 0, Size: 100}}
-		req := ComputeTruncateReqs(100, eks)
+		req := ComputeTruncateReqs(100, NewReadOnlyOeks(eks))
 		require.True(t, req.KeepExtent.IsEmpty())
 		require.True(t, req.DiscardFrom.IsEmpty())
 	})
@@ -368,19 +368,20 @@ func TestComputeTruncateReqs_tail_only_discard(t *testing.T) {
 		{FileOffset: 0, Size: 50},
 		{FileOffset: 50, Size: 50},
 	}
-	req := ComputeTruncateReqs(50, eks)
+	req := ComputeTruncateReqs(50, NewReadOnlyOeks(eks))
 	require.True(t, req.KeepExtent.IsEmpty())
 	require.False(t, req.DiscardFrom.IsEmpty())
 	require.Equal(t, uint64(50), req.DiscardFrom.FileOffset)
 	require.Equal(t, uint64(50), req.DiscardFrom.Size)
 }
 
-func TestComputeTruncateReqs_unsorted_input(t *testing.T) {
+func TestComputeTruncateReqs_sorted_input(t *testing.T) {
+	// ComputeTruncateReqs requires FileOffset-ascending order (same as computeOverwriteReqs).
 	eks := []cproto.ObjExtentKey{
-		{FileOffset: 100, Size: 50},
 		{FileOffset: 0, Size: 50},
+		{FileOffset: 100, Size: 50},
 	}
-	req := ComputeTruncateReqs(75, eks)
+	req := ComputeTruncateReqs(75, NewReadOnlyOeks(eks))
 	require.True(t, req.KeepExtent.IsEmpty())
 	require.Equal(t, uint64(100), req.DiscardFrom.FileOffset)
 	require.Equal(t, uint64(50), req.DiscardFrom.Size)
@@ -505,7 +506,7 @@ func TestTruncateV2Extents_ReadWriteRetryThenSuccess(t *testing.T) {
 		BlobsLen:   1,
 	}
 
-	newObj, delFrom, err := ebs.TruncateV2Extents(context.Background(), "vol", []cproto.ObjExtentKey{src}, keepSize)
+	newObj, delFrom, err := ebs.TruncateV2Extents(context.Background(), "vol", NewReadOnlyOeks([]cproto.ObjExtentKey{src}), keepSize)
 	require.NoError(t, err)
 	require.Equal(t, 2, getAttempt, "Read should retry once via access Get")
 	require.Equal(t, 2, putAttempt, "Write should retry once via access Put")
@@ -522,7 +523,7 @@ func TestTruncateV2Extents_OnlyKeepNoEBS(t *testing.T) {
 		{FileOffset: 0, Size: 50},
 		{FileOffset: 50, Size: 50},
 	}
-	req := ComputeTruncateReqs(100, objExtents)
+	req := ComputeTruncateReqs(100, NewReadOnlyOeks(objExtents))
 	require.True(t, req.KeepExtent.IsEmpty())
 	require.True(t, req.DiscardFrom.IsEmpty())
 
@@ -981,11 +982,12 @@ func TestApplyTruncateReqs_MoreBranches(t *testing.T) {
 
 func TestComputeTruncateReqsAndTruncateV2Extents(t *testing.T) {
 	exts := []cproto.ObjExtentKey{
-		{FileOffset: 10, Size: 10},
 		{FileOffset: 0, Size: 10},
+		{FileOffset: 10, Size: 10},
 		{FileOffset: 20, Size: 10},
 	}
-	req := ComputeTruncateReqs(15, exts)
+	ro := NewReadOnlyOeks(exts)
+	req := ComputeTruncateReqs(15, ro)
 	require.False(t, req.KeepExtent.IsEmpty())
 	require.Equal(t, uint64(10), req.KeepExtent.FileOffset)
 	require.Equal(t, uint64(5), req.KeepExtent.Size)
@@ -1002,7 +1004,7 @@ func TestComputeTruncateReqsAndTruncateV2Extents(t *testing.T) {
 				require.Equal(t, uint64(5), in.KeepExtent.Size)
 				return cproto.ObjExtentKey{FileOffset: 10, Size: 5}, in.DiscardFrom, nil
 			})
-		out, del, err := ebs.TruncateV2Extents(context.Background(), "v", exts, 15)
+		out, del, err := ebs.TruncateV2Extents(context.Background(), "v", ro, 15)
 		require.NoError(t, err)
 		require.False(t, out.IsEmpty())
 		require.False(t, del.IsEmpty())
@@ -1122,7 +1124,7 @@ func TestTruncateV2Extents_MultiRoundConsistency(t *testing.T) {
 
 		round := func(name string, target uint64) {
 			t.Helper()
-			newObj, delFrom, err := ebs.TruncateV2Extents(ctx, vol, exts, target)
+			newObj, delFrom, err := ebs.TruncateV2Extents(ctx, vol, NewReadOnlyOeks(exts), target)
 			require.NoError(t, err, name)
 			dropped := truncateV2DroppedKeys(exts, newObj, delFrom)
 			for _, d := range dropped {
@@ -1161,7 +1163,7 @@ func TestTruncateV2Extents_MultiRoundConsistency(t *testing.T) {
 
 		round := func(name string, target uint64) {
 			t.Helper()
-			newObj, delFrom, err := ebs.TruncateV2Extents(ctx, vol, exts, target)
+			newObj, delFrom, err := ebs.TruncateV2Extents(ctx, vol, NewReadOnlyOeks(exts), target)
 			require.NoError(t, err, name)
 			dropped := truncateV2DroppedKeys(exts, newObj, delFrom)
 			for _, d := range dropped {
@@ -1198,7 +1200,7 @@ func TestTruncateV2Extents_MultiRoundConsistency(t *testing.T) {
 		seenDel := make(map[string]struct{})
 
 		round := func(target uint64) {
-			newObj, delFrom, err := ebs.TruncateV2Extents(ctx, vol, exts, target)
+			newObj, delFrom, err := ebs.TruncateV2Extents(ctx, vol, NewReadOnlyOeks(exts), target)
 			require.NoError(t, err)
 			for _, d := range truncateV2DroppedKeys(exts, newObj, delFrom) {
 				k := discardDedupKey(d)

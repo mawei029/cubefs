@@ -1321,7 +1321,7 @@ func inodeOekAtOffset(eks []proto.ObjExtentKey, fileOffset uint64) proto.ObjExte
 // newObj uses keep offset/size with synthetic Cid (EBS object identity is not compared on partial path).
 func buildTruncateV2ReqFromCompute(ino, target uint64, eks []proto.ObjExtentKey) *proto.TruncateRequest {
 	eks = ensureTruncateV2ExtentSliceCrcs(eks)
-	plan := blobstore.ComputeTruncateReqs(target, eks)
+	plan := blobstore.ComputeTruncateReqs(target, blobstore.NewReadOnlyOeks(eks))
 	req := &proto.TruncateRequest{Inode: ino, Size: target}
 	if !plan.KeepExtent.IsEmpty() {
 		req.NewObjExtent = plan.KeepExtent
@@ -1501,7 +1501,7 @@ func TestCheckTruncateV2Conflict_BlobstoreComputeTruncateReqs(t *testing.T) {
 	t.Run("logical hole past last end", func(t *testing.T) {
 		eks := ensureTruncateV2ExtentSliceCrcs([]proto.ObjExtentKey{{FileOffset: 0, Size: 50}, {FileOffset: 50, Size: 50}})
 		req := buildTruncateV2ReqFromCompute(ino, 100, eks)
-		plan := blobstore.ComputeTruncateReqs(100, eks)
+		plan := blobstore.ComputeTruncateReqs(100, blobstore.NewReadOnlyOeks(eks))
 		require.True(t, plan.KeepExtent.IsEmpty())
 		require.True(t, plan.DiscardFrom.IsEmpty())
 		st, final, _ := mp.checkTruncateV2Conflict(req, eks, truncInodeSizePreApply(req, eks))
@@ -1517,7 +1517,7 @@ func TestCheckTruncateV2Conflict_BlobstoreComputeTruncateReqs(t *testing.T) {
 		})
 		target := uint64(150)
 		req := buildTruncateV2ReqFromCompute(ino, target, eks)
-		plan := blobstore.ComputeTruncateReqs(target, eks)
+		plan := blobstore.ComputeTruncateReqs(target, blobstore.NewReadOnlyOeks(eks))
 		require.Equal(t, uint64(100), plan.KeepExtent.FileOffset)
 		require.Equal(t, uint64(50), plan.KeepExtent.Size)
 		require.Equal(t, uint64(100), plan.DiscardFrom.FileOffset)
@@ -1534,7 +1534,7 @@ func TestCheckTruncateV2Conflict_BlobstoreComputeTruncateReqs(t *testing.T) {
 		eks := ensureTruncateV2ExtentSliceCrcs([]proto.ObjExtentKey{{FileOffset: 0, Size: 100}, {FileOffset: 100, Size: 100}})
 		target := uint64(100)
 		req := buildTruncateV2ReqFromCompute(ino, target, eks)
-		plan := blobstore.ComputeTruncateReqs(target, eks)
+		plan := blobstore.ComputeTruncateReqs(target, blobstore.NewReadOnlyOeks(eks))
 		require.True(t, plan.KeepExtent.IsEmpty())
 		require.Equal(t, uint64(100), plan.DiscardFrom.FileOffset)
 

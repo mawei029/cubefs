@@ -203,7 +203,7 @@ func TestWriter_truncate(t *testing.T) {
 
 	t.Run("no_shrink_when_target_ge_current", func(t *testing.T) {
 		s := mustTestECStreamerWithEbsc(265, &BlobStoreClient{}, 8<<20)
-		eks := []proto.ObjExtentKey{{FileOffset: 0, Size: 100}}
+		eks := NewReadOnlyOeks([]proto.ObjExtentKey{{FileOffset: 0, Size: 100}})
 		newEk, del, err := s.fWriter.TruncateV2FromExtents(context.Background(), 100, 100, eks)
 		require.NoError(t, err)
 		require.True(t, newEk.IsEmpty())
@@ -245,7 +245,7 @@ func TestWriter_truncate(t *testing.T) {
 		patches := gomonkey.NewPatches()
 		defer patches.Reset()
 		patches.ApplyMethod(reflect.TypeOf(w.ecStreamer.ebsc), "TruncateV2Extents",
-			func(_ *BlobStoreClient, _ context.Context, _ string, _ []proto.ObjExtentKey, ts uint64) (proto.ObjExtentKey, proto.ObjExtentKey, error) {
+			func(_ *BlobStoreClient, _ context.Context, _ string, _ *ReadOnlyOeks, ts uint64) (proto.ObjExtentKey, proto.ObjExtentKey, error) {
 				return proto.ObjExtentKey{FileOffset: 0, Size: ts}, proto.ObjExtentKey{FileOffset: ts, Size: 100 - ts}, nil
 			})
 		newEk, del, err := w.TruncateV2(context.Background(), 50)
@@ -487,7 +487,7 @@ func TestComputeOverwriteReqs(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			reqs := computeOverwriteReqs(tc.start, tc.end, tc.objExtents)
+			reqs := computeOverwriteReqs(tc.start, tc.end, NewReadOnlyOeks(tc.objExtents))
 			require.NotEqual(t, 0, len(reqs), "computeOverwriteReqs fail. got 0 reqs, expect at least 1")
 			require.Equal(t, len(tc.result), len(reqs))
 
@@ -508,7 +508,7 @@ func TestComputeOverwriteReqs_exactExtentReplace(t *testing.T) {
 		end   = uint64(150)
 	)
 	old := proto.ObjExtentKey{FileOffset: 50, Size: 100, Cid: 7}
-	reqs := computeOverwriteReqs(start, end, []proto.ObjExtentKey{old})
+	reqs := computeOverwriteReqs(start, end, NewReadOnlyOeks([]proto.ObjExtentKey{old}))
 	require.Len(t, reqs, 1)
 	require.Equal(t, proto.ObjExtentKey{FileOffset: 50, Size: 100}, reqs[0].NewExtent)
 	require.Equal(t, old, reqs[0].DiscardExtent)
@@ -657,10 +657,10 @@ func TestWriterCoverageAdditionalBranches(t *testing.T) {
 	})
 
 	t.Run("computeOverwriteReqs covers continue and hole", func(t *testing.T) {
-		reqs := computeOverwriteReqs(50, 120, []proto.ObjExtentKey{
+		reqs := computeOverwriteReqs(50, 120, NewReadOnlyOeks([]proto.ObjExtentKey{
 			{FileOffset: 0, Size: 20},
 			{FileOffset: 80, Size: 20},
-		})
+		}))
 		require.NotEmpty(t, reqs)
 		var hasHole bool
 		for _, r := range reqs {

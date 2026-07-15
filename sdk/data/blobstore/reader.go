@@ -443,8 +443,8 @@ func (reader *Reader) prepareEbsSlice(offset int, size uint32, fileSize uint64) 
 
 	chunks := make([]*rwSlice, 0)
 	cur := start
-	for i := range keys {
-		oek := keys[i]
+	for i := 0; i < keys.Len(); i++ {
+		oek := keys.At(i)
 		ekEnd := oek.FileOffset + uint64(oek.Size)
 		if ekEnd <= cur {
 			continue

@@ -791,9 +791,10 @@ func (writer *Writer) flushWithoutPool(inode uint64, ctx context.Context, flushF
 //	Result:
 //	  - req1: NewExtent=[100, 150), DiscardExtent=[50, 150) (partial overlap)
 //	  - req2: NewExtent=[150, 200), DiscardExtent=empty (new data, no overlap)
-func computeOverwriteReqs(start, end uint64, objExtents []proto.ObjExtentKey) (reqs []overwriteReq) {
+func computeOverwriteReqs(start, end uint64, objExtents *ReadOnlyOeks) (reqs []overwriteReq) {
 	reqs = make([]overwriteReq, 0)
-	for _, ek := range objExtents {
+	for i := 0; i < objExtents.Len(); i++ {
+		ek := objExtents.At(i)
 		// last extent, append a new extent
 		if end <= ek.FileOffset {
 			reqs = append(reqs, overwriteReq{
@@ -954,8 +955,8 @@ func (writer *Writer) flushExt(inode uint64, ctx context.Context, flushFlag bool
 	log.LogDebugf("flushExt: ino(%v) start(%v) end(%v) reqsCount(%v) bufferSize(%v) oldOeks(%v) newOeks(%v)", inode, start, end, len(reqs), bufferSize, objExtents, reqs)
 
 	lastExtentEnd := uint64(0)
-	if len(objExtents) > 0 {
-		last := objExtents[len(objExtents)-1]
+	if objExtents.Len() > 0 {
+		last := objExtents.At(objExtents.Len() - 1)
 		lastExtentEnd = last.FileOffset + last.Size
 	}
 	isPureTailAppend := len(reqs) == 1 && reqs[0].DiscardExtent.IsEmpty() &&
@@ -1040,7 +1041,8 @@ func (writer *Writer) TruncateV2(ctx context.Context, targetSize uint64,
 }
 
 // TruncateV2FromExtents uses provided currentSize/objExtents to avoid duplicate GetObjExtents.
-func (writer *Writer) TruncateV2FromExtents(ctx context.Context, targetSize uint64, currentSize uint64, objExtents []proto.ObjExtentKey,
+// objExtents must be sorted by FileOffset ascending (same contract as computeOverwriteReqs).
+func (writer *Writer) TruncateV2FromExtents(ctx context.Context, targetSize uint64, currentSize uint64, objExtents *ReadOnlyOeks,
 ) (newObjExtent proto.ObjExtentKey, toDeleteFrom proto.ObjExtentKey, err error) {
 	if writer == nil || writer.ecStreamer.Ebsc() == nil {
 		log.LogErrorf("Writer.TruncateV2FromExtents: writer/ebsc nil")

@@ -569,12 +569,12 @@ func TestECExtentClient_NeedRefreshObjExtents(t *testing.T) {
 	require.True(t, c.NeedRefreshObjExtents(405))
 
 	s.mu.Lock()
-	s.oeks = []proto.ObjExtentKey{}
+	s.oeks = &ReadOnlyOeks{items: []proto.ObjExtentKey{}}
 	s.mu.Unlock()
 	require.True(t, c.NeedRefreshObjExtents(405))
 
 	s.mu.Lock()
-	s.oeks = []proto.ObjExtentKey{{FileOffset: 0, Size: 32}}
+	s.oeks = &ReadOnlyOeks{items: []proto.ObjExtentKey{{FileOffset: 0, Size: 32}}}
 	s.mu.Unlock()
 	require.False(t, c.NeedRefreshObjExtents(405))
 

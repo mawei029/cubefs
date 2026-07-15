@@ -17,6 +17,27 @@ import (
 	"github.com/cubefs/cubefs/util/log"
 )
 
+// ReadOnlyOeks is an immutable view of sorted obj extents shared by Reader/Writer.
+type ReadOnlyOeks struct {
+	items []proto.ObjExtentKey
+}
+
+// NewReadOnlyOeks wraps a oek slice as a shared read-only view (no copy).
+func NewReadOnlyOeks(oeks []proto.ObjExtentKey) *ReadOnlyOeks {
+	return &ReadOnlyOeks{items: oeks}
+}
+
+func (r *ReadOnlyOeks) Len() int {
+	if r == nil {
+		return 0
+	}
+	return len(r.items)
+}
+
+func (r *ReadOnlyOeks) At(idx int) proto.ObjExtentKey {
+	return r.items[idx]
+}
+
 // ECStreamer shares Reader/Writer and logical view (fileSize, inoVersion, oeks, dirty) per inode.
 // refCnt via OpenStreamWithArgs/CloseStream; map delete and nil RW pointers in EvictStream.
 type ECStreamer struct {
@@ -30,7 +51,7 @@ type ECStreamer struct {
 	// Writes raise tail only; truncate may lower via updateMetaInfo; clean refresh aligns with meta/oek tail.
 	fileSize   uint64
 	inoVersion uint64
-	oeks       []proto.ObjExtentKey
+	oeks       *ReadOnlyOeks
 	// dirty: 1=must sync before read/flush (buffer and/or stale oeks); 0=clean. External code uses isDirty() only.
 	dirty uint32
 
@@ -103,16 +124,17 @@ func (s *ECStreamer) RefCnt() int32 {
 	return atomic.LoadInt32(&s.refCnt)
 }
 
-// OeksLocked copies oeks under RLock for Reader/Writer without holding ECStreamer.mu.
-func (s *ECStreamer) OeksLocked() []proto.ObjExtentKey {
-	return append([]proto.ObjExtentKey(nil), s.oeks...)
+// OeksLocked returns the shared read-only oeks view (no slice copy).
+// Caller must already hold s.mu (Read/Write/Flush paths); do not mutate the returned object.
+func (s *ECStreamer) OeksLocked() *ReadOnlyOeks {
+	return s.oeks
 }
 
 func (s *ECStreamer) HasObjExtents() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	return s.oeks != nil && len(s.oeks) > 0
+	return s.oeks != nil && s.oeks.items != nil && len(s.oeks.items) > 0
 }
 
 // String for debug logs; reads atomic fields and ino without s.mu.
@@ -344,9 +366,9 @@ func (s *ECStreamer) updateMetaInfo(commitSize *uint64) error {
 	}
 
 	// must has mutex here, because oeks is used by reader and writer
-	s.oeks = objExtents
-	sort.Slice(s.oeks, func(i, j int) bool {
-		return s.oeks[i].FileOffset < s.oeks[j].FileOffset
+	s.oeks = &ReadOnlyOeks{items: objExtents}
+	sort.Slice(s.oeks.items, func(i, j int) bool {
+		return s.oeks.items[i].FileOffset < s.oeks.items[j].FileOffset
 	})
 
 	// TODO: only use atomit.StoreUint64 for inoVersion and fileSize
@@ -503,7 +525,10 @@ func (s *ECStreamer) truncateV2Locked(ctx context.Context, ino uint64, targetSiz
 	}
 
 	// shrink file, and has oeks
-	newObjExtent, toDeleteFrom, err := s.fWriter.TruncateV2FromExtents(ctx, targetSize, currentSize, objExtents)
+	sort.Slice(objExtents, func(i, j int) bool {
+		return objExtents[i].FileOffset < objExtents[j].FileOffset
+	})
+	newObjExtent, toDeleteFrom, err := s.fWriter.TruncateV2FromExtents(ctx, targetSize, currentSize, NewReadOnlyOeks(objExtents))
 	if err != nil {
 		return err
 	}

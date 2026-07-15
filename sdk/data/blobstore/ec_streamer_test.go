@@ -437,13 +437,17 @@ func TestECStreamer_flushExt_empty_dirty_only_meta(t *testing.T) {
 	require.False(t, s.isDirty())
 }
 
-func TestECStreamer_OeksLocked_copy(t *testing.T) {
+func TestECStreamer_OeksLocked_sharedView(t *testing.T) {
 	s := mustTestECStreamer(23, nil, nil)
-	s.oeks = []proto.ObjExtentKey{{FileOffset: 1, Size: 2}}
-	cp := s.OeksLocked()
-	require.Len(t, cp, 1)
-	cp[0].FileOffset = 99
-	require.Equal(t, uint64(1), s.oeks[0].FileOffset)
+	s.oeks = &ReadOnlyOeks{items: []proto.ObjExtentKey{{FileOffset: 1, Size: 2}}}
+	got := s.OeksLocked()
+	require.Same(t, s.oeks, got)
+	require.Equal(t, 1, got.Len())
+	require.Equal(t, uint64(1), got.At(0).FileOffset)
+	// At returns by value; mutating the copy must not affect the shared view.
+	ek := got.At(0)
+	ek.FileOffset = 99
+	require.Equal(t, uint64(1), got.At(0).FileOffset)
 }
 
 func TestECStreamer_HasObjExtents(t *testing.T) {
@@ -451,12 +455,12 @@ func TestECStreamer_HasObjExtents(t *testing.T) {
 	require.False(t, s.HasObjExtents())
 
 	s.mu.Lock()
-	s.oeks = []proto.ObjExtentKey{}
+	s.oeks = &ReadOnlyOeks{items: []proto.ObjExtentKey{}}
 	s.mu.Unlock()
 	require.False(t, s.HasObjExtents())
 
 	s.mu.Lock()
-	s.oeks = []proto.ObjExtentKey{{FileOffset: 0, Size: 8}}
+	s.oeks = &ReadOnlyOeks{items: []proto.ObjExtentKey{{FileOffset: 0, Size: 8}}}
 	s.mu.Unlock()
 	require.True(t, s.HasObjExtents())
 }
@@ -554,8 +558,9 @@ func TestECStreamer_updateMetaInfo_under_mu(t *testing.T) {
 		s2.mu.Lock()
 		require.NoError(t, s2.updateMetaInfo(nil))
 		s2.mu.Unlock()
-		require.Equal(t, uint64(0), s2.oeks[0].FileOffset)
-		require.Equal(t, uint64(40), s2.oeks[1].FileOffset)
+		require.Equal(t, 2, s2.oeks.Len())
+		require.Equal(t, uint64(0), s2.oeks.At(0).FileOffset)
+		require.Equal(t, uint64(40), s2.oeks.At(1).FileOffset)
 	})
 }
 
@@ -654,7 +659,7 @@ func TestECStreamer_truncateV2_shrink_with_meta_deltas(t *testing.T) {
 			}, nil
 		})
 	patches.ApplyMethod(reflect.TypeOf(w), "TruncateV2FromExtents",
-		func(_ *Writer, _ context.Context, target, current uint64, _ []proto.ObjExtentKey) (proto.ObjExtentKey, proto.ObjExtentKey, error) {
+		func(_ *Writer, _ context.Context, target, current uint64, _ *ReadOnlyOeks) (proto.ObjExtentKey, proto.ObjExtentKey, error) {
 			require.Equal(t, uint64(150), target)
 			require.Equal(t, uint64(250), current)
 			return newDelta, delAnchor, nil
@@ -693,7 +698,7 @@ func TestECStreamer_truncateV2_shrink_calls_writer_with_deltas(t *testing.T) {
 		})
 	var shrinkCalled bool
 	patches.ApplyMethod(reflect.TypeOf(w), "TruncateV2FromExtents",
-		func(_ *Writer, _ context.Context, target, current uint64, _ []proto.ObjExtentKey) (proto.ObjExtentKey, proto.ObjExtentKey, error) {
+		func(_ *Writer, _ context.Context, target, current uint64, _ *ReadOnlyOeks) (proto.ObjExtentKey, proto.ObjExtentKey, error) {
 			shrinkCalled = true
 			require.Equal(t, uint64(100), target)
 			require.Equal(t, uint64(200), current)
@@ -728,7 +733,7 @@ func TestECStreamer_truncateV2_shrink_no_oeks(t *testing.T) {
 	patches.ApplyMethod(reflect.TypeOf(w), "Flush", func(_ *Writer, _ uint64, _ context.Context) error { return nil })
 	var writerShrink bool
 	patches.ApplyMethod(reflect.TypeOf(w), "TruncateV2FromExtents",
-		func(_ *Writer, _ context.Context, _, _ uint64, _ []proto.ObjExtentKey) (proto.ObjExtentKey, proto.ObjExtentKey, error) {
+		func(_ *Writer, _ context.Context, _, _ uint64, _ *ReadOnlyOeks) (proto.ObjExtentKey, proto.ObjExtentKey, error) {
 			writerShrink = true
 			return proto.ObjExtentKey{}, proto.ObjExtentKey{}, nil
 		})
@@ -769,7 +774,7 @@ func TestECStreamer_truncateV2_shrink_size_only_past_last_extent_end(t *testing.
 			return 1, 200, nil, []proto.ObjExtentKey{lastEk}, nil
 		})
 	patches.ApplyMethod(reflect.TypeOf(w), "TruncateV2FromExtents",
-		func(_ *Writer, _ context.Context, target, current uint64, _ []proto.ObjExtentKey) (proto.ObjExtentKey, proto.ObjExtentKey, error) {
+		func(_ *Writer, _ context.Context, target, current uint64, _ *ReadOnlyOeks) (proto.ObjExtentKey, proto.ObjExtentKey, error) {
 			require.Equal(t, uint64(150), target)
 			require.Equal(t, uint64(200), current)
 			return proto.ObjExtentKey{}, proto.ObjExtentKey{}, nil
@@ -855,7 +860,7 @@ func TestECStreamer_truncateV2_shrink_invalid_empty_delta(t *testing.T) {
 			return 1, 200, nil, []proto.ObjExtentKey{{FileOffset: 0, Size: 200}}, nil
 		})
 	patches.ApplyMethod(reflect.TypeOf(w), "TruncateV2FromExtents",
-		func(_ *Writer, _ context.Context, _, _ uint64, _ []proto.ObjExtentKey) (proto.ObjExtentKey, proto.ObjExtentKey, error) {
+		func(_ *Writer, _ context.Context, _, _ uint64, _ *ReadOnlyOeks) (proto.ObjExtentKey, proto.ObjExtentKey, error) {
 			return proto.ObjExtentKey{}, proto.ObjExtentKey{}, nil
 		})
 
@@ -896,10 +901,10 @@ func TestECStreamer_updateMetaInfo_sorts_unsorted_oeks(t *testing.T) {
 		})
 
 	require.NoError(t, s.updateMetaInfo(nil))
-	require.Len(t, s.oeks, 3)
-	require.Equal(t, uint64(0), s.oeks[0].FileOffset)
-	require.Equal(t, uint64(100), s.oeks[1].FileOffset)
-	require.Equal(t, uint64(200), s.oeks[2].FileOffset)
+	require.Equal(t, 3, s.oeks.Len())
+	require.Equal(t, uint64(0), s.oeks.At(0).FileOffset)
+	require.Equal(t, uint64(100), s.oeks.At(1).FileOffset)
+	require.Equal(t, uint64(200), s.oeks.At(2).FileOffset)
 	require.Equal(t, uint64(250), atomic.LoadUint64(&s.fileSize))
 }
 
