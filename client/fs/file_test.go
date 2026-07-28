@@ -17,8 +17,10 @@ import (
 	"testing"
 	"unsafe"
 
+	"github.com/agiledragon/gomonkey/v2"
 	"github.com/cubefs/cubefs/depends/bazil.org/fuse"
 	"github.com/cubefs/cubefs/proto"
+	"github.com/cubefs/cubefs/sdk/data/blobstore"
 	"github.com/cubefs/cubefs/sdk/data/stream"
 	"github.com/cubefs/cubefs/sdk/meta"
 	"github.com/stretchr/testify/require"
@@ -253,7 +255,7 @@ func TestFile_Attr_coldVolume_usesInodeSize(t *testing.T) {
 	t.Parallel()
 	const fileIno uint64 = 91003
 	s := superForFileTest(t)
-	s.volType = proto.VolumeTypeCold
+	s.volType = proto.VolumeTypeHot
 	info := fileInodeInfoForMutationTest(fileIno)
 	info.Size = 2048
 	s.ic.Put(info)
@@ -477,4 +479,98 @@ func flagName(flag uint32) string {
 	default:
 		return "unknown"
 	}
+}
+
+func TestIsReadEio_ExtentNotFound(t *testing.T) {
+	require.False(t, isReadEio(stream.ExtentNotFoundError))
+	require.False(t, isReadEio(errors.New("wrap: ExtentNotFoundError")))
+	require.False(t, isReadEio(syscall.ENOENT))
+	require.False(t, isReadEio(syscall.ENOTSUP))
+	require.True(t, isReadEio(errors.New("unexpected read failure")))
+	require.True(t, isReadEio(syscall.EIO))
+}
+
+func TestFile_Read_nonEio_confirmsMetaInode(t *testing.T) {
+	const ino uint64 = 22021436
+	type setupOut struct {
+		f         *File
+		igetCalls *int
+	}
+	newReadSetup := func(t *testing.T, readErr error, iget func(uint64) (*proto.InodeInfo, error)) setupOut {
+		t.Helper()
+		s := newTestSuperForFile()
+		s.volType = proto.VolumeTypeCold
+		s.volname = "vol"
+		s.poolCache = map[uint8]*proto.StoragePoolInfo{
+			1: {Id: 1, StorageClass: uint8(proto.StorageClass_BlobStore)},
+		}
+		f := &File{super: s, ino: ino, parentIno: 1, name: "missing-ext"}
+		f.refreshFileMeta(1, proto.StorageClass_BlobStore)
+		s.ic.Put(&proto.InodeInfo{Inode: ino, PoolId: 1, StorageClass: proto.StorageClass_BlobStore, Size: 1})
+		igetCalls := 0
+		patches := gomonkey.NewPatches()
+		t.Cleanup(patches.Reset)
+		patches.ApplyMethod(reflect.TypeOf(&meta.MetaWrapper{}), "InodeGet_ll",
+			func(_ *meta.MetaWrapper, gotIno uint64, _ bool) (*proto.InodeInfo, error) {
+				igetCalls++
+				require.Equal(t, ino, gotIno)
+				return iget(gotIno)
+			})
+		patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "Read",
+			func(_ *blobstore.ECExtentClient, _ uint64, _ []byte, _ int, _ int) (int, error) {
+				return 0, readErr
+			})
+		return setupOut{f: f, igetCalls: &igetCalls}
+	}
+	doRead := func(f *File) error {
+		req := &fuse.ReadRequest{Offset: 0, Size: 4}
+		resp := &fuse.ReadResponse{Data: make([]byte, fuse.OutHeaderSize+4)}
+		return f.Read(context.Background(), req, resp)
+	}
+	t.Run("extent_not_found_skips_meta_confirm", func(t *testing.T) {
+		out := newReadSetup(t, stream.ExtentNotFoundError, func(uint64) (*proto.InodeInfo, error) {
+			t.Fatal("InodeGet_ll must not be called on !isReadEio path")
+			return nil, nil
+		})
+		err := doRead(out.f)
+		require.Equal(t, fuse.EIO, err)
+		require.Equal(t, 0, *out.igetCalls)
+		require.Nil(t, out.f.super.ic.Get(ino))
+	})
+	t.Run("eio_inode_gone_reports_notsup_metric_still_eio", func(t *testing.T) {
+		out := newReadSetup(t, errors.New("unexpected read failure"), func(uint64) (*proto.InodeInfo, error) {
+			return nil, syscall.ENOENT
+		})
+		err := doRead(out.f)
+		require.Equal(t, fuse.EIO, err)
+		require.Equal(t, 1, *out.igetCalls)
+		require.Nil(t, out.f.super.ic.Get(ino))
+	})
+	t.Run("eio_inode_nil_info_treated_missing", func(t *testing.T) {
+		out := newReadSetup(t, errors.New("unexpected read failure"), func(uint64) (*proto.InodeInfo, error) {
+			return nil, nil
+		})
+		err := doRead(out.f)
+		require.Equal(t, fuse.EIO, err)
+		require.Equal(t, 1, *out.igetCalls)
+		require.Nil(t, out.f.super.ic.Get(ino))
+	})
+	t.Run("eio_inode_present_reports_eio", func(t *testing.T) {
+		out := newReadSetup(t, errors.New("unexpected read failure"), func(uint64) (*proto.InodeInfo, error) {
+			return &proto.InodeInfo{Inode: ino, PoolId: 1, StorageClass: proto.StorageClass_BlobStore}, nil
+		})
+		err := doRead(out.f)
+		require.Equal(t, fuse.EIO, err)
+		require.Equal(t, 1, *out.igetCalls)
+		require.Nil(t, out.f.super.ic.Get(ino))
+	})
+	t.Run("eio_meta_rpc_fail_treated_present", func(t *testing.T) {
+		out := newReadSetup(t, errors.New("unexpected read failure"), func(uint64) (*proto.InodeInfo, error) {
+			return nil, errors.New("meta rpc timeout")
+		})
+		err := doRead(out.f)
+		require.Equal(t, fuse.EIO, err)
+		require.Equal(t, 1, *out.igetCalls)
+		require.Nil(t, out.f.super.ic.Get(ino))
+	})
 }
