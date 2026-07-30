@@ -327,7 +327,10 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 
 	// ec stream oeks
 	if proto.IsStorageClassBlobStore(info.StorageClass) {
-		f.super.oec.RefreshExtentsCache(ino)
+		if err := f.super.oec.RefreshExtentsCache(ino); err != nil {
+			log.LogErrorf("Open: oec RefreshExtentsCache ino(%v) err(%v)", ino, err)
+			return nil, ParseError(err)
+		}
 	}
 
 	if f.super.keepCache && resp != nil {
@@ -640,11 +643,11 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 		if proto.IsHot(f.super.volType) || proto.IsStorageClassReplica(storageClass) {
 			err = f.super.ec.Flush(ino)
 		} else {
-			f.super.oec.Flush(ino)
+			err = f.super.oec.Flush(ino)
 		}
 		if err != nil {
 			msg := fmt.Sprintf("Write: failed to wait for flush, ino(%v) offset(%v) len(%v) err(%v) req(%v)", ino, req.Offset, reqlen, err, req)
-			f.super.handleError("Wrtie", msg)
+			f.super.handleError("Write", msg)
 			errMetric := exporter.NewCounter("fileWriteFailed")
 			if !isWriteEio(err) {
 				errMetric.AddWithLabels(1, map[string]string{exporter.Vol: f.super.volname, exporter.Err: "NOTSUP"})
