@@ -18,6 +18,7 @@ import (
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/cubefs/cubefs/blobstore/api/access"
+	"github.com/cubefs/cubefs/blobstore/sdk"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/blobstore"
 	"github.com/cubefs/cubefs/sdk/data/stream"
@@ -603,7 +604,6 @@ func TestGetBlobStoreClientPassesStreamRetryTimeout(t *testing.T) {
 	require.Equal(t, access.NoLimitConnMode, gotAccessCfg.ConnMode)
 	require.Equal(t, 60, gotAccessCfg.ServiceIntervalS)
 	require.Equal(t, -1, gotAccessCfg.FailRetryIntervalS)
-	// require.Equal(t, int64(8388608), gotAccessCfg.MaxSizePutOnce)
 	require.Equal(t, MaxSizePutOnce, gotAccessCfg.MaxSizePutOnce)
 	require.Equal(t, 6, gotAccessCfg.MaxHostRetry)
 	require.Equal(t, int64(6000), gotAccessCfg.BodyBaseTimeoutMs)
@@ -613,7 +613,7 @@ func TestGetBlobStoreClientPassesStreamRetryTimeout(t *testing.T) {
 
 func TestGetBlobStoreClientConsulAddressOverridesPoolECAddr(t *testing.T) {
 	ec := proto.DefaultEbsClientConfig()
-	ec.ConsulAddress = "10.52.128.57:8500"
+	ec.ConsulAddress = "consul_address:8500"
 
 	s := &Super{
 		ebsc:      make(map[uint8]*blobstore.BlobStoreClient),
@@ -633,7 +633,7 @@ func TestGetBlobStoreClientConsulAddressOverridesPoolECAddr(t *testing.T) {
 
 	_, err := s.getBlobStoreClient(1)
 	require.NoError(t, err)
-	require.Equal(t, "10.52.128.57:8500", gotConsul)
+	require.Equal(t, "consul_address:8500", gotConsul)
 }
 
 func TestGetBlobStoreClientToAccessConfigError(t *testing.T) {
@@ -650,6 +650,105 @@ func TestGetBlobStoreClientToAccessConfigError(t *testing.T) {
 	_, err := s.getBlobStoreClient(1)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "ToAccessConfig failed")
+}
+
+func TestGetBlobStoreClientEnableEbsSdk(t *testing.T) {
+	const wantTimeout = 120
+	ec := proto.DefaultEbsClientConfig()
+	ec.Idc = "z0"
+	ec.Region = "test-region"
+	ec.RegionMagic = "test-region"
+	ec.Clusters = []proto.EbsSdkCluster{{
+		ClusterID: 50,
+		Hosts:     []string{"http://10.0.0.1:9998"},
+	}}
+	s := &Super{
+		ebsc:               make(map[uint8]*blobstore.BlobStoreClient),
+		logpath:            t.TempDir(),
+		streamRetryTimeout: wantTimeout,
+		ebsConfig:          ec,
+		enableEbsSdk:       true,
+		poolCache: map[uint8]*proto.StoragePoolInfo{
+			1: {Id: 1, ECAddr: "127.0.0.1:8500"},
+		},
+	}
+
+	gotTimeout := -1
+	var gotSdkCfg *sdk.Config
+	newEbsClientCalled := false
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyFunc(blobstore.NewEbsClientSdk, func(cfg *sdk.Config, maxTimeoutSec int) (*blobstore.BlobStoreClient, error) {
+		gotSdkCfg = cfg
+		gotTimeout = maxTimeoutSec
+		return &blobstore.BlobStoreClient{}, nil
+	})
+	patches.ApplyFunc(blobstore.NewEbsClient, func(access.Config, int) (*blobstore.BlobStoreClient, error) {
+		newEbsClientCalled = true
+		return &blobstore.BlobStoreClient{}, nil
+	})
+
+	cli, err := s.getBlobStoreClient(1)
+	require.NoError(t, err)
+	require.NotNil(t, cli)
+	require.False(t, newEbsClientCalled)
+	require.Equal(t, wantTimeout, gotTimeout)
+	require.NotNil(t, gotSdkCfg)
+	require.Equal(t, "127.0.0.1:8500", gotSdkCfg.ClusterConfig.ConsulAgentAddr)
+	require.Len(t, gotSdkCfg.ClusterConfig.Clusters, 1)
+	require.Equal(t, "z0", gotSdkCfg.IDC)
+	require.Equal(t, "test-region", gotSdkCfg.ClusterConfig.RegionMagic)
+	require.Equal(t, uint32(16<<20), gotSdkCfg.MaxBlobSize)
+	require.Same(t, cli, s.ebsc[1])
+}
+
+func TestGetBlobStoreClientEnableEbsSdkConsulOnly(t *testing.T) {
+	ec := proto.DefaultEbsClientConfig()
+	ec.ConsulAddress = "consul_address:8500"
+	ec.Idc = "z0"
+	ec.RegionMagic = "rm"
+
+	s := &Super{
+		ebsc:         make(map[uint8]*blobstore.BlobStoreClient),
+		logpath:      t.TempDir(),
+		ebsConfig:    ec,
+		enableEbsSdk: true,
+		poolCache: map[uint8]*proto.StoragePoolInfo{
+			1: {Id: 1, ECAddr: "127.0.0.1:9999"},
+		},
+	}
+
+	var gotSdkCfg *sdk.Config
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyFunc(blobstore.NewEbsClientSdk, func(cfg *sdk.Config, maxTimeoutSec int) (*blobstore.BlobStoreClient, error) {
+		gotSdkCfg = cfg
+		return &blobstore.BlobStoreClient{}, nil
+	})
+
+	cli, err := s.getBlobStoreClient(1)
+	require.NoError(t, err)
+	require.NotNil(t, cli)
+	require.NotNil(t, gotSdkCfg)
+	require.Equal(t, "consul_address:8500", gotSdkCfg.ClusterConfig.ConsulAgentAddr)
+	require.Empty(t, gotSdkCfg.ClusterConfig.Clusters)
+}
+
+func TestGetBlobStoreClientEnableEbsSdkBuildSdkConfigError(t *testing.T) {
+	ec := proto.EbsClientConfig{}
+	s := &Super{
+		ebsc:         make(map[uint8]*blobstore.BlobStoreClient),
+		logpath:      t.TempDir(),
+		ebsConfig:    ec,
+		enableEbsSdk: true,
+		poolCache: map[uint8]*proto.StoragePoolInfo{
+			1: {Id: 1, ECAddr: ""},
+		},
+	}
+
+	_, err := s.getBlobStoreClient(1)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "BuildSdkConfig failed")
 }
 
 func TestNewSuperStoresEbsConfigFromMountOptions(t *testing.T) {
@@ -731,10 +830,12 @@ func TestNewSuperStoresEbsConfigFromMountOptions(t *testing.T) {
 		TrashRebuildGoroutineLimit:          1,
 		TrashDeleteExpiredDirGoroutineLimit: 1,
 		EbsConfig:                           custom,
+		EnableEbsSdk:                        true,
 	})
 	require.NoError(t, err)
 	require.NotNil(t, s.ebsConfig.HostTryTimes)
 	require.Equal(t, 40, *s.ebsConfig.HostTryTimes)
+	require.True(t, s.enableEbsSdk)
 	close(s.closeC)
 	s.runningMonitor.Stop()
 }

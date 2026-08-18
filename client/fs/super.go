@@ -134,6 +134,7 @@ type Super struct {
 	aheadWindowCnt     int
 	streamRetryTimeout int
 	ebsConfig          proto.EbsClientConfig
+	enableEbsSdk       bool // mount -enableEbsSdk; default false → NewEbsClient
 }
 
 // BlobStoreAheadReadForReader returns mount ahead-read flags for blobstore.Reader.
@@ -386,6 +387,7 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 	s.streamRetryTimeout = opt.StreamRetryTimeout
 	s.aheadWindowCnt = opt.AheadReadWindowCnt
 	s.ebsConfig = opt.EbsConfig
+	s.enableEbsSdk = opt.EnableEbsSdk
 	if opt.MinReadAheadSize > 0 {
 		s.minReadAheadSize = uint64(opt.MinReadAheadSize)
 	} else {
@@ -549,19 +551,40 @@ func (s *Super) getBlobStoreClient(poolId uint8) (*blobstore.BlobStoreClient, er
 		log.LogErrorf("getBlobStoreClient: pool(%v) not found", pool.String())
 		return nil, errors.New(fmt.Sprintf("pool(%v) not found", pool.String()))
 	}
-	log.LogWarnf("getBlobStoreClient: create blobstore client for pool(%v)", pool.String())
+	log.LogWarnf("getBlobStoreClient: create blobstore client for pool(%v) enableEbsSdk(%v)", pool.String(), s.enableEbsSdk)
 
-	accessCfg, err := s.ebsConfig.ToAccessConfig(pool.ECAddr, s.logpath)
-	if err != nil {
-		log.LogErrorf("[getBlobStoreClient] build access config err: %v", err)
-		return nil, errors.Trace(err, "ToAccessConfig failed!")
-	}
-
-	// super.getBlobStoreClient → blobstore.NewEbsClient → access.New(cfg) → getClient(&cfg, hosts) → cfg.ConnMode.getConfig(...)   //  ConnMode to rpc.Config	→ rpc.NewLbClient → rpc.NewClient(&cfg.Config)	→ doWithCtx() // raw body timeout
-	ebsc, err = blobstore.NewEbsClient(accessCfg, s.streamRetryTimeout)
-	if err != nil {
-		log.LogErrorf("[getBlobStoreClient] create blobstore client err: %v", err)
-		return nil, errors.Trace(err, "NewEbsClient failed!")
+	if s.enableEbsSdk {
+		sdkCfg, err := blobstore.BuildSdkConfig(s.ebsConfig, pool.ECAddr, s.logpath)
+		if err != nil {
+			log.LogErrorf("getBlobStoreClient: BuildSdkConfig FAILED pool(%v) err(%v)", pool.Id, err)
+			return nil, errors.Trace(err, "BuildSdkConfig failed!")
+		}
+		log.LogWarnf("getBlobStoreClient: sdk cfg idc(%v) region(%v) magic(%v) clusters(%d)",
+			sdkCfg.IDC, sdkCfg.ClusterConfig.Region, sdkCfg.ClusterConfig.RegionMagic,
+			len(sdkCfg.ClusterConfig.Clusters))
+		for i, cl := range sdkCfg.ClusterConfig.Clusters {
+			log.LogWarnf("getBlobStoreClient: sdk cluster[%d] id(%v) hosts(%v)", i, cl.ClusterID, cl.Hosts)
+		}
+		// NewEbsClientSdk → blobstore/sdk.New (in-process stream).
+		ebsc, err = blobstore.NewEbsClientSdk(sdkCfg, s.streamRetryTimeout)
+		if err != nil {
+			log.LogErrorf("getBlobStoreClient: NewEbsClientSdk FAILED pool(%v) err(%v)", pool.Id, err)
+			return nil, errors.Trace(err, "NewEbsClientSdk failed!")
+		}
+		log.LogWarnf("getBlobStoreClient: NewEbsClientSdk OK pool(%v)", pool.Id)
+	} else {
+		accessCfg, err := s.ebsConfig.ToAccessConfig(pool.ECAddr, s.logpath)
+		if err != nil {
+			log.LogErrorf("getBlobStoreClient: ToAccessConfig FAILED pool(%v) err(%v)", pool.Id, err)
+			return nil, errors.Trace(err, "ToAccessConfig failed!")
+		}
+		// Default path: NewEbsClient → HTTP access (same as metanode/lcnode/objectnode).
+		ebsc, err = blobstore.NewEbsClient(accessCfg, s.streamRetryTimeout)
+		if err != nil {
+			log.LogErrorf("getBlobStoreClient: NewEbsClient FAILED pool(%v) err(%v)", pool.Id, err)
+			return nil, errors.Trace(err, "NewEbsClient failed!")
+		}
+		log.LogWarnf("getBlobStoreClient: NewEbsClient OK pool(%v)", pool.Id)
 	}
 
 	s.ebsc[pool.Id] = ebsc

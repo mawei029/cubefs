@@ -12,10 +12,10 @@ import (
 	"github.com/cubefs/cubefs/util/log"
 )
 
-// EbsClientConfig controls blobstore access client settings for cfs-client fuse mount.
+// EbsClientConfig controls blobstore access/sdk client settings for cfs-client fuse mount.
 type EbsClientConfig struct {
 	ConnMode           *uint8   `json:"conn_mode,omitempty"`
-	ConsulAddress      string   `json:"consul_address,omitempty"`
+	ConsulAddress      string   `json:"consul_address,omitempty"` // same consul addr: Access consul for normal client;CM consul for SDK client
 	MaxSizePutOnce     *int64   `json:"max_size_put_once,omitempty"`
 	LogLevel           *int     `json:"log_level,omitempty"`
 	ServiceIntervalS   *int     `json:"service_interval_s,omitempty"`
@@ -27,12 +27,28 @@ type EbsClientConfig struct {
 	MaxHostRetry       *int     `json:"max_host_retry,omitempty"`
 	MaxPartRetry       *int     `json:"max_part_retry,omitempty"`
 	PartConcurrence    *int     `json:"part_concurrence,omitempty"`
+
+	// SDK (in-process stream) fields for NewEbsClientSdk.
+	// Minimal --ebsConfig: idc, region_magic, max_blob_size, and either
+	// consul_address (CM KV ebs/{region}/clusters/) or static clusters.
+	Idc         string          `json:"idc,omitempty"`
+	Region      string          `json:"region,omitempty"`
+	RegionMagic string          `json:"region_magic,omitempty"`
+	MaxBlobSize *uint32         `json:"max_blob_size,omitempty"` // default 16777216 when omitted
+	Clusters    []EbsSdkCluster `json:"clusters,omitempty"`
+}
+
+// EbsSdkCluster is a static clustermgr endpoint list for NewEbsClientSdk (same as access stream.cluster_config.clusters).
+type EbsSdkCluster struct {
+	ClusterID uint32   `json:"cluster_id"`
+	Hosts     []string `json:"hosts"`
 }
 
 // DefaultEbsClientConfig returns fuse mount defaults when ebs_config is absent or partial.
+// LogLevel is left nil so BuildSdkConfig/ToAccessConfig can follow cfs-client --logLevel
+// (GetBlobLogLevel after InitLog). Set log_level in ebs_config/JSON to override.
 func DefaultEbsClientConfig() EbsClientConfig {
 	connMode := uint8(access.NoLimitConnMode) // no limit conn mode.
-	logLevel := int(log.GetBlobLogLevel())    // warn log level. Default is 2.
 	bodyBandwidthMBPs := 2.0                  // if access.NoLimitConnMode, it's invalid. 2MB/s. body Minimum Speed: timeout = ContentLength/BodyBandwidthMBPs + BodyBaseTimeoutMs. Default is 10MBps.
 	bodyBaseTimeoutMs := int64(6000)          // if access.NoLimitConnMode, it's invalid. 6 seconds. base timeout for read body. Default is 30000ms.
 	serviceIntervalS := 60                    // 1 minute. interval seconds for discovering service hosts, at least 5 seconds and default is 5 minutes. Default is 300s.
@@ -45,7 +61,6 @@ func DefaultEbsClientConfig() EbsClientConfig {
 	hostTryTimes := 0                         //  if FailRetryIntervalS <0. it's invalid. 0 means no retry. Number of host failure retries. Default is 3.
 	return EbsClientConfig{
 		ConnMode:           &connMode,
-		LogLevel:           &logLevel,
 		BodyBandwidthMBPs:  &bodyBandwidthMBPs,
 		BodyBaseTimeoutMs:  &bodyBaseTimeoutMs,
 		ServiceIntervalS:   &serviceIntervalS,
@@ -135,6 +150,21 @@ func mergeEbsClientConfig(base *EbsClientConfig, patch EbsClientConfig) {
 	if patch.HostTryTimes != nil {
 		base.HostTryTimes = patch.HostTryTimes
 	}
+	if patch.Idc != "" {
+		base.Idc = patch.Idc
+	}
+	if patch.Region != "" {
+		base.Region = patch.Region
+	}
+	if patch.RegionMagic != "" {
+		base.RegionMagic = patch.RegionMagic
+	}
+	if len(patch.Clusters) > 0 {
+		base.Clusters = patch.Clusters
+	}
+	if patch.MaxBlobSize != nil {
+		base.MaxBlobSize = patch.MaxBlobSize
+	}
 }
 
 // ToAccessConfig builds access.Config for blobstore.NewEbsClient.
@@ -162,6 +192,8 @@ func (c EbsClientConfig) ToAccessConfig(poolECAddr, logPath string) (access.Conf
 	}
 	if c.LogLevel != nil {
 		ac.LogLevel = blog.Level(*c.LogLevel)
+	} else {
+		ac.LogLevel = log.GetBlobLogLevel()
 	}
 	if c.BodyBandwidthMBPs != nil {
 		ac.BodyBandwidthMBPs = *c.BodyBandwidthMBPs

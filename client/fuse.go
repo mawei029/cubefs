@@ -1146,6 +1146,7 @@ func parseMountOption(cfg *config.Config) (*proto.MountOptions, error) {
 	opt.FuseServeThreads = GlobalMountOptions[proto.FuseServeThreads].GetInt64()
 	opt.PoolId = GlobalMountOptions[proto.PoolId].GetUint8()
 	opt.MetaRegion = GlobalMountOptions[proto.MetaRegion].GetString()
+	opt.EnableEbsSdk = GlobalMountOptions[proto.EnableEbsSdk].GetBool()
 	ebsConfigJson := GlobalMountOptions[proto.EbsConfig].GetString()
 
 	if opt.MountPoint == "" || opt.Volname == "" || opt.Owner == "" || opt.Master == "" {

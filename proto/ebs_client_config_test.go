@@ -13,8 +13,7 @@ func TestDefaultEbsClientConfig(t *testing.T) {
 	ec := DefaultEbsClientConfig()
 	require.NotNil(t, ec.ConnMode)
 	require.Equal(t, uint8(access.NoLimitConnMode), *ec.ConnMode)
-	require.NotNil(t, ec.LogLevel)
-	require.Equal(t, 2, *ec.LogLevel)
+	require.Nil(t, ec.LogLevel) // follow fuse --logLevel unless ebs_config sets log_level
 	require.NotNil(t, ec.BodyBandwidthMBPs)
 	require.Equal(t, 2.0, *ec.BodyBandwidthMBPs)
 	require.NotNil(t, ec.BodyBaseTimeoutMs)
@@ -50,7 +49,7 @@ func TestParseEbsClientConfigMissingKeyUsesDefaults(t *testing.T) {
 	ec, err := ParseEbsClientConfig(cfg)
 	require.NoError(t, err)
 	def := DefaultEbsClientConfig()
-	require.Equal(t, *def.LogLevel, *ec.LogLevel)
+	require.Nil(t, ec.LogLevel)
 	require.Equal(t, *def.FailRetryIntervalS, *ec.FailRetryIntervalS)
 	require.Equal(t, *def.MaxSizePutOnce, *ec.MaxSizePutOnce)
 }

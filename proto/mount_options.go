@@ -113,6 +113,7 @@ const (
 
 	// ebs config
 	EbsConfig
+	EnableEbsSdk
 
 	// end index
 	MaxMountOption
@@ -235,6 +236,7 @@ func InitMountOptions(opts []MountOption) {
 	opts[MetaRegion] = MountOption{"metaRegion", "Meta region for creating inodes (empty means use volume default region)", "", ""}
 	opts[ExtentHandlerMaxRetryTime] = MountOption{"extentHandlerMaxRetryTime", "process-wide max extent alloc retry budget (seconds); 0 = use built-in 2*dpCheck+2*dpPull", "", int64(0)}
 	opts[EbsConfig] = MountOption{"ebsConfig", "EBS client JSON config, e.g. '{\"fail_retry_interval_s\":60}'", "", ""}
+	opts[EnableEbsSdk] = MountOption{"enableEbsSdk", "Use in-process blobstore SDK (NewEbsClientSdk); default false keeps HTTP NewEbsClient", "", false}
 	for i := 0; i < MaxMountOption; i++ {
 		flag.StringVar(&opts[i].cmdlineValue, opts[i].keyword, "", opts[i].description)
 	}
@@ -453,4 +455,5 @@ type MountOptions struct {
 	PoolId                uint8
 	MetaRegion            string // Meta region for creating inodes, empty means use volume default region
 	EbsConfig             EbsClientConfig
+	EnableEbsSdk          bool // default false: NewEbsClient (HTTP access); true: NewEbsClientSdk
 }

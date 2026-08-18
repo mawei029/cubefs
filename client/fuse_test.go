@@ -146,6 +146,34 @@ func TestParseMountOptionEbsBufferCacheLimit(t *testing.T) {
 	require.Contains(t, err.Error(), "EbsBufferCacheLimit")
 }
 
+func TestParseMountOptionEnableEbsSdk(t *testing.T) {
+	savedOptions := append([]proto.MountOption(nil), GlobalMountOptions...)
+	t.Cleanup(func() {
+		GlobalMountOptions = savedOptions
+	})
+
+	newConfig := func() *config.Config {
+		cfg := config.NewConfig()
+		cfg.SetString("mountPoint", t.TempDir())
+		cfg.SetString("volName", "testvol")
+		cfg.SetString("owner", "test-owner")
+		cfg.SetString("masterAddr", "127.0.0.1:17010")
+		return cfg
+	}
+
+	GlobalMountOptions = append([]proto.MountOption(nil), savedOptions...)
+	opt, err := parseMountOption(newConfig())
+	require.NoError(t, err)
+	require.False(t, opt.EnableEbsSdk)
+
+	GlobalMountOptions = append([]proto.MountOption(nil), savedOptions...)
+	cfg := newConfig()
+	cfg.SetNewVal("enableEbsSdk", "true")
+	opt, err = parseMountOption(cfg)
+	require.NoError(t, err)
+	require.True(t, opt.EnableEbsSdk)
+}
+
 func TestParseMountOptionEbsConfig(t *testing.T) {
 	savedOptions := append([]proto.MountOption(nil), GlobalMountOptions...)
 	t.Cleanup(func() {
@@ -166,7 +194,7 @@ func TestParseMountOptionEbsConfig(t *testing.T) {
 	opt, err := parseMountOption(cfg)
 	require.NoError(t, err)
 	require.Same(t, cfg, opt.Config)
-	require.NotNil(t, opt.EbsConfig.LogLevel)
+	require.Nil(t, opt.EbsConfig.LogLevel) // follow --logLevel unless ebs_config.log_level set
 	require.Equal(t, -1, *opt.EbsConfig.FailRetryIntervalS)
 
 	GlobalMountOptions = append([]proto.MountOption(nil), savedOptions...)
