@@ -350,7 +350,7 @@ func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 
 		if err := f.openOECStream(info, uint32(req.Flags&0x0f), uint64(fileSize)); err != nil {
 			log.LogErrorf("Open: openOECStream ino(%v) err: %v", ino, err)
-			return nil, err
+			return nil, ParseError(err)
 		}
 		log.LogDebugf("TRACE file open (oec), ino(%v) req.Flags(%v) streamer(%v) writer(%v)",
 			ino, req.Flags, f.super.oec.GetStreamer(ino) != nil, f.super.oec.HasWriter(ino))

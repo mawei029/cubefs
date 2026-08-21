@@ -19,6 +19,7 @@ import (
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/cubefs/cubefs/blobstore/api/access"
 	"github.com/cubefs/cubefs/blobstore/sdk"
+	"github.com/cubefs/cubefs/depends/bazil.org/fuse"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/blobstore"
 	"github.com/cubefs/cubefs/sdk/data/stream"
@@ -650,6 +651,68 @@ func TestGetBlobStoreClientToAccessConfigError(t *testing.T) {
 	_, err := s.getBlobStoreClient(1)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "ToAccessConfig failed")
+}
+
+// TestGetBlobStoreClientConcurrentSingleCreate: write lock serializes create; only one NewEbsClient.
+func TestGetBlobStoreClientConcurrentSingleCreate(t *testing.T) {
+	s := &Super{
+		ebsc:      make(map[uint8]*blobstore.BlobStoreClient),
+		logpath:   t.TempDir(),
+		ebsConfig: proto.DefaultEbsClientConfig(),
+		poolCache: map[uint8]*proto.StoragePoolInfo{
+			1: {Id: 1, ECAddr: "127.0.0.1:8500"},
+		},
+	}
+
+	want := &blobstore.BlobStoreClient{}
+	var calls int32
+	patches := gomonkey.ApplyFunc(blobstore.NewEbsClient, func(access.Config, int) (*blobstore.BlobStoreClient, error) {
+		atomic.AddInt32(&calls, 1)
+		time.Sleep(20 * time.Millisecond)
+		return want, nil
+	})
+	defer patches.Reset()
+
+	const n = 32
+	var wg sync.WaitGroup
+	clis := make([]*blobstore.BlobStoreClient, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			clis[idx], errs[idx] = s.getBlobStoreClient(1)
+		}(i)
+	}
+	wg.Wait()
+
+	require.Equal(t, int32(1), atomic.LoadInt32(&calls))
+	for i := 0; i < n; i++ {
+		require.NoError(t, errs[i])
+		require.Same(t, want, clis[i])
+	}
+	require.Same(t, want, s.ebsc[1])
+}
+
+func TestGetBlobStoreClientCreatePanic(t *testing.T) {
+	s := &Super{
+		ebsc:      make(map[uint8]*blobstore.BlobStoreClient),
+		logpath:   t.TempDir(),
+		ebsConfig: proto.DefaultEbsClientConfig(),
+		poolCache: map[uint8]*proto.StoragePoolInfo{
+			3: {Id: 3, ECAddr: "127.0.0.1:8500"},
+		},
+	}
+	patches := gomonkey.ApplyFunc(blobstore.NewEbsClient, func(access.Config, int) (*blobstore.BlobStoreClient, error) {
+		panic("access client service discovery disconnect")
+	})
+	defer patches.Reset()
+
+	_, err := s.getBlobStoreClient(3)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "panic creating blobstore client")
+	require.Equal(t, fuse.EIO, ParseError(err))
+	require.Nil(t, s.ebsc[3])
 }
 
 func TestGetBlobStoreClientEnableEbsSdk(t *testing.T) {

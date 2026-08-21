@@ -538,21 +538,36 @@ func (s *Super) getBlobStoreClient(poolId uint8) (*blobstore.BlobStoreClient, er
 		return ebsc, nil
 	}
 
+	pool, ok := s.getPoolInfo(poolId)
+	if !ok {
+		log.LogErrorf("getBlobStoreClient: pool(%v) not found", poolId)
+		return nil, fmt.Errorf("pool(%v) not found", poolId)
+	}
+
+	// Double check: Hold write lock for create: concurrent callers serialize here, then hit the cache.
 	s.ebscLock.Lock()
 	defer s.ebscLock.Unlock()
-
-	ebsc, ok = s.ebsc[poolId]
-	if ok {
+	if ebsc, ok := s.ebsc[poolId]; ok {
 		return ebsc, nil
 	}
 
-	pool, ok := s.getPoolInfo(poolId)
-	if !ok {
-		log.LogErrorf("getBlobStoreClient: pool(%v) not found", pool.String())
-		return nil, errors.New(fmt.Sprintf("pool(%v) not found", pool.String()))
+	ebsc, err := s.doNewBlobStoreClient(pool)
+	if err != nil {
+		log.LogErrorf("getBlobStoreClient: create blobstore client err: pool(%v) err(%v)", pool.Id, err)
+		return nil, err
 	}
-	log.LogWarnf("getBlobStoreClient: create blobstore client for pool(%v) enableEbsSdk(%v)", pool.String(), s.enableEbsSdk)
+	s.ebsc[poolId] = ebsc
+	return ebsc, nil
+}
 
+func (s *Super) doNewBlobStoreClient(pool *proto.StoragePoolInfo) (ebsc *blobstore.BlobStoreClient, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			ebsc, err = nil, fmt.Errorf("panic creating blobstore client: %v", r)
+		}
+	}()
+
+	log.LogWarnf("getBlobStoreClient: create blobstore client for pool(%v) enableEbsSdk(%v)", pool.String(), s.enableEbsSdk)
 	if s.enableEbsSdk {
 		sdkCfg, err := blobstore.BuildSdkConfig(s.ebsConfig, pool.ECAddr, s.logpath)
 		if err != nil {
@@ -565,29 +580,26 @@ func (s *Super) getBlobStoreClient(poolId uint8) (*blobstore.BlobStoreClient, er
 		for i, cl := range sdkCfg.ClusterConfig.Clusters {
 			log.LogWarnf("getBlobStoreClient: sdk cluster[%d] id(%v) hosts(%v)", i, cl.ClusterID, cl.Hosts)
 		}
-		// NewEbsClientSdk → blobstore/sdk.New (in-process stream).
 		ebsc, err = blobstore.NewEbsClientSdk(sdkCfg, s.streamRetryTimeout)
 		if err != nil {
 			log.LogErrorf("getBlobStoreClient: NewEbsClientSdk FAILED pool(%v) err(%v)", pool.Id, err)
 			return nil, errors.Trace(err, "NewEbsClientSdk failed!")
 		}
 		log.LogWarnf("getBlobStoreClient: NewEbsClientSdk OK pool(%v)", pool.Id)
-	} else {
-		accessCfg, err := s.ebsConfig.ToAccessConfig(pool.ECAddr, s.logpath)
-		if err != nil {
-			log.LogErrorf("getBlobStoreClient: ToAccessConfig FAILED pool(%v) err(%v)", pool.Id, err)
-			return nil, errors.Trace(err, "ToAccessConfig failed!")
-		}
-		// Default path: NewEbsClient → HTTP access (same as metanode/lcnode/objectnode).
-		ebsc, err = blobstore.NewEbsClient(accessCfg, s.streamRetryTimeout)
-		if err != nil {
-			log.LogErrorf("getBlobStoreClient: NewEbsClient FAILED pool(%v) err(%v)", pool.Id, err)
-			return nil, errors.Trace(err, "NewEbsClient failed!")
-		}
-		log.LogWarnf("getBlobStoreClient: NewEbsClient OK pool(%v)", pool.Id)
+		return ebsc, nil
 	}
 
-	s.ebsc[pool.Id] = ebsc
+	accessCfg, err := s.ebsConfig.ToAccessConfig(pool.ECAddr, s.logpath)
+	if err != nil {
+		log.LogErrorf("getBlobStoreClient: ToAccessConfig FAILED pool(%v) err(%v)", pool.Id, err)
+		return nil, errors.Trace(err, "ToAccessConfig failed!")
+	}
+	ebsc, err = blobstore.NewEbsClient(accessCfg, s.streamRetryTimeout)
+	if err != nil {
+		log.LogErrorf("getBlobStoreClient: NewEbsClient FAILED pool(%v) err(%v)", pool.Id, err)
+		return nil, errors.Trace(err, "NewEbsClient failed!")
+	}
+	log.LogWarnf("getBlobStoreClient: NewEbsClient OK pool(%v)", pool.Id)
 	return ebsc, nil
 }
 
