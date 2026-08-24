@@ -644,31 +644,41 @@ func (s *Super) revalidateNegativeDentries() {
 func (s *Super) scheduleFlush() {
 	t := time.NewTicker(2 * time.Second)
 	defer t.Stop()
+
 	for range t.C {
 		{
+			pending := make([]uint64, 0)
 			s.fslock.Lock()
 			for ino, node := range s.nodeCache {
-				if _, ok := node.(*File); !ok {
+				file, ok := node.(*File)
+				if !ok {
 					continue
 				}
-				file := node.(*File)
 				ei, ok := file.getExtendInfo()
 				if !ok || ei == nil {
 					continue
 				}
-				ei.RLock()
-				idle := atomic.LoadInt32(&ei.idle)
-				ei.RUnlock()
-				if idle >= BlobWriterIdleTimeoutPeriod {
+				if atomic.LoadInt32(&ei.idle) >= BlobWriterIdleTimeoutPeriod {
 					atomic.StoreInt32(&ei.idle, 0)
-					if strm := s.oec.GetStreamer(ino); strm != nil && s.oec.RefCnt(ino) > 0 {
-						go s.oec.Flush(ino)
-					}
+					pending = append(pending, ino)
 				} else {
 					atomic.AddInt32(&ei.idle, 1)
 				}
 			}
 			s.fslock.Unlock()
+
+			// Collect idle inodes under fslock, then TryFlush outside it, skips already-flushing streams
+			for _, ino := range pending {
+				st := s.oec.GetStreamer(ino)
+				if st == nil || s.oec.RefCnt(ino) <= 0 || !st.CanFlush() {
+					continue
+				}
+				go func(st *blobstore.ECStreamer, ino uint64) {
+					if err := st.Flush(context.Background()); err != nil {
+						log.LogErrorf("scheduleFlush: oec TryFlush failed ino(%v) err(%v)", ino, err)
+					}
+				}(st, ino)
+			}
 		}
 	}
 }

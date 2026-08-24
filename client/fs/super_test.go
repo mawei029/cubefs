@@ -9,6 +9,7 @@
 package fs
 
 import (
+	"context"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -912,20 +913,262 @@ func TestSuper_scheduleFlush_idleWriterTriggersOecFlush(t *testing.T) {
 	s.fslock.Lock()
 	s.nodeCache[f.ino] = f
 	s.fslock.Unlock()
-	// scheduleFlush 仅在 oec 流存在且 refCnt>0 时刷盘（与 File.storeIdle / oec 数据面一致）。
 	registerOecTestStreamerWithLogicalView(s, f.ino, nil, &blobstore.Writer{}, 0, 1)
 	require.NoError(t, s.oec.OpenStreamWithArgs(blobstore.ECStreamOpenArgs{Ino: f.ino}))
 
-	flushed := make(chan uint64, 1)
+	flushed := make(chan uint64, 2)
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
-	patches.ApplyMethod(reflect.TypeOf(s.oec), "Flush",
-		func(_ *blobstore.ECExtentClient, ino uint64) error {
-			flushed <- ino
-			return nil
-		})
+	patchECStreamerFlush(patches, func(st *blobstore.ECStreamer, _ context.Context) error {
+		flushed <- st.Inode()
+		return nil
+	})
 
-	// Run one scheduleFlush iteration (do not start the ticker goroutine — it would outlive the test).
+	runScheduleFlushOnceForTest(s)
+
+	select {
+	case got := <-flushed:
+		require.Equal(t, f.ino, got)
+	case <-time.After(2 * time.Second):
+		t.Fatal("scheduleFlush iteration did not trigger ECStreamer.Flush in time")
+	}
+}
+
+func TestSuper_scheduleFlush_eachIdleTickLaunchesFlush(t *testing.T) {
+	s := newTestSuperForFile()
+	s.oec = blobstore.NewObjExtentClient(blobstore.ObjExtentConfig{})
+	f := &File{super: s, ino: 61, parentIno: 1, name: "idle2.dat"}
+	ei := f.getOrCreateExtendInfo()
+	atomic.StoreInt32(&ei.idle, BlobWriterIdleTimeoutPeriod)
+	s.fslock.Lock()
+	s.nodeCache[f.ino] = f
+	s.fslock.Unlock()
+	registerOecTestStreamerWithLogicalView(s, f.ino, nil, &blobstore.Writer{}, 0, 1)
+	require.NoError(t, s.oec.OpenStreamWithArgs(blobstore.ECStreamOpenArgs{Ino: f.ino}))
+
+	var calls int32
+	started := make(chan struct{})
+	unblock := make(chan struct{})
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patchECStreamerFlush(patches, func(_ *blobstore.ECStreamer, _ context.Context) error {
+		atomic.AddInt32(&calls, 1)
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		<-unblock
+		return nil
+	})
+
+	runScheduleFlushOnceForTest(s)
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first idle flush did not start")
+	}
+	atomic.StoreInt32(&ei.idle, BlobWriterIdleTimeoutPeriod)
+	runScheduleFlushOnceForTest(s)
+	close(unblock)
+	require.Eventually(t, func() bool { return atomic.LoadInt32(&calls) == 2 }, 2*time.Second, 10*time.Millisecond)
+}
+
+func TestSuper_scheduleFlush_idleBelowThresholdIncrements(t *testing.T) {
+	s := newTestSuperForFile()
+	s.oec = blobstore.NewObjExtentClient(blobstore.ObjExtentConfig{})
+	f := &File{super: s, ino: 62, parentIno: 1, name: "not-idle.dat"}
+	ei := f.getOrCreateExtendInfo()
+	atomic.StoreInt32(&ei.idle, 0)
+	s.fslock.Lock()
+	s.nodeCache[f.ino] = f
+	s.fslock.Unlock()
+	registerOecTestStreamerWithLogicalView(s, f.ino, nil, &blobstore.Writer{}, 0, 1)
+	require.NoError(t, s.oec.OpenStreamWithArgs(blobstore.ECStreamOpenArgs{Ino: f.ino}))
+
+	var calls int32
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patchECStreamerFlush(patches, func(_ *blobstore.ECStreamer, _ context.Context) error {
+		atomic.AddInt32(&calls, 1)
+		return nil
+	})
+
+	runScheduleFlushOnceForTest(s)
+	require.Equal(t, int32(1), atomic.LoadInt32(&ei.idle))
+	require.Equal(t, int32(0), atomic.LoadInt32(&calls))
+}
+
+func TestSuper_scheduleFlush_skips_closed_stream(t *testing.T) {
+	s := newTestSuperForFile()
+	s.oec = blobstore.NewObjExtentClient(blobstore.ObjExtentConfig{})
+	f := &File{super: s, ino: 63, parentIno: 1, name: "closed.dat"}
+	ei := f.getOrCreateExtendInfo()
+	atomic.StoreInt32(&ei.idle, BlobWriterIdleTimeoutPeriod)
+	s.fslock.Lock()
+	s.nodeCache[f.ino] = f
+	s.fslock.Unlock()
+
+	var calls int32
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patchECStreamerFlush(patches, func(_ *blobstore.ECStreamer, _ context.Context) error {
+		atomic.AddInt32(&calls, 1)
+		return nil
+	})
+
+	runScheduleFlushOnceForTest(s)
+	require.Equal(t, int32(0), atomic.LoadInt32(&ei.idle))
+	require.Equal(t, int32(0), atomic.LoadInt32(&calls))
+}
+
+func TestSuper_scheduleFlush_liveTicker_scansAndSingleFlights(t *testing.T) {
+	s := newTestSuperForFile()
+	s.oec = blobstore.NewObjExtentClient(blobstore.ObjExtentConfig{})
+
+	dir := &Dir{super: s, ino: 1, name: "d"}
+	noEi := &File{super: s, ino: 70, parentIno: 1, name: "no-ei.dat"}
+	nilEi := &File{super: s, ino: 71, parentIno: 1, name: "nil-ei.dat"}
+	s.fileExtendInfoMap[71] = nil
+	warming := &File{super: s, ino: 72, parentIno: 1, name: "warm.dat"}
+	warmingEi := warming.getOrCreateExtendInfo()
+	atomic.StoreInt32(&warmingEi.idle, 0)
+	closed := &File{super: s, ino: 73, parentIno: 1, name: "closed.dat"}
+	closedEi := closed.getOrCreateExtendInfo()
+	atomic.StoreInt32(&closedEi.idle, BlobWriterIdleTimeoutPeriod)
+	zeroRef := &File{super: s, ino: 74, parentIno: 1, name: "zeroref.dat"}
+	zeroEi := zeroRef.getOrCreateExtendInfo()
+	atomic.StoreInt32(&zeroEi.idle, BlobWriterIdleTimeoutPeriod)
+	ready := &File{super: s, ino: 75, parentIno: 1, name: "ready.dat"}
+	readyEi := ready.getOrCreateExtendInfo()
+	atomic.StoreInt32(&readyEi.idle, BlobWriterIdleTimeoutPeriod)
+
+	s.fslock.Lock()
+	s.nodeCache[1] = dir
+	s.nodeCache[70] = noEi
+	s.nodeCache[71] = nilEi
+	s.nodeCache[72] = warming
+	s.nodeCache[73] = closed
+	s.nodeCache[74] = zeroRef
+	s.nodeCache[75] = ready
+	s.fslock.Unlock()
+
+	registerOecTestStreamerWithLogicalView(s, 74, nil, &blobstore.Writer{}, 0, 1)
+	registerOecTestStreamerWithLogicalView(s, 75, nil, &blobstore.Writer{}, 0, 1)
+	require.NoError(t, s.oec.OpenStreamWithArgs(blobstore.ECStreamOpenArgs{Ino: 75}))
+
+	var calls int32
+	started := make(chan struct{})
+	unblock := make(chan struct{})
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patchECStreamerFlush(patches, func(st *blobstore.ECStreamer, _ context.Context) error {
+		require.Equal(t, uint64(75), st.Inode())
+		atomic.AddInt32(&calls, 1)
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		<-unblock
+		return nil
+	})
+
+	fast := time.NewTicker(5 * time.Millisecond)
+	defer fast.Stop()
+	patches.ApplyFunc(time.NewTicker, func(time.Duration) *time.Ticker { return fast })
+
+	go s.scheduleFlush()
+
+	select {
+	case <-started:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("scheduleFlush live ticker did not flush idle writer")
+	}
+
+	require.Equal(t, int32(1), atomic.LoadInt32(&warmingEi.idle))
+	require.Equal(t, int32(0), atomic.LoadInt32(&readyEi.idle))
+	require.Equal(t, int32(0), atomic.LoadInt32(&closedEi.idle))
+	require.Equal(t, int32(0), atomic.LoadInt32(&zeroEi.idle))
+	require.Equal(t, int32(1), atomic.LoadInt32(&calls))
+
+	fast.Stop()
+	close(unblock)
+}
+
+func TestSuper_scheduleFlush_skipsWhenCannotFlush(t *testing.T) {
+	s := newTestSuperForFile()
+	s.oec = blobstore.NewObjExtentClient(blobstore.ObjExtentConfig{})
+	f := &File{super: s, ino: 76, parentIno: 1, name: "busy.dat"}
+	ei := f.getOrCreateExtendInfo()
+	atomic.StoreInt32(&ei.idle, BlobWriterIdleTimeoutPeriod)
+	s.fslock.Lock()
+	s.nodeCache[f.ino] = f
+	s.fslock.Unlock()
+	registerOecTestStreamerWithLogicalView(s, f.ino, nil, &blobstore.Writer{}, 0, 1)
+	require.NoError(t, s.oec.OpenStreamWithArgs(blobstore.ECStreamOpenArgs{Ino: f.ino}))
+
+	var flushCalls, gateCalls int32
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECStreamer)(nil)), "CanFlush",
+		func(_ *blobstore.ECStreamer) bool {
+			atomic.AddInt32(&gateCalls, 1)
+			return false
+		})
+	patchECStreamerFlush(patches, func(_ *blobstore.ECStreamer, _ context.Context) error {
+		atomic.AddInt32(&flushCalls, 1)
+		return nil
+	})
+
+	fast := time.NewTicker(5 * time.Millisecond)
+	defer fast.Stop()
+	patches.ApplyFunc(time.NewTicker, func(time.Duration) *time.Ticker { return fast })
+	go s.scheduleFlush()
+
+	require.Eventually(t, func() bool {
+		return atomic.LoadInt32(&gateCalls) >= 1
+	}, 200*time.Millisecond, 5*time.Millisecond)
+	fast.Stop()
+	require.Equal(t, int32(0), atomic.LoadInt32(&flushCalls))
+}
+
+func TestSuper_scheduleFlush_flushErrorDoesNotPanic(t *testing.T) {
+	s := newTestSuperForFile()
+	s.oec = blobstore.NewObjExtentClient(blobstore.ObjExtentConfig{})
+	f := &File{super: s, ino: 77, parentIno: 1, name: "flush-err.dat"}
+	ei := f.getOrCreateExtendInfo()
+	atomic.StoreInt32(&ei.idle, BlobWriterIdleTimeoutPeriod)
+	s.fslock.Lock()
+	s.nodeCache[f.ino] = f
+	s.fslock.Unlock()
+	registerOecTestStreamerWithLogicalView(s, f.ino, nil, &blobstore.Writer{}, 0, 1)
+	require.NoError(t, s.oec.OpenStreamWithArgs(blobstore.ECStreamOpenArgs{Ino: f.ino}))
+
+	done := make(chan struct{})
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patchECStreamerFlush(patches, func(_ *blobstore.ECStreamer, _ context.Context) error {
+		defer close(done)
+		return context.Canceled
+	})
+
+	fast := time.NewTicker(5 * time.Millisecond)
+	defer fast.Stop()
+	patches.ApplyFunc(time.NewTicker, func(time.Duration) *time.Ticker { return fast })
+	go s.scheduleFlush()
+
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("scheduleFlush did not call Flush")
+	}
+	fast.Stop()
+}
+
+// runScheduleFlushOnceForTest runs one Super.scheduleFlush tick without starting the ticker.
+func runScheduleFlushOnceForTest(s *Super) {
+	pending := make([]uint64, 0)
 	s.fslock.Lock()
 	for ino, node := range s.nodeCache {
 		file, ok := node.(*File)
@@ -936,22 +1179,25 @@ func TestSuper_scheduleFlush_idleWriterTriggersOecFlush(t *testing.T) {
 		if !ok || ei == nil {
 			continue
 		}
-		ei.RLock()
-		idle := atomic.LoadInt32(&ei.idle)
-		ei.RUnlock()
-		if idle >= BlobWriterIdleTimeoutPeriod {
+		if atomic.LoadInt32(&ei.idle) >= BlobWriterIdleTimeoutPeriod {
 			atomic.StoreInt32(&ei.idle, 0)
-			if strm := s.oec.GetStreamer(ino); strm != nil && s.oec.RefCnt(ino) > 0 {
-				go s.oec.Flush(ino)
-			}
+			pending = append(pending, ino)
+		} else {
+			atomic.AddInt32(&ei.idle, 1)
 		}
 	}
 	s.fslock.Unlock()
-
-	select {
-	case got := <-flushed:
-		require.Equal(t, f.ino, got)
-	case <-time.After(2 * time.Second):
-		t.Fatal("scheduleFlush iteration did not trigger oec.Flush in time")
+	for _, ino := range pending {
+		st := s.oec.GetStreamer(ino)
+		if st == nil || s.oec.RefCnt(ino) <= 0 || !st.CanFlush() {
+			continue
+		}
+		go func(st *blobstore.ECStreamer) {
+			_ = st.Flush(context.Background())
+		}(st)
 	}
+}
+
+func patchECStreamerFlush(patches *gomonkey.Patches, fn func(*blobstore.ECStreamer, context.Context) error) {
+	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECStreamer)(nil)), "Flush", fn)
 }

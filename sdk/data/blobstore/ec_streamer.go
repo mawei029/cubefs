@@ -17,6 +17,14 @@ import (
 	"github.com/cubefs/cubefs/util/log"
 )
 
+const (
+	streamerNormal uint32 = 0
+	streamerError  uint32 = 1
+
+	flushIdle uint32 = 0
+	flushRun  uint32 = 1
+)
+
 // ReadOnlyOeks is an immutable view of sorted obj extents shared by Reader/Writer.
 type ReadOnlyOeks struct {
 	items []proto.ObjExtentKey
@@ -52,16 +60,17 @@ type ECStreamer struct {
 	fileSize   uint64
 	inoVersion uint64
 	oeks       *ReadOnlyOeks
-	// dirty: 1=must sync before read/flush (buffer and/or stale oeks); 0=clean. External code uses isDirty() only.
-	dirty uint32
+	dirty      uint32 // dirty: 1=must sync before read/flush (buffer and/or stale oeks); 0=clean. External code uses isDirty() only.
+	flushing   uint32 // 1 while flushLocked holds s.mu. TryFlush skips; Flush waits on s.mu (Go 1.18: not atomic.Bool).
+	status     uint32 // streamerError: poison after io.EOF; later Write/Flush skip EBS.
 
 	// mu serializes RW, flush, updateMetaInfo, Read/Write; EBS IO under lock (correctness over throughput, LTP).
 	mu      sync.RWMutex
 	fReader *Reader // TODO: next version, merge reader and writer into one
 	fWriter *Writer
 
-	// once: first Read/Write pulls meta; CloseStream zero ref resets once so next Open refreshes.
-	once sync.Once
+	once   sync.Once       // once: first Read/Write pulls meta; CloseStream zero ref resets once so next Open refreshes.
+	client *ECExtentClient // client is the map owner; nil in tests that construct a streamer without ECExtentClient.
 }
 
 // NewECStreamer constructs stream; production passes nil r/w, OpenStreamWithArgs creates RW under s.mu.
@@ -89,9 +98,31 @@ func NewECStreamer(args ECStreamOpenArgs, r *Reader, w *Writer) (*ECStreamer, er
 }
 
 // ----- ECStreamer exported methods -----
+
+// CanFlush is the idle scheduleFlush gate: false when poisoned or flushLocked is already running.
+func (s *ECStreamer) CanFlush() bool {
+	if atomic.LoadUint32(&s.flushing) != flushIdle {
+		return false
+	}
+	return s.rejectIfInError() == nil
+}
+
+// Flush is FUSE Fsync, O_SYNC write, and CloseStream.
+// If another flushLocked holds s.mu, this waits then flushes again; it does not return nil for an inflight flush.
 func (s *ECStreamer) Flush(ctx context.Context) error {
+	if err := s.rejectIfInError(); err != nil {
+		return err
+	}
+	return s.handleIoError(s.flushLocked(ctx))
+}
+
+// flushLocked sets flushing while holding s.mu around writer.Flush and updateMetaInfo. Caller must not hold s.mu.
+func (s *ECStreamer) flushLocked(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	atomic.StoreUint32(&s.flushing, flushRun)
+	defer atomic.StoreUint32(&s.flushing, flushIdle)
 
 	if err := s.fWriter.Flush(s.ino, ctx); err != nil {
 		return err
@@ -143,8 +174,8 @@ func (s *ECStreamer) String() string {
 		log.LogErrorf("ECStreamer String: s is nil")
 		return "ECStreamer{nil}"
 	}
-	return fmt.Sprintf("ECStreamer{ino(%v), ref(%v), dirty(%v), fileSize(%v), inoVer(%v), addr(%p)}",
-		s.ino, atomic.LoadInt32(&s.refCnt), s.isDirty(),
+	return fmt.Sprintf("ECStreamer{ino(%v), ref(%v), dirty(%v), err(%v), fileSize(%v), inoVer(%v), addr(%p)}",
+		s.ino, atomic.LoadInt32(&s.refCnt), s.isDirty(), s.inError(),
 		atomic.LoadUint64(&s.fileSize), atomic.LoadUint64(&s.inoVersion), s)
 }
 
@@ -162,6 +193,13 @@ func (s *ECStreamer) Writer() *Writer {
 
 // Truncate under lock: grow/shrink via truncateV2Locked (Flush → GetObjExtents → TruncateV2 → updateMetaInfo).
 func (s *ECStreamer) Truncate(ctx context.Context, size uint64, fullPath string) error {
+	if err := s.rejectIfInError(); err != nil {
+		return err
+	}
+	return s.handleIoError(s.truncateLocked(ctx, size, fullPath))
+}
+
+func (s *ECStreamer) truncateLocked(ctx context.Context, size uint64, fullPath string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -173,11 +211,18 @@ func (s *ECStreamer) Truncate(ctx context.Context, size uint64, fullPath string)
 	return s.truncateV2Locked(ctx, s.ino, size, fullPath)
 }
 
-func (s *ECStreamer) Read(ctx context.Context, dst []byte, offset int, size int) (int, error) {
+func (s *ECStreamer) Read(ctx context.Context, dst []byte, offset int, size int) (n int, err error) {
 	if size == 0 {
 		return 0, nil
 	}
+	if err := s.rejectIfInError(); err != nil {
+		return 0, err
+	}
+	n, err = s.readLocked(ctx, dst, offset, size)
+	return n, s.handleIoError(err)
+}
 
+func (s *ECStreamer) readLocked(ctx context.Context, dst []byte, offset int, size int) (int, error) {
 	// TODO: next version, lock tuning for reads; short term document; mid term split view sync vs data IO or short lock only when dirty.
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -208,11 +253,18 @@ func (s *ECStreamer) Read(ctx context.Context, dst []byte, offset int, size int)
 }
 
 // Write performs buffered or direct blob I/O on this inode. O_SYNC / waitForFlush is handled in client/fs after oec.Write returns.
-func (s *ECStreamer) Write(ctx context.Context, offset int, data []byte, flags int) (int, error) {
+func (s *ECStreamer) Write(ctx context.Context, offset int, data []byte, flags int) (n int, err error) {
 	if len(data) == 0 {
 		return 0, nil
 	}
+	if err := s.rejectIfInError(); err != nil {
+		return 0, err
+	}
+	n, err = s.writeLocked(ctx, offset, data, flags)
+	return n, s.handleIoError(err)
+}
 
+func (s *ECStreamer) writeLocked(ctx context.Context, offset int, data []byte, flags int) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -263,7 +315,15 @@ func (s *ECStreamer) RefreshExtentsCache() error {
 }
 
 // For fs_volume.go
-func (s *ECStreamer) WriteFromReader(ctx context.Context, reader io.Reader, h hash.Hash) (uint64, error) {
+func (s *ECStreamer) WriteFromReader(ctx context.Context, reader io.Reader, h hash.Hash) (n uint64, err error) {
+	if err := s.rejectIfInError(); err != nil {
+		return 0, err
+	}
+	n, err = s.writeFromReaderLocked(ctx, reader, h)
+	return n, s.handleIoError(err)
+}
+
+func (s *ECStreamer) writeFromReaderLocked(ctx context.Context, reader io.Reader, h hash.Hash) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var errGetExtents error
@@ -276,7 +336,15 @@ func (s *ECStreamer) WriteFromReader(ctx context.Context, reader io.Reader, h ha
 	return s.fWriter.WriteFromReader(ctx, reader, h)
 }
 
-func (s *ECStreamer) WriteWithoutPool(ctx context.Context, writeOffset int, data []byte) (int, error) {
+func (s *ECStreamer) WriteWithoutPool(ctx context.Context, writeOffset int, data []byte) (n int, err error) {
+	if err := s.rejectIfInError(); err != nil {
+		return 0, err
+	}
+	n, err = s.writeWithoutPoolLocked(ctx, writeOffset, data)
+	return n, s.handleIoError(err)
+}
+
+func (s *ECStreamer) writeWithoutPoolLocked(ctx context.Context, writeOffset int, data []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var errGetExtents error
@@ -290,9 +358,13 @@ func (s *ECStreamer) WriteWithoutPool(ctx context.Context, writeOffset int, data
 }
 
 func (s *ECStreamer) FlushWithoutPool(ino uint64, ctx context.Context) error {
+	if err := s.rejectIfInError(); err != nil {
+		return err
+	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.fWriter.FlushWithoutPool(ino, ctx)
+	err := s.fWriter.FlushWithoutPool(ino, ctx)
+	s.mu.Unlock()
+	return s.handleIoError(err)
 }
 
 // ----- ECStreamer internal methods -----
@@ -307,6 +379,22 @@ func (s *ECStreamer) cleanDirty() {
 
 func (s *ECStreamer) isDirty() bool {
 	return atomic.LoadUint32(&s.dirty) != 0
+}
+
+func (s *ECStreamer) setError() {
+	atomic.StoreUint32(&s.status, streamerError)
+}
+
+func (s *ECStreamer) inError() bool {
+	return atomic.LoadUint32(&s.status) >= streamerError
+}
+
+func (s *ECStreamer) rejectIfInError() error {
+	if s.inError() {
+		// Same substring as replica Streamer.IssueWriteRequest so file.go isWriteEio treats it as NOTSUP.
+		return fmt.Errorf("IssueWriteRequest: stream writer in error status, ino(%v)", s.ino)
+	}
+	return nil
 }
 
 // mergeInodeGen/raiseFileSize updated under mu on write paths; lock-free readers Load only.
@@ -425,6 +513,10 @@ func (s *ECStreamer) dropIOCachesLocked() {
 
 // closeReaderWriterLocked under mu: Flush writer + dropIOCaches; nil RW only on EvictStream delete.
 func (s *ECStreamer) closeReaderWriterLocked(ino uint64, ctx context.Context) error {
+	if s.inError() {
+		s.dropIOCachesLocked()
+		return nil
+	}
 	if w := s.fWriter; w != nil {
 		if err := w.Flush(ino, ctx); err != nil {
 			return err
@@ -551,4 +643,62 @@ func (s *ECStreamer) truncateV2Locked(ctx context.Context, ino uint64, targetSiz
 		return err
 	}
 	return s.updateMetaInfo(&targetSize)
+}
+
+// inodeDeleted reports whether metanode no longer has this inode. Must not run under s.mu: InodeGet_ll is RPC.
+func (s *ECStreamer) inodeDeleted() bool {
+	if s == nil || s.mw == nil {
+		return false
+	}
+
+	info, err := s.mw.InodeGet_ll(s.ino, false)
+	if err == nil && info != nil {
+		return false
+	}
+	if err == syscall.ENOENT || errors.Is(err, syscall.ENOENT) ||
+		(err != nil && strings.Contains(err.Error(), syscall.ENOENT.Error())) {
+		s.setError()
+		return true
+	}
+	return false
+}
+
+// dropStreamer clears IO caches and nils RW under s.mu. Called when the inode is gone.
+func (s *ECStreamer) dropStreamer() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dropIOCachesLocked()
+	s.fReader = nil
+	s.fWriter = nil
+}
+
+// handleIoError runs after s.mu is released. nil/EBADF: return as-is. io.EOF: poison, keep map. already inError: return, skip meta RPC.
+// inode ENOENT: dropStreamer then removeDeletedStreamer. other errors with inode still present: return err, no poison.
+func (s *ECStreamer) handleIoError(err error) error {
+	// don't handle nil or EBADF
+	if err == nil || errors.Is(err, syscall.EBADF) {
+		return err
+	}
+	// EOF is a local error, set error and return, prevent later IO
+	if errors.Is(err, io.EOF) {
+		s.setError()
+		log.LogWarnf("ECStreamer: IO failed, inode still present, poison streamer ino(%v) ref(%v) err(%v)",
+			s.ino, atomic.LoadInt32(&s.refCnt), err)
+		return err
+	}
+	// if already in error, return. reduce call metanode RPC
+	if s.inError() {
+		return err
+	}
+
+	// inode deleted, drop map entry. prevent later IO
+	if s.inodeDeleted() {
+		log.LogWarnf("ECStreamer: inode deleted, drop streamer ino(%v) ref(%v) err(%v)",
+			s.ino, atomic.LoadInt32(&s.refCnt), err)
+		s.dropStreamer()
+		s.client.removeDeletedStreamer(s)
+		return err
+	}
+
+	return err
 }

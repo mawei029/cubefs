@@ -7,9 +7,11 @@ import (
 	"hash"
 	"io"
 	"reflect"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/require"
@@ -416,7 +418,7 @@ func TestECExtentClient_EvictStream_ref_positive_no_delete(t *testing.T) {
 	s := mustTestECStreamer(100, nil, nil)
 	setStreamerForTest(c, 100, s)
 	atomic.StoreInt32(&s.refCnt, 1)
-	require.NoError(t, c.EvictStream(100))
+	require.ErrorIs(t, c.EvictStream(100), errStreamerBusy)
 	require.NotNil(t, c.GetStreamer(100))
 }
 
@@ -560,6 +562,180 @@ func TestECExtentClient_nil_streamer_in_map(t *testing.T) {
 	})
 }
 
+func TestECExtentClient_CloseStream_flush_does_not_hold_client_mu(t *testing.T) {
+	c := NewObjExtentClient(ObjExtentConfig{})
+	s := mustTestECStreamer(81, nil, nil)
+	atomic.StoreInt32(&s.refCnt, 1)
+	setStreamerForTest(c, 81, s)
+
+	started := make(chan struct{})
+	unblock := make(chan struct{})
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf((*ECStreamer)(nil)), "Flush",
+		func(_ *ECStreamer, _ context.Context) error {
+			close(started)
+			<-unblock
+			return nil
+		})
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- c.CloseStream(81) }()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("CloseStream did not enter Flush")
+	}
+	done := make(chan struct{})
+	go func() {
+		require.NotNil(t, c.GetStreamer(81))
+		require.Equal(t, int32(0), c.RefCnt(81))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("GetStreamer blocked; CloseStream still holds c.mu during Flush")
+	}
+	close(unblock)
+	require.NoError(t, <-errCh)
+}
+
+func TestECExtentClient_CloseStream_waitsInflightFlushBeforeDropCache(t *testing.T) {
+	c := NewObjExtentClient(ObjExtentConfig{})
+	s := mustTestECStreamer(90, nil, nil)
+	atomic.StoreInt32(&s.refCnt, 1)
+	setStreamerForTest(c, 90, s)
+	wireStreamerMetaForFlush(s)
+
+	var flushCalls, freeCalls int32
+	started := make(chan struct{})
+	unblock := make(chan struct{})
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf(s.fWriter), "Flush",
+		func(_ *Writer, _ uint64, _ context.Context) error {
+			atomic.AddInt32(&flushCalls, 1)
+			select {
+			case <-started:
+			default:
+				close(started)
+			}
+			<-unblock
+			return nil
+		})
+	patches.ApplyMethod(reflect.TypeOf(s.fWriter), "FreeCache", func(_ *Writer) {
+		atomic.AddInt32(&freeCalls, 1)
+	})
+
+	firstErr := make(chan error, 1)
+	go func() { firstErr <- s.Flush(context.Background()) }()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first Flush did not start")
+	}
+
+	closeErr := make(chan error, 1)
+	go func() { closeErr <- c.CloseStream(90) }()
+	select {
+	case err := <-closeErr:
+		t.Fatalf("CloseStream returned before inflight Flush finished: %v", err)
+	case <-time.After(80 * time.Millisecond):
+	}
+	require.Equal(t, int32(0), atomic.LoadInt32(&freeCalls))
+
+	close(unblock)
+	require.NoError(t, <-firstErr)
+	require.NoError(t, <-closeErr)
+	require.Equal(t, int32(0), atomic.LoadInt32(&s.refCnt))
+	require.GreaterOrEqual(t, atomic.LoadInt32(&flushCalls), int32(2))
+	require.Equal(t, int32(1), atomic.LoadInt32(&freeCalls))
+}
+
+func TestECExtentClient_EvictStream_close_does_not_hold_client_mu(t *testing.T) {
+	c := NewObjExtentClient(ObjExtentConfig{})
+	s := mustTestECStreamer(83, nil, nil)
+	atomic.StoreInt32(&s.refCnt, 0)
+	setStreamerForTest(c, 83, s)
+
+	started := make(chan struct{})
+	unblock := make(chan struct{})
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf((*ECStreamer)(nil)), "CloseReaderWriter",
+		func(_ *ECStreamer) error {
+			close(started)
+			<-unblock
+			return nil
+		})
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- c.EvictStream(83) }()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("EvictStream did not enter CloseReaderWriter")
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		require.NotNil(t, c.GetStreamer(83))
+	}()
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("GetStreamer blocked; EvictStream still holds c.mu during CloseReaderWriter")
+	}
+	close(unblock)
+	require.NoError(t, <-errCh)
+	require.Nil(t, c.GetStreamer(83))
+}
+
+func TestECExtentClient_EvictStream_streamer_mismatch(t *testing.T) {
+	c := NewObjExtentClient(ObjExtentConfig{})
+	old := mustTestECStreamer(85, nil, nil)
+	newer := mustTestECStreamer(85, nil, nil)
+	atomic.StoreInt32(&old.refCnt, 0)
+	setStreamerForTest(c, 85, old)
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf((*ECStreamer)(nil)), "CloseReaderWriter",
+		func(_ *ECStreamer) error {
+			c.mu.Lock()
+			c.streamers[85] = newer
+			c.mu.Unlock()
+			return nil
+		})
+
+	err := c.EvictStream(85)
+	require.NoError(t, err)
+	require.Equal(t, newer, c.GetStreamer(85))
+	require.NotNil(t, newer.fReader)
+}
+
+func TestECExtentClient_EvictStream_reopened_during_close(t *testing.T) {
+	c := NewObjExtentClient(ObjExtentConfig{})
+	s := mustTestECStreamer(86, nil, nil)
+	atomic.StoreInt32(&s.refCnt, 0)
+	setStreamerForTest(c, 86, s)
+
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyMethod(reflect.TypeOf((*ECStreamer)(nil)), "CloseReaderWriter",
+		func(_ *ECStreamer) error {
+			atomic.StoreInt32(&s.refCnt, 1)
+			return nil
+		})
+
+	require.ErrorIs(t, c.EvictStream(86), errStreamerBusy)
+	require.Equal(t, s, c.GetStreamer(86))
+}
+
 func TestECExtentClient_NeedRefreshObjExtents(t *testing.T) {
 	c := NewObjExtentClient(ObjExtentConfig{})
 	require.False(t, c.NeedRefreshObjExtents(404))
@@ -604,7 +780,7 @@ func TestECExtentClient_EvictStream_ref_edges(t *testing.T) {
 		s := mustTestECStreamer(57, nil, nil)
 		atomic.StoreInt32(&s.refCnt, 2)
 		setStreamerForTest(c, 57, s)
-		require.NoError(t, c.EvictStream(57))
+		require.ErrorIs(t, c.EvictStream(57), errStreamerBusy)
 		require.NotNil(t, c.GetStreamer(57))
 	})
 	t.Run("ref_zero_removes_streamer", func(t *testing.T) {
@@ -689,7 +865,7 @@ func TestObjExtentClient_EvictStreamRefBusy(t *testing.T) {
 	c.streamers[22] = s
 
 	err := c.EvictStream(22)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, errStreamerBusy)
 	require.NotNil(t, c.streamers[22])
 }
 
@@ -721,13 +897,13 @@ func TestObjExtentClient_CloseStreamWritableFlushNoDelete(t *testing.T) {
 	require.Nil(t, c.streamers[44])
 }
 
-func TestObjExtentClient_EvictStreamWritableRefBusyReturnsNil(t *testing.T) {
+func TestObjExtentClient_EvictStreamWritableRefBusy(t *testing.T) {
 	c := NewObjExtentClient(ObjExtentConfig{})
 	s := mustTestECStreamer(55, nil, nil)
 	atomic.StoreInt32(&s.refCnt, 1)
 	c.streamers[55] = s
 
-	require.NoError(t, c.EvictStream(55))
+	require.ErrorIs(t, c.EvictStream(55), errStreamerBusy)
 	require.NotNil(t, c.streamers[55])
 }
 
@@ -794,4 +970,30 @@ func TestECStreamer_BadfdOnMissingReaderWriter(t *testing.T) {
 	require.ErrorIs(t, got, syscall.EBADF)
 
 	require.NoError(t, s.Flush(context.Background()))
+}
+
+func TestECExtentClient_removeDeletedStreamer(t *testing.T) {
+	t.Run("drops_matching_pointer", func(t *testing.T) {
+		c := NewObjExtentClient(ObjExtentConfig{})
+		s := mustTestECStreamer(401, nil, nil)
+		setStreamerForTest(c, 401, s)
+		c.removeDeletedStreamer(s)
+		require.Nil(t, c.GetStreamer(401))
+		require.NotNil(t, s.fReader)
+		require.NotNil(t, s.fWriter)
+	})
+	t.Run("mismatch_keeps_newer", func(t *testing.T) {
+		c := NewObjExtentClient(ObjExtentConfig{})
+		old := mustTestECStreamer(402, nil, nil)
+		newer := mustTestECStreamer(402, nil, nil)
+		setStreamerForTest(c, 402, newer)
+		c.removeDeletedStreamer(old)
+		require.Equal(t, newer, c.GetStreamer(402))
+		require.NotNil(t, newer.fReader)
+	})
+	t.Run("nil_args_safe", func(t *testing.T) {
+		var c *ECExtentClient
+		c.removeDeletedStreamer(mustTestECStreamer(403, nil, nil))
+		NewObjExtentClient(ObjExtentConfig{}).removeDeletedStreamer(nil)
+	})
 }

@@ -242,6 +242,8 @@ func (f *File) Forget() {
 		fullPath := f.getParentPath() + f.name
 		if proto.IsDataUseBlobEC(f.super.volType, f.storageClass()) {
 			// Evict oec only on cold/Blob; do not call ec.EvictStream.
+			// err != nil: refCnt>0 or CloseRW fail — skip orphan/meta.
+			// nil includes mismatch (old pointer already replaced) — continue.
 			if err := f.super.oec.EvictStream(ino); err != nil {
 				log.LogWarnf("Forget: oec EvictStream not ready, ino(%v) path(%v) err(%v)", ino, fullPath, err)
 				return

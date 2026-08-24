@@ -468,6 +468,69 @@ func TestFile_Forget_deletesFromNodeCache_whenDisableMetaCacheOff(t *testing.T) 
 	require.False(t, okAfter, "Forget must delete the file from nodeCache even when DisableMetaCache is false")
 }
 
+func TestFile_Forget_oecEvictBusySkipsOrphanMeta(t *testing.T) {
+	const ino uint64 = 95011
+	s := superForFileTest(t)
+	s.orphan = NewOrphanInodeList()
+	s.orphan.Put(ino)
+	s.mw = &meta.MetaWrapper{}
+	s.oec = blobstore.NewObjExtentClient(blobstore.ObjExtentConfig{})
+	info := fileInodeInfoForMutationTest(ino)
+	info.StorageClass = proto.StorageClass_BlobStore
+	s.ic.Put(info)
+	f := newTestFile(s, info, s.rootIno, "busy.txt")
+	s.nodeCache[ino] = f
+
+	metaEvicts := 0
+	patches := gomonkey.NewPatches()
+	t.Cleanup(patches.Reset)
+	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "EvictStream",
+		func(_ *blobstore.ECExtentClient, _ uint64) error {
+			return errors.New("streamer still referenced")
+		})
+	patches.ApplyMethod(reflect.TypeOf(&meta.MetaWrapper{}), "Evict",
+		func(_ *meta.MetaWrapper, _ uint64, _ string, _ bool) error {
+			metaEvicts++
+			return nil
+		})
+
+	f.Forget()
+	require.Equal(t, 0, metaEvicts)
+	require.True(t, s.orphan.Evict(ino), "refCnt>0 must keep orphan for later Forget")
+}
+
+func TestFile_Forget_oecEvictMismatchContinuesOrphanMeta(t *testing.T) {
+	const ino uint64 = 95012
+	s := superForFileTest(t)
+	s.orphan = NewOrphanInodeList()
+	s.orphan.Put(ino)
+	s.mw = &meta.MetaWrapper{}
+	s.oec = blobstore.NewObjExtentClient(blobstore.ObjExtentConfig{})
+	info := fileInodeInfoForMutationTest(ino)
+	info.StorageClass = proto.StorageClass_BlobStore
+	s.ic.Put(info)
+	f := newTestFile(s, info, s.rootIno, "replaced.txt")
+	s.nodeCache[ino] = f
+
+	metaEvicts := 0
+	patches := gomonkey.NewPatches()
+	t.Cleanup(patches.Reset)
+	patches.ApplyMethod(reflect.TypeOf((*blobstore.ECExtentClient)(nil)), "EvictStream",
+		func(_ *blobstore.ECExtentClient, _ uint64) error {
+			return nil
+		})
+	patches.ApplyMethod(reflect.TypeOf(&meta.MetaWrapper{}), "Evict",
+		func(_ *meta.MetaWrapper, gotIno uint64, _ string, _ bool) error {
+			require.Equal(t, ino, gotIno)
+			metaEvicts++
+			return nil
+		})
+
+	f.Forget()
+	require.Equal(t, 1, metaEvicts)
+	require.False(t, s.orphan.Evict(ino), "mismatch/replaced EvictStream is success; orphan must be consumed")
+}
+
 func flagName(flag uint32) string {
 	switch flag {
 	case syscall.O_RDONLY:

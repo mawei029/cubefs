@@ -194,7 +194,7 @@ func TestWriter_truncate(t *testing.T) {
 
 	t.Run("nil_ebsc", func(t *testing.T) {
 		s := mustTestECStreamer(1, nil, nil)
-		s.mw = &meta.MetaWrapper{}
+		s.mw = newTestMetaWrapper()
 		s.ebsc = nil
 		_, _, err := s.fWriter.TruncateV2FromExtents(context.Background(), 10, 100, nil)
 		require.Error(t, err)
@@ -339,7 +339,7 @@ func TestWriter_write(t *testing.T) {
 		const blockSize = 4096
 		buf.InitCachePool(blockSize, 8)
 		s := mustTestECStreamerWithEbsc(1000, &BlobStoreClient{}, blockSize)
-		s.mw = &meta.MetaWrapper{}
+		s.mw = newTestMetaWrapper()
 		w := s.fWriter
 		w.buf = nil
 		w.bufPooled = false
@@ -369,7 +369,7 @@ func TestWriter_write(t *testing.T) {
 	t.Run("parallel_write", func(t *testing.T) {
 		const blockSize = 16
 		s := mustTestECStreamerWithEbsc(360, &BlobStoreClient{}, blockSize)
-		s.mw = &meta.MetaWrapper{}
+		s.mw = newTestMetaWrapper()
 		w := s.fWriter
 		require.NoError(t, gohook.HookMethod(w.ecStreamer.ebsc, "Write", MockEbscWriteTrue, nil))
 		defer gohook.UnHookMethod(w.ecStreamer.ebsc, "Write")
@@ -701,7 +701,7 @@ func TestWriterCoverageMoreLowFunctions(t *testing.T) {
 		t.Skip("需完整 EBS mock 链，暂由 writer_dirty / ec_streamer 增量单测覆盖 flush 路径")
 		buf.InitCachePool(8, 0)
 		s := mustTestECStreamerWithEbsc(2, &BlobStoreClient{}, 8)
-		s.mw = &meta.MetaWrapper{}
+		s.mw = newTestMetaWrapper()
 		w := s.fWriter
 		w.buf = make([]byte, 0, 8)
 
@@ -731,7 +731,7 @@ func TestWriterCoverageMoreLowFunctions(t *testing.T) {
 
 	t.Run("flush function direct path", func(t *testing.T) {
 		s := mustTestECStreamerWithEbsc(3, &BlobStoreClient{}, 4)
-		s.mw = &meta.MetaWrapper{}
+		s.mw = newTestMetaWrapper()
 		w := s.fWriter
 		w.blockPosition = 4
 		w.fileOffset = 4
@@ -755,7 +755,7 @@ func TestWriterCoverageMoreLowFunctions(t *testing.T) {
 		t.Skip("tryOverWrite 依赖完整 extent 视图，暂由增量单测覆盖")
 		blockSize := 8
 		s := mustTestECStreamerWithEbsc(5, &BlobStoreClient{}, blockSize)
-		s.mw = &meta.MetaWrapper{}
+		s.mw = newTestMetaWrapper()
 		w := s.fWriter
 		w.blockPosition = 59287 % blockSize
 		w.fileOffset = 100
@@ -816,7 +816,7 @@ func TestWriter_notifyCompleteFlushMeta_cleans_dirty(t *testing.T) {
 	w := &Writer{fileOffset: 64, blockPosition: 8}
 	s := mustTestECStreamer(303, nil, w)
 	seedDirtyForTest(s)
-	s.mw = &meta.MetaWrapper{}
+	s.mw = newTestMetaWrapper()
 
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
@@ -843,7 +843,7 @@ func TestWriter_bufferDirtyLen_pool_and_without_pool(t *testing.T) {
 func TestWriter_flushExt_empty_dirty_updates_meta_only(t *testing.T) {
 	w := &Writer{}
 	s := mustTestECStreamer(305, nil, w)
-	s.mw = &meta.MetaWrapper{}
+	s.mw = newTestMetaWrapper()
 	seedDirtyForTest(s)
 
 	patches := gomonkey.NewPatches()
@@ -1458,7 +1458,7 @@ func TestWriter_WriteFromReader_setsBufPooledFalse(t *testing.T) {
 	const blockSize = 64
 	buf.InitCachePool(blockSize, 4)
 	s := mustTestECStreamerWithEbsc(417, &BlobStoreClient{}, blockSize)
-	s.mw = &meta.MetaWrapper{}
+	s.mw = newTestMetaWrapper()
 	w := s.fWriter
 	w.allocateCache()
 	require.True(t, w.bufPooled)
@@ -1495,7 +1495,7 @@ func TestWriter_doParallelWrite_releasesPooledBufAfterFlush(t *testing.T) {
 	const blockSize = 16
 	buf.InitCachePool(blockSize, 1)
 	s := mustTestECStreamerWithEbsc(416, &BlobStoreClient{}, blockSize)
-	s.mw = &meta.MetaWrapper{}
+	s.mw = newTestMetaWrapper()
 	w := s.fWriter
 	seedDirtyForTest(s)
 
@@ -1524,7 +1524,7 @@ func TestWriter_doBufferWrite_flushMidWriteReallocatesBuf(t *testing.T) {
 	const blockSize = 16
 	buf.InitCachePool(blockSize, 4)
 	s := mustTestECStreamerWithEbsc(418, &BlobStoreClient{}, blockSize)
-	s.mw = &meta.MetaWrapper{}
+	s.mw = newTestMetaWrapper()
 	w := s.fWriter
 	t.Cleanup(func() { w.FreeCache() })
 
@@ -1557,7 +1557,7 @@ func TestWriter_doBufferWrite_flushesPendingBufferWhenOffsetMismatch(t *testing.
 	const blockSize = 16
 	buf.InitCachePool(blockSize, 4)
 	s := mustTestECStreamerWithEbsc(421, &BlobStoreClient{}, blockSize)
-	s.mw = &meta.MetaWrapper{}
+	s.mw = newTestMetaWrapper()
 	w := s.fWriter
 	t.Cleanup(func() { w.FreeCache() })
 
@@ -1621,7 +1621,7 @@ func TestWriter_tryOverWrite_flushMidWriteReallocatesBuf(t *testing.T) {
 	const blockSize = 16
 	buf.InitCachePool(blockSize, 4)
 	s := mustTestECStreamerWithEbsc(419, &BlobStoreClient{}, blockSize)
-	s.mw = &meta.MetaWrapper{}
+	s.mw = newTestMetaWrapper()
 	w := s.fWriter
 	t.Cleanup(func() { w.FreeCache() })
 
@@ -1682,7 +1682,7 @@ func TestWriter_tryOverWrite_defersPartialBlockWithoutFinalFlush(t *testing.T) {
 	const blockSize = 16
 	buf.InitCachePool(blockSize, 4)
 	s := mustTestECStreamerWithEbsc(423, &BlobStoreClient{}, blockSize)
-	s.mw = &meta.MetaWrapper{}
+	s.mw = newTestMetaWrapper()
 	w := s.fWriter
 	t.Cleanup(func() { w.FreeCache() })
 
@@ -1804,7 +1804,7 @@ func TestWriter_extended(t *testing.T) {
 	t.Run("write_sync", func(t *testing.T) {
 		const blockSize = 16
 		s := mustTestECStreamerWithEbsc(505, &BlobStoreClient{}, blockSize)
-		s.mw = &meta.MetaWrapper{}
+		s.mw = newTestMetaWrapper()
 		w := s.fWriter
 		metaErr := errors.New("update meta failed")
 		patches := gomonkey.NewPatches()
@@ -1851,7 +1851,7 @@ func TestWriter_extended(t *testing.T) {
 	t.Run("doParallelWrite_dirty_pre_flush", func(t *testing.T) {
 		const blockSize = 16
 		s := mustTestECStreamerWithEbsc(507, &BlobStoreClient{}, blockSize)
-		s.mw = &meta.MetaWrapper{}
+		s.mw = newTestMetaWrapper()
 		w := s.fWriter
 		seedDirtyForTest(s)
 		w.buf = make([]byte, 4)
@@ -1880,7 +1880,7 @@ func TestWriter_extended(t *testing.T) {
 	t.Run("doParallelWrite_slice_and_meta_errors", func(t *testing.T) {
 		const blockSize = 16
 		s := mustTestECStreamerWithEbsc(5071, &BlobStoreClient{}, blockSize)
-		s.mw = &meta.MetaWrapper{}
+		s.mw = newTestMetaWrapper()
 		w := s.fWriter
 
 		require.NoError(t, gohook.HookMethod(w.ecStreamer.ebsc, "Write", MockEbscWriteFalse, nil))
@@ -1898,7 +1898,7 @@ func TestWriter_extended(t *testing.T) {
 	t.Run("WriteFromReader_error_paths", func(t *testing.T) {
 		const blockSize = 16
 		s := mustTestECStreamerWithEbsc(508, &BlobStoreClient{}, blockSize)
-		s.mw = &meta.MetaWrapper{}
+		s.mw = newTestMetaWrapper()
 		w := s.fWriter
 
 		_, err := w.WriteFromReader(context.Background(), &errReader{err: syscall.EIO}, nil)

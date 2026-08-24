@@ -8,11 +8,14 @@ import (
 	"sync/atomic"
 	"syscall"
 
+	"github.com/cubefs/cubefs/blobstore/util/errors"
 	"github.com/cubefs/cubefs/client/blockcache/bcache"
 	"github.com/cubefs/cubefs/sdk/data/manager"
 	"github.com/cubefs/cubefs/sdk/meta"
 	"github.com/cubefs/cubefs/util/log"
 )
+
+var errStreamerBusy = errors.New("streamer still referenced")
 
 // ObjExtentConfig holds construction fields; LimitManager may be shared with replica ExtentClient.
 type ObjExtentConfig struct {
@@ -105,29 +108,30 @@ func (c *ECExtentClient) OpenStreamWithArgs(args ECStreamOpenArgs) (err error) {
 	defer c.mu.Unlock()
 
 	s, ok := c.streamers[args.Ino]
-	if !ok {
+	if !ok || s == nil {
 		s, err = NewECStreamer(args, nil, nil)
 		if err != nil {
 			return err
 		}
+		s.client = c
 		c.streamers[args.Ino] = s
 		log.LogDebugf("ECExtentClient OpenStreamWithArgs: new ECStreamer ino(%v)", args.Ino)
 	}
-
 	atomic.AddInt32(&s.refCnt, 1)
 	log.LogDebugf("ECExtentClient OpenStreamWithArgs: ino(%v) ref(%v)", args.Ino, atomic.LoadInt32(&s.refCnt))
 	return nil
 }
 
 // CloseStream decrements refCnt and flushes dirty writer data on every close (aligned with replica Streamer.release).
+// Map lock is not held across Flush/s.mu: a slow EBS flush must not block Lookup/Read on other inodes.
+// Flush waits on inflight flushLocked; dropIOCaches runs only after Flush returns.
 // Map entry removed only in EvictStream. refCnt==0 after decrement: dropIOCaches + resetExtentsOnce; RW kept for re-Open.
-// On Flush failure refCnt is rolled back; negative refCnt logs Warn and still attempts Flush.
+// On transient Flush failure refCnt is rolled back; poisoned streamer (inError) keeps the decrement so Evict can proceed.
 func (c *ECExtentClient) CloseStream(ino uint64) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
+	c.mu.RLock()
 	s, ok := c.streamers[ino]
 	if !ok {
+		c.mu.RUnlock()
 		return nil
 	}
 	if log.EnableDebug() {
@@ -141,10 +145,22 @@ func (c *ECExtentClient) CloseStream(ino uint64) error {
 		// Same as n==0: best-effort Flush and dropIOCaches to avoid stale dirty data
 		n = 0
 	}
+	c.mu.RUnlock()
 
 	if err := s.Flush(context.Background()); err != nil {
-		atomic.AddInt32(&s.refCnt, 1)
-		log.LogErrorf("ECExtentClient CloseStream: flush streamer failed, ino(%v) err(%v)", ino, err)
+		// Poisoned: keep the ref decrement (replica release does not roll back) so Forget/Evict can run.
+		if !s.inError() {
+			atomic.AddInt32(&s.refCnt, 1)
+			log.LogErrorf("ECExtentClient CloseStream: flush streamer failed, ino(%v) err(%v)", ino, err)
+			return err
+		}
+		log.LogErrorf("ECExtentClient CloseStream: streamer in error, skip retry ino(%v) err(%v)", ino, err)
+		if n <= 0 {
+			s.mu.Lock()
+			s.dropIOCachesLocked()
+			s.resetExtentsOnceLocked()
+			s.mu.Unlock()
+		}
 		return err
 	}
 
@@ -173,32 +189,50 @@ func (c *ECExtentClient) FreeCache(ino uint64) {
 	s.mu.Unlock()
 }
 
-// EvictStream closes RW and deletes map entry when refCnt==0; refCnt>0 warns and returns nil (entry kept for Forget retry).
+// EvictStream closes RW and deletes the map entry when refCnt==0.
+// refCnt>0 returns errStreamerBusy so File.Forget skips orphan/meta evict.
+// CloseReaderWriter (Flush) runs without c.mu.
+// If the map owner is no longer s (replaced or already deleted), this Evict is a no-op:
+// the old pointer is not the map owner — Warn and return nil so Forget can still orphan/meta-evict.
 func (c *ECExtentClient) EvictStream(ino uint64) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
+	c.mu.RLock()
 	s, ok := c.streamers[ino]
 	if !ok {
+		c.mu.RUnlock()
 		return nil
 	}
 	log.LogDebugf("EvictStream: stream(%v)", s.String())
 
 	if atomic.LoadInt32(&s.refCnt) > 0 {
+		c.mu.RUnlock()
 		log.LogWarnf("evict: streamer(%v) refcnt(%v)", s.String(), atomic.LoadInt32(&s.refCnt))
-		return nil
+		return errStreamerBusy
 	}
+	c.mu.RUnlock()
 
 	if err := s.CloseReaderWriter(); err != nil {
 		log.LogErrorf("ECExtentClient EvictStream: CloseReaderWriter failed, ino(%v) err(%v)", ino, err)
 		return err
 	}
 
-	if cur := c.streamers[ino]; cur == s {
-		delete(c.streamers, ino)
-		s.fReader = nil
-		s.fWriter = nil
+	c.mu.Lock()
+	if cur := c.streamers[ino]; cur != s {
+		log.LogWarnf("evict: streamer mismatch ino(%v), old pointer no longer map owner, skip delete", ino)
+		c.mu.Unlock()
+		return nil
 	}
+
+	// Double check: a racing Open may have bumped refCnt after CloseReaderWriter.
+	if atomic.LoadInt32(&s.refCnt) > 0 {
+		log.LogWarnf("evict: streamer(%v) reopened during close, keep map entry ref(%v)", s.String(), atomic.LoadInt32(&s.refCnt))
+		c.mu.Unlock()
+		return errStreamerBusy
+	}
+
+	delete(c.streamers, ino)
+	c.mu.Unlock()
+
+	s.dropStreamer()
 	return nil
 }
 
@@ -329,13 +363,11 @@ func (c *ECExtentClient) Truncate(parentIno uint64, ino uint64, targetSize uint6
 // Returns false when stream is not open (RefreshExtentsCache would be noop).
 func (c *ECExtentClient) NeedRefreshObjExtents(ino uint64) bool {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-
 	s, ok := c.streamers[ino]
+	c.mu.RUnlock()
 	if !ok || s == nil {
 		return false
 	}
-
 	return !s.HasObjExtents()
 }
 
@@ -366,14 +398,27 @@ func (c *ECExtentClient) OpenStream(ino uint64, openForWrite bool, isCache bool,
 // Close copies inode list then EvictStream each; aligned with replica stream teardown (no replica-only stopCh/RemoteCache).
 func (c *ECExtentClient) Close() error {
 	var inodes []uint64
-	c.mu.Lock()
+	c.mu.RLock()
 	inodes = make([]uint64, 0, len(c.streamers))
 	for inode := range c.streamers {
 		inodes = append(inodes, inode)
 	}
-	c.mu.Unlock()
+	c.mu.RUnlock()
 	for _, inode := range inodes {
 		_ = c.EvictStream(inode)
 	}
 	return nil
+}
+
+// removeDeletedStreamer drops the map entry without Flush: inode is already gone,
+// and waiting on s.mu / EBS would recreate the stuck-overwrite hang.
+func (c *ECExtentClient) removeDeletedStreamer(s *ECStreamer) {
+	if c == nil || s == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if cur := c.streamers[s.ino]; cur == s {
+		delete(c.streamers, s.ino)
+	}
 }

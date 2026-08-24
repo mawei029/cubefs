@@ -42,14 +42,39 @@ func mustTestECStreamer(ino uint64, r *Reader, w *Writer) *ECStreamer {
 	return s
 }
 
-// wireStreamerMetaForFlush 为 CloseStream/Flush 等会走 updateMetaInfo 的单测打桩 GetObjExtents。
-func wireStreamerMetaForFlush(s *ECStreamer) {
-	if s == nil || s.mw == nil {
+// newTestMetaWrapper returns an empty MetaWrapper with streamer test stubs.
+// finishIO calls InodeGet_ll on IO errors; a raw MetaWrapper panics in getPartitionByInode.
+func newTestMetaWrapper() *meta.MetaWrapper {
+	mw := &meta.MetaWrapper{}
+	wireMetaWrapperForStreamerTest(mw)
+	return mw
+}
+
+func wireMetaWrapperForStreamerTest(mw *meta.MetaWrapper) {
+	if mw == nil {
 		return
 	}
-	_ = gohook.HookMethod(s.mw, "GetObjExtents", func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
+	_ = gohook.HookMethod(mw, "GetObjExtents", func(_ *meta.MetaWrapper, _ uint64) (uint64, uint64, []proto.ExtentKey, []proto.ObjExtentKey, error) {
 		return 1, 0, nil, nil, nil
 	}, nil)
+	_ = gohook.HookMethod(mw, "InodeGet_ll", func(_ *meta.MetaWrapper, ino uint64, _ bool) (*proto.InodeInfo, error) {
+		return &proto.InodeInfo{Inode: ino}, nil
+	}, nil)
+}
+
+func stubInodeGetLL(mw *meta.MetaWrapper, fn func(*meta.MetaWrapper, uint64, bool) (*proto.InodeInfo, error)) {
+	if mw == nil {
+		return
+	}
+	_ = gohook.HookMethod(mw, "InodeGet_ll", fn, nil)
+}
+
+// wireStreamerMetaForFlush stubs GetObjExtents and InodeGet_ll for CloseStream/Flush/finishIO.
+func wireStreamerMetaForFlush(s *ECStreamer) {
+	if s == nil {
+		return
+	}
+	wireMetaWrapperForStreamerTest(s.mw)
 }
 
 // seedDirtyForTest 将 dirty 置 1，便于单测走 Read/Flush 脏路径。
@@ -104,7 +129,7 @@ func mustTestECStreamerWithEbsc(ino uint64, ebsc *BlobStoreClient, blockSize int
 // testWriterWithMwEbsc 返回带 mw/ebsc 的 (streamer, writer)，供 writer_test 打桩 EBS/meta。
 func testWriterWithMwEbsc(ino uint64, ebsc *BlobStoreClient) (*ECStreamer, *Writer) {
 	s := mustTestECStreamer(ino, nil, nil)
-	s.mw = &meta.MetaWrapper{}
+	s.mw = newTestMetaWrapper()
 	if ebsc != nil {
 		s.ebsc = ebsc
 	} else {
@@ -119,6 +144,7 @@ func setStreamerForTest(c *ECExtentClient, ino uint64, s *ECStreamer) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	s.client = c
 	c.streamers[ino] = s
 }
 
