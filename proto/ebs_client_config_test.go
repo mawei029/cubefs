@@ -13,7 +13,7 @@ func TestDefaultEbsClientConfig(t *testing.T) {
 	ec := DefaultEbsClientConfig()
 	require.NotNil(t, ec.ConnMode)
 	require.Equal(t, uint8(access.NoLimitConnMode), *ec.ConnMode)
-	require.Nil(t, ec.LogLevel) // follow fuse --logLevel unless ebs_config sets log_level
+	require.Nil(t, ec.LogLevel) // follow fuse --logLevel unless ebsConfig sets log_level
 	require.NotNil(t, ec.BodyBandwidthMBPs)
 	require.Equal(t, 2.0, *ec.BodyBandwidthMBPs)
 	require.NotNil(t, ec.BodyBaseTimeoutMs)
@@ -56,7 +56,7 @@ func TestParseEbsClientConfigMissingKeyUsesDefaults(t *testing.T) {
 
 func TestParseEbsClientConfigPartialOverride(t *testing.T) {
 	cfg := config.LoadConfigString(`{
-		"ebs_config": {
+		"ebsConfig": {
 			"host_try_times": 40,
 			"fail_retry_interval_s": 60
 		}
@@ -73,7 +73,7 @@ func TestParseEbsClientConfigPartialOverride(t *testing.T) {
 
 func TestParseEbsClientConfigFullOverride(t *testing.T) {
 	cfg := config.LoadConfigString(`{
-		"ebs_config": {
+		"ebsConfig": {
 			"conn_mode": 0,
 			"log_level": 1,
 			"body_bandwidth_mb_ps": 5.5,
@@ -119,7 +119,7 @@ func TestParseEbsClientConfigFullOverride(t *testing.T) {
 }
 
 func TestParseEbsClientConfigInvalidValue(t *testing.T) {
-	cfg := config.LoadConfigString(`{"ebs_config":{"conn_mode":"bad"}}`)
+	cfg := config.LoadConfigString(`{"ebsConfig":{"conn_mode":"bad"}}`)
 	_, err := ParseEbsClientConfig(cfg)
 	require.Error(t, err)
 }
@@ -154,7 +154,7 @@ func TestEbsClientConfigToAccessConfigUsesPoolECAddr(t *testing.T) {
 
 func TestEbsClientConfigToAccessConfigCustomFields(t *testing.T) {
 	cfg := config.LoadConfigString(`{
-		"ebs_config": {
+		"ebsConfig": {
 			"conn_mode": 0,
 			"log_level": 1,
 			"body_bandwidth_mb_ps": 5.5,

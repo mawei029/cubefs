@@ -12,6 +12,10 @@ import (
 	"github.com/cubefs/cubefs/util/log"
 )
 
+// CfgEbsConfig / CfgEnableEbsSdk are the CLI flag names and client JSON keys.
+// --ebsConfig matches "ebsConfig"; --enableEbsSdk matches "enableEbsSdk".
+const CfgEbsConfig = "ebsConfig"
+
 // EbsClientConfig controls blobstore access/sdk client settings for cfs-client fuse mount.
 type EbsClientConfig struct {
 	ConnMode           *uint8   `json:"conn_mode,omitempty"`
@@ -44,9 +48,9 @@ type EbsSdkCluster struct {
 	Hosts     []string `json:"hosts"`
 }
 
-// DefaultEbsClientConfig returns fuse mount defaults when ebs_config is absent or partial.
+// DefaultEbsClientConfig returns fuse mount defaults when ebsConfig is absent or partial.
 // LogLevel is left nil so BuildSdkConfig/ToAccessConfig can follow cfs-client --logLevel
-// (GetBlobLogLevel after InitLog). Set log_level in ebs_config/JSON to override.
+// (GetBlobLogLevel after InitLog). Set log_level in ebsConfig/JSON to override.
 func DefaultEbsClientConfig() EbsClientConfig {
 	connMode := uint8(access.NoLimitConnMode) // no limit conn mode.
 	bodyBandwidthMBPs := 2.0                  // if access.NoLimitConnMode, it's invalid. 2MB/s. body Minimum Speed: timeout = ContentLength/BodyBandwidthMBPs + BodyBaseTimeoutMs. Default is 10MBps.
@@ -74,13 +78,13 @@ func DefaultEbsClientConfig() EbsClientConfig {
 	}
 }
 
-// ParseEbsClientConfig loads ebs_config from client json; missing key uses DefaultEbsClientConfig.
+// ParseEbsClientConfig loads ebsConfig from client json; missing key uses DefaultEbsClientConfig.
 func ParseEbsClientConfig(cfg *config.Config) (EbsClientConfig, error) {
 	ec := DefaultEbsClientConfig()
-	if cfg == nil || !cfg.HasKey("ebs_config") {
+	if cfg == nil || !cfg.HasKey(CfgEbsConfig) {
 		return ec, nil
 	}
-	raw, err := json.Marshal(cfg.GetValue("ebs_config"))
+	raw, err := json.Marshal(cfg.GetValue(CfgEbsConfig))
 	if err != nil {
 		return EbsClientConfig{}, err
 	}
@@ -168,14 +172,14 @@ func mergeEbsClientConfig(base *EbsClientConfig, patch EbsClientConfig) {
 }
 
 // ToAccessConfig builds access.Config for blobstore.NewEbsClient.
-// consul_address in ebs_config overrides poolECAddr when non-empty.
+// consul_address in ebsConfig overrides poolECAddr when non-empty.
 func (c EbsClientConfig) ToAccessConfig(poolECAddr, logPath string) (access.Config, error) {
 	consulAddr := poolECAddr
 	if c.ConsulAddress != "" {
 		consulAddr = c.ConsulAddress
 	}
 	if consulAddr == "" {
-		return access.Config{}, fmt.Errorf("consul address empty: set pool ecAddr or ebs_config.consul_address")
+		return access.Config{}, fmt.Errorf("consul address empty: set pool ecAddr or ebsConfig.consul_address")
 	}
 
 	ac := access.Config{

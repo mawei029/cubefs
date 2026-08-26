@@ -71,14 +71,14 @@ func NewEbsClientSdk(cfg *sdk.Config, maxTimeoutSec int) (*BlobStoreClient, erro
 // poolECAddr(volume pool Access consul == CM consul). region falls back to region_magic.
 func BuildSdkConfig(c proto.EbsClientConfig, poolECAddr, logPath string) (*sdk.Config, error) {
 	if c.Idc == "" {
-		return nil, fmt.Errorf("ebs_config.idc empty")
+		return nil, fmt.Errorf("ebsConfig.idc empty")
 	}
 	regionMagic := c.RegionMagic
 	if regionMagic == "" {
 		regionMagic = c.Region
 	}
 	if regionMagic == "" {
-		return nil, fmt.Errorf("ebs_config.region_magic empty")
+		return nil, fmt.Errorf("ebsConfig.region_magic empty")
 	}
 	region := c.Region
 	if region == "" {
@@ -101,7 +101,7 @@ func BuildSdkConfig(c proto.EbsClientConfig, poolECAddr, logPath string) (*sdk.C
 		consulAddr = c.ConsulAddress
 	}
 	if consulAddr == "" && len(clusters) == 0 {
-		return nil, fmt.Errorf("ebs_config: need consul_address or clusters")
+		return nil, fmt.Errorf("ebsConfig: need consul_address or clusters")
 	}
 
 	maxBlob := defaultMaxBlobSize

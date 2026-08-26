@@ -235,8 +235,8 @@ func InitMountOptions(opts []MountOption) {
 	opts[PoolId] = MountOption{"poolId", "Storage pool ID for new inodes (0 means use volume default)", "", int64(0)}
 	opts[MetaRegion] = MountOption{"metaRegion", "Meta region for creating inodes (empty means use volume default region)", "", ""}
 	opts[ExtentHandlerMaxRetryTime] = MountOption{"extentHandlerMaxRetryTime", "process-wide max extent alloc retry budget (seconds); 0 = use built-in 2*dpCheck+2*dpPull", "", int64(0)}
-	opts[EbsConfig] = MountOption{"ebsConfig", "EBS client JSON config, e.g. '{\"fail_retry_interval_s\":60}'", "", ""}
-	opts[EnableEbsSdk] = MountOption{"enableEbsSdk", "Use in-process blobstore SDK (NewEbsClientSdk); default false keeps HTTP NewEbsClient", "", false}
+	opts[EbsConfig] = MountOption{CfgEbsConfig, "EBS client JSON config (object or string); same name as --ebsConfig", "", ""}
+	opts[EnableEbsSdk] = MountOption{"enableEbsSdk", "Use in-process blobstore SDK (NewEbsClientSdk); same name as --enableEbsSdk; default false keeps HTTP NewEbsClient", "", false}
 	for i := 0; i < MaxMountOption; i++ {
 		flag.StringVar(&opts[i].cmdlineValue, opts[i].keyword, "", opts[i].description)
 	}

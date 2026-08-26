@@ -1147,7 +1147,7 @@ func parseMountOption(cfg *config.Config) (*proto.MountOptions, error) {
 	opt.PoolId = GlobalMountOptions[proto.PoolId].GetUint8()
 	opt.MetaRegion = GlobalMountOptions[proto.MetaRegion].GetString()
 	opt.EnableEbsSdk = GlobalMountOptions[proto.EnableEbsSdk].GetBool()
-	ebsConfigJson := GlobalMountOptions[proto.EbsConfig].GetString()
+	ebsConfigJson := GlobalMountOptions[proto.EbsConfig].GetString() // CLI --ebsConfig / file string: GetString. File nested object: ParseEbsClientConfig (same key proto.CfgEbsConfig).
 
 	if opt.MountPoint == "" || opt.Volname == "" || opt.Owner == "" || opt.Master == "" {
 		return nil, errors.New(fmt.Sprintf("invalid config file: lack of mandatory fields, mountPoint(%v), volName(%v), owner(%v), masterAddr(%v)", opt.MountPoint, opt.Volname, opt.Owner, opt.Master))

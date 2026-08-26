@@ -194,12 +194,12 @@ func TestParseMountOptionEbsConfig(t *testing.T) {
 	opt, err := parseMountOption(cfg)
 	require.NoError(t, err)
 	require.Same(t, cfg, opt.Config)
-	require.Nil(t, opt.EbsConfig.LogLevel) // follow --logLevel unless ebs_config.log_level set
+	require.Nil(t, opt.EbsConfig.LogLevel) // follow --logLevel unless ebsConfig.log_level set
 	require.Equal(t, -1, *opt.EbsConfig.FailRetryIntervalS)
 
 	GlobalMountOptions = append([]proto.MountOption(nil), savedOptions...)
 	cfg = newConfig()
-	cfg.SetNewVal("ebs_config", map[string]interface{}{
+	cfg.SetNewVal(proto.CfgEbsConfig, map[string]interface{}{
 		"consul_address":        "10.0.0.2:8500",
 		"fail_retry_interval_s": 30,
 	})
@@ -221,7 +221,7 @@ func TestParseMountOptionEbsConfigInvalid(t *testing.T) {
 	cfg.SetString("volName", "testvol")
 	cfg.SetString("owner", "test-owner")
 	cfg.SetString("masterAddr", "127.0.0.1:17010")
-	cfg.SetNewVal("ebs_config", map[string]interface{}{
+	cfg.SetNewVal(proto.CfgEbsConfig, map[string]interface{}{
 		"conn_mode": "invalid",
 	})
 
@@ -231,7 +231,7 @@ func TestParseMountOptionEbsConfigInvalid(t *testing.T) {
 	require.Contains(t, err.Error(), "ParseEbsClientConfig failed")
 }
 
-func TestParseMountOptionEbsConfigCLIOverride(t *testing.T) {
+func TestParseMountOptionEbsConfigJSONString(t *testing.T) {
 	savedOptions := append([]proto.MountOption(nil), GlobalMountOptions...)
 	t.Cleanup(func() {
 		GlobalMountOptions = savedOptions
@@ -242,10 +242,7 @@ func TestParseMountOptionEbsConfigCLIOverride(t *testing.T) {
 	cfg.SetString("volName", "testvol")
 	cfg.SetString("owner", "test-owner")
 	cfg.SetString("masterAddr", "127.0.0.1:17010")
-	cfg.SetNewVal("ebs_config", map[string]interface{}{
-		"host_try_times": 10,
-	})
-	cfg.SetString("ebsConfig", `{"host_try_times":40,"fail_retry_interval_s":30}`)
+	cfg.SetString(proto.CfgEbsConfig, `{"host_try_times":40,"fail_retry_interval_s":30}`)
 
 	GlobalMountOptions = append([]proto.MountOption(nil), savedOptions...)
 	opt, err := parseMountOption(cfg)
@@ -267,7 +264,7 @@ func TestParseMountOptionEbsConfigCLIInvalidJSON(t *testing.T) {
 	cfg.SetString("volName", "testvol")
 	cfg.SetString("owner", "test-owner")
 	cfg.SetString("masterAddr", "127.0.0.1:17010")
-	cfg.SetString("ebsConfig", `{invalid`)
+	cfg.SetString(proto.CfgEbsConfig, `{invalid`)
 
 	GlobalMountOptions = append([]proto.MountOption(nil), savedOptions...)
 	_, err := parseMountOption(cfg)
