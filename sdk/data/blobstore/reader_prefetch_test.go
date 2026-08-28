@@ -242,7 +242,7 @@ func TestReaderPrefetch_dedupKickAndMiss(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 4, n)
 	require.Equal(t, []byte{0xAA, 0xAA, 0xAA, 0xAA}, buf)
-	require.Equal(t, 0, r.missStreak)
+	require.Equal(t, uint32(0), atomic.LoadUint32(&r.missStreak))
 	atomic.StoreInt32(&r.wins.active.inflight, 0)
 	waitAsyncPrefetchForTest(r)
 }
@@ -285,7 +285,7 @@ func TestReaderPrefetch_coversFillMissCoolAndPromote(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 4, n)
 	require.Equal(t, []byte{0xCC, 0xCC, 0xCC, 0xCC}, buf)
-	require.Equal(t, 3, r.missStreak)
+	require.Equal(t, uint32(3), atomic.LoadUint32(&r.missStreak))
 	require.Equal(t, 0, r.wins.active.off) // not promoted
 	atomic.StoreInt32(&standby.inflight, 0)
 	standby.fillOff, standby.fillLen = 0, 0
@@ -302,7 +302,7 @@ func TestReaderPrefetch_coversFillMissCoolAndPromote(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 4, n)
 	require.False(t, prefetchReady(r))
-	require.Equal(t, 0, r.missStreak)
+	require.Equal(t, uint32(0), atomic.LoadUint32(&r.missStreak))
 	require.Equal(t, uint64(0), r.seqHeatBytes)
 	waitAsyncPrefetchForTest(r)
 
@@ -380,7 +380,7 @@ func TestReaderPrefetch_adaptiveRandomDisarm(t *testing.T) {
 		require.Equal(t, 4, n)
 	}
 	require.False(t, prefetchReady(r2))
-	require.Equal(t, 0, r2.missStreak)
+	require.Equal(t, uint32(0), atomic.LoadUint32(&r2.missStreak))
 	require.False(t, r2.prefetchHit)
 	waitAsyncPrefetchForTest(r2)
 
@@ -393,7 +393,7 @@ func TestReaderPrefetch_adaptiveRandomDisarm(t *testing.T) {
 	n, err := readUnderStreamerMu(s, context.Background(), buf, 0, 4)
 	require.NoError(t, err)
 	require.Equal(t, 4, n)
-	require.Equal(t, asyncKickMissLimit+1, r2.missStreak)
+	require.Equal(t, uint32(asyncKickMissLimit+1), atomic.LoadUint32(&r2.missStreak))
 	require.False(t, anyPrefetchInflight(r2))
 }
 
@@ -466,7 +466,7 @@ func TestReaderPrefetch_invalidateRewindCanceledCtx(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 4, n)
 	require.Equal(t, []byte{0xAB, 0xAB, 0xAB, 0xAB}, buf)
-	require.Equal(t, 0, r.missStreak)
+	require.Equal(t, uint32(0), atomic.LoadUint32(&r.missStreak))
 	require.True(t, r.prefetchHit)
 }
 

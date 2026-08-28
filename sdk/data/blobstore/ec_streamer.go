@@ -25,56 +25,6 @@ const (
 	flushRun  uint32 = 1
 )
 
-// ReadOnlyOeks is an immutable view of sorted obj extents shared by Reader/Writer.
-type ReadOnlyOeks struct {
-	items []proto.ObjExtentKey
-}
-
-// NewReadOnlyOeks wraps a oek slice as a shared read-only view (no copy).
-func NewReadOnlyOeks(oeks []proto.ObjExtentKey) *ReadOnlyOeks {
-	return &ReadOnlyOeks{items: oeks}
-}
-
-func (r *ReadOnlyOeks) Len() int {
-	if r == nil {
-		return 0
-	}
-	return len(r.items)
-}
-
-func (r *ReadOnlyOeks) At(idx int) proto.ObjExtentKey {
-	return r.items[idx]
-}
-
-// FindContainOrAfter returns the index of the sorted oek whose [FileOffset, FileOffset+Size)
-// contains fileOff. If fileOff is in a hole (or before the first oek), returns the first oek after
-// that hole (FileOffset > fileOff). Returns -1 if the list is empty or fileOff is past the last extent.
-func (r *ReadOnlyOeks) FindContainOrAfter(fileOff uint64) int {
-	n := r.Len()
-	if n == 0 {
-		return -1
-	}
-	lo, hi := 0, n
-	for lo < hi {
-		mid := (lo + hi) / 2
-		oek := r.At(mid)
-		start, end := oek.FileOffset, oek.FileOffset+oek.Size
-		if start <= fileOff && fileOff < end {
-			return mid
-		}
-		if start <= fileOff {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	// lo is the first index with FileOffset > fileOff: fileOff is in a hole
-	if lo < n {
-		return lo
-	}
-	return -1
-}
-
 // ECStreamer shares Reader/Writer and logical view (fileSize, inoVersion, oeks, dirty) per inode.
 // refCnt via OpenStreamWithArgs/CloseStream; map delete and nil RW pointers in EvictStream.
 type ECStreamer struct {
@@ -93,7 +43,8 @@ type ECStreamer struct {
 	flushing   uint32 // 1 while flushLocked holds s.mu. TryFlush skips; Flush waits on s.mu (Go 1.18: not atomic.Bool).
 	status     uint32 // streamerError: poison after io.EOF; later Write/Flush skip EBS.
 
-	// mu serializes RW, flush, updateMetaInfo, Read/Write; EBS IO under lock (correctness over throughput, LTP).
+	// mu serializes Write/Flush/updateMetaInfo and dirty Read; clean Read uses RLock.
+	// Prefetch window state is under Reader.prefetchInfo.mu (not a Cond).
 	mu      sync.RWMutex
 	fReader *Reader // TODO: next version, merge reader and writer into one
 	fWriter *Writer
@@ -252,33 +203,41 @@ func (s *ECStreamer) Read(ctx context.Context, dst []byte, offset int, size int)
 }
 
 func (s *ECStreamer) readLocked(ctx context.Context, dst []byte, offset int, size int) (int, error) {
-	// TODO: next version, lock tuning for reads; short term document; mid term split view sync vs data IO or short lock only when dirty.
+	// ensureMetaOnce then: clean → RLock read; dirty → Lock flush+read (scheme A, same lock).
+	if err := s.ensureMetaOnce(); err != nil {
+		return 0, fmt.Errorf("get extents err(%w)", err)
+	}
+
+	// clean: only do read
+	s.mu.RLock()
+	if !s.isDirty() {
+		n, err := s.readAfterFlush(ctx, dst, offset, size)
+		s.mu.RUnlock()
+		return n, err
+	}
+	s.mu.RUnlock()
+
+	// dirty: flush and read. don't check dirty again.
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	var errGetExtents error
-	s.once.Do(func() {
-		errGetExtents = s.updateMetaInfo(nil)
-	})
-	if errGetExtents != nil {
-		return 0, fmt.Errorf("get extents err(%w)", errGetExtents)
+	if err := s.flushDirtyLocked(ctx); err != nil {
+		return 0, err
 	}
+	n, err := s.readAfterFlush(ctx, dst, offset, size)
+	return n, err
+}
 
-	// When dirty, Flush writer then updateMetaInfo so Reader sees persisted oeks (LTP gf05/gf19).
-	if s.isDirty() {
-		if err := s.fWriter.Flush(s.ino, ctx); err != nil {
-			return 0, err
-		}
-		if err := s.updateMetaInfo(nil); err != nil {
-			return 0, err
-		}
-	}
-
+func (s *ECStreamer) readAfterFlush(ctx context.Context, dst []byte, offset int, size int) (int, error) {
 	if s.fReader == nil {
 		log.LogErrorf("ECStreamer.readAfterFlush: reader is nil, ino(%v) offset(%v) size(%v)", s.ino, offset, size)
 		return 0, syscall.EBADF
 	}
-	return s.fReader.Read(ctx, dst, offset, size)
+	n, err := s.fReader.Read(ctx, dst, offset, size)
+	if err != nil {
+		log.LogErrorf("ECStreamer.readAfterFlush: reader.Read failed, ino(%v) offset(%v) size(%v) err(%v)", s.ino, offset, size, err)
+		return n, err
+	}
+	return n, nil
 }
 
 // Write performs buffered or direct blob I/O on this inode. O_SYNC / waitForFlush is handled in client/fs after oec.Write returns.
@@ -294,16 +253,12 @@ func (s *ECStreamer) Write(ctx context.Context, offset int, data []byte, flags i
 }
 
 func (s *ECStreamer) writeLocked(ctx context.Context, offset int, data []byte, flags int) (int, error) {
+	if err := s.ensureMetaOnce(); err != nil {
+		return 0, fmt.Errorf("get extents err(%w)", err)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	var errGetExtents error
-	s.once.Do(func() {
-		errGetExtents = s.updateMetaInfo(nil)
-	})
-	if errGetExtents != nil {
-		return 0, fmt.Errorf("get extents err(%w)", errGetExtents)
-	}
 
 	if s.fWriter == nil {
 		log.LogErrorf("ECStreamer.WriteWithOpts: writer is nil, ino(%v) offset(%v) len(%v) flags(%v)", s.ino, offset, len(data), flags)
@@ -326,8 +281,8 @@ func (s *ECStreamer) FileSizeView() (size int, gen uint64) {
 		return 0, 0
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return int(s.fileSizeViewLocked()), atomic.LoadUint64(&s.inoVersion)
 }
 
@@ -353,15 +308,11 @@ func (s *ECStreamer) WriteFromReader(ctx context.Context, reader io.Reader, h ha
 }
 
 func (s *ECStreamer) writeFromReaderLocked(ctx context.Context, reader io.Reader, h hash.Hash) (uint64, error) {
+	if err := s.ensureMetaOnce(); err != nil {
+		return 0, fmt.Errorf("get extents err(%w)", err)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var errGetExtents error
-	s.once.Do(func() {
-		errGetExtents = s.updateMetaInfo(nil)
-	})
-	if errGetExtents != nil {
-		return 0, fmt.Errorf("get extents err(%w)", errGetExtents)
-	}
 	return s.fWriter.WriteFromReader(ctx, reader, h)
 }
 
@@ -374,15 +325,11 @@ func (s *ECStreamer) WriteWithoutPool(ctx context.Context, writeOffset int, data
 }
 
 func (s *ECStreamer) writeWithoutPoolLocked(ctx context.Context, writeOffset int, data []byte) (int, error) {
+	if err := s.ensureMetaOnce(); err != nil {
+		return 0, fmt.Errorf("get extents err(%w)", err)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var errGetExtents error
-	s.once.Do(func() {
-		errGetExtents = s.updateMetaInfo(nil)
-	})
-	if errGetExtents != nil {
-		return 0, fmt.Errorf("get extents err(%w)", errGetExtents)
-	}
 	return s.fWriter.WriteWithoutPool(ctx, writeOffset, data)
 }
 
@@ -424,6 +371,17 @@ func (s *ECStreamer) rejectIfInError() error {
 		return fmt.Errorf("IssueWriteRequest: stream writer in error status, ino(%v)", s.ino)
 	}
 	return nil
+}
+
+// flushDirtyLocked persists the writer then refreshes oeks. Caller must hold s.mu (write lock).
+func (s *ECStreamer) flushDirtyLocked(ctx context.Context) error {
+	if !s.isDirty() {
+		return nil
+	}
+	if err := s.fWriter.Flush(s.ino, ctx); err != nil {
+		return err
+	}
+	return s.updateMetaInfo(nil)
 }
 
 // mergeInodeGen/raiseFileSize updated under mu on write paths; lock-free readers Load only.
@@ -523,6 +481,17 @@ func (s *ECStreamer) updateMetaInfo(commitSize *uint64) error {
 
 	s.invalidateReaderPrefetchBuf()
 	return nil
+}
+
+// ensureMetaOnce pulls extents on first Read/Write. Caller must NOT hold s.mu (Do takes the write lock).
+// Only the goroutine that runs Do sees updateMetaInfo's error; concurrent waiters get nil.
+func (s *ECStreamer) ensureMetaOnce() (err error) {
+	s.once.Do(func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		err = s.updateMetaInfo(nil)
+	})
+	return err
 }
 
 // resetExtentsOnceLocked resets once for next updateMetaInfo; after CloseStream zero ref and dropIOCaches, under mu.
@@ -730,4 +699,54 @@ func (s *ECStreamer) handleIoError(err error) error {
 	}
 
 	return err
+}
+
+// ReadOnlyOeks is an immutable view of sorted obj extents shared by Reader/Writer.
+type ReadOnlyOeks struct {
+	items []proto.ObjExtentKey
+}
+
+// NewReadOnlyOeks wraps a oek slice as a shared read-only view (no copy).
+func NewReadOnlyOeks(oeks []proto.ObjExtentKey) *ReadOnlyOeks {
+	return &ReadOnlyOeks{items: oeks}
+}
+
+func (r *ReadOnlyOeks) Len() int {
+	if r == nil {
+		return 0
+	}
+	return len(r.items)
+}
+
+func (r *ReadOnlyOeks) At(idx int) proto.ObjExtentKey {
+	return r.items[idx]
+}
+
+// FindContainOrAfter returns the index of the sorted oek whose [FileOffset, FileOffset+Size)
+// contains fileOff. If fileOff is in a hole (or before the first oek), returns the first oek after
+// that hole (FileOffset > fileOff). Returns -1 if the list is empty or fileOff is past the last extent.
+func (r *ReadOnlyOeks) FindContainOrAfter(fileOff uint64) int {
+	n := r.Len()
+	if n == 0 {
+		return -1
+	}
+	lo, hi := 0, n
+	for lo < hi {
+		mid := (lo + hi) / 2
+		oek := r.At(mid)
+		start, end := oek.FileOffset, oek.FileOffset+oek.Size
+		if start <= fileOff && fileOff < end {
+			return mid
+		}
+		if start <= fileOff {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	// lo is the first index with FileOffset > fileOff: fileOff is in a hole
+	if lo < n {
+		return lo
+	}
+	return -1
 }

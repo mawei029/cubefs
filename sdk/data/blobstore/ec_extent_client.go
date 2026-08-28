@@ -295,7 +295,7 @@ func (c *ECExtentClient) FileSize(ino uint64) (size int, gen uint64, valid bool)
 	return size, gen, true
 }
 
-// Read matches replica ExtentClient.Read signature; view synced inside ECStreamer; tail from FileSizeView.
+// Read matches replica ExtentClient.Read. Looks up the opened streamer under RLock; per-inode serialize is ECStreamer.mu. size usually <=128KB
 func (c *ECExtentClient) Read(ino uint64, data []byte, offset int, size int) (int, error) {
 	c.mu.RLock()
 	s, ok := c.streamers[ino]

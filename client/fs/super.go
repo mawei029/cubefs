@@ -574,9 +574,6 @@ func (s *Super) doNewBlobStoreClient(pool *proto.StoragePoolInfo) (ebsc *blobsto
 			log.LogErrorf("getBlobStoreClient: BuildSdkConfig FAILED pool(%v) err(%v)", pool.Id, err)
 			return nil, errors.Trace(err, "BuildSdkConfig failed!")
 		}
-		log.LogWarnf("getBlobStoreClient: sdk cfg idc(%v) region(%v) magic(%v) clusters(%d)",
-			sdkCfg.IDC, sdkCfg.ClusterConfig.Region, sdkCfg.ClusterConfig.RegionMagic,
-			len(sdkCfg.ClusterConfig.Clusters))
 		for i, cl := range sdkCfg.ClusterConfig.Clusters {
 			log.LogWarnf("getBlobStoreClient: sdk cluster[%d] id(%v) hosts(%v)", i, cl.ClusterID, cl.Hosts)
 		}

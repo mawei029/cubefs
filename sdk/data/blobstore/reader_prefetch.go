@@ -39,8 +39,10 @@ const (
 	asyncKickMissLimit = 4  // only schedule async on the first few true misses
 )
 
-// observeRead updates heat/cursor under prefetchInfo.mu and reports whether heat is armed.
-// Sequential or window-covered → accumulate heat; large seek / non-seq → cool.
+// observeRead decides whether to arm prefetch (access pattern), not whether a window hit.
+// missStreak / kick live in readWithPrefetch: they need hit vs coversFill after the window check.
+// Warm (sequential or covered by a prefetch window) → accumulate heat; else cool immediately
+// (may be large seek, short random, or mid-range jump — false heat must not keep kicking async fills).
 func (reader *Reader) observeRead(offset, size int) (heatReady bool) {
 	if size <= 0 {
 		return false
@@ -56,13 +58,10 @@ func (reader *Reader) observeRead(offset, size int) (heatReady bool) {
 		return false
 	}
 
-	if reader.isLargeSeek(offset, size) {
-		log.LogDebugf("TRACE prefetch ino(%v) event(cool) reason(large_seek) off(%v) size(%v) lastEnd(%v)",
-			reader.ecStreamer.Inode(), offset, size, reader.lastReadEnd)
-		reader.coolPrefetchLocked()
-	} else if reader.isSequentialRead(offset, size) || reader.coversAnyWindow(offset, size) {
+	if reader.isSequentialRead(offset, size) || reader.coversAnyWindow(offset, size) {
 		reader.seqHeatBytes += uint64(seqAdvanceBytes(offset, size, reader.lastReadEnd))
 	} else {
+		// Pattern no longer looks sequential; disarm before more async over-fetch.
 		log.LogDebugf("TRACE prefetch ino(%v) event(cool) reason(non_seq) off(%v) size(%v) lastEnd(%v)",
 			reader.ecStreamer.Inode(), offset, size, reader.lastReadEnd)
 		reader.coolPrefetchLocked()
@@ -85,8 +84,12 @@ func (reader *Reader) coolPrefetchLocked() {
 	reader.prefetchHit = false
 }
 
-// readWithPrefetch: hit active/standby; coversFill → sync without missStreak; true miss → sync + limited kick.
+// readWithPrefetch serves an armed read: hit active/standby, or sync-fetch on miss/coversFill.
 // Holds prefetchInfo.mu only around window/heat updates; releases it across readEbsRange.
+//
+// observeRead answers "should we arm?"; missStreak answers "is the window useful once armed?".
+// The latter needs hit/coversFill, so count only here—after the window check and a successful
+// sync read (serve first, then account). coversFill is not a miss; EBS error does not bump streak.
 func (reader *Reader) readWithPrefetch(ctx context.Context, buf []byte, offset, size int, fileSize uint64, fuseReqSize int, beg time.Time) (int, error) {
 	reader.mu.Lock()
 	if reader.tryPrefetchHit(buf, offset, size) {
@@ -108,7 +111,7 @@ func (reader *Reader) readWithPrefetch(ctx context.Context, buf []byte, offset, 
 		return n, err
 	}
 
-	// Inflight window already covers this read: sync path, do not count as miss.
+	// Inflight fill already covers this read: sync fallback, do not count as miss.
 	covering := reader.wins.active.coversFill(offset, size) || reader.wins.standby.coversFill(offset, size)
 	reader.mu.Unlock()
 
@@ -117,12 +120,14 @@ func (reader *Reader) readWithPrefetch(ctx context.Context, buf []byte, offset, 
 		return 0, err
 	}
 
-	reader.mu.Lock()
+	missStreak := atomic.LoadUint32(&reader.missStreak)
 	if !covering {
+		reader.mu.Lock()
+		// True miss feedback: cool if useless streak is long; else limited async kick.
 		reader.missStreak++
-		coolLimit := coolMissColdCnt
+		coolLimit := uint32(coolMissColdCnt)
 		if reader.prefetchHit {
-			coolLimit = coolMissStreakCnt
+			coolLimit = uint32(coolMissStreakCnt)
 		}
 		if reader.missStreak >= coolLimit {
 			log.LogDebugf("TRACE prefetch ino(%v) event(cool) reason(miss_streak) off(%v) missStreak(%v) useful(%v)",
@@ -131,9 +136,9 @@ func (reader *Reader) readWithPrefetch(ctx context.Context, buf []byte, offset, 
 		} else if reader.missStreak <= asyncKickMissLimit {
 			reader.ensureOekAsyncWindows(ctx, offset, fileSize)
 		}
+		missStreak = reader.missStreak
+		reader.mu.Unlock()
 	}
-	missStreak := reader.missStreak
-	reader.mu.Unlock()
 
 	if log.EnableDebug() {
 		log.LogDebugf("TRACE prefetch ino(%v) event(miss) cost(%v)us off(%v) fuseReq(%v) fuseRet(%v) ebsFetchBytes(%v) missStreak(%v) covering(%v)",
@@ -453,24 +458,6 @@ func (reader *Reader) isSequentialRead(offset, size int) bool {
 	}
 	if offset > reader.lastReadEnd && offset-reader.lastReadEnd <= sequentialGapMax {
 		return true
-	}
-	return false
-}
-
-// isLargeSeek: jump farther than BlockSize and not covered by any prefetch window (readahead wobble stays warm).
-func (reader *Reader) isLargeSeek(offset, size int) bool {
-	if !reader.hasLastRead {
-		return false
-	}
-	if reader.coversAnyWindow(offset, size) {
-		return false
-	}
-	bs := reader.ecStreamer.BlockSize()
-	if offset+size <= reader.lastReadEnd {
-		return reader.lastReadEnd-offset > bs
-	}
-	if offset > reader.lastReadEnd {
-		return offset-reader.lastReadEnd > bs
 	}
 	return false
 }

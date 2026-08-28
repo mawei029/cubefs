@@ -144,7 +144,7 @@ func BuildSdkConfig(c proto.EbsClientConfig, poolECAddr, logPath string) (*sdk.C
 		},
 		Logger: f, // same as demo -log=sdk.log; takes precedence over LogConf.Filename
 	}
-	log.LogWarnf("BuildSdkConfig: idc(%v) magic(%v) consul(%v) clusters(%d) maxBlob(%v) sdkLogLevel(%v) ebsLogLevelSet(%v) log(%v)",
-		cfg.IDC, regionMagic, consulAddr, len(clusters), maxBlob, logLevel, c.LogLevel != nil, ebsLog)
+	log.LogWarnf("BuildSdkConfig: idc(%v) region(%v) magic(%v) consul(%v) clusters(%d) maxBlob(%v) sdkLogLevel(%v) ebsLogLevelSet(%v) log(%v)",
+		cfg.IDC, region, regionMagic, consulAddr, len(clusters), maxBlob, logLevel, c.LogLevel != nil, ebsLog)
 	return cfg, nil
 }

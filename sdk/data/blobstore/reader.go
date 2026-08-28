@@ -101,12 +101,13 @@ type Reader struct {
 }
 
 // Prefetch (reader_prefetch.go): off unless AheadReadEnable.
-// Heat after prefetchHeatBytes sequential; cool on large seek / non-seq.
+// Heat after prefetchHeatBytes sequential; cool when not sequential and outside windows.
 // Always dual windows async-fill ObjExtentKey spans from sorted oeks.
 // Conf is immutable after NewReader; reserved uses atomics; limiter is CAS-based.
 type prefetchConf struct {
 	aheadReadEnable  bool
 	minReadAheadSize uint64
+	aheadWindowCnt   int
 	prefetchReserved int64 // atomic; bytes reserved from global blobPreReadLimiter
 	preReadLimiter   *blobPreReadLimiter
 }
@@ -119,7 +120,7 @@ type prefetchInfo struct {
 	lastReadOff  int    // last request offset
 	lastReadEnd  int    // last request end (exclusive)
 	seqHeatBytes uint64 // sequential heat accumulator
-	missStreak   int    // consecutive true prefetch misses since last hit/cool
+	missStreak   uint32 // consecutive true prefetch misses since last hit/cool
 	prefetchHit  bool   // true after at least one prefetch hit since last cool
 
 	wins        aheadPair // active + standby; each holds one oek extent
@@ -274,6 +275,7 @@ func NewReader(config ClientConfig) (reader *Reader) {
 
 	reader.limitManager = config.LimitManager
 	reader.aheadReadEnable = config.AheadReadEnable
+	reader.aheadWindowCnt = config.AheadWindowCnt
 	mra := config.MinReadAheadSize
 	if mra < 0 {
 		mra = 0
