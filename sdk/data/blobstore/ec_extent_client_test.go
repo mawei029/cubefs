@@ -177,7 +177,7 @@ func TestECExtentClient_CloseStream_negative_ref_reset(t *testing.T) {
 	setStreamerForTest(c, 4, s)
 	r := s.fReader
 	r.preReadLimiter = &blobPreReadLimiter{maxBytes: 256}
-	r.readBuf = make([]byte, 16)
+	r.wins.active.buf = make([]byte, 16)
 	r.prefetchReserved = 16
 
 	var flushCalls int32
@@ -195,7 +195,7 @@ func TestECExtentClient_CloseStream_negative_ref_reset(t *testing.T) {
 	require.NoError(t, c.CloseStream(4))
 	require.Equal(t, int32(0), atomic.LoadInt32(&s.refCnt))
 	require.Equal(t, int32(1), atomic.LoadInt32(&flushCalls))
-	require.Nil(t, r.readBuf)
+	require.Nil(t, r.wins.active.buf)
 	require.Equal(t, int64(0), r.prefetchReserved)
 }
 
@@ -246,7 +246,7 @@ func TestECExtentClient_CloseStream_last_ref_releases_prefetch(t *testing.T) {
 	setStreamerForTest(c, 71, s)
 	r := s.fReader
 	r.preReadLimiter = &blobPreReadLimiter{maxBytes: 256}
-	r.readBuf = make([]byte, 32)
+	r.wins.active.buf = make([]byte, 32)
 	r.prefetchReserved = 32
 
 	patches := gomonkey.NewPatches()
@@ -259,7 +259,7 @@ func TestECExtentClient_CloseStream_last_ref_releases_prefetch(t *testing.T) {
 
 	require.NoError(t, c.CloseStream(71))
 	require.NotNil(t, c.GetStreamer(71))
-	require.Nil(t, r.readBuf)
+	require.Nil(t, r.wins.active.buf)
 	require.Equal(t, int64(0), r.prefetchReserved)
 	require.NotNil(t, s.fReader)
 }
@@ -333,12 +333,12 @@ func TestECExtentClient_args_toClientConfig(t *testing.T) {
 		c := NewObjExtentClient(ObjExtentConfig{})
 		s := mustTestECStreamerWithEbsc(401, nil, 16)
 		r := s.fReader
-		r.readBuf = make([]byte, 16)
-		r.bufValidLen = 8
+		r.wins.active.buf = make([]byte, 16)
+		r.wins.active.valid = 8
 		setStreamerForTest(c, 401, s)
 		c.FreeCache(401)
-		require.Nil(t, r.readBuf)
-		require.Equal(t, 0, r.bufValidLen)
+		require.Nil(t, r.wins.active.buf)
+		require.Equal(t, 0, r.wins.active.valid)
 	})
 	t.Run("FreeCache_missing_stream_noop", func(t *testing.T) {
 		c := NewObjExtentClient(ObjExtentConfig{})
@@ -352,7 +352,7 @@ func TestECExtentClient_CloseStream_ref_gt_zero(t *testing.T) {
 	atomic.StoreInt32(&s.refCnt, 2)
 	setStreamerForTest(c, 54, s)
 	r := s.fReader
-	r.readBuf = make([]byte, 32)
+	r.wins.active.buf = make([]byte, 32)
 	r.prefetchReserved = 32
 
 	var flushCalls int32
@@ -375,7 +375,7 @@ func TestECExtentClient_CloseStream_ref_gt_zero(t *testing.T) {
 	require.Equal(t, int32(1), atomic.LoadInt32(&s.refCnt))
 	require.Equal(t, int32(1), atomic.LoadInt32(&flushCalls))
 	require.NotNil(t, c.GetStreamer(54))
-	require.NotNil(t, r.readBuf)
+	require.NotNil(t, r.wins.active.buf)
 	require.Equal(t, int64(32), r.prefetchReserved)
 
 	onceRuns = 0

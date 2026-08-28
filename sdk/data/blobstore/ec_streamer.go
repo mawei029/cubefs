@@ -46,6 +46,35 @@ func (r *ReadOnlyOeks) At(idx int) proto.ObjExtentKey {
 	return r.items[idx]
 }
 
+// FindContainOrAfter returns the index of the sorted oek whose [FileOffset, FileOffset+Size)
+// contains fileOff. If fileOff is in a hole (or before the first oek), returns the first oek after
+// that hole (FileOffset > fileOff). Returns -1 if the list is empty or fileOff is past the last extent.
+func (r *ReadOnlyOeks) FindContainOrAfter(fileOff uint64) int {
+	n := r.Len()
+	if n == 0 {
+		return -1
+	}
+	lo, hi := 0, n
+	for lo < hi {
+		mid := (lo + hi) / 2
+		oek := r.At(mid)
+		start, end := oek.FileOffset, oek.FileOffset+oek.Size
+		if start <= fileOff && fileOff < end {
+			return mid
+		}
+		if start <= fileOff {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	// lo is the first index with FileOffset > fileOff: fileOff is in a hole
+	if lo < n {
+		return lo
+	}
+	return -1
+}
+
 // ECStreamer shares Reader/Writer and logical view (fileSize, inoVersion, oeks, dirty) per inode.
 // refCnt via OpenStreamWithArgs/CloseStream; map delete and nil RW pointers in EvictStream.
 type ECStreamer struct {

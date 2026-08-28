@@ -122,7 +122,7 @@ func TestECStreamer_NewReader_idempotent(t *testing.T) {
 }
 
 func TestECStreamer_Read_dirty_flushes_before_read(t *testing.T) {
-	s := mustTestECStreamer(25, &Reader{}, nil)
+	s := mustTestECStreamer(25, nil, nil)
 	seedDirtyForTest(s)
 	s.mw = newTestMetaWrapper()
 
@@ -575,7 +575,7 @@ func TestECStreamer_closeReaderWriterLocked_releases_prefetch_keeps_endpoints(t 
 	l := &blobPreReadLimiter{maxBytes: 64}
 	require.True(t, l.tryAcquire(32))
 	r.preReadLimiter = l
-	r.readBuf = make([]byte, 32)
+	r.wins.active.buf = make([]byte, 32)
 	r.prefetchReserved = 32
 
 	patches := gomonkey.NewPatches()
@@ -588,7 +588,7 @@ func TestECStreamer_closeReaderWriterLocked_releases_prefetch_keeps_endpoints(t 
 	// 端点置空由 EvictStream 负责；closeReaderWriterLocked 仅 dropIOCachesLocked。
 	require.NotNil(t, s.fReader)
 	require.NotNil(t, s.fWriter)
-	require.Nil(t, r.readBuf)
+	require.Nil(t, r.wins.active.buf)
 	require.Equal(t, int64(0), r.prefetchReserved)
 	require.Equal(t, int64(0), atomic.LoadInt64(&l.usedBytes))
 }
@@ -648,6 +648,38 @@ func TestECStreamer_OeksLocked_sharedView(t *testing.T) {
 	ek := got.At(0)
 	ek.FileOffset = 99
 	require.Equal(t, uint64(1), got.At(0).FileOffset)
+}
+
+// FindContainOrAfter: empty, single, holes→next, edges, multi-span, past EOF.
+func TestReadOnlyOeks_FindContainOrAfter(t *testing.T) {
+	empty := NewReadOnlyOeks(nil)
+	require.Equal(t, -1, empty.FindContainOrAfter(0))
+
+	single := NewReadOnlyOeks([]proto.ObjExtentKey{{FileOffset: 100, Size: 50}})
+	require.Equal(t, 0, single.FindContainOrAfter(0))   // before first → first
+	require.Equal(t, 0, single.FindContainOrAfter(99))  // hole before → first
+	require.Equal(t, 0, single.FindContainOrAfter(100)) // contain start
+	require.Equal(t, 0, single.FindContainOrAfter(125)) // contain mid (early return)
+	require.Equal(t, 0, single.FindContainOrAfter(149)) // contain end-1
+	require.Equal(t, -1, single.FindContainOrAfter(150))
+
+	oeks := NewReadOnlyOeks([]proto.ObjExtentKey{
+		{FileOffset: 0, Size: 8 << 20},
+		{FileOffset: 16 << 20, Size: 8 << 20},
+		{FileOffset: 128 << 20, Size: 8 << 20},
+	})
+	require.Equal(t, 0, oeks.FindContainOrAfter(0))
+	require.Equal(t, 0, oeks.FindContainOrAfter(1024))
+	require.Equal(t, 0, oeks.FindContainOrAfter((8<<20)-1))
+	require.Equal(t, 1, oeks.FindContainOrAfter(8<<20))      // hole → next
+	require.Equal(t, 1, oeks.FindContainOrAfter((16<<20)-1)) // hole → next
+	require.Equal(t, 1, oeks.FindContainOrAfter(16<<20))     // contain
+	require.Equal(t, 1, oeks.FindContainOrAfter((24<<20)-1))
+	require.Equal(t, 2, oeks.FindContainOrAfter(24<<20)) // hole → next
+	require.Equal(t, 2, oeks.FindContainOrAfter(128<<20))
+	require.Equal(t, 2, oeks.FindContainOrAfter(128<<20+1)) // contain mid of last
+	require.Equal(t, -1, oeks.FindContainOrAfter(136<<20))  // past last end
+	require.Equal(t, -1, oeks.FindContainOrAfter(200<<20))
 }
 
 func TestECStreamer_HasObjExtents(t *testing.T) {
@@ -1139,13 +1171,13 @@ func TestECStreamer_invalidateReaderPrefetchBuf_and_nilReceiver(t *testing.T) {
 	var nilS *ECStreamer
 	nilS.invalidateReaderPrefetchBuf()
 
-	r := &Reader{readBuf: make([]byte, 16)}
+	r := &Reader{prefetchInfo: prefetchInfo{wins: aheadPair{active: &aheadWin{buf: make([]byte, 16)}, standby: &aheadWin{}}}}
 	s := mustTestECStreamer(62, r, nil)
 	r.ecStreamer = s
-	r.bufBaseOff = 0
-	r.bufValidLen = 8
+	r.wins.active.off = 0
+	r.wins.active.valid = 8
 	s.invalidateReaderPrefetchBuf()
-	require.Equal(t, 0, r.bufValidLen)
+	require.Equal(t, 0, r.wins.active.valid)
 
 	s2 := mustTestECStreamer(63, nil, nil)
 	s2.invalidateReaderPrefetchBuf()

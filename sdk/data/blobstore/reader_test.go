@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/brahma-adshonor/gohook"
@@ -145,6 +146,22 @@ func MockGetFalse(bc *bcache.BcacheClient, vol, key string, buf []byte, offset u
 	return 0, errors.New("Bcache get failed")
 }
 
+func anyPrefetchInflight(reader *Reader) bool {
+	return atomic.LoadInt32(&reader.wins.active.inflight) != 0 ||
+		atomic.LoadInt32(&reader.wins.standby.inflight) != 0
+}
+
+func waitAsyncPrefetchForTest(reader *Reader) {
+	deadline := time.Now().Add(3 * time.Second)
+	for anyPrefetchInflight(reader) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func prefetchReady(reader *Reader) bool {
+	return reader.seqHeatBytes >= prefetchHeatBytes
+}
+
 // ---------- 2. lifecycle ----------
 
 func TestReader_lifecycle(t *testing.T) {
@@ -161,13 +178,10 @@ func TestReader_lifecycle(t *testing.T) {
 		assert.NotEmpty(t, reader, nil)
 	})
 
-	t.Run("String_and_nil_Read", func(t *testing.T) {
+	t.Run("String", func(t *testing.T) {
 		s := mustTestECStreamer(90, nil, nil)
 		r := s.Reader()
 		require.Contains(t, r.String(), "Reader{")
-		var nilR *Reader
-		_, err := nilR.Read(context.Background(), []byte{1}, 0, 1)
-		require.Error(t, err)
 	})
 }
 
@@ -240,11 +254,14 @@ func TestReader_read(t *testing.T) {
 		require.NoError(t, err)
 		defer gohook.UnHookMethod(ebsc, "Read")
 
-		n, err := r.Read(context.Background(), make([]byte, 3), 0, 3)
+		n, err := readUnderStreamerMu(s, context.Background(), make([]byte, 3), 0, 3)
 		require.NoError(t, err)
 		require.Equal(t, 3, n)
+		waitAsyncPrefetchForTest(r)
+		require.Equal(t, 0, r.wins.active.valid)
+		require.False(t, prefetchReady(r))
 
-		n, err = r.Read(context.Background(), make([]byte, 2), 60, 2)
+		n, err = readUnderStreamerMu(s, context.Background(), make([]byte, 2), 60, 2)
 		require.NoError(t, err)
 		require.Equal(t, 0, n)
 	})
@@ -327,6 +344,13 @@ func TestReader_bcache(t *testing.T) {
 
 // ---------- 7. prefetch ----------
 
+func heatReaderPrefetch(r *Reader, lastEnd int) {
+	r.hasLastRead = true
+	r.lastReadOff = lastEnd
+	r.lastReadEnd = lastEnd
+	r.seqHeatBytes = prefetchHeatBytes
+}
+
 func TestReader_prefetch(t *testing.T) {
 	t.Run("limiter_singleton_and_acquire", func(t *testing.T) {
 		require.Nil(t, getBlobPreReadLimiter(0))
@@ -348,12 +372,23 @@ func TestReader_prefetch(t *testing.T) {
 
 	t.Run("ensurePrefetchBuf", func(t *testing.T) {
 		s := mustTestECStreamerWithEbsc(1, nil, 0)
-		r := &Reader{ecStreamer: s, preReadLimiter: &blobPreReadLimiter{maxBytes: 4}}
+		r := s.fReader
+		r.preReadLimiter = &blobPreReadLimiter{maxBytes: 4}
 		assert.False(t, r.ensurePrefetchBuf())
 
 		s2 := mustTestECStreamerWithEbsc(2, nil, 16)
-		r2 := &Reader{ecStreamer: s2, aheadWindowCnt: 1, prefetchCap: 16, preReadLimiter: &blobPreReadLimiter{maxBytes: 64}}
+		r2 := s2.fReader
+		r2.aheadReadEnable = true
+		r2.preReadLimiter = &blobPreReadLimiter{maxBytes: 64}
 		assert.True(t, r2.ensurePrefetchBuf())
+		require.NotNil(t, r2.wins.active.buf)
+		require.NotNil(t, r2.wins.standby.buf)
+
+		r3 := NewReader(ClientConfig{ECStreamer: s2, AheadReadEnable: true})
+		r3.preReadLimiter = &blobPreReadLimiter{maxBytes: 64}
+		assert.True(t, r3.ensurePrefetchBuf())
+		require.NotNil(t, r3.wins.active.buf)
+		require.NotNil(t, r3.wins.standby.buf)
 	})
 }
 
@@ -388,25 +423,34 @@ func TestReader_incremental_last2commits(t *testing.T) {
 		readerPutBuf(big, maxCap)
 	})
 
-	t.Run("readerReleasePrefetchReadBuf_pooled", func(t *testing.T) {
+	t.Run("releaseAllPrefetchBuffers", func(t *testing.T) {
 		s := mustTestECStreamerWithEbsc(501, nil, 16)
-		r := &Reader{ecStreamer: s, readBuf: make([]byte, 16), prefetchCap: 16, bufValidLen: 4}
-		readerReleasePrefetchReadBuf(r)
-		require.Nil(t, r.readBuf)
+		r := &Reader{
+			ecStreamer: s,
+			prefetchConf: prefetchConf{
+				aheadReadEnable: true,
+			},
+			prefetchInfo: prefetchInfo{
+				wins: aheadPair{
+					active:  &aheadWin{buf: make([]byte, 16), valid: 4},
+					standby: &aheadWin{buf: make([]byte, 16), valid: 4},
+				},
+			},
+		}
+		releaseAllPrefetchBuffers(r)
+		require.Nil(t, r.wins.active.buf)
+		require.Nil(t, r.wins.standby.buf)
 	})
 
-	t.Run("NewReader_aheadWindowCnt_and_prefetch_cap", func(t *testing.T) {
-		s := mustTestECStreamerWithEbsc(502, nil, 32)
-		r := NewReader(ClientConfig{ECStreamer: s, AheadWindowCnt: -2, MinReadAheadSize: -1})
-		require.Equal(t, 1, r.aheadWindowCnt)
-		require.Equal(t, 0, int(r.minReadAheadSize))
-		require.Equal(t, 32, r.prefetchCap)
-		require.Equal(t, 32, r.prefetchBufCap())
+	t.Run("NewReader_prefetch_cap_dual_window", func(t *testing.T) {
+		s := mustTestECStreamer(96, nil, nil)
+		r := NewReader(ClientConfig{ECStreamer: s, AheadReadEnable: true, MinReadAheadSize: -1})
+		require.Equal(t, uint64(0), r.minReadAheadSize)
+		require.Equal(t, s.BlockSize()*2, r.prefetchBufCap()) // always dual
 
-		r2 := NewReader(ClientConfig{ECStreamer: s, AheadWindowCnt: 4})
-		require.Equal(t, 4, r2.aheadWindowCnt)
-		require.Equal(t, 128, r2.prefetchCap)
-		require.Equal(t, r2.prefetchCap, r2.prefetchBufCap())
+		rOff := NewReader(ClientConfig{ECStreamer: s, AheadReadEnable: false})
+		require.False(t, rOff.prefetchEnabled())
+		require.Equal(t, 0, rOff.prefetchBufCap())
 	})
 
 	t.Run("prepareEbsSlice_and_readEbsRange", func(t *testing.T) {
@@ -613,63 +657,182 @@ func TestReader_incremental_last2commits(t *testing.T) {
 		r := s.fReader
 		r.readConcurrency = 1
 		r.aheadReadEnable = true
-		r.aheadWindowCnt = 2
-		r.prefetchCap = 32
 		r.minReadAheadSize = 0
 		r.preReadLimiter = &blobPreReadLimiter{maxBytes: 512}
+		heatReaderPrefetch(r, 0)
 		require.NoError(t, gohook.HookMethod(ebsc, "Read", MockEbscReadTrue, nil))
 		defer gohook.UnHookMethod(ebsc, "Read")
 
 		buf := make([]byte, 3)
-		n, err := r.Read(context.Background(), buf, 0, 3)
+		n, err := readUnderStreamerMu(s, context.Background(), buf, 0, 3)
 		require.NoError(t, err)
 		require.Equal(t, 3, n)
+		waitAsyncPrefetchForTest(r)
+		require.Greater(t, r.wins.active.valid, 3) // async-filled active window
 
 		big := make([]byte, 20)
-		n, err = r.Read(context.Background(), big, 0, 20)
+		n, err = readUnderStreamerMu(s, context.Background(), big, 0, 20)
 		require.NoError(t, err)
 		require.Equal(t, 20, n)
 
-		r.bufBaseOff = 0
-		r.bufValidLen = 8
+		r.wins.active.off = 0
+		r.wins.active.valid = 8
 		small := make([]byte, 12)
-		n, err = r.Read(context.Background(), small, 0, 12)
+		n, err = readUnderStreamerMu(s, context.Background(), small, 0, 12)
 		require.NoError(t, err)
 		require.Equal(t, 12, n)
 	})
 
-	t.Run("Read_prefetch_extend_buf", func(t *testing.T) {
+	t.Run("Read_prefetch_single_window_async", func(t *testing.T) {
 		ebsc := newSafeBlobStoreClientForTest()
 		s := mustTestECStreamerWithEbsc(507, ebsc, 16)
 		seedStreamerExtentsForTest(s, 100, []proto.ObjExtentKey{{FileOffset: 0, Size: 100}})
 		r := s.fReader
 		r.readConcurrency = 1
 		r.aheadReadEnable = true
-		r.aheadWindowCnt = 4
-		r.prefetchCap = 64
 		r.minReadAheadSize = 0
 		r.preReadLimiter = &blobPreReadLimiter{maxBytes: 512}
-		r.readBuf = make([]byte, 8)
+		heatReaderPrefetch(r, 0)
 		require.NoError(t, gohook.HookMethod(ebsc, "Read", MockEbscReadTrue, nil))
 		defer gohook.UnHookMethod(ebsc, "Read")
-		patches := gomonkey.NewPatches()
-		defer patches.Reset()
-		patches.ApplyPrivateMethod(reflect.TypeOf(r), "ensurePrefetchBuf", func(_ *Reader) bool { return true })
 
-		n, err := r.Read(context.Background(), make([]byte, 4), 0, 4)
+		n, err := readUnderStreamerMu(s, context.Background(), make([]byte, 4), 0, 4)
 		require.NoError(t, err)
 		require.Equal(t, 4, n)
-		require.GreaterOrEqual(t, cap(r.readBuf), 64)
+		waitAsyncPrefetchForTest(r)
+		require.Equal(t, 0, r.wins.active.off)
+		require.Greater(t, r.wins.active.valid, 4)
+		require.NotNil(t, r.wins.standby.buf)     // dual window always allocated
+		require.Equal(t, 0, r.wins.standby.valid) // single oek: no next to fill
+	})
+
+	t.Run("Read_dense_dual_async_both_windows", func(t *testing.T) {
+		ebsc := newSafeBlobStoreClientForTest()
+		s := mustTestECStreamerWithEbsc(510, ebsc, 16)
+		seedStreamerExtentsForTest(s, 256, []proto.ObjExtentKey{
+			{FileOffset: 0, Size: 16},
+			{FileOffset: 16, Size: 16},
+			{FileOffset: 32, Size: 16},
+		})
+		r := s.fReader
+		r.readConcurrency = 1
+		r.aheadReadEnable = true
+		r.minReadAheadSize = 0
+		r.preReadLimiter = &blobPreReadLimiter{maxBytes: 512}
+		heatReaderPrefetch(r, 0)
+		require.NoError(t, gohook.HookMethod(ebsc, "Read", MockEbscReadTrue, nil))
+		defer gohook.UnHookMethod(ebsc, "Read")
+
+		// Miss: normal FUSE read + async oek[0] and oek[1]
+		n, err := readUnderStreamerMu(s, context.Background(), make([]byte, 4), 0, 4)
+		require.NoError(t, err)
+		require.Equal(t, 4, n)
+		waitAsyncPrefetchForTest(r)
+		require.Equal(t, 0, r.wins.active.off)
+		require.Equal(t, 16, r.wins.active.valid)
+		require.Equal(t, 16, r.wins.standby.off)
+		require.Equal(t, 16, r.wins.standby.valid)
+
+		n, err = readUnderStreamerMu(s, context.Background(), make([]byte, 4), 4, 4)
+		require.NoError(t, err)
+		require.Equal(t, 4, n)
+
+		// Cross into standby window → promote.
+		n, err = readUnderStreamerMu(s, context.Background(), make([]byte, 4), 16, 4)
+		require.NoError(t, err)
+		require.Equal(t, 4, n)
+		require.Equal(t, 16, r.wins.active.off)
+	})
+
+	t.Run("Read_large_seek_cools", func(t *testing.T) {
+		ebsc := newSafeBlobStoreClientForTest()
+		s := mustTestECStreamerWithEbsc(512, ebsc, 16)
+		const fileSize = 8192
+		seedStreamerExtentsForTest(s, uint64(fileSize), []proto.ObjExtentKey{{FileOffset: 0, Size: uint64(fileSize)}})
+		r := s.fReader
+		r.readConcurrency = 1
+		r.aheadReadEnable = true
+		r.minReadAheadSize = 0
+		heatReaderPrefetch(r, 8)
+		r.preReadLimiter = &blobPreReadLimiter{maxBytes: 1 << 20}
+		require.NoError(t, gohook.HookMethod(ebsc, "Read", MockEbscReadTrue, nil))
+		defer gohook.UnHookMethod(ebsc, "Read")
+
+		const jump = 16 + 1024 // > BlockSize, outside windows
+		require.True(t, prefetchReady(r))
+		n, err := readUnderStreamerMu(s, context.Background(), make([]byte, 4), jump, 4)
+		require.NoError(t, err)
+		require.Equal(t, 4, n)
+		require.False(t, prefetchReady(r))
+		waitAsyncPrefetchForTest(r)
+		require.False(t, anyPrefetchInflight(r))
+		require.Equal(t, 0, r.wins.active.valid)
+		require.Equal(t, 0, r.wins.standby.valid)
+	})
+
+	t.Run("observeRead_heat_and_cool", func(t *testing.T) {
+		s := mustTestECStreamerWithEbsc(511, nil, 8<<20)
+		r := s.fReader
+		r.aheadReadEnable = true
+		const step = 128 << 10
+		require.False(t, r.isSequentialRead(0, step))
+		r.observeRead(0, step)
+		require.False(t, prefetchReady(r))
+		require.Equal(t, uint64(0), r.seqHeatBytes)
+
+		off := step
+		for r.seqHeatBytes < prefetchHeatBytes {
+			r.observeRead(off, step)
+			off += step
+		}
+		require.True(t, prefetchReady(r))
+
+		r.observeRead(off+128<<10, step) // small gap: stay warm
+		require.True(t, prefetchReady(r))
+		r.observeRead(off+2*(8<<20), step) // jump > BlockSize: cool
+		require.False(t, prefetchReady(r))
+		require.Equal(t, uint64(0), r.seqHeatBytes)
+		require.False(t, r.isSequentialRead(0, step))
+	})
+
+	t.Run("Read_standby_hit_promotes", func(t *testing.T) {
+		ebsc := newSafeBlobStoreClientForTest()
+		s := mustTestECStreamerWithEbsc(513, ebsc, 16)
+		seedStreamerExtentsForTest(s, 256, []proto.ObjExtentKey{{FileOffset: 0, Size: 16}, {FileOffset: 16, Size: 16}})
+		r := s.fReader
+		r.readConcurrency = 1
+		r.aheadReadEnable = true
+		r.minReadAheadSize = 0
+		r.preReadLimiter = &blobPreReadLimiter{maxBytes: 512}
+		require.True(t, r.ensurePrefetchBuf())
+		heatReaderPrefetch(r, 16)
+		require.NoError(t, gohook.HookMethod(ebsc, "Read", MockEbscReadTrue, nil))
+		defer gohook.UnHookMethod(ebsc, "Read")
+
+		r.wins.active.off = 0
+		r.wins.active.valid = 16
+		copy(r.wins.standby.buf[:16], make([]byte, 16))
+		r.wins.standby.off = 16
+		r.wins.standby.valid = 16
+
+		n, err := readUnderStreamerMu(s, context.Background(), make([]byte, 4), 16, 4)
+		require.NoError(t, err)
+		require.Equal(t, 4, n)
+		require.Equal(t, 16, r.wins.active.off)
+		require.Equal(t, 16, r.wins.active.valid)
+		waitAsyncPrefetchForTest(r)
 	})
 
 	t.Run("asyncCache_uses_pooled_buf", func(t *testing.T) {
 		ebsc := newSafeBlobStoreClientForTest()
-		s := mustTestECStreamerWithEbsc(508, ebsc, 0)
+		s := mustTestECStreamerWithEbsc(508, ebsc, 16<<20)
 		r := &Reader{
 			ecStreamer:   s,
 			enableBcache: true,
 			bc:           &bcache.BcacheClient{},
-			prefetchCap:  16 << 20,
+			prefetchConf: prefetchConf{
+				aheadReadEnable: true,
+			},
 		}
 		patches := gomonkey.NewPatches()
 		defer patches.Reset()
@@ -685,14 +848,22 @@ func TestReader_incremental_last2commits(t *testing.T) {
 		require.True(t, l.tryAcquire(32))
 		s := mustTestECStreamerWithEbsc(509, nil, 16)
 		r := &Reader{
-			ecStreamer:       s,
-			preReadLimiter:   l,
-			readBuf:          make([]byte, 32),
-			prefetchCap:      32,
-			prefetchReserved: 32,
+			ecStreamer: s,
+			prefetchConf: prefetchConf{
+				preReadLimiter:   l,
+				aheadReadEnable:  true,
+				prefetchReserved: 32,
+			},
+			prefetchInfo: prefetchInfo{
+				wins: aheadPair{
+					active:  &aheadWin{buf: make([]byte, 16)},
+					standby: &aheadWin{buf: make([]byte, 16)},
+				},
+			},
 		}
 		r.releasePrefetchCache()
-		require.Nil(t, r.readBuf)
+		require.Nil(t, r.wins.active.buf)
+		require.Nil(t, r.wins.standby.buf)
 		require.Equal(t, int64(0), r.prefetchReserved)
 		require.Equal(t, int64(0), atomic.LoadInt64(&l.usedBytes))
 	})

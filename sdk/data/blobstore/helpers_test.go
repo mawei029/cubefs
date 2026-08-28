@@ -126,6 +126,13 @@ func mustTestECStreamerWithEbsc(ino uint64, ebsc *BlobStoreClient, blockSize int
 	return s
 }
 
+// readUnderStreamerMu runs Reader.Read as ECStreamer.Read does: hold s.mu for OeksLocked / fileSizeView.
+func readUnderStreamerMu(s *ECStreamer, ctx context.Context, dst []byte, offset, size int) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fReader.Read(ctx, dst, offset, size)
+}
+
 // testWriterWithMwEbsc 返回带 mw/ebsc 的 (streamer, writer)，供 writer_test 打桩 EBS/meta。
 func testWriterWithMwEbsc(ino uint64, ebsc *BlobStoreClient) (*ECStreamer, *Writer) {
 	s := mustTestECStreamer(ino, nil, nil)

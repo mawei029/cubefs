@@ -68,6 +68,23 @@ func (reader *Reader) String() string {
 		&reader, reader.ecStreamer.Volume(), reader.ecStreamer.Inode(), reader.enableBcache, reader.readConcurrency)
 }
 
+// aheadWin is one prefetch window: active (consumed) or standby (filled in background).
+// Heap-allocated so promote() swaps pointers; an in-flight filler always writes this object.
+type aheadWin struct {
+	buf      []byte // allocated lazily on first prefetch Read to avoid holding prefetchCap per open file
+	off      int    // file offset of buf[0]
+	valid    int    // ready bytes
+	inflight int32  // async fill in progress
+	fillOff  int    // starting offset of the async fill
+	fillLen  int    // length of the async fill
+}
+
+// aheadPair: active for sequential consume; standby for the next OEK window (always dual).
+type aheadPair struct {
+	active  *aheadWin
+	standby *aheadWin
+}
+
 // Reader is bound to one inode ECStreamer: split reads by oeks, sparse zero-fill, optional prefetch and async L1 refill.
 type Reader struct {
 	bc              *bcache.BcacheClient
@@ -76,19 +93,37 @@ type Reader struct {
 	inflightCache   sync.Map // TODO: keep for now; dedupe asyncCache L1 refill per extent key
 	limitManager    *manager.LimitManager
 
-	// Prefetch: when aheadRead is on and fileSize > minReadAheadSize, merge small reads into one readEbsRange (<= prefetchCap) cached in readBuf.
-	// Semantics match replica AheadReadWindow; buffering lives in Reader, not stream.
+	ecStreamer *ECStreamer // required; logical tail/gen/oeks from stream (see NewReader)
+
+	// prefetch conf and info
+	prefetchConf
+	prefetchInfo
+}
+
+// Prefetch (reader_prefetch.go): off unless AheadReadEnable.
+// Heat after prefetchHeatBytes sequential; cool on large seek / non-seq.
+// Always dual windows async-fill ObjExtentKey spans from sorted oeks.
+// Conf is immutable after NewReader; reserved uses atomics; limiter is CAS-based.
+type prefetchConf struct {
 	aheadReadEnable  bool
 	minReadAheadSize uint64
-	aheadWindowCnt   int
-	prefetchCap      int // BlockSize * aheadWindowCnt; also max size accepted by readerBytePool
-	readBuf          []byte
-	bufBaseOff       int   // file offset of valid data at readBuf[0] (prefetch block start)
-	bufValidLen      int   // valid bytes in readBuf[0:bufValidLen] (prefetch block end)
-	prefetchReserved int64 // bytes reserved from global blobPreReadLimiter
+	prefetchReserved int64 // atomic; bytes reserved from global blobPreReadLimiter
 	preReadLimiter   *blobPreReadLimiter
+}
 
-	ecStreamer *ECStreamer // required; logical tail/gen/oeks from stream (see NewReader)
+// Mutable prefetch state. Guarded by mu (embedded as Reader.mu).
+type prefetchInfo struct {
+	mu sync.Mutex
+
+	hasLastRead  bool   // observeRead cursor initialized
+	lastReadOff  int    // last request offset
+	lastReadEnd  int    // last request end (exclusive)
+	seqHeatBytes uint64 // sequential heat accumulator
+	missStreak   int    // consecutive true prefetch misses since last hit/cool
+	prefetchHit  bool   // true after at least one prefetch hit since last cool
+
+	wins        aheadPair // active + standby; each holds one oek extent
+	prefetchGen uint64    // incremented when prefetch buffer is invalidated/released
 }
 
 // ClientConfig builds Reader/Writer; production fills via ECStreamOpenArgs.toClientConfig.
@@ -167,7 +202,7 @@ func getBlobPreReadLimiter(totalMem int64) *blobPreReadLimiter {
 
 var readerBytePool sync.Pool
 
-// readerGetBuf allocates a buffer of length n. maxPooledCap is BlockSize*aheadWindowCnt (Reader.prefetchCap);
+// readerGetBuf allocates a buffer of length n. maxPooledCap is Reader.prefetchBufCap();
 // only buffers with 0 < cap <= maxPooledCap are eligible for readerBytePool.
 func readerGetBuf(n, maxPooledCap int) []byte {
 	if n <= 0 {
@@ -206,12 +241,25 @@ func readerZeroBuf(b []byte) {
 	}
 }
 
-func readerReleasePrefetchReadBuf(reader *Reader) {
-	if reader == nil || reader.readBuf == nil {
+// releaseAllPrefetchBuffers detaches window buffers. If a window is still async-filling,
+// do not Put into readerBytePool (filler still writes that array); only nil the slot and
+// let the filler reclaim via readerPutBuf when it finishes.
+func releaseAllPrefetchBuffers(reader *Reader) {
+	capN := reader.prefetchBufCap()
+	releaseWindowBuffer(reader.wins.active, capN)
+	releaseWindowBuffer(reader.wins.standby, capN)
+}
+
+func releaseWindowBuffer(w *aheadWin, maxPooledCap int) {
+	if w == nil || w.buf == nil {
 		return
 	}
-	readerPutBuf(reader.readBuf, reader.prefetchCap)
-	reader.readBuf = nil
+	if atomic.LoadInt32(&w.inflight) != 0 {
+		w.buf = nil
+		return
+	}
+	readerPutBuf(w.buf, maxPooledCap)
+	w.buf = nil
 }
 
 func NewReader(config ClientConfig) (reader *Reader) {
@@ -226,10 +274,6 @@ func NewReader(config ClientConfig) (reader *Reader) {
 
 	reader.limitManager = config.LimitManager
 	reader.aheadReadEnable = config.AheadReadEnable
-	reader.aheadWindowCnt = config.AheadWindowCnt
-	if reader.aheadWindowCnt < 0 {
-		reader.aheadWindowCnt = 1
-	}
 	mra := config.MinReadAheadSize
 	if mra < 0 {
 		mra = 0
@@ -237,54 +281,24 @@ func NewReader(config ClientConfig) (reader *Reader) {
 	reader.minReadAheadSize = uint64(mra)
 	reader.preReadLimiter = getBlobPreReadLimiter(config.PrefetchTotalMem)
 	reader.ecStreamer = config.ECStreamer
-	if bs := reader.ecStreamer.BlockSize(); bs > 0 && reader.aheadWindowCnt > 0 {
-		reader.prefetchCap = bs * reader.aheadWindowCnt
-	}
+	reader.wins.ensure() // both windows exist for the Reader lifetime; buf is allocated lazily
 
-	log.LogDebugf("blobstore NewReader: ino(%v) aheadReadEnable(%v) aheadReadWindowCnt(%v) minReadAheadSize(%v) aheadReadTotalMemGB(%v)",
-		reader.ecStreamer.Inode(), reader.aheadReadEnable, reader.aheadWindowCnt, reader.minReadAheadSize, config.PrefetchTotalMem)
+	log.LogDebugf("blobstore NewReader: ino(%v) aheadReadEnable(%v) dualWindow(true) blockSize(%v) minReadAheadSize(%v) aheadReadTotalMemGB(%v)",
+		reader.ecStreamer.Inode(), reader.aheadReadEnable, reader.ecStreamer.BlockSize(), reader.minReadAheadSize, config.PrefetchTotalMem)
+
 	// readBuf is allocated lazily on first prefetch Read to avoid holding prefetchCap per open file
 	// when the file turns out tiny or ahead-read is off after fileSize check.
 	return
 }
 
-// prefetchBufCap is readBuf capacity and the max single prefetch fetch size (cached BlockSize*aheadWindowCnt).
-func (reader *Reader) prefetchBufCap() int {
-	return reader.prefetchCap
-}
-
-// ensurePrefetchBuf reserves readBuf and global budget; on failure Read falls back to per-call readEbsRange.
-func (reader *Reader) ensurePrefetchBuf() bool {
-	capW := reader.prefetchCap
-	if capW <= 0 {
-		return false
-	}
-	if reader.readBuf != nil && cap(reader.readBuf) >= capW {
-		return true
-	}
-	need := int64(capW) - reader.prefetchReserved
-	if need > 0 && !reader.preReadLimiter.tryAcquire(need) {
-		log.LogDebugf("TRACE reader prefetch budget exhausted. ino(%v) need(%v)", reader.ecStreamer.Inode(), need)
-		return false
-	}
-	if need > 0 {
-		reader.prefetchReserved += need
-	}
-	readerReleasePrefetchReadBuf(reader)
-	reader.readBuf = readerGetBuf(capW, capW)
-	return true
-}
-
+// Read is the blobstore entry for an EC FUSE read.
+// Caller ECStreamer.readLocked holds s.mu (write lock if dirty, else RLock).
 func (reader *Reader) Read(ctx context.Context, buf []byte, offset int, size int) (n int, err error) {
 	beg := time.Now()
 	defer func() {
 		d := time.Since(beg)
 		readerMetric.WithLabelValues("BlobstorRead").Observe(float64(d.Microseconds()))
 	}()
-
-	if reader == nil {
-		return 0, fmt.Errorf("reader is not opened yet")
-	}
 
 	if size != len(buf) {
 		size = len(buf)
@@ -299,10 +313,9 @@ func (reader *Reader) Read(ctx context.Context, buf []byte, offset int, size int
 
 	// Same as replica Streamer.read: offset >= logical tail returns n=0, err=nil (POSIX EOF); caller buf unchanged.
 	if uint64(offset) >= fileSize {
-		// TODO: next version, optionally zero caller buf at entry (not required for correctness)
 		return 0, nil
 	}
-	// TODO: next version, optionally zero-fill caller buf for holes at entry
+
 	if uint64(offset)+uint64(size) > fileSize {
 		readerZeroBuf(buf[fileSize-uint64(offset) : uint64(size)])
 		size = int(fileSize - uint64(offset))
@@ -321,84 +334,20 @@ func (reader *Reader) Read(ctx context.Context, buf []byte, offset int, size int
 		return n, nil
 	}
 
-	// Prefetch gate: requires blockSize configured, mount-level aheadRead enabled, and file length > minReadAheadSize (same as stream-side policy to avoid over-buffering small files).
-	usePrefetch := reader.ecStreamer.BlockSize() > 0 && reader.aheadReadEnable && fileSize > reader.minReadAheadSize
-	// case 1: prefetch disabled or file too small -> each call does one readEbsRange;
+	heatReady := reader.observeRead(offset, size)
+	usePrefetch := reader.prefetchEnabled() && fileSize > reader.minReadAheadSize && heatReady
 	if !usePrefetch {
 		return normalReadFunc()
 	}
-	// case 2: prefetch budget reservation failed and global prefetch pool is exhausted: still read correctly but without readBuf, fallback as above;
 	if !reader.ensurePrefetchBuf() {
 		return normalReadFunc()
 	}
-	// case 3: single request >= blockSize: cannot fit prefetch window, read EBS range directly and invalidate buffer to avoid half-block logic.
 	if size >= reader.ecStreamer.BlockSize() {
-		reader.invalidateReadBuf()
+		reader.coolPrefetch()
 		return normalReadFunc()
 	}
 
-	// case 4: Prefetch: on miss fetch [offset,offset+fetch) with fetch<=prefetchCap; later reads in window copy from readBuf.
-	ebsFetchSize := 0
-	if reader.bufValidLen == 0 || offset < reader.bufBaseOff || offset >= reader.bufBaseOff+reader.bufValidLen {
-		// rem: bytes from offset to logical file end (meta / ObjExtent tail / stream fileSize). fetch is capped by prefetchCap and rem,
-		// so a 1MiB tail yields a 1MiB window; a 20MiB tail yields at most prefetchCap (e.g. 32MiB when blockSize is 8MiB and aheadWindowCnt is 4).
-		// readEbsRange/prepareEbsSlice materialize [offset, offset+fetch): ObjExtent ranges go through EBS Read; holes are zero-filled.
-		// On success the merged buffer length equals fetch (the requested logical span); if offset is already at EOF, fetch<=0 above.
-		reader.invalidateReadBuf()
-		fetch := reader.prefetchCap
-		rem := int(fileSize - uint64(offset))
-		if fetch > rem {
-			fetch = rem
-		}
-		if fetch <= 0 {
-			return 0, nil
-		}
-		if fetch > cap(reader.readBuf) {
-			log.LogWarnf("extend reader Read prefetch buffer. ino(%v) cost(%v)us offset(%v) fetchLen(%v) readBufCap(%v)", reader.ecStreamer.Inode(), time.Since(beg).Microseconds(), offset, fetch, cap(reader.readBuf))
-			readerReleasePrefetchReadBuf(reader)
-			reader.readBuf = readerGetBuf(fetch, reader.prefetchCap)
-		}
-		fetchN, err := reader.readEbsRange(ctx, offset, uint32(fetch), fileSize, reader.readBuf[:fetch])
-		if err != nil {
-			return 0, err
-		}
-		if fetchN == 0 {
-			log.LogErrorf("reader Read prefetch buffer is empty. ino(%v) offset(%v) fetchLen(%v)", reader.ecStreamer.Inode(), offset, fetch)
-			reader.invalidateReadBuf()
-			return 0, syscall.EIO
-		}
-		ebsFetchSize = fetchN
-		reader.bufBaseOff = offset
-		reader.bufValidLen = fetchN
-		if log.EnableDebug() {
-			log.LogDebugf("TRACE reader Read prefetch. ino(%v) cost(%v)us offset(%v) fetchLen(%v)", reader.ecStreamer.Inode(), time.Since(beg).Microseconds(), offset, fetchN)
-		}
-	}
-
-	if reader.bufValidLen <= 0 {
-		log.LogErrorf("reader Read prefetch buffer is invalid. ino(%v) offset(%v) bufValidLen(%v)", reader.ecStreamer.Inode(), offset, reader.bufValidLen)
-		return 0, syscall.EIO
-	}
-
-	if offset < reader.bufBaseOff || offset >= reader.bufBaseOff+reader.bufValidLen {
-		log.LogErrorf("reader Read prefetch buffer is out of range. ino(%v) offset(%v) bufBaseOff(%v) bufValidLen(%v)", reader.ecStreamer.Inode(), offset, reader.bufBaseOff, reader.bufValidLen)
-		return 0, syscall.EIO
-	}
-	if size > reader.bufValidLen-(offset-reader.bufBaseOff) {
-		log.LogDebugf("reader Read prefetch buffer is too small. ino(%v) offset(%v) bufBaseOff(%v) bufValidLen(%v)", reader.ecStreamer.Inode(), offset, reader.bufBaseOff, reader.bufValidLen)
-		reader.invalidateReadBuf()
-		return normalReadFunc()
-	}
-
-	// case 4.1: copy data from readBuf to destination buffer.
-	winStart := offset - reader.bufBaseOff
-	copy(buf, reader.readBuf[winStart:winStart+size])
-
-	if log.EnableDebug() {
-		log.LogDebugf("TRACE reader Read done, temp ignore, ino(%v) cost(%v)us off(%v) fuseReq(%v) fuseRet(%v) ebsFetchBytes(%v) prefetchBufRemain(%v) path(prefetch)",
-			reader.ecStreamer.Inode(), time.Since(beg).Microseconds(), offset, fuseReqSize, size, ebsFetchSize, reader.bufValidLen)
-	}
-	return size, nil
+	return reader.readWithPrefetch(ctx, buf, offset, size, fileSize, fuseReqSize, beg)
 }
 
 // rwSlicesAllHoles reports whether every slice is a sparse hole (no EBS read).
@@ -413,12 +362,17 @@ func rwSlicesAllHoles(rSlices []*rwSlice) bool {
 
 // readEbsRange splits [offset,offset+size) into rwSlices and reads EBS sequentially into dst (holes zeroed in place).
 func (reader *Reader) readEbsRange(ctx context.Context, offset int, size uint32, fileSize uint64, dst []byte) (int, error) {
+	return reader.readEbsRangeWithOeks(ctx, offset, size, fileSize, reader.ecStreamer.OeksLocked(), dst)
+}
+
+// readEbsRangeWithOeks issues EBS IO with the given oeks snapshot (async prefetch must not read a mutating view).
+func (reader *Reader) readEbsRangeWithOeks(ctx context.Context, offset int, size uint32, fileSize uint64, oeks *ReadOnlyOeks, dst []byte) (int, error) {
 	beg := time.Now()
 	if int(size) > len(dst) {
 		log.LogErrorf("readEbsRange: dst too short ino(%v) need(%v) have(%v)", reader.ecStreamer.Inode(), size, len(dst))
 		return 0, syscall.EIO
 	}
-	rSlices, readSize, err := reader.prepareEbsSlice(offset, size, fileSize, dst)
+	rSlices, readSize, err := reader.prepareEbsSliceFromOeks(offset, size, fileSize, oeks, dst)
 	if log.EnableDebug() {
 		log.LogDebugf("TRACE reader readEbsRange. ino(%v) cost(%v)us rSlices-length(%v) readSize(%v)", reader.ecStreamer.Inode(), time.Since(beg).Microseconds(), len(rSlices), readSize)
 	}
@@ -483,31 +437,16 @@ func logicalReadBound(metaReportedSize uint64, objKeys []proto.ObjExtentKey) uin
 	return logical
 }
 
-// invalidateReadBuf clears prefetch window metadata; next Read refetches via readEbsRange.
-func (reader *Reader) invalidateReadBuf() {
-	reader.bufValidLen = 0
-	reader.bufBaseOff = 0
-}
-
-// releasePrefetchCache frees readBuf and releases global budget; call under ECStreamer.mu, not concurrent with Read.
-func (reader *Reader) releasePrefetchCache() {
-	if reader == nil {
-		return
-	}
-	if reader.prefetchReserved > 0 && reader.preReadLimiter != nil {
-		reader.preReadLimiter.release(reader.prefetchReserved)
-		reader.prefetchReserved = 0
-	}
-	readerReleasePrefetchReadBuf(reader)
-	reader.bufValidLen = 0
-	reader.bufBaseOff = 0
-}
-
 // prepareEbsSlice splits [offset,offset+size) by sorted oeks into hole and data slices backed by dst subranges.
+func (reader *Reader) prepareEbsSlice(offset int, size uint32, fileSize uint64, dst []byte) ([]*rwSlice, uint32, error) {
+	return reader.prepareEbsSliceFromOeks(offset, size, fileSize, reader.ecStreamer.OeksLocked(), dst)
+}
+
+// prepareEbsSliceFromOeks is prepareEbsSlice with an explicit oeks snapshot (async prefetch).
 // Sparse layout: |--hole--|==oek1==|--hole--|==oek2==|--hole--|; holes zeroed in readSliceRange.
 // Data slice rOffset/rSize is within oek; require rOffset+rSize <= oek.Size.
 // No oeks: whole range is one hole; offset>=fileSize returns readSize=0.
-func (reader *Reader) prepareEbsSlice(offset int, size uint32, fileSize uint64, dst []byte) ([]*rwSlice, uint32, error) {
+func (reader *Reader) prepareEbsSliceFromOeks(offset int, size uint32, fileSize uint64, keys *ReadOnlyOeks, dst []byte) ([]*rwSlice, uint32, error) {
 	if offset < 0 {
 		return nil, 0, syscall.EIO
 	}
@@ -529,7 +468,9 @@ func (reader *Reader) prepareEbsSlice(offset int, size uint32, fileSize uint64, 
 	start := uint64(offset)
 	end := start + uint64(size)
 
-	keys := reader.ecStreamer.OeksLocked()
+	if keys == nil {
+		keys = NewReadOnlyOeks(nil)
+	}
 
 	chunks := make([]*rwSlice, 0)
 	cur := start
@@ -696,8 +637,8 @@ func (reader *Reader) asyncCache(ctx context.Context, cacheKey string, objExtent
 	defer reader.inflightCache.Delete(cacheKey)
 
 	volName := reader.ecStreamer.Volume()
-	buf := readerGetBuf(int(objExtentKey.Size), reader.prefetchCap)
-	defer readerPutBuf(buf, reader.prefetchCap)
+	buf := readerGetBuf(int(objExtentKey.Size), reader.prefetchBufCap())
+	defer readerPutBuf(buf, reader.prefetchBufCap())
 	read, err := reader.ecStreamer.Ebsc().Read(ctx, volName, buf, 0, uint64(len(buf)), objExtentKey)
 	if err != nil || read != len(buf) {
 		log.LogErrorf("ERROR blobStore asyncCache fail, size no match. cacheKey=%v, objExtentKey.size=%v, read=%v",
